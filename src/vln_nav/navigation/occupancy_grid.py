@@ -7,7 +7,7 @@ from heapq import heappop, heappush
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 
 from .candidate_waypoint_predictor import CandidateSet, WaypointCandidate
 from .observation_adapter import Pose2D, VLNObservation
@@ -31,7 +31,7 @@ class OccupancyGridConfig:
     occupied_threshold: float = 1.2
     free_threshold: float = -0.5
     occupied_min_neighbors: int = 3
-    decay_rate: float = 0.997
+    decay_rate: float = 0.990
     inflation_radius_m: float = 0.26
     robot_radius_m: float = 0.32
     path_corridor_radius_m: float = 0.30
@@ -68,7 +68,7 @@ class _CandidateEvaluation:
 
 
 class OccupancyGridMapper:
-    """Depth-updated odom-frame occupancy grid used for local reachability checks.
+    """Local odom-frame occupancy grid used for local reachability checks.
 
     Frame convention:
     - Observation pose is odom/base pose in meters.
@@ -76,8 +76,9 @@ class OccupancyGridMapper:
     - Robot local +Y is left.
     - Image u increases to the right, so image-left pixels project to +Y.
 
-    This is not full SLAM. It is a lightweight local planning layer that uses
-    depth observations to reject candidates whose short path is occupied.
+    This is not full SLAM. It is a lightweight local planning layer.
+    LiDAR observations are preferred. Depth observations remain available for
+    fallback when LiDAR is disabled.
     """
 
     def __init__(self, *, config: OccupancyGridConfig, logger) -> None:
@@ -93,6 +94,7 @@ class OccupancyGridMapper:
         self._last_update_time_sec = -float("inf")
         self._last_debug_save_time_sec = -float("inf")
         self._last_filter_signature: tuple[int, int, tuple[str, ...]] | None = None
+        self._last_lidar_points_local_xy = np.zeros((0, 2), dtype=np.float32)
         self._debug_path = Path(config.debug_image_path)
         if not self._debug_path.is_absolute():
             self._debug_path = PROJECT_ROOT / self._debug_path
@@ -157,6 +159,56 @@ class OccupancyGridMapper:
         if occupied_updates > 0:
             self._logger.debug(
                 "[Occupancy] update free_cells=%s occupied_cells=%s occupied_total=%s",
+                free_updates,
+                occupied_updates,
+                int(np.count_nonzero(self._occupied_mask())),
+            )
+
+    def update_from_lidar(
+        self,
+        *,
+        robot_pose: Pose2D,
+        points_local_xy: np.ndarray,
+        timestamp_sec: float,
+    ) -> None:
+        if not bool(self._config.enabled):
+            return
+        if float(timestamp_sec) - float(self._last_update_time_sec) < max(0.02, float(self._config.update_period_sec)):
+            return
+        points = np.asarray(points_local_xy, dtype=np.float32)
+        if points.ndim != 2 or points.shape[1] < 2 or points.size == 0:
+            return
+        self._last_lidar_points_local_xy = points[:, :2].copy()
+
+        self._log_odds *= float(np.clip(self._config.decay_rate, 0.90, 1.0))
+        robot_xy = (float(robot_pose.x), float(robot_pose.y))
+        cos_yaw = float(np.cos(robot_pose.yaw_rad))
+        sin_yaw = float(np.sin(robot_pose.yaw_rad))
+        min_depth = max(0.02, float(self._config.min_depth_m))
+        max_depth = max(min_depth + 0.10, float(self._config.max_depth_m))
+
+        occupied_updates = 0
+        free_updates = 0
+        for forward_m, left_m in points[:, :2]:
+            forward = float(forward_m)
+            left = float(left_m)
+            distance = float(np.hypot(forward, left))
+            if not np.isfinite(distance) or distance < min_depth or distance > max_depth:
+                continue
+            world_x = robot_xy[0] + cos_yaw * forward - sin_yaw * left
+            world_y = robot_xy[1] + sin_yaw * forward + cos_yaw * left
+            free_count, occupied_count = self._mark_ray(
+                start_xy=robot_xy,
+                end_xy=(float(world_x), float(world_y)),
+                endpoint_distance_m=distance,
+            )
+            free_updates += free_count
+            occupied_updates += occupied_count
+
+        self._last_update_time_sec = float(timestamp_sec)
+        if occupied_updates > 0:
+            self._logger.debug(
+                "[Occupancy] lidar_update free_cells=%s occupied_cells=%s occupied_total=%s",
                 free_updates,
                 occupied_updates,
                 int(np.count_nonzero(self._occupied_mask())),
@@ -539,40 +591,93 @@ class OccupancyGridMapper:
         width = max(360, int(self._config.debug_width))
         height = max(360, int(self._config.debug_height))
         view_size_m = max(2.0, float(self._config.debug_view_size_m))
-        image = Image.new("RGB", (width, height), (14, 18, 22))
+        image = self._render_binary_grid_image(
+            width=width,
+            height=height,
+            center_x=float(observation.pose.x),
+            center_y=float(observation.pose.y),
+            yaw_rad=float(observation.pose.yaw_rad),
+            view_size_m=view_size_m,
+        )
         draw = ImageDraw.Draw(image)
         transform = _DebugTransform(
             width=width,
             height=height,
             center_x=float(observation.pose.x),
             center_y=float(observation.pose.y),
+            yaw_rad=float(observation.pose.yaw_rad),
             size_m=view_size_m,
         )
         self._draw_debug_grid(draw=draw, transform=transform)
-        self._draw_debug_cells(draw=draw, transform=transform)
         self._draw_debug_candidates(draw=draw, transform=transform, observation=observation, candidate_set=candidate_set)
         self._draw_debug_robot(draw=draw, transform=transform, pose=observation.pose)
-        draw.rectangle((0, 0, width, 54), fill=(0, 0, 0))
-        draw.text((12, 10), "LOCAL DEPTH OBSTACLE MAP / PLANNER", fill=(245, 245, 245))
-        free_text = "green=free " if bool(self._config.debug_show_free_space) else ""
-        draw.text((12, 30), f"{free_text}red=depth obstacle orange=safety margin cyan=robot yellow=valid gray=blocked", fill=(215, 220, 224))
+        draw.rectangle((0, 0, width, 64), fill=(235, 235, 235))
+        title_font = _load_font(22)
+        label_font = _load_font(16)
+        draw.text((12, 8), "ROBOT-CENTERED LIDAR OCCUPANCY MAP", fill=(0, 0, 0), font=title_font)
+        draw.text(
+            (12, 34),
+            "up=front | image-left=robot-left | black=occupied white=free gray=unknown cyan=current lidar yellow=candidate",
+            fill=(30, 30, 30),
+            font=label_font,
+        )
         return image
 
+    def _render_binary_grid_image(
+        self,
+        *,
+        width: int,
+        height: int,
+        center_x: float,
+        center_y: float,
+        yaw_rad: float,
+        view_size_m: float,
+    ) -> Image.Image:
+        transform = _DebugTransform(
+            width=int(width),
+            height=int(height),
+            center_x=float(center_x),
+            center_y=float(center_y),
+            yaw_rad=float(yaw_rad),
+            size_m=float(view_size_m),
+        )
+        header_h = 64
+        canvas = np.full((int(height), int(width), 3), 185, dtype=np.uint8)
+        canvas[:header_h, :, :] = 235
+        occupied = self._occupied_mask()
+        free = self._log_odds <= float(self._config.free_threshold)
+
+        y_indices, x_indices = np.indices((int(height) - header_h, int(width)), dtype=np.float32)
+        x_indices = x_indices
+        y_indices = y_indices + float(header_h)
+        local_left = -(x_indices - float(width) * 0.5) / max(transform.scale, 1e-6)
+        local_forward = (float(header_h) + float(height - header_h) * 0.5 - y_indices) / max(transform.scale, 1e-6)
+        cos_yaw = float(np.cos(float(yaw_rad)))
+        sin_yaw = float(np.sin(float(yaw_rad)))
+        world_x = float(center_x) + cos_yaw * local_forward - sin_yaw * local_left
+        world_y = float(center_y) + sin_yaw * local_forward + cos_yaw * local_left
+        cols = np.floor((world_x + self._half_size_m) / self._resolution_m).astype(np.int32)
+        rows = np.floor((world_y + self._half_size_m) / self._resolution_m).astype(np.int32)
+        inside = (rows >= 0) & (rows < self._cell_count) & (cols >= 0) & (cols < self._cell_count)
+        sampled_occupied = np.zeros_like(inside, dtype=bool)
+        sampled_free = np.zeros_like(inside, dtype=bool)
+        sampled_occupied[inside] = occupied[rows[inside], cols[inside]]
+        sampled_free[inside] = free[rows[inside], cols[inside]]
+        body = canvas[header_h:, :, :]
+        body[sampled_free] = 255
+        body[sampled_occupied] = 0
+        return Image.fromarray(canvas, mode="RGB")
+
     def _draw_debug_grid(self, *, draw: ImageDraw.ImageDraw, transform: "_DebugTransform") -> None:
-        for meter in np.arange(
-            np.floor(transform.center_x - transform.size_m * 0.5),
-            np.ceil(transform.center_x + transform.size_m * 0.5) + 0.01,
-            1.0,
-        ):
-            x, _ = transform.to_px(float(meter), transform.center_y)
-            draw.line((x, 54, x, transform.height), fill=(38, 46, 54), width=1)
-        for meter in np.arange(
-            np.floor(transform.center_y - transform.size_m * 0.5),
-            np.ceil(transform.center_y + transform.size_m * 0.5) + 0.01,
-            1.0,
-        ):
-            _, y = transform.to_px(transform.center_x, float(meter))
-            draw.line((0, y, transform.width, y), fill=(38, 46, 54), width=1)
+        half = float(transform.size_m) * 0.5
+        for left_m in np.arange(np.floor(-half), np.ceil(half) + 0.01, 1.0):
+            x0, y0 = transform.local_to_px(-half, float(left_m))
+            x1, y1 = transform.local_to_px(half, float(left_m))
+            draw.line((x0, y0, x1, y1), fill=(145, 145, 145), width=1)
+        for forward_m in np.arange(np.floor(-half), np.ceil(half) + 0.01, 1.0):
+            x0, y0 = transform.local_to_px(float(forward_m), -half)
+            x1, y1 = transform.local_to_px(float(forward_m), half)
+            draw.line((x0, y0, x1, y1), fill=(145, 145, 145), width=1)
 
     def _draw_debug_cells(self, *, draw: ImageDraw.ImageDraw, transform: "_DebugTransform") -> None:
         occupied = self._occupied_mask()
@@ -616,31 +721,35 @@ class OccupancyGridMapper:
         observation: VLNObservation,
         candidate_set: CandidateSet,
     ) -> None:
-        rx, ry = transform.to_px(float(observation.pose.x), float(observation.pose.y))
+        rx, ry = transform.local_to_px(0.0, 0.0)
         for candidate in candidate_set.candidates:
-            gx, gy = _local_to_world_xy(robot_pose=observation.pose, local_xy=candidate.local_goal_xy)
-            x, y = transform.to_px(gx, gy)
+            local_forward, local_left = [float(value) for value in candidate.local_goal_xy[:2]]
+            x, y = transform.local_to_px(local_forward, local_left)
             color = (255, 225, 55) if candidate.valid else (120, 120, 120)
             draw.line((rx, ry, x, y), fill=color, width=2)
             draw.ellipse((x - 10, y - 10, x + 10, y + 10), fill=color, outline=(255, 255, 255), width=2)
-            draw.text((x - 4, y - 7), str(candidate.slot_id), fill=(0, 0, 0))
+            draw.text((x - 5, y - 9), str(candidate.slot_id), fill=(0, 0, 0), font=_load_font(16))
             reason = str(candidate.depth_support.get("occupancy_reason", ""))
             if reason and reason != "reachable":
-                draw.text((x + 12, y - 8), reason, fill=color)
+                draw.text((x + 12, y - 9), reason, fill=color, font=_load_font(14))
+
+        self._draw_latest_lidar_points(draw=draw, transform=transform)
+
+    def _draw_latest_lidar_points(self, *, draw: ImageDraw.ImageDraw, transform: "_DebugTransform") -> None:
+        points = np.asarray(self._last_lidar_points_local_xy, dtype=np.float32)
+        if points.ndim != 2 or points.shape[1] < 2 or points.size == 0:
+            return
+        for forward_m, left_m in points[:: max(1, int(len(points) / 220))]:
+            x, y = transform.local_to_px(float(forward_m), float(left_m))
+            draw.ellipse((x - 2, y - 2, x + 2, y + 2), fill=(0, 190, 255))
 
     def _draw_debug_robot(self, *, draw: ImageDraw.ImageDraw, transform: "_DebugTransform", pose: Pose2D) -> None:
-        x, y = transform.to_px(float(pose.x), float(pose.y))
-        yaw = float(pose.yaw_rad)
-        scale = 20.0
-        tip = (x + int(round(np.cos(yaw) * scale)), y - int(round(np.sin(yaw) * scale)))
-        left = (
-            x + int(round(np.cos(yaw + 2.45) * scale * 0.75)),
-            y - int(round(np.sin(yaw + 2.45) * scale * 0.75)),
-        )
-        right = (
-            x + int(round(np.cos(yaw - 2.45) * scale * 0.75)),
-            y - int(round(np.sin(yaw - 2.45) * scale * 0.75)),
-        )
+        _ = pose
+        x, y = transform.local_to_px(0.0, 0.0)
+        scale = 22.0
+        tip = (x, y - int(round(scale)))
+        left = (x - int(round(scale * 0.70)), y + int(round(scale * 0.70)))
+        right = (x + int(round(scale * 0.70)), y + int(round(scale * 0.70)))
         draw.polygon([tip, left, right], fill=(80, 180, 255), outline=(220, 245, 255))
 
 
@@ -650,6 +759,7 @@ class _DebugTransform:
     height: int
     center_x: float
     center_y: float
+    yaw_rad: float
     size_m: float
 
     @property
@@ -657,9 +767,25 @@ class _DebugTransform:
         return min(float(self.width), float(self.height - 54)) / max(1e-6, float(self.size_m))
 
     def to_px(self, x_m: float, y_m: float) -> tuple[int, int]:
-        x = int(round(float(self.width) * 0.5 + (float(x_m) - float(self.center_x)) * self.scale))
-        y = int(round(54.0 + float(self.height - 54) * 0.5 - (float(y_m) - float(self.center_y)) * self.scale))
+        dx = float(x_m) - float(self.center_x)
+        dy = float(y_m) - float(self.center_y)
+        cos_yaw = float(np.cos(self.yaw_rad))
+        sin_yaw = float(np.sin(self.yaw_rad))
+        forward_m = cos_yaw * dx + sin_yaw * dy
+        left_m = -sin_yaw * dx + cos_yaw * dy
+        return self.local_to_px(forward_m, left_m)
+
+    def local_to_px(self, forward_m: float, left_m: float) -> tuple[int, int]:
+        header_h = 64.0
+        x = int(round(float(self.width) * 0.5 - float(left_m) * self.scale))
+        y = int(round(header_h + float(self.height - header_h) * 0.5 - float(forward_m) * self.scale))
         return x, y
+
+    def cell_rect(self, x_m: float, y_m: float, resolution_m: float) -> tuple[int, int, int, int]:
+        half = 0.5 * float(resolution_m)
+        x0, y0 = self.to_px(float(x_m) - half, float(y_m) + half)
+        x1, y1 = self.to_px(float(x_m) + half, float(y_m) - half)
+        return min(x0, x1), min(y0, y1), max(x0, x1) + 1, max(y0, y1) + 1
 
 
 def _local_to_world_xy(*, robot_pose: Pose2D, local_xy: list[float] | tuple[float, float]) -> tuple[float, float]:
@@ -685,6 +811,18 @@ def _shift_mask(mask: np.ndarray, row_shift: int, col_shift: int) -> np.ndarray:
     if src_r0 < src_r1 and src_c0 < src_c1:
         result[dst_r0:dst_r1, dst_c0:dst_c1] = mask[src_r0:src_r1, src_c0:src_c1]
     return result
+
+
+def _load_font(size: int):
+    for path in (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    ):
+        try:
+            return ImageFont.truetype(path, int(size))
+        except Exception:
+            continue
+    return ImageFont.load_default()
 
 
 def _neighbor_count(mask: np.ndarray) -> np.ndarray:

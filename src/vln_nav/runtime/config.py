@@ -206,6 +206,20 @@ class AppConfig:
     occupancy_grid_debug_height: int = 900
     occupancy_grid_debug_view_size_m: float = 8.0
     occupancy_grid_debug_show_free_space: bool = False
+    occupancy_grid_lidar_bootstrap_sec: float = 0.8
+    lidar_enabled: bool = True
+    lidar_prim_path: str = "dummy_base_link/base_link/Lidar_link"
+    lidar_child_name: str = "lidar_sensor"
+    lidar_horizontal_fov_deg: float = 360.0
+    lidar_vertical_fov_deg: float = 10.0
+    lidar_horizontal_resolution_deg: float = 1.0
+    lidar_vertical_resolution_deg: float = 5.0
+    lidar_rotation_rate_hz: float = 10.0
+    lidar_min_range_m: float = 0.20
+    lidar_max_range_m: float = 6.0
+    lidar_yaw_offset_deg: float = 0.0
+    lidar_draw_points: bool = False
+    lidar_draw_lines: bool = False
     stuck_detection_enabled: bool = True
     stuck_window_sec: float = 2.0
     stuck_displacement_threshold_m: float = 0.05
@@ -258,8 +272,17 @@ def setup_logging(level: str) -> logging.Logger:
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
 
-    logging.getLogger("asyncio").setLevel(logging.WARNING)
-    logging.getLogger("PIL").setLevel(logging.WARNING)
+    for noisy_logger in (
+        "asyncio",
+        "PIL",
+        "matplotlib",
+        "matplotlib.font_manager",
+        "fontTools",
+        "transformers",
+        "torch",
+        "timm",
+    ):
+        logging.getLogger(noisy_logger).setLevel(logging.WARNING)
     return logger
 
 
@@ -284,6 +307,7 @@ def load_config(config_path: str | None = None) -> AppConfig:
     odom = _section(file_data, "odom")
     navigation_map = _section(file_data, "navigation_map")
     occupancy_grid = _section(file_data, "occupancy_grid")
+    lidar = _section(file_data, "lidar")
     scene = _section(file_data, "scene")
     logging_section = _section(file_data, "logging")
 
@@ -949,6 +973,53 @@ def load_config(config_path: str | None = None) -> AppConfig:
             "OCCUPANCY_GRID_DEBUG_SHOW_FREE_SPACE",
             occupancy_grid.get("debug_show_free_space", False),
         ),
+        occupancy_grid_lidar_bootstrap_sec=_float_env_or_value(
+            "OCCUPANCY_GRID_LIDAR_BOOTSTRAP_SEC",
+            occupancy_grid.get("lidar_bootstrap_sec", 0.8),
+        ),
+        lidar_enabled=_bool_env_or_value("LIDAR_ENABLED", lidar.get("enabled", True)),
+        lidar_prim_path=_env_or_value(
+            "LIDAR_PRIM_PATH",
+            lidar.get("prim_path", "dummy_base_link/base_link/Lidar_link"),
+        ),
+        lidar_child_name=_env_or_value(
+            "LIDAR_CHILD_NAME",
+            lidar.get("child_name", "lidar_sensor"),
+        ),
+        lidar_horizontal_fov_deg=_float_env_or_value(
+            "LIDAR_HORIZONTAL_FOV_DEG",
+            lidar.get("horizontal_fov_deg", 360.0),
+        ),
+        lidar_vertical_fov_deg=_float_env_or_value(
+            "LIDAR_VERTICAL_FOV_DEG",
+            lidar.get("vertical_fov_deg", 10.0),
+        ),
+        lidar_horizontal_resolution_deg=_float_env_or_value(
+            "LIDAR_HORIZONTAL_RESOLUTION_DEG",
+            lidar.get("horizontal_resolution_deg", 1.0),
+        ),
+        lidar_vertical_resolution_deg=_float_env_or_value(
+            "LIDAR_VERTICAL_RESOLUTION_DEG",
+            lidar.get("vertical_resolution_deg", 5.0),
+        ),
+        lidar_rotation_rate_hz=_float_env_or_value(
+            "LIDAR_ROTATION_RATE_HZ",
+            lidar.get("rotation_rate_hz", 10.0),
+        ),
+        lidar_min_range_m=_float_env_or_value(
+            "LIDAR_MIN_RANGE_M",
+            lidar.get("min_range_m", 0.20),
+        ),
+        lidar_max_range_m=_float_env_or_value(
+            "LIDAR_MAX_RANGE_M",
+            lidar.get("max_range_m", 6.0),
+        ),
+        lidar_yaw_offset_deg=_float_env_or_value(
+            "LIDAR_YAW_OFFSET_DEG",
+            lidar.get("yaw_offset_deg", 0.0),
+        ),
+        lidar_draw_points=_bool_env_or_value("LIDAR_DRAW_POINTS", lidar.get("draw_points", False)),
+        lidar_draw_lines=_bool_env_or_value("LIDAR_DRAW_LINES", lidar.get("draw_lines", False)),
         stuck_detection_enabled=_bool_env_or_value(
             "STUCK_DETECTION_ENABLED",
             control.get("stuck_detection_enabled", True),

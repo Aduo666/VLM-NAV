@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import contextlib
+import io
+import logging
 import sys
 import types
 import os
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -75,12 +79,13 @@ class GroundingDinoDetector:
             return None, "invalid_rgb"
         image_bgr = image_rgb[:, :, :3][:, :, ::-1].copy()
         try:
-            detections = model.predict_with_classes(
-                image=image_bgr,
-                classes=[str(target_label).strip().lower()],
-                box_threshold=float(self._config.box_threshold),
-                text_threshold=float(self._config.text_threshold),
-            )
+            with _suppress_grounding_dino_noise():
+                detections = model.predict_with_classes(
+                    image=image_bgr,
+                    classes=[str(target_label).strip().lower()],
+                    box_threshold=float(self._config.box_threshold),
+                    text_threshold=float(self._config.text_threshold),
+                )
         except Exception as exc:
             self._logger.warning("[GroundingDINO] predict_failed target=%s error=%s", target_label, exc)
             return None, "grounding_dino_predict_failed"
@@ -121,13 +126,15 @@ class GroundingDinoDetector:
             if str(repo_path) not in sys.path:
                 sys.path.insert(0, str(repo_path))
             _ensure_supervision_compat()
-            from groundingdino.util.inference import Model
+            _set_noisy_library_log_levels()
+            with _suppress_grounding_dino_noise():
+                from groundingdino.util.inference import Model
 
-            self._model = Model(
-                model_config_path=str(Path(self._config.config_path).expanduser().resolve()),
-                model_checkpoint_path=str(Path(self._config.checkpoint_path).expanduser().resolve()),
-                device=str(self._config.device),
-            )
+                self._model = Model(
+                    model_config_path=str(Path(self._config.config_path).expanduser().resolve()),
+                    model_checkpoint_path=str(Path(self._config.checkpoint_path).expanduser().resolve()),
+                    device=str(self._config.device),
+                )
             self._logger.info(
                 "[GroundingDINO] loaded config=%s checkpoint=%s device=%s",
                 self._config.config_path,
@@ -145,6 +152,32 @@ def _path_exists(value: str) -> bool:
     if not str(value).strip():
         return False
     return Path(value).expanduser().exists()
+
+
+def _set_noisy_library_log_levels() -> None:
+    for name in (
+        "matplotlib",
+        "matplotlib.font_manager",
+        "PIL",
+        "transformers",
+        "torch",
+        "timm",
+    ):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
+@contextlib.contextmanager
+def _suppress_grounding_dino_noise():
+    """Hide third-party import/inference warnings that otherwise break the interactive prompt."""
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FutureWarning)
+        warnings.filterwarnings("ignore", message=".*torch.meshgrid.*", category=UserWarning)
+        warnings.filterwarnings("ignore", message=".*use_reentrant.*", category=UserWarning)
+        warnings.filterwarnings("ignore", message=".*None of the inputs have requires_grad.*", category=UserWarning)
+        warnings.filterwarnings("ignore", message=".*Importing from timm.models.layers.*", category=FutureWarning)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            yield
 
 
 def _ensure_supervision_compat() -> None:

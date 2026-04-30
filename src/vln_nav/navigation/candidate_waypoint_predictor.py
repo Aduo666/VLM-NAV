@@ -114,12 +114,21 @@ class CandidateWaypointPredictor:
             },
         )
 
-    def save_debug(self, *, observation: VLNObservation, candidate_set: CandidateSet) -> Path | None:
+    def save_debug(
+        self,
+        *,
+        observation: VLNObservation,
+        candidate_set: CandidateSet,
+        target_observation=None,
+        left_panel_image_path: str | Path | None = None,
+    ) -> Path | None:
         if observation.rgb is None or np.asarray(observation.rgb).ndim != 3:
             return None
         image_rgb = np.asarray(observation.rgb, dtype=np.uint8)
         rgb_panel = Image.fromarray(image_rgb.copy())
+        _overlay_fresh_target_mask(image=rgb_panel, target_observation=target_observation)
         draw = ImageDraw.Draw(rgb_panel)
+        _draw_target_overlay(draw=draw, image_size=rgb_panel.size, target_observation=target_observation)
         for candidate in candidate_set.candidates:
             u, v = candidate.image_uv
             fill = (220, 40, 40) if candidate.valid else (100, 100, 100)
@@ -130,12 +139,18 @@ class CandidateWaypointPredictor:
 
         rgb_width, rgb_height = rgb_panel.size
         costmap_width = max(360, int(rgb_height * 0.78))
-        costmap_panel = self._render_candidate_costmap_panel(
+        costmap_panel = _load_left_panel_image(
+            image_path=left_panel_image_path,
             width=costmap_width,
             height=rgb_height,
-            depth=None if observation.depth is None else np.asarray(observation.depth, dtype=np.float32),
-            candidate_set=candidate_set,
         )
+        if costmap_panel is None:
+            costmap_panel = self._render_candidate_costmap_panel(
+                width=costmap_width,
+                height=rgb_height,
+                depth=None if observation.depth is None else np.asarray(observation.depth, dtype=np.float32),
+                candidate_set=candidate_set,
+            )
         canvas = Image.new("RGB", (costmap_width + rgb_width, rgb_height), (0, 0, 0))
         canvas.paste(costmap_panel, (0, 0))
         canvas.paste(rgb_panel, (costmap_width, 0))
@@ -417,6 +432,90 @@ def _draw_depth_costmap_points(
                 color = (75, 92, 104)
                 radius = 1
             draw.rectangle((x - radius, y - radius, x + radius, y + radius), fill=color)
+
+
+def _load_left_panel_image(*, image_path: str | Path | None, width: int, height: int) -> Image.Image | None:
+    if image_path is None:
+        return None
+    path = Path(image_path)
+    if not path.exists():
+        return None
+    try:
+        source = Image.open(path).convert("RGB")
+        source.thumbnail((int(width), int(height)), Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS)
+        panel = Image.new("RGB", (int(width), int(height)), (14, 18, 22))
+        offset = ((int(width) - source.width) // 2, (int(height) - source.height) // 2)
+        panel.paste(source, offset)
+        draw = ImageDraw.Draw(panel)
+        draw.rectangle((0, 0, int(width), 34), fill=(0, 0, 0))
+        draw.text((12, 10), "LOCAL OCCUPANCY MAP / CANDIDATES", fill=(255, 255, 255))
+        return panel
+    except Exception:
+        return None
+
+
+def _overlay_fresh_target_mask(*, image: Image.Image, target_observation) -> None:
+    if not _fresh_visible_target(target_observation):
+        return
+    mask = getattr(target_observation, "mask", None)
+    if mask is None:
+        return
+    mask_np = np.asarray(mask, dtype=bool)
+    if mask_np.ndim != 2 or mask_np.shape[0] != image.height or mask_np.shape[1] != image.width:
+        return
+    mask_alpha = Image.fromarray(np.asarray(mask_np, dtype=np.uint8) * 95, mode="L")
+    green = Image.new("RGB", image.size, (40, 255, 110))
+    blended = Image.blend(image, green, 0.36)
+    image.paste(blended, (0, 0), mask_alpha)
+
+
+def _draw_target_overlay(*, draw: ImageDraw.ImageDraw, image_size: tuple[int, int], target_observation) -> None:
+    width, height = [int(value) for value in image_size]
+    if target_observation is None:
+        draw.rectangle((0, height - 34, width, height), fill=(0, 0, 0))
+        draw.text((12, height - 24), "target grounding: unavailable", fill=(255, 210, 90))
+        return
+
+    label = str(getattr(target_observation, "label", "target"))
+    reason = str(getattr(target_observation, "reason", "unknown"))
+    source = str(getattr(target_observation, "source", "unknown"))
+    depth_m = getattr(target_observation, "depth_m", None)
+    depth_text = "none" if depth_m is None else f"{float(depth_m):.2f}m"
+    if _fresh_visible_target(target_observation):
+        bbox = getattr(target_observation, "bbox", None)
+        if bbox is not None:
+            xmin, ymin, xmax, ymax = [int(value) for value in bbox]
+            xmin = max(0, min(width - 1, xmin))
+            ymin = max(0, min(height - 1, ymin))
+            xmax = max(0, min(width, xmax))
+            ymax = max(0, min(height, ymax))
+            color = (40, 255, 110)
+            draw.rectangle((xmin, ymin, xmax, ymax), outline=color, width=4)
+            center_uv = getattr(target_observation, "center_uv", None)
+            if center_uv is not None:
+                center_u, center_v = [int(round(float(value))) for value in center_uv]
+                draw.line((center_u - 12, center_v, center_u + 12, center_v), fill=color, width=3)
+                draw.line((center_u, center_v - 12, center_u, center_v + 12), fill=color, width=3)
+            text = f"fresh grounded {label} depth={depth_text} source={source}"
+            draw.rectangle((xmin, max(0, ymin - 26), min(width, xmin + 520), ymin), fill=(0, 0, 0))
+            draw.text((xmin + 4, max(0, ymin - 21)), text[:95], fill=color)
+            return
+
+    status = f"target grounding: not overlaid label={label} reason={reason} source={source} depth={depth_text}"
+    draw.rectangle((0, height - 38, width, height), fill=(0, 0, 0))
+    draw.text((12, height - 26), status[:125], fill=(255, 130, 90))
+
+
+def _fresh_visible_target(target_observation) -> bool:
+    if target_observation is None:
+        return False
+    if not bool(getattr(target_observation, "visible", False)):
+        return False
+    if getattr(target_observation, "bbox", None) is None:
+        return False
+    source = str(getattr(target_observation, "source", "")).lower()
+    reason = str(getattr(target_observation, "reason", "")).lower()
+    return "reused" not in source and reason == "ok"
 
 
 def _save_image_atomic(image: Image.Image, target: Path) -> None:

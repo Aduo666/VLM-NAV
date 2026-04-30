@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 
 from ..control.controller import (
     SteeringDriveController,
@@ -20,6 +20,7 @@ from ..navigation.depth_safety import DepthSafetyConfig, DepthSafetyMonitor
 from ..navigation.instruction_manager import InstructionManager
 from ..navigation.landmark_map import LandmarkMap, LandmarkMapConfig
 from ..navigation.landmark_tracker import LandmarkTracker, LandmarkTrackerConfig
+from ..navigation.lidar_sensor import PhysXLidarConfig, PhysXLidarReader
 from ..navigation.navigation_map_visualizer import NavigationMapConfig, NavigationMapVisualizer
 from ..navigation.occupancy_grid import OccupancyGridConfig, OccupancyGridMapper
 from ..navigation.observation_adapter import ObservationAdapter
@@ -305,6 +306,25 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
         ),
         logger=logger,
     )
+    lidar_reader = PhysXLidarReader(
+        config=PhysXLidarConfig(
+            enabled=bool(config.lidar_enabled),
+            prim_path=str(config.lidar_prim_path),
+            child_name=str(config.lidar_child_name),
+            horizontal_fov_deg=float(config.lidar_horizontal_fov_deg),
+            vertical_fov_deg=float(config.lidar_vertical_fov_deg),
+            horizontal_resolution_deg=float(config.lidar_horizontal_resolution_deg),
+            vertical_resolution_deg=float(config.lidar_vertical_resolution_deg),
+            rotation_rate_hz=float(config.lidar_rotation_rate_hz),
+            min_range_m=float(config.lidar_min_range_m),
+            max_range_m=float(config.lidar_max_range_m),
+            yaw_offset_deg=float(config.lidar_yaw_offset_deg),
+            draw_points=bool(config.lidar_draw_points),
+            draw_lines=bool(config.lidar_draw_lines),
+        ),
+        robot_root_path=str(config.robot_prim_path),
+        logger=logger,
+    )
     navigation_map_visualizer = NavigationMapVisualizer(
         config=NavigationMapConfig(
             enabled=bool(config.navigation_map_enabled),
@@ -462,6 +482,7 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
         observer_camera.initialize()
         logger.info("observer camera initialize() complete")
         _attach_camera_annotators(camera=observer_camera, logger=logger, enable_depth=False)
+    lidar_reader.initialize(stage=stage)
 
     _bind_viewport_to_camera(
         camera_prim_path=front_camera_prim_path,
@@ -570,7 +591,8 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
         logger.info("Navigation map output: %s", navigation_map_visualizer.output_path)
     if config.occupancy_grid_enabled:
         logger.info(
-            "[OccupancyGridConfig] enabled=1 resolution=%.2fm size=%.1fm inflation=%.2fm min_neighbors=%s path_corridor=%.2fm roi=%s debug=%s",
+            "[OccupancyGridConfig] enabled=1 source=%s resolution=%.2fm size=%.1fm inflation=%.2fm min_neighbors=%s path_corridor=%.2fm roi=%s debug=%s",
+            "lidar" if bool(config.lidar_enabled) else "depth",
             float(config.occupancy_grid_resolution_m),
             float(config.occupancy_grid_size_m),
             float(config.occupancy_grid_inflation_radius_m),
@@ -578,6 +600,19 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
             float(config.occupancy_grid_path_corridor_radius_m),
             config.occupancy_grid_depth_roi_vertical_range,
             occupancy_grid.output_path,
+        )
+    if config.lidar_enabled:
+        logger.info(
+            "[LidarConfig] prim_path=%s child=%s fov=[%.1f,%.1f] res=[%.2f,%.2f] range=[%.2f,%.2f] yaw_offset=%.1f",
+            str(config.lidar_prim_path),
+            str(config.lidar_child_name),
+            float(config.lidar_horizontal_fov_deg),
+            float(config.lidar_vertical_fov_deg),
+            float(config.lidar_horizontal_resolution_deg),
+            float(config.lidar_vertical_resolution_deg),
+            float(config.lidar_min_range_m),
+            float(config.lidar_max_range_m),
+            float(config.lidar_yaw_offset_deg),
         )
 
     last_depth_image: np.ndarray | None = None
@@ -605,6 +640,11 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
         sim_time_sec += float(config.physics_dt)
         drive_controller.apply("STOP", speed_scale=0.0)
     logger.info("Warmup complete, controller is armed.")
+    occupancy_bootstrap_end_sec = sim_time_sec
+    occupancy_bootstrap_logged = False
+    occupancy_bootstrap_done_logged = False
+    if bool(config.occupancy_grid_enabled) and bool(config.lidar_enabled):
+        occupancy_bootstrap_end_sec = sim_time_sec + max(0.0, float(config.occupancy_grid_lidar_bootstrap_sec))
 
     while simulation_app.is_running():
         world.step(render=True)
@@ -670,11 +710,53 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
                 "total_distance_m": float(odom_state.total_distance_m),
             },
         )
-        occupancy_grid.update(observation=observation)
+        lidar_scan = lidar_reader.read(pose=observation.pose, timestamp_sec=sim_time_sec) if bool(config.lidar_enabled) else None
+        if bool(config.lidar_enabled) and lidar_scan is not None:
+            occupancy_grid.update_from_lidar(
+                robot_pose=observation.pose,
+                points_local_xy=lidar_scan.points_local_xy,
+                timestamp_sec=sim_time_sec,
+            )
+            observation.meta["lidar"] = {
+                "enabled": True,
+                "source": lidar_scan.source,
+                "sensor_path": lidar_scan.sensor_path,
+                "point_count": int(lidar_scan.point_count),
+            }
+        elif bool(config.lidar_enabled):
+            observation.meta["lidar"] = {
+                "enabled": True,
+                "source": "unavailable",
+                "sensor_path": lidar_reader.sensor_path,
+                "point_count": 0,
+            }
+        else:
+            occupancy_grid.update(observation=observation)
+            observation.meta["lidar"] = {
+                "enabled": False,
+                "source": "depth",
+                "sensor_path": lidar_reader.sensor_path,
+                "point_count": 0,
+            }
+
+        if sim_time_sec < float(occupancy_bootstrap_end_sec):
+            if not occupancy_bootstrap_logged:
+                logger.info(
+                    "[OccupancyBootstrap] accumulating initial lidar map before first policy step duration_sec=%.2f",
+                    max(0.0, float(config.occupancy_grid_lidar_bootstrap_sec)),
+                )
+                occupancy_bootstrap_logged = True
+            drive_controller.apply("STOP", speed_scale=0.0)
+            last_action_name = "STOP"
+            continue
+        if occupancy_bootstrap_logged and not occupancy_bootstrap_done_logged:
+            logger.info("[OccupancyBootstrap] complete; starting VLN policy.")
+            occupancy_bootstrap_done_logged = True
 
         current_landmark = policy.current_landmark
         target_observation: TargetObservation | None = None
-        if current_landmark:
+        grounding_enabled_this_frame = not _is_executing_motion_step(active_step_result)
+        if current_landmark and grounding_enabled_this_frame:
             target_observation = target_grounder.observe(
                 rgb=front_rgb,
                 depth=last_depth_image,
@@ -696,6 +778,14 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
             )
             policy.set_landmark_state(landmark_state)
             policy.set_landmark_map_entry(landmark_map_entry)
+            policy.set_landmark_map_summary(
+                landmark_map.summary(
+                    target_label=current_landmark,
+                    robot_pose=observation.pose,
+                    timestamp_sec=sim_time_sec,
+                )
+            )
+        elif current_landmark:
             policy.set_landmark_map_summary(
                 landmark_map.summary(
                     target_label=current_landmark,
@@ -1097,6 +1187,17 @@ def _resolve_output_path(path_str: str) -> Path:
     return candidate
 
 
+def _is_executing_motion_step(step_result) -> bool:
+    if step_result is None:
+        return False
+    action = str(getattr(step_result, "action_name", "STOP")).strip().upper()
+    if action not in {"FORWARD", "BACKWARD", "TURN_LEFT", "TURN_RIGHT", "TRACK_TARGET"}:
+        return False
+    source = str(getattr(step_result, "decision_source", "")).strip().upper()
+    remaining = int(getattr(step_result, "execution_steps_remaining", 0) or 0)
+    return remaining > 0 and source in {"LLM_PRIMITIVE", "ACTIVE_PRIMITIVE", "ACTIVE_GOAL", "RECOVERY"}
+
+
 def _save_rgb_debug_image(image_rgb: np.ndarray, output_path: Path) -> None:
     image = Image.fromarray(np.asarray(image_rgb, dtype=np.uint8))
     _save_image_atomic(image, output_path)
@@ -1142,11 +1243,11 @@ def _save_current_target_debug_image(
         color = (255, 220, 0) if abs(heading_rad) <= half_fov_rad else (255, 120, 0)
         fp_draw.line((origin[0], origin[1], target_u, target_v), fill=color, width=4)
         fp_draw.ellipse((target_u - 16, target_v - 16, target_u + 16, target_v + 16), outline=color, width=4)
-        fp_draw.text((target_u + 18, max(0, target_v - 12)), "current target", fill=color)
+        fp_draw.text((target_u + 18, max(0, target_v - 14)), "current target", fill=color, font=_debug_font(15))
     else:
         color = (255, 80, 80)
         fp_draw.line((origin[0] - 35, origin[1], origin[0] + 35, origin[1]), fill=color, width=4)
-        fp_draw.text((origin[0] + 42, origin[1] - 10), "no active target", fill=color)
+        fp_draw.text((origin[0] + 42, origin[1] - 12), "no active target", fill=color, font=_debug_font(15))
 
     heading_deg = float(np.degrees(heading_rad))
     overlay_lines = [
@@ -1157,21 +1258,22 @@ def _save_current_target_debug_image(
         f"distance={distance_m:.2f}m heading={heading_deg:+.1f}deg",
     ]
     margin = 10
-    line_height = 18
+    overlay_font = _debug_font(15)
+    line_height = 22
     box_height = margin * 2 + line_height * len(overlay_lines)
     fp_draw.rectangle((0, 0, fp_width, box_height), fill=(0, 0, 0))
     for index, text in enumerate(overlay_lines):
-        fp_draw.text((margin, margin + index * line_height), text, fill=(255, 255, 255))
+        fp_draw.text((margin, margin + index * line_height), text, fill=(255, 255, 255), font=overlay_font)
 
-    occ_width = max(360, int(fp_height * 0.95))
+    occ_width = max(540, int(fp_width))
     occ_image = _load_occupancy_debug_panel(
         occupancy_image_path=map_image_path,
         width=occ_width,
         height=fp_height,
     )
-    canvas = Image.new("RGB", (fp_width + occ_width, fp_height), (0, 0, 0))
-    canvas.paste(fp_image, (0, 0))
-    canvas.paste(occ_image, (fp_width, 0))
+    canvas = Image.new("RGB", (occ_width + fp_width, fp_height), (0, 0, 0))
+    canvas.paste(occ_image, (0, 0))
+    canvas.paste(fp_image, (occ_width, 0))
 
     _save_image_atomic(canvas, output_path)
     return canvas
@@ -1196,8 +1298,9 @@ def _draw_grounded_target_overlay(
     image_size: tuple[int, int],
 ) -> None:
     width, height = [int(value) for value in image_size]
+    label_font = _debug_font(15)
     if observation is None:
-        draw.text((12, height - 28), "grounding: no current landmark", fill=(255, 210, 90))
+        draw.text((12, height - 30), "grounding: no current landmark", fill=(255, 210, 90), font=label_font)
         return
     visible = bool(observation.visible)
     reason = str(observation.reason)
@@ -1216,12 +1319,12 @@ def _draw_grounded_target_overlay(
             draw.line((center_u - 10, center_v, center_u + 10, center_v), fill=color, width=3)
             draw.line((center_u, center_v - 10, center_u, center_v + 10), fill=color, width=3)
         label = f"grounded {observation.label} depth={depth_text} conf={observation.confidence:.2f}"
-        draw.rectangle((xmin, max(0, ymin - 24), min(width, xmin + 420), ymin), fill=(0, 0, 0))
-        draw.text((xmin + 4, max(0, ymin - 20)), label, fill=color)
+        draw.rectangle((xmin, max(0, ymin - 28), min(width, xmin + 500), ymin), fill=(0, 0, 0))
+        draw.text((xmin + 4, max(0, ymin - 24)), label, fill=color, font=label_font)
         return
     text = f"grounding: lost/hidden label={observation.label} reason={reason} source={source} depth={depth_text}"
-    draw.rectangle((0, height - 38, width, height), fill=(0, 0, 0))
-    draw.text((12, height - 26), text[:120], fill=(255, 110, 90))
+    draw.rectangle((0, height - 44, width, height), fill=(0, 0, 0))
+    draw.text((12, height - 32), text[:120], fill=(255, 110, 90), font=label_font)
 
 
 def _load_occupancy_debug_panel(*, occupancy_image_path: Path | None, width: int, height: int) -> Image.Image:
@@ -1238,8 +1341,20 @@ def _load_occupancy_debug_panel(*, occupancy_image_path: Path | None, width: int
         panel = Image.new("RGB", (int(width), int(height)), (14, 18, 22))
     draw = ImageDraw.Draw(panel)
     draw.rectangle((0, 0, int(width), 34), fill=(0, 0, 0))
-    draw.text((12, 10), "NAV MAP / OCCUPANCY / LANDMARKS", fill=(245, 245, 245))
+    draw.text((12, 8), "ROBOT-CENTERED LIDAR OCCUPANCY MAP", fill=(245, 245, 245), font=_debug_font(16))
     return panel
+
+
+def _debug_font(size: int):
+    for path in (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    ):
+        try:
+            return ImageFont.truetype(path, int(size))
+        except Exception:
+            continue
+    return ImageFont.load_default()
 
 
 def _save_image_atomic(image: Image.Image, output_path: Path) -> None:
@@ -1443,7 +1558,87 @@ def _resolve_existing_prim_path(*, stage, prim_path: str, kind: str) -> str:
             if fallback_prim and fallback_prim.IsValid():
                 return fallback_path
 
-    raise RuntimeError(f"Configured {kind} prim does not exist: {prim_path}")
+    discovered = _discover_matching_prim_path(stage=stage, requested_path=prim_path)
+    if discovered:
+        return discovered
+
+    root_hint = _stage_root_hint(prim_path)
+    available = _available_camera_like_prim_paths(stage=stage, root_hint=root_hint)
+    detail = "\n".join(f"  - {path}" for path in available[:40]) if available else "  none"
+    raise RuntimeError(
+        f"Configured {kind} prim does not exist: {prim_path}\n"
+        f"Camera-like prims under {root_hint or '/'}:\n{detail}"
+    )
+
+
+def _discover_matching_prim_path(*, stage, requested_path: str) -> str:
+    requested = str(requested_path).rstrip("/")
+    requested_lower = requested.lower()
+    root_hint = _stage_root_hint(requested)
+    suffixes = _candidate_path_suffixes(requested)
+    matches: list[tuple[int, str]] = []
+    for prim in stage.Traverse():
+        path = str(prim.GetPath())
+        if root_hint and not path.startswith(root_hint.rstrip("/") + "/") and path != root_hint:
+            continue
+        path_lower = path.lower()
+        if path_lower == requested_lower:
+            return path
+        if any(path_lower.endswith(suffix) for suffix in suffixes):
+            matches.append((0, path))
+            continue
+        if _is_camera_like_prim(prim) and path_lower.rsplit("/", 1)[-1] == requested_lower.rsplit("/", 1)[-1]:
+            matches.append((1, path))
+    if not matches:
+        return ""
+    matches.sort(key=lambda item: (item[0], len(item[1])))
+    return matches[0][1]
+
+
+def _candidate_path_suffixes(requested_path: str) -> list[str]:
+    parts = [part for part in str(requested_path).strip("/").split("/") if part]
+    suffixes: list[str] = []
+    for count in range(min(4, len(parts)), 0, -1):
+        suffix = "/" + "/".join(parts[-count:]).lower()
+        if suffix not in suffixes:
+            suffixes.append(suffix)
+        tail = parts[-1]
+        swapped_tail = "camera" if tail == "Camera" else "Camera" if tail == "camera" else ""
+        if swapped_tail:
+            swapped = "/" + "/".join([*parts[-count:-1], swapped_tail]).lower()
+            if swapped not in suffixes:
+                suffixes.append(swapped)
+    return suffixes
+
+
+def _available_camera_like_prim_paths(*, stage, root_hint: str) -> list[str]:
+    paths: list[str] = []
+    for prim in stage.Traverse():
+        path = str(prim.GetPath())
+        if root_hint and not path.startswith(root_hint.rstrip("/") + "/") and path != root_hint:
+            continue
+        if _is_camera_like_prim(prim):
+            paths.append(path)
+    return paths
+
+
+def _is_camera_like_prim(prim) -> bool:
+    try:
+        type_name = str(prim.GetTypeName())
+        path = str(prim.GetPath())
+    except Exception:
+        return False
+    lowered = path.lower()
+    return type_name == "Camera" or "camera" in lowered
+
+
+def _stage_root_hint(path: str) -> str:
+    parts = [part for part in str(path).strip("/").split("/") if part]
+    if len(parts) >= 2:
+        return "/" + "/".join(parts[:2])
+    if len(parts) == 1:
+        return "/" + parts[0]
+    return ""
 
 
 def _find_articulation_root_path(*, stage, root_path: str) -> str:

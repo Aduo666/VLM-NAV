@@ -112,6 +112,8 @@ class TargetGrounder:
         self._last_call_started_wall_sec = -float("inf")
         self._last_observation: TargetObservation | None = None
         self._last_observation_wall_sec = -float("inf")
+        self._last_observation_log_signature: tuple | None = None
+        self._last_observation_log_wall_sec = -float("inf")
         self._grounding_dino = GroundingDinoDetector(
             config=GroundingDinoConfig(
                 enabled=str(config.backend).strip().lower() in {"auto", "grounding_dino", "dino"},
@@ -273,7 +275,7 @@ class TargetGrounder:
         )
         self._last_observation = observation
         self._last_observation_wall_sec = float(wall_time_sec)
-        if observation.visible:
+        if observation.visible and self._should_log_observation(observation=observation, wall_time_sec=wall_time_sec):
             self._logger.info(
                 "[Grounding] target=%s visible=1 bbox=%s depth=%.2f valid_ratio=%.2f mask_area=%.3f bearing_deg=%.1f world=%s confidence=%.2f coord=%s seg=%s",
                 observation.label,
@@ -287,9 +289,31 @@ class TargetGrounder:
                 observation.coordinate_mode,
                 observation.segmentation_source,
             )
-        else:
+        elif not observation.visible and self._should_log_observation(observation=observation, wall_time_sec=wall_time_sec):
             self._logger.info("[GroundingReject] target=%s reason=%s", observation.label, observation.reason)
         return observation
+
+    def _should_log_observation(self, *, observation: TargetObservation, wall_time_sec: float) -> bool:
+        bbox = tuple(int(round(float(value) / 12.0)) for value in (observation.bbox or ()))
+        depth_bucket = None if observation.depth_m is None else round(float(observation.depth_m), 1)
+        bearing_bucket = None if observation.bearing_rad is None else round(float(np.degrees(observation.bearing_rad)) / 10.0)
+        signature = (
+            str(observation.label),
+            bool(observation.visible),
+            str(observation.reason),
+            str(observation.source),
+            bbox,
+            depth_bucket,
+            bearing_bucket,
+        )
+        if signature != self._last_observation_log_signature:
+            self._last_observation_log_signature = signature
+            self._last_observation_log_wall_sec = float(wall_time_sec)
+            return True
+        if float(wall_time_sec) - float(self._last_observation_log_wall_sec) >= 5.0:
+            self._last_observation_log_wall_sec = float(wall_time_sec)
+            return True
+        return False
 
     def _call_grounding(self, request: _GroundingRequest) -> tuple[str, str]:
         backend = str(self._config.backend).strip().lower() or "auto"
@@ -448,7 +472,7 @@ class TargetGrounder:
                 reason="bbox_out_of_range",
             )
         source_prefix = str(payload.get("source", "qwen_vl_bbox")).strip() or "qwen_vl_bbox"
-        self._logger.info(
+        self._logger.debug(
             "[GroundingBbox] target=%s raw_bbox=%s mapped_bbox=%s image_size=%s upload_image_size=%s coord=%s source=%s",
             request.target_label,
             bbox_upload,
@@ -510,7 +534,7 @@ class TargetGrounder:
                 statistic=str(self._config.depth_statistic),
             )
             segmentation_source = segmentation.source
-            self._logger.info(
+            self._logger.debug(
                 "[SAM] target=%s score=%.3f mask_area=%.3f depth=%s valid_ratio=%.2f",
                 request.target_label,
                 float(segmentation.score),
@@ -521,7 +545,7 @@ class TargetGrounder:
 
         if depth_m is None or valid_ratio < float(self._config.min_depth_valid_ratio):
             if segmentation is not None:
-                self._logger.info(
+                self._logger.debug(
                     "[SAMFallback] target=%s reason=mask_depth_invalid depth=%s valid_ratio=%.2f fallback=%s",
                     request.target_label,
                     "none" if depth_m is None else f"{float(depth_m):.2f}",

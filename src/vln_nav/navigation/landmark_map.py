@@ -177,15 +177,15 @@ class LandmarkMap:
     def _log_entry_if_needed(self, *, entry: LandmarkMapEntry, timestamp_sec: float) -> None:
         signature = (
             entry.status,
-            _format_xy(entry.world_xy),
-            None if entry.anchor_distance_m is None else round(float(entry.anchor_distance_m), 2),
+            _format_xy_bucket(entry.world_xy, bucket_m=0.10),
+            None if entry.anchor_distance_m is None else round(float(entry.anchor_distance_m), 1),
             bool(entry.reached),
         )
         last_signature = self._last_log_signature_by_label.get(entry.label)
         last_time = self._last_log_time_by_label.get(entry.label, -float("inf"))
         if (
             signature == last_signature
-            and float(timestamp_sec) - float(last_time) < max(0.1, float(self._config.log_period_sec))
+            and float(timestamp_sec) - float(last_time) < max(3.0, float(self._config.log_period_sec))
         ):
             return
         self._last_log_signature_by_label[entry.label] = signature
@@ -237,3 +237,12 @@ def _format_xy(value: list[float] | tuple[float, float] | None) -> str:
     if value is None:
         return "none"
     return f"[{float(value[0]):.2f},{float(value[1]):.2f}]"
+
+
+def _format_xy_bucket(value: list[float] | tuple[float, float] | None, *, bucket_m: float) -> str:
+    if value is None:
+        return "none"
+    bucket = max(0.01, float(bucket_m))
+    x = round(float(value[0]) / bucket) * bucket
+    y = round(float(value[1]) / bucket) * bucket
+    return f"[{x:.2f},{y:.2f}]"

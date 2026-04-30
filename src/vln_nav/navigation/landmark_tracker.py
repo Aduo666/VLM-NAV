@@ -59,6 +59,8 @@ class LandmarkTracker:
         self._pending_anchors: dict[str, _PendingAnchor] = {}
         self._last_log_time_by_label: dict[str, float] = {}
         self._last_log_signature_by_label: dict[str, tuple] = {}
+        self._last_anchor_log_time_by_label: dict[str, float] = {}
+        self._last_anchor_log_xy_by_label: dict[str, list[float]] = {}
 
     def reset(self, label: str | None = None) -> None:
         if label is None:
@@ -167,16 +169,15 @@ class LandmarkTracker:
         signature = (
             state.status,
             bool(observation.visible),
-            int(state.visible_count),
             lost_bucket,
-            _format_xy(state.estimated_world_xy),
+            _format_xy_bucket(state.estimated_world_xy, bucket_m=0.10),
             bool(state.reached),
             state.reach_reason,
             observation.reason,
         )
         last_time = self._last_log_time_by_label.get(label, -float("inf"))
         last_signature = self._last_log_signature_by_label.get(label)
-        if signature == last_signature and float(timestamp_sec) - float(last_time) < 1.0:
+        if signature == last_signature and float(timestamp_sec) - float(last_time) < 3.0:
             return
         self._last_log_time_by_label[label] = float(timestamp_sec)
         self._last_log_signature_by_label[label] = signature
@@ -244,12 +245,20 @@ class LandmarkTracker:
                 return None
 
         confirmed = [float(averaged[0]), float(averaged[1])]
-        self._logger.info(
-            "[LandmarkAnchor] target=%s confirmed=%s observations=%s",
-            label,
-            _format_xy(confirmed),
-            int(pending.count),
+        last_anchor_log_time = self._last_anchor_log_time_by_label.get(label, -float("inf"))
+        last_anchor_xy = self._last_anchor_log_xy_by_label.get(label)
+        moved_m = float("inf") if last_anchor_xy is None else float(
+            np.linalg.norm(np.asarray(confirmed, dtype=np.float32) - np.asarray(last_anchor_xy, dtype=np.float32))
         )
+        if moved_m >= 0.10 or float(pending.count) <= float(required) or float(pending.count) % 10 == 0 or float(last_anchor_log_time) < -1.0e20:
+            self._logger.info(
+                "[LandmarkAnchor] target=%s confirmed=%s observations=%s",
+                label,
+                _format_xy(confirmed),
+                int(pending.count),
+            )
+            self._last_anchor_log_time_by_label[label] = 0.0
+            self._last_anchor_log_xy_by_label[label] = list(confirmed)
         return confirmed
 
     def _update_reach_state(
@@ -341,3 +350,12 @@ def _format_xy(value: list[float] | tuple[float, float] | None) -> str:
     if value is None:
         return "none"
     return f"[{float(value[0]):.2f},{float(value[1]):.2f}]"
+
+
+def _format_xy_bucket(value: list[float] | tuple[float, float] | None, *, bucket_m: float) -> str:
+    if value is None:
+        return "none"
+    bucket = max(0.01, float(bucket_m))
+    x = round(float(value[0]) / bucket) * bucket
+    y = round(float(value[1]) / bucket) * bucket
+    return f"[{x:.2f},{y:.2f}]"

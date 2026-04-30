@@ -61,6 +61,19 @@ class SamSegmenter:
                 source=f"sam_{self._config.model_type}",
             )
         except Exception as exc:
+            message = str(exc)
+            if "out of memory" in message.lower() or "cuda oom" in message.lower():
+                self._load_failed_reason = "runtime_cuda_out_of_memory"
+                self._predictor = None
+                self._logger.warning("[SAM] disabled_for_this_run reason=%s error=%s", self._load_failed_reason, exc)
+                try:
+                    import torch
+
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                return None
             self._logger.warning("[SAMReject] reason=segment_failed error=%s", exc)
             return None
 

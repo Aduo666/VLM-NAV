@@ -167,17 +167,27 @@ class OpenNavReasoner:
         if selected_action is None:
             selected_action = expected_action
         if selected_action != expected_action:
-            return ReasonerDecision(
-                selected_candidate_id=None,
-                selected_action=None,
-                thought=(
-                    "LLM returned inconsistent candidate/action pair: "
-                    f"candidate_id={selected_candidate_id} expects {expected_action}, got {selected_action}."
-                ),
-                progress_estimation=progress_estimation,
-                used_fallback=False,
-                reason="action_candidate_mismatch",
+            repaired_candidate = _find_candidate_for_action(valid_candidates, selected_action)
+            if repaired_candidate is None:
+                return ReasonerDecision(
+                    selected_candidate_id=None,
+                    selected_action=None,
+                    thought=(
+                        "LLM returned inconsistent candidate/action pair and no matching candidate is valid: "
+                        f"candidate_id={selected_candidate_id} expects {expected_action}, got {selected_action}."
+                    ),
+                    progress_estimation=progress_estimation,
+                    used_fallback=False,
+                    reason="action_candidate_mismatch",
+                )
+            self._logger.warning(
+                "[LLMRepair] action_candidate_mismatch original_candidate=%s expected=%s selected_action=%s repaired_candidate=%s",
+                selected_candidate_id,
+                expected_action,
+                selected_action,
+                repaired_candidate.slot_id,
             )
+            selected_candidate_id = int(repaired_candidate.slot_id)
 
         return ReasonerDecision(
             selected_candidate_id=selected_candidate_id,
@@ -216,8 +226,9 @@ class OpenNavReasoner:
         system_prompt = (
             "You are the local decision module of a Vision-Language Navigation agent.\n"
             "Your job is to choose exactly one valid motion candidate id from the image and candidate list.\n"
-            "The image has two panels: LEFT is a local top-down depth costmap, RIGHT is the current egocentric/front camera view.\n"
-            "Candidate ids are drawn on both panels; the same ids appear in the text list. Use the costmap to avoid obstacles and the front view to judge target visibility.\n"
+            "The image has two panels: LEFT is the local LiDAR occupancy/candidate map, RIGHT is the current egocentric/front camera view.\n"
+            "Candidate ids are drawn on the map and front view; the same ids appear in the text list. Use the occupancy map to avoid obstacles and the front view to judge target visibility.\n"
+            "If the RIGHT panel contains a green target bbox/mask overlay, treat it as grounded target evidence from GroundingDINO/SAM and do not contradict it with a visual guess.\n"
             "Candidate convention: positive heading_deg and side=left mean steering LEFT; negative heading_deg and side=right mean steering RIGHT; side=center means moving generally FORWARD.\n"
             "The selected candidate is executed as one fixed discrete motion primitive: left -> TURN_LEFT, center -> FORWARD, right -> TURN_RIGHT. There is no continuous waypoint tracking.\n"
             "Use only the current target for this step, not every landmark in the full instruction.\n"
@@ -260,18 +271,19 @@ class OpenNavReasoner:
             f"Progress signal: {progress_state.progress_signal}\n"
             "\n"
             "## Decision Procedure\n"
-            "1. Judge visibility and coarse bearing of Current target only.\n"
-            "2. If Current target is not visible in the current image, write target_visible=false and target_bearing_hint=unknown, even if memory says it was last seen left/right.\n"
-            "3. If visible at an image edge, select a same-side candidate unless all same-side candidates are invalid.\n"
-            "4. If visible within the usable field of view, prefer approaching over perfect centering; CENTER may be correct only when the target is roughly ahead and the costmap is clear.\n"
-            "5. Check direction consistency only when visible_now: right target cannot choose left candidate; left target cannot choose right candidate.\n"
-            "6. If Safety context says the previous action was blocked, choose a different valid candidate or the safest valid candidate visible in the current frame.\n"
-            "7. If progress is STALLED/SPINNING, select an escape/recovery candidate instead of continuing the same direction.\n"
-            "8. If not visible but grounded_landmark_map has confirmed=1, choose a candidate that moves the robot toward robot_forward_m/robot_left_m instead of forgetting the landmark.\n"
-            "9. If not visible but only weak target memory has a last seen anchor, try to reacquire around that memory bearing; avoid continuing straight into a dead end.\n"
-            "10. If Reacquire guard names a Forbidden action this step and target_visible=false, do not output that action even if memory says the target was last seen that way.\n"
-            "11. If this is not the first landmark, use the route context to check whether the candidate is plausible relative to the previous landmark and the instruction direction.\n"
-            "12. Select exactly one valid candidate id and output the matching selected_action.\n"
+            "1. Read current_grounding first. If current_grounding says fresh=1 and visible=1, use its bbox/center/depth/bearing as the strongest current target evidence.\n"
+            "2. Judge visibility and coarse bearing of Current target only.\n"
+            "3. If Current target is not visible in the current image and current_grounding is not fresh visible, write target_visible=false and target_bearing_hint=unknown, even if memory says it was last seen left/right.\n"
+            "4. If visible at an image edge, select a same-side candidate unless all same-side candidates are invalid.\n"
+            "5. If visible within the usable field of view, prefer approaching over perfect centering; CENTER may be correct only when the target is roughly ahead and the occupancy map is clear.\n"
+            "6. Check direction consistency only when visible_now: right target cannot choose left candidate; left target cannot choose right candidate.\n"
+            "7. If Safety context says the previous action was blocked, choose a different valid candidate or the safest valid candidate visible in the current frame.\n"
+            "8. If progress is STALLED/SPINNING, select an escape/recovery candidate instead of continuing the same direction.\n"
+            "9. If not visible but grounded_landmark_map has confirmed=1, choose a candidate that moves the robot toward robot_forward_m/robot_left_m instead of forgetting the landmark.\n"
+            "10. If not visible but only weak target memory has a last seen anchor, try to reacquire around that memory bearing; avoid continuing straight into a dead end.\n"
+            "11. If Reacquire guard names a Forbidden action this step and target_visible=false, do not output that action even if memory says the target was last seen that way.\n"
+            "12. If this is not the first landmark, use the route context to check whether the candidate is plausible relative to the previous landmark and the instruction direction.\n"
+            "13. Select exactly one valid candidate id and output the matching selected_action.\n"
             "\n"
             "## Available Candidates\n"
             "(ID matches the numbered red circle marker in the image.)\n"
@@ -335,6 +347,14 @@ def _candidate_primitive_action(candidate: WaypointCandidate) -> str:
     if side == "right":
         return "TURN_RIGHT"
     return "FORWARD"
+
+
+def _find_candidate_for_action(candidates: list[WaypointCandidate], action: str) -> WaypointCandidate | None:
+    desired = str(action).strip().upper()
+    matching = [candidate for candidate in candidates if _candidate_primitive_action(candidate) == desired]
+    if not matching:
+        return None
+    return max(matching, key=lambda item: (float(item.clearance_score), float(item.travel_distance_m)))
 
 
 def _sanitize_selected_action(value) -> str | None:

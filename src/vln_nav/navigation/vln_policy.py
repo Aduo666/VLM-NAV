@@ -313,9 +313,20 @@ class OpenNavVLNPolicy:
                 candidate_set=candidate_set,
             )
         self._last_candidate_set = candidate_set
-        debug_image_path = self._candidate_predictor.save_debug(observation=observation, candidate_set=candidate_set)
+        occupancy_debug_path = None
         if self._occupancy_grid is not None:
-            self._occupancy_grid.save_debug(observation=observation, candidate_set=candidate_set)
+            saved_occupancy_path = self._occupancy_grid.save_debug(observation=observation, candidate_set=candidate_set)
+            occupancy_debug_path = saved_occupancy_path or getattr(self._occupancy_grid, "output_path", None)
+        debug_image_path = self._candidate_predictor.save_debug(
+            observation=observation,
+            candidate_set=candidate_set,
+            target_observation=(
+                None
+                if self._landmark_tracker_state is None
+                else self._landmark_tracker_state.last_observation
+            ),
+            left_panel_image_path=occupancy_debug_path,
+        )
         annotated_png_bytes = None
         if debug_image_path is not None and Path(debug_image_path).exists():
             annotated_png_bytes = Path(debug_image_path).read_bytes()
@@ -530,9 +541,42 @@ class OpenNavVLNPolicy:
 
     def _combined_target_memory_text(self, *, robot_pose) -> str:
         semantic_memory = self._target_memory.summary(robot_pose=robot_pose)
-        if not self._landmark_map_summary:
-            return semantic_memory
-        return f"semantic_target_memory={semantic_memory}; grounded_landmark_map={self._landmark_map_summary}"
+        current_grounding = self._current_grounding_summary()
+        parts = [f"current_grounding={current_grounding}", f"semantic_target_memory={semantic_memory}"]
+        if self._landmark_map_summary:
+            parts.append(f"grounded_landmark_map={self._landmark_map_summary}")
+        return "; ".join(parts)
+
+    def _current_grounding_summary(self) -> str:
+        state = self._landmark_tracker_state
+        observation = None if state is None else state.last_observation
+        if observation is None:
+            return "none"
+        bbox = getattr(observation, "bbox", None)
+        center_uv = getattr(observation, "center_uv", None)
+        depth_m = getattr(observation, "depth_m", None)
+        bearing_rad = getattr(observation, "bearing_rad", None)
+        world_xy = getattr(observation, "estimated_world_xy", None)
+        source = str(getattr(observation, "source", "unknown"))
+        reason = str(getattr(observation, "reason", "unknown"))
+        fresh = bool(
+            getattr(observation, "visible", False)
+            and bbox is not None
+            and reason.strip().lower() == "ok"
+            and "reused" not in source.strip().lower()
+        )
+        return (
+            f"label={getattr(observation, 'label', self._current_target_text())} "
+            f"visible={int(bool(getattr(observation, 'visible', False)))} "
+            f"fresh={int(fresh)} reason={reason} source={source} "
+            f"bbox={list(bbox) if bbox is not None else 'none'} "
+            f"center_uv={_format_xy(center_uv) if center_uv is not None else 'none'} "
+            f"depth_m={_format_optional_float(depth_m)} "
+            f"bearing_deg={_format_optional_float(None if bearing_rad is None else np.degrees(float(bearing_rad)))} "
+            f"world_xy={_format_xy(world_xy) if world_xy is not None else 'none'} "
+            f"mask_area={float(getattr(observation, 'mask_area_ratio', 0.0)):.4f} "
+            f"segmentation={getattr(observation, 'segmentation_source', 'none')}"
+        )
 
     def _build_reacquire_guard_context(self, *, now: float) -> ReacquireGuardContext:
         current_grounded_visible, grounded_reason = self._current_grounded_visibility()
@@ -1336,6 +1380,17 @@ def _format_optional_float(value: float | None) -> str:
     if value is None or not np.isfinite(float(value)):
         return "none"
     return f"{float(value):.2f}"
+
+
+def _format_xy(value) -> str:
+    if value is None:
+        return "none"
+    try:
+        if len(value) < 2:
+            return "none"
+        return f"[{float(value[0]):.2f},{float(value[1]):.2f}]"
+    except Exception:
+        return "none"
 
 
 def _wrap_angle_rad(angle_rad: float) -> float:

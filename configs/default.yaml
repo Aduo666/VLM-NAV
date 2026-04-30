@@ -1,5 +1,5 @@
 sim:
-  headless: false
+  headless: true
   width: 1280
   height: 720
   active_gpu: 1
@@ -16,7 +16,7 @@ llm:
   timeout_sec: 30
   retry_cooldown_sec: 0
   upload_max_edge_px: 512
-  camera_image_detail: "low"
+  camera_image_detail: "high"
 
 opennav:
   instruction: "go forward to the wheelchair, then turn left toward the stairs"
@@ -38,7 +38,7 @@ opennav:
   policy_execution_steps: 24
   landmark_arrival_distance_m: 1.0
   landmark_arrival_confirmations: 2
-  recovery_enabled: true
+  recovery_enabled: false
   recovery_trigger_stalled_steps: 3
   recovery_execution_steps: 18
 
@@ -112,13 +112,13 @@ camera:
   follow_observer_camera_in_gui: true
   sensor_frequency_hz: 15
   camera_horizontal_fov_deg: 90.0
-  interactive_confirmation_enabled: true
+  interactive_confirmation_enabled: false
   roi_vertical_range: [0.45, 0.85]
   clearance_threshold_m: 1.2
   valid_depth_range_m: [0.2, 8.0]
   candidate_preferred_distance_m: 1.0
   depth_eval_period_sec: 0.12
-  depth_debug_enabled: true
+  depth_debug_enabled: false
   depth_debug_image_path: "assets/depth_debug.png"
   obstacle_avoidance_enabled: true
   obstacle_stop_distance_m: 0.65
@@ -147,7 +147,7 @@ control:
   track_smoothing_alpha: 0.92
   track_steering_sign: -1.0
   use_discrete_action_primitives: true
-  stuck_detection_enabled: true
+  stuck_detection_enabled: false
   stuck_window_sec: 2.0
   stuck_displacement_threshold_m: 0.05
   stuck_yaw_threshold_deg: 5.0
@@ -207,6 +207,22 @@ occupancy_grid:
   debug_height: 900
   debug_view_size_m: 8.0
   debug_show_free_space: false
+  lidar_bootstrap_sec: 0.8
+
+lidar:
+  enabled: true
+  prim_path: "dummy_base_link/base_link/Lidar_link"
+  child_name: "Lidar"
+  horizontal_fov_deg: 180.0
+  vertical_fov_deg: 10.0
+  horizontal_resolution_deg: 0.4
+  vertical_resolution_deg: 4.0
+  rotation_rate_hz: 30.0
+  min_range_m: 0.40
+  max_range_m: 10.0
+  yaw_offset_deg: 0.0
+  draw_points: false
+  draw_lines: false
 
 scene:
   usd_path: "usd/hospital.usd"

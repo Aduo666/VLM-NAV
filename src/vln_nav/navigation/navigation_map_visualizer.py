@@ -31,8 +31,9 @@ class NavigationMapVisualizer:
     """Persistent top-down map for debugging the VLN loop.
 
     It is not SLAM. It visualizes odom-frame trajectory, currently remembered
-    landmark anchors, active local/world goal, and sparse obstacle points
-    projected from the latest depth frame.
+    landmark anchors, active local/world goal, and occupancy. If no occupancy
+    snapshot is supplied, it falls back to sparse obstacle points projected
+    from the latest depth frame.
     """
 
     def __init__(self, *, config: NavigationMapConfig, logger) -> None:
@@ -144,16 +145,14 @@ class NavigationMapVisualizer:
         image = Image.new("RGB", (width, height), (12, 15, 18))
         draw = ImageDraw.Draw(image)
 
-        points = [(pose.x, pose.y) for pose in self._trajectory]
-        if occupancy_snapshot is None:
-            points.extend(self._obstacle_points[-800:])
-        for entry in landmark_entries:
-            points.append((float(entry.world_xy[0]), float(entry.world_xy[1])))
-        if step_result.world_goal_xy is not None:
-            points.append((float(step_result.world_goal_xy[0]), float(step_result.world_goal_xy[1])))
-        points.append((float(observation.pose.x), float(observation.pose.y)))
-
-        transform = _MapTransform.from_points(points=points, width=width, height=height, padding_px=70)
+        transform = _MapTransform.from_center(
+            center_x=float(observation.pose.x),
+            center_y=float(observation.pose.y),
+            size_m=8.0,
+            width=width,
+            height=height,
+            padding_px=70,
+        )
         self._draw_grid(draw=draw, transform=transform)
         self._draw_occupancy_grid(draw=draw, transform=transform, snapshot=occupancy_snapshot)
         if occupancy_snapshot is None:
@@ -179,7 +178,7 @@ class NavigationMapVisualizer:
             _, y = transform.to_px(transform.min_x, float(y_m))
             draw.line((30, y, transform.width - 30, y), fill=(38, 46, 54), width=1)
         draw.rectangle((0, 0, transform.width, 40), fill=(0, 0, 0))
-        draw.text((12, 12), "ODOM MAP / TRAJECTORY / LANDMARKS", fill=(245, 245, 245))
+        draw.text((12, 12), "LOCAL ODOM MAP / LIDAR OCCUPANCY / LANDMARKS", fill=(245, 245, 245))
 
     def _draw_obstacles(self, *, draw: ImageDraw.ImageDraw, transform: "_MapTransform") -> None:
         for world_x, world_y in self._obstacle_points[-int(self._config.max_depth_obstacle_points) :]:
@@ -306,7 +305,7 @@ class NavigationMapVisualizer:
             f"landmark={step_result.current_landmark or 'none'} completed={step_result.completed_landmarks}",
             f"policy={step_result.action_name} executed={executed_action} source={step_result.decision_source}",
             f"odom=({pose.x:.2f},{pose.y:.2f}) yaw={np.degrees(pose.yaw_rad):+.1f}deg",
-            "cyan=trajectory/robot yellow=active goal orange=landmark green=reached red=occupancy gray=depth points",
+            "cyan=trajectory/robot yellow=active goal orange=landmark green=reached red=LiDAR occupancy gray=depth fallback",
         ]
         line_height = 18
         box_h = 12 + len(lines) * line_height
@@ -362,6 +361,34 @@ class _MapTransform:
             scale=float(scale),
             center_x=0.5 * (min_x + max_x),
             center_y=0.5 * (min_y + max_y),
+        )
+
+    @classmethod
+    def from_center(
+        cls,
+        *,
+        center_x: float,
+        center_y: float,
+        size_m: float,
+        width: int,
+        height: int,
+        padding_px: int,
+    ) -> "_MapTransform":
+        size = max(2.0, float(size_m))
+        usable_w = max(10, int(width) - 2 * int(padding_px))
+        usable_h = max(10, int(height) - 2 * int(padding_px) - 40)
+        scale = min(float(usable_w), float(usable_h)) / size
+        half = 0.5 * size
+        return cls(
+            min_x=float(center_x) - half,
+            max_x=float(center_x) + half,
+            min_y=float(center_y) - half,
+            max_y=float(center_y) + half,
+            width=int(width),
+            height=int(height),
+            scale=float(scale),
+            center_x=float(center_x),
+            center_y=float(center_y),
         )
 
     def to_px(self, x_m: float, y_m: float) -> tuple[int, int]:

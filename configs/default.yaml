@@ -1,0 +1,223 @@
+sim:
+  headless: false
+  width: 1280
+  height: 720
+  active_gpu: 1
+  physics_gpu: 1
+  multi_gpu: false
+  physics_dt: 0.0166667
+  rendering_dt: 0.0166667
+  warmup_steps: 30
+
+llm:
+  api_key: "sk-bduqejichuzwbbzuesgwfvwswcetzfagmfkyadbpkzykfjjh"
+  api_base_url: "https://api.siliconflow.cn/v1"
+  model_name: "Qwen/Qwen3-VL-30B-A3B-Instruct"
+  timeout_sec: 30
+  retry_cooldown_sec: 0
+  upload_max_edge_px: 512
+  camera_image_detail: "low"
+
+opennav:
+  instruction: "go forward to the wheelchair, then turn left toward the stairs"
+  candidate_slot_bearings_deg: [75.0, 35.0, 0.0, -35.0, -75.0]
+  candidate_min_travel_distance_m: 0.55
+  candidate_max_travel_distance_m: 1.35
+  candidate_min_free_ratio: 0.28
+  candidate_column_half_width_px: 26
+  candidate_debug_image_path: "assets/opennav_request.png"
+  target_debug_enabled: true
+  target_debug_image_path: "assets/opennav_debug.png"
+  debug_video_enabled: true
+  debug_video_path: "assets/opennav_debug.mp4"
+  debug_video_fps: 4.0
+  debug_image_update_period_sec: 1.0
+  progress_history_length: 6
+  progress_stall_distance_m: 0.08
+  progress_spin_yaw_deg: 85.0
+  policy_execution_steps: 24
+  landmark_arrival_distance_m: 1.0
+  landmark_arrival_confirmations: 2
+  recovery_enabled: true
+  recovery_trigger_stalled_steps: 3
+  recovery_execution_steps: 18
+
+target_grounding:
+  enabled: true
+  backend: "auto"
+  call_period_sec: 1.5
+  reuse_last_observation_sec: 2.5
+  upload_max_edge_px: 512
+  min_bbox_area_ratio: 0.002
+  max_bbox_area_ratio: 0.60
+  min_bbox_width_px: 4
+  min_bbox_height_px: 4
+  max_bbox_aspect_ratio: 8.0
+  min_depth_valid_ratio: 0.12
+  depth_statistic: "median"
+  center_patch_ratio: 0.25
+  min_depth_m: 0.20
+  max_depth_m: 6.0
+  min_confidence: 0.20
+  coordinate_mode: "auto"
+  allow_normalized_bbox: true
+  normalized_bbox_scale: 1000.0
+  depth_region: "bbox_depth_mask"
+  depth_mask_tolerance_ratio: 0.35
+  depth_mask_min_pixels: 16
+  grounding_dino_repo_path: "third_party/GroundingDINO"
+  grounding_dino_config_path: "weights/grounded_sam/GroundingDINO_SwinT_OGC.py"
+  grounding_dino_checkpoint_path: "weights/grounded_sam/groundingdino_swint_ogc.pth"
+  grounding_dino_device: "cuda:1"
+  grounding_dino_box_threshold: 0.30
+  grounding_dino_text_threshold: 0.25
+  sam_checkpoint_path: "weights/grounded_sam/sam_vit_h_4b8939.pth"
+  sam_model_type: "vit_h"
+  sam_device: "cuda:1"
+  sam_min_mask_area_ratio: 0.0005
+
+landmark_tracker:
+  arrival_visible_depth_m: 1.00
+  arrival_anchor_radius_m: 1.00
+  min_visible_count: 2
+  arrival_confirmations: 2
+  max_lost_count: 6
+  anchor_update_min_consistent_observations: 2
+  anchor_update_max_jump_m: 1.5
+  landmark_map_enabled: true
+  landmark_map_anchor_ttl_sec: 120.0
+  landmark_map_min_confidence: 0.20
+  landmark_map_log_period_sec: 2.0
+  reacquire_guard_enabled: true
+  reacquire_guard_recent_visible_sec: 20.0
+  reacquire_guard_override_action: "STOP"
+
+robot:
+  usd_path: "src/ros2_car_model_ws/src/1557/urdf/1557_all/1557_all.usd"
+  prim_path: "/World/Robot"
+  articulation_path: ""
+  init_position: [1.5, 4.0, 0.22]
+  init_orientation_deg: [0.0, 0.0, 0.0]
+  left_wheel_joint_names: []
+  right_wheel_joint_names: []
+  steering_joint_names: []
+
+camera:
+  width: 640
+  height: 480
+  front_camera_prim_path: "link6/Camera"
+  observer_enabled: true
+  observer_camera_prim_path: "dummy_base_link/observecamera"
+  follow_front_camera_in_gui: false
+  follow_observer_camera_in_gui: true
+  sensor_frequency_hz: 15
+  camera_horizontal_fov_deg: 90.0
+  interactive_confirmation_enabled: true
+  roi_vertical_range: [0.45, 0.85]
+  clearance_threshold_m: 1.2
+  valid_depth_range_m: [0.2, 8.0]
+  candidate_preferred_distance_m: 1.0
+  depth_eval_period_sec: 0.12
+  depth_debug_enabled: true
+  depth_debug_image_path: "assets/depth_debug.png"
+  obstacle_avoidance_enabled: true
+  obstacle_stop_distance_m: 0.65
+  obstacle_roi_vertical_range: [0.50, 0.95]
+  obstacle_center_width_ratio: 0.34
+  obstacle_side_width_ratio: 0.30
+  near_field_memory_enabled: true
+  near_field_memory_sec: 2.0
+  waypoint_heading_threshold_rad: 0.3
+  waypoint_stop_distance_m: 0.45
+  waypoint_turn_speed_scale: 1.0
+  waypoint_forward_speed_scale: 1.0
+  replanning_cooldown_sec: 0.5
+
+control:
+  wheel_drive_velocity: 14.0
+  turn_drive_velocity: 6.0
+  steering_angle: 0.65
+  turn_mode: "spin_4ws"
+  turn_steering_angle: 0.50
+  rear_steering_ratio: 1.0
+  track_min_speed_scale: 0.45
+  track_max_speed_scale: 1.0
+  track_heading_gain: 1.15
+  track_slow_heading_rad: 1.35
+  track_smoothing_alpha: 0.92
+  track_steering_sign: -1.0
+  use_discrete_action_primitives: true
+  stuck_detection_enabled: true
+  stuck_window_sec: 2.0
+  stuck_displacement_threshold_m: 0.05
+  stuck_yaw_threshold_deg: 5.0
+  stuck_recovery_backward_sec: 0.75
+  stuck_recovery_turn_sec: 0.35
+  stuck_recovery_turn_action: "TURN_RIGHT"
+  action_forward_duration_sec: 1.40
+  action_backward_duration_sec: 1.00
+  action_turn_duration_sec: 1.00
+  action_turn_angle_deg: 15.0
+  action_forward_distance_m: 0.55
+  action_backward_distance_m: 0.35
+  action_distance_tolerance_m: 0.04
+  action_turn_tolerance_deg: 1.5
+  action_odom_completion_enabled: true
+  active_track_max_yaw_deg: 10.0
+  active_track_min_duration_sec: 0.45
+  wheel_drive_damping: 10000.0
+  steering_stiffness: 10000.0
+  steering_damping: 1000.0
+  hold_joint_stiffness: 20000.0
+  hold_joint_damping: 2000.0
+
+odom:
+  enabled: true
+  source: "isaac_world_pose"
+
+navigation_map:
+  enabled: false
+  image_path: "assets/navigation_map.png"
+  update_period_sec: 0.5
+  width: 900
+  height: 900
+  depth_sample_stride_px: 16
+  max_depth_obstacle_points: 2500
+
+occupancy_grid:
+  enabled: true
+  resolution_m: 0.08
+  size_m: 24.0
+  update_period_sec: 0.12
+  depth_sample_stride_px: 10
+  depth_roi_vertical_range: [0.38, 0.72]
+  min_depth_m: 0.20
+  max_depth_m: 5.0
+  inflation_radius_m: 0.26
+  occupied_min_neighbors: 3
+  robot_radius_m: 0.32
+  path_corridor_radius_m: 0.30
+  turn_clearance_radius_m: 0.36
+  unknown_is_traversable: true
+  unknown_cell_cost: 0.10
+  debug_enabled: true
+  debug_image_path: "assets/occupancy_grid.png"
+  debug_update_period_sec: 0.5
+  debug_width: 900
+  debug_height: 900
+  debug_view_size_m: 8.0
+  debug_show_free_space: false
+
+scene:
+  usd_path: "usd/hospital.usd"
+  prim_path: "/World/Environment"
+  add_default_ground_plane: false
+  stage_load_timeout_sec: 120.0
+  viewport_eye: [7.0, -2.0, 4.0]
+  viewport_target: [1.5, 4.0, 1.0]
+  tip_stop_enabled: false
+  tip_stop_roll_pitch_deg: 28.0
+
+logging:
+  level: "INFO"
+  motion_log_period_sec: 2.5

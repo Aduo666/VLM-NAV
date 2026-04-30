@@ -1,0 +1,230 @@
+# Copyright (c) 2022-2025, The Isaac Lab Project Developers.
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+import argparse
+
+from isaaclab.app import AppLauncher
+
+# add argparse arguments
+parser = argparse.ArgumentParser(
+    description="This script demonstrates adding a custom robot to an Isaac Lab environment."
+)
+parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to spawn.")
+# append AppLauncher cli args
+AppLauncher.add_app_launcher_args(parser)
+# parse the arguments
+args_cli = parser.parse_args()
+
+# launch omniverse app
+app_launcher = AppLauncher(args_cli)
+simulation_app = app_launcher.app
+
+import numpy as np
+import torch
+
+import isaaclab.sim as sim_utils
+from isaaclab.actuators import ImplicitActuatorCfg
+from isaaclab.assets import AssetBaseCfg
+from isaaclab.assets.articulation import ArticulationCfg
+from isaaclab.scene import InteractiveScene, InteractiveSceneCfg
+from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
+
+
+DOFBOT_CONFIG = ArticulationCfg(
+    spawn=sim_utils.UsdFileCfg(
+        usd_path=f"/home/gm_qiangsb1205/ros2_car_model_ws/ranger_with_xarm6.usd",
+        rigid_props=sim_utils.RigidBodyPropertiesCfg(
+            disable_gravity=False,
+            max_depenetration_velocity=5.0,
+        ),
+        articulation_props=sim_utils.ArticulationRootPropertiesCfg(
+            enabled_self_collisions=True, solver_position_iteration_count=8, solver_velocity_iteration_count=0
+        ),
+    ),
+    init_state=ArticulationCfg.InitialStateCfg(
+        joint_pos={
+            "fl_steering_joint": 0.0,
+            "fl_wheel": 0.0,
+            "fr_steering_joint": 0.0,
+            "fr_wheel": 0.0,
+            "joint1": 0.0,
+            "joint2": 0.0,
+            "joint3": 0.0,
+            "joint4": 0.0,
+            "joint5": 0.0,
+            "joint6": 0.0,
+            "pan_tilt_yaw_joint": 0.0,
+            "pan_tilt_pitch_joint": 0.0,
+            "rl_steering_joint": 0.0,
+            "rl_wheel": 0.0,
+            "rr_steering_joint": 0.0,
+            "rr_wheel": 0.0,
+        },
+        pos=(0.0, 0.0, 0.325),
+    ),
+    actuators={
+        "fr_joints": ImplicitActuatorCfg(
+            joint_names_expr=["fr_wheel"],
+            effort_limit_sim=100.0,
+            velocity_limit_sim=100.0,
+            stiffness=0.0,
+            damping=10000.0,
+        ),
+        "fl_joints": ImplicitActuatorCfg(
+            joint_names_expr=["fl_wheel"],
+            effort_limit_sim=100.0,
+            velocity_limit_sim=100.0,
+            stiffness=0.0,
+            damping=10000.0,
+        ),
+        "rl_joints": ImplicitActuatorCfg(
+            joint_names_expr=["rl_wheel"],
+            effort_limit_sim=100.0,
+            velocity_limit_sim=100.0,
+            stiffness=0.0,
+            damping=10000.0,
+        ),
+        "rr_joints": ImplicitActuatorCfg(
+            joint_names_expr=["rr_wheel"],
+            effort_limit_sim=100.0,
+            velocity_limit_sim=100.0,
+            stiffness=0.0,
+            damping=10000.0,
+        ),
+        "rr_str_joints": ImplicitActuatorCfg(
+            joint_names_expr=["rr_steering_joint"],
+            effort_limit_sim=100.0,
+            velocity_limit_sim=100.0,
+            stiffness=10000.0,
+            damping=100.0,
+        ),
+        "fr_str_joints": ImplicitActuatorCfg(
+            joint_names_expr=["fr_steering_joint"],
+            effort_limit_sim=100.0,
+            velocity_limit_sim=100.0,
+            stiffness=10000.0,
+            damping=100.0,
+        ),
+        "fl_str_joints": ImplicitActuatorCfg(
+            joint_names_expr=["fl_steering_joint"],
+            effort_limit_sim=100.0,
+            velocity_limit_sim=100.0,
+            stiffness=10000.0,
+            damping=100.0,
+        ),
+        "rl_str_joints": ImplicitActuatorCfg(
+            joint_names_expr=["rl_steering_joint"],
+            effort_limit_sim=100.0,
+            velocity_limit_sim=100.0,
+            stiffness=10000.0,
+            damping=100.0,
+        ),
+        "joint1_act": ImplicitActuatorCfg(
+            joint_names_expr=["joint1"],
+            effort_limit_sim=100.0,
+            velocity_limit_sim=100.0,
+            stiffness=10000.0,
+            damping=100.0,
+        ),
+        "joint2_act": ImplicitActuatorCfg(
+            joint_names_expr=["joint2"],
+            effort_limit_sim=100.0,
+            velocity_limit_sim=100.0,
+            stiffness=10000.0,
+            damping=100.0,
+        ),
+        "joint3_act": ImplicitActuatorCfg(
+            joint_names_expr=["joint3"],
+            effort_limit_sim=100.0,
+            velocity_limit_sim=100.0,
+            stiffness=10000.0,
+            damping=100.0,
+        ),
+        "joint4_act": ImplicitActuatorCfg(
+            joint_names_expr=["joint4"],
+            effort_limit_sim=100.0,
+            velocity_limit_sim=100.0,
+            stiffness=10000.0,
+            damping=100.0,
+        ),
+        "joint5_act": ImplicitActuatorCfg(
+            joint_names_expr=["joint5"],
+            effort_limit_sim=100.0,
+            velocity_limit_sim=100.0,
+            stiffness=10000.0,
+            damping=100.0,
+        ),
+        "joint6_act": ImplicitActuatorCfg(
+            joint_names_expr=["joint6"],
+            effort_limit_sim=100.0,
+            velocity_limit_sim=100.0,
+            stiffness=10000.0,
+            damping=100.0,
+        ),
+        "pan_yaw": ImplicitActuatorCfg(
+            joint_names_expr=["pan_tilt_yaw_joint"],
+            effort_limit_sim=100.0,
+            velocity_limit_sim=100.0,
+            stiffness=10000.0,
+            damping=100.0,
+        ),
+        "rl_joints": ImplicitActuatorCfg(
+            joint_names_expr=["pan_tilt_pitch_joint"],
+            effort_limit_sim=100.0,
+            velocity_limit_sim=100.0,
+            stiffness=10000.0,
+            damping=100.0,
+        ),       
+    },
+)
+
+
+class NewRobotsSceneCfg(InteractiveSceneCfg):
+    """Designs the scene."""
+
+    # Ground-plane
+    ground = AssetBaseCfg(prim_path="/World/defaultGroundPlane", spawn=sim_utils.GroundPlaneCfg())
+
+    # lights
+    dome_light = AssetBaseCfg(
+        prim_path="/World/Light", spawn=sim_utils.DomeLightCfg(intensity=3000.0, color=(0.75, 0.75, 0.75))
+    )
+
+    # robot
+    Dofbot = DOFBOT_CONFIG.replace(prim_path="{ENV_REGEX_NS}/Dofbot")
+
+
+def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
+    sim_dt = sim.get_physics_dt()
+    sim_time = 0.0
+    count = 0
+
+    while simulation_app.is_running():
+        
+        sim.step()
+        
+
+
+def main():
+    """Main function."""
+    # Initialize the simulation context
+    sim_cfg = sim_utils.SimulationCfg(device=args_cli.device)
+    sim = sim_utils.SimulationContext(sim_cfg)
+
+    sim.set_camera_view([3.5, 0.0, 3.2], [0.0, 0.0, 0.5])
+    # design scene
+    scene_cfg = NewRobotsSceneCfg(args_cli.num_envs, env_spacing=2.0)
+    scene = InteractiveScene(scene_cfg)
+    # Play the simulator
+    sim.reset()
+    # Now we are ready!
+    print("[INFO]: Setup complete...")
+    # Run the simulator
+    run_simulator(sim, scene)
+
+
+if __name__ == "__main__":
+    main()
+    simulation_app.close()

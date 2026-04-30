@@ -1,0 +1,65 @@
+<?xml version="1.0"?>
+<robot name="ranger_with_xarm6" xmlns:xacro="http://ros.org/wiki/xacro">
+
+    <xacro:include filename="$(find ranger_mini_v3)/urdf/ranger_mini.xacro" />
+    <xacro:include filename="$(find 1557)/urdf/1557.urdf"/>
+    <xacro:include filename="$(find pan_tilt_description)/urdf/pan_tilt_st.urdf.xacro"/>
+    <xacro:include filename="$(find 1557)/urdf/xarm6_urdf/xarm6_robot.urdf.xacro" />
+
+  <xacro:arg name="prefix" default=""/>
+  <xacro:arg name="ros_namespace" default="xarm"/>
+  <xacro:arg name="limited" default="false"/>
+  <xacro:arg name="effort_control" default="false"/>
+  <xacro:arg name="velocity_control" default="false"/>
+
+  <xacro:arg name="add_other_geometry" default="false"/>
+  <xacro:arg name="geometry_type" default="box"/>
+  <xacro:arg name="geometry_mass" default="0.1"/>
+  <xacro:arg name="geometry_height" default="0.1"/>
+  <xacro:arg name="geometry_radius" default="0.1"/>
+  <xacro:arg name="geometry_length" default="0.1"/>
+  <xacro:arg name="geometry_width" default="0.1"/>
+  <xacro:arg name="geometry_mesh_filename" default=""/>
+  <xacro:arg name="geometry_mesh_origin_xyz" default="0 0 0"/>
+  <xacro:arg name="geometry_mesh_origin_rpy" default="0 0 0"/>
+  <xacro:arg name="geometry_mesh_tcp_xyz" default="0 0 0"/>
+  <xacro:arg name="geometry_mesh_tcp_rpy" default="0 0 0"/>
+
+  <xacro:arg name="add_realsense_d435i" default="false"/>
+
+     <link name="dummy_base_link"/>
+     <joint
+      name="dummy_base_joint"
+      type="fixed">
+      <parent
+        link="dummy_base_link" />
+      <child
+        link="base_link" />
+    </joint>
+
+    <joint
+      name="ranger_with_xarm"
+      type="fixed">
+      <origin
+        xyz="-0.08 -0.01 0.646 "
+        rpy="0 -1.57 3.14" />
+      <parent
+        link="base_link" />
+      <child
+        link="link_base" />
+    </joint>
+
+    <joint
+      name="pan_tilt_joint"
+      type="fixed">
+      <origin
+        xyz="-0.12 -0.002 0.8"
+        rpy="0 0 0" />
+      <parent
+        link="base_link" />
+      <child
+        link="pan_base_link" />
+    </joint>
+
+
+    </robot>

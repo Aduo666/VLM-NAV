@@ -1,0 +1,23 @@
+<package format="3">
+  <name>1557</name>
+  <version>1.0.0</version>
+  <description>
+    <p>URDF Description package for 1557</p>
+    <p>This package contains configuration data, 3D models and launch files
+for 1557 robot</p>
+  </description>
+  <author>TODO</author>
+  <maintainer email="TODO@email.com" />
+  <license>BSD</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <exec_depend>ament_index_python</exec_depend>
+  <depend>roslaunch</depend>
+  <depend>robot_state_publisher</depend>
+  <depend>rviz</depend>
+  <depend>joint_state_publisher_gui</depend>
+  <depend>gazebo</depend>
+  <export>
+    <architecture_independent />
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

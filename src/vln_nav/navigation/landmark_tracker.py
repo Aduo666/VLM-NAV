@@ -28,6 +28,13 @@ class LandmarkState:
     reach_window_hits: int = 0
     reach_window_size: int = 0
     recent_reach_history: list[int] = field(default_factory=list)
+    potential_world_xy: list[float] | None = None
+    potential_confidence: float = 0.0
+    confirmed_confidence: float = 0.0
+    confirmed_observation_count: int = 0
+    last_confirmed_depth_m: float | None = None
+    evidence_level: str = "none"  # none / potential / confirmed
+    can_complete: bool = False
 
 
 @dataclass
@@ -40,6 +47,12 @@ class LandmarkTrackerConfig:
     anchor_update_min_consistent_observations: int
     anchor_update_max_jump_m: float
     arrival_window_size: int
+    confirm_confidence_threshold: float = 0.90
+    confirm_min_observations: int = 3
+    confirm_max_anchor_jump_m: float = 0.50
+    confirm_max_depth_jump_m: float = 0.80
+    qwen_fallback_confirm_allowed: bool = False
+    potential_confidence_threshold: float = 0.50
 
 
 @dataclass
@@ -47,6 +60,14 @@ class _PendingAnchor:
     xy_sum: np.ndarray
     count: int
     last_xy: np.ndarray
+
+
+@dataclass
+class _PendingConfirmedCandidate:
+    xy_sum: np.ndarray
+    count: int
+    last_xy: np.ndarray
+    last_depth_m: float | None = None
 
 
 class LandmarkTracker:
@@ -62,6 +83,7 @@ class LandmarkTracker:
         self._logger = logger.getChild("landmark_tracker")
         self._states: dict[str, LandmarkState] = {}
         self._pending_anchors: dict[str, _PendingAnchor] = {}
+        self._pending_confirmed: dict[str, _PendingConfirmedCandidate] = {}
         self._last_log_time_by_label: dict[str, float] = {}
         self._last_log_signature_by_label: dict[str, tuple] = {}
         self._last_anchor_log_time_by_label: dict[str, float] = {}
@@ -72,11 +94,13 @@ class LandmarkTracker:
         if label is None:
             self._states.clear()
             self._pending_anchors.clear()
+            self._pending_confirmed.clear()
             self._reach_windows.clear()
             return
         key = _normalize_label(label)
         self._states.pop(key, None)
         self._pending_anchors.pop(key, None)
+        self._pending_confirmed.pop(key, None)
         self._reach_windows.pop(key, None)
 
     def update(
@@ -110,37 +134,84 @@ class LandmarkTracker:
                 reach_window_hits=0,
                 reach_window_size=max(1, int(self._config.arrival_window_size)),
                 recent_reach_history=[],
+                potential_world_xy=None,
+                potential_confidence=0.0,
+                confirmed_confidence=0.0,
+                confirmed_observation_count=0,
+                last_confirmed_depth_m=None,
+                evidence_level="none",
+                can_complete=False,
             )
 
         fresh_visible = (
             bool(observation.visible)
-            and str(observation.reason).strip().lower() == "ok"
+            and str(observation.reason).strip().lower() in {"ok", "depth_invalid"}
             and "reused" not in str(observation.source).strip().lower()
         )
+        has_valid_depth = (
+            fresh_visible
+            and str(observation.reason).strip().lower() == "ok"
+            and observation.depth_m is not None
+        )
+        current_fresh = (
+            has_valid_depth
+            and bool(getattr(observation, "is_current_frame", True))
+        )
         transient_observation = _is_observation_transient(observation)
+
         if bool(observation.visible):
             if fresh_visible:
                 state.visible_count += 1
             state.lost_count = 0
             state.last_observation = observation
             state.last_seen_time_sec = float(timestamp_sec)
-            state.confidence = max(float(state.confidence), float(observation.confidence))
+
+            # All visible observations update potential
+            if observation.estimated_world_xy is not None:
+                state.potential_world_xy = list(observation.estimated_world_xy)
+                state.potential_confidence = max(float(state.potential_confidence), float(observation.confidence))
+                if state.evidence_level == "none":
+                    state.evidence_level = "potential"
+
             state.candidate_world_xy = (
                 None if observation.estimated_world_xy is None else list(observation.estimated_world_xy)
             )
-            state.status = "visible"
-            if fresh_visible and observation.estimated_world_xy is not None:
-                confirmed = self._update_anchor_candidate(
+
+            # Only high-confidence fresh current-frame from confirmable source enters confirmed pipeline
+            high_conf = float(observation.confidence) >= float(self._config.confirm_confidence_threshold)
+            can_confirm = bool(getattr(observation, "can_confirm", False))
+            has_world = observation.estimated_world_xy is not None
+
+            if current_fresh and has_world and high_conf and can_confirm:
+                self._try_confirm_candidate(
                     label=label,
-                    candidate_world_xy=observation.estimated_world_xy,
-                    current_confirmed_world_xy=state.estimated_world_xy,
+                    state=state,
+                    observation=observation,
                 )
-                if confirmed is not None:
-                    state.estimated_world_xy = confirmed
-                    state.status = "confirmed"
+            elif current_fresh and has_world:
+                # Log rejection reason
+                reasons = []
+                if not high_conf:
+                    reasons.append("low_confidence")
+                if not can_confirm:
+                    reasons.append("qwen_fallback_not_confirmable")
+                if reasons:
+                    self._logger.info(
+                        "[LandmarkConfirmReject] target=%s reason=%s confidence=%.2f can_confirm=%s source=%s",
+                        label,
+                        "_".join(reasons),
+                        float(observation.confidence),
+                        int(can_confirm),
+                        getattr(observation, "semantic_source", "unknown"),
+                    )
+
+            state.status = "visible"
+            if state.evidence_level == "confirmed":
+                state.status = "confirmed"
+
         elif transient_observation:
             state.last_observation = observation
-            if state.estimated_world_xy is not None:
+            if state.evidence_level == "confirmed" and state.estimated_world_xy is not None:
                 state.status = "confirmed"
             elif int(state.visible_count) > 0:
                 state.status = "visible"
@@ -149,7 +220,17 @@ class LandmarkTracker:
         else:
             state.visible_count = 0
             state.lost_count += 1
-            state.status = "lost" if state.estimated_world_xy is not None else "searching"
+            if state.evidence_level == "confirmed" and state.estimated_world_xy is not None:
+                state.status = "lost"
+            else:
+                state.status = "searching"
+
+        # Update can_complete
+        state.can_complete = (
+            state.estimated_world_xy is not None
+            and state.confirmed_observation_count >= int(self._config.confirm_min_observations)
+            and state.evidence_level == "confirmed"
+        )
 
         state.anchor_distance_m = _distance_to_anchor(
             robot_pose=robot_pose,
@@ -186,6 +267,7 @@ class LandmarkTracker:
             bool(state.reached),
             state.reach_reason,
             observation.reason,
+            state.evidence_level,
         )
         last_time = self._last_log_time_by_label.get(label, -float("inf"))
         last_signature = self._last_log_signature_by_label.get(label)
@@ -193,9 +275,11 @@ class LandmarkTracker:
             return
         self._last_log_time_by_label[label] = float(timestamp_sec)
         self._last_log_signature_by_label[label] = signature
+        can_confirm = bool(getattr(observation, "can_confirm", False))
         self._logger.info(
             "[LandmarkTracker] target=%s behavior=%s status=%s visible=%s visible_count=%s lost_count=%s "
-            "depth=%s candidate_anchor=%s confirmed_anchor=%s anchor_dist=%s reached=%s confirm=%s obs_source=%s reason=%s",
+            "depth=%s candidate_anchor=%s confirmed_anchor=%s anchor_dist=%s reached=%s confirm=%s obs_source=%s reason=%s "
+            "evidence=%s can_confirm=%s can_complete=%s potential_anchor=%s confirmed_obs=%s confidence=%.2f",
             state.label,
             state.behavior_type,
             state.status,
@@ -210,6 +294,111 @@ class LandmarkTracker:
             f"{int(state.reach_window_hits)}/{int(state.reach_window_size)}",
             observation.source,
             state.reach_reason,
+            state.evidence_level,
+            int(can_confirm),
+            int(state.can_complete),
+            _format_xy(state.potential_world_xy),
+            int(state.confirmed_observation_count),
+            float(state.confidence),
+        )
+
+    def _try_confirm_candidate(
+        self,
+        *,
+        label: str,
+        state: LandmarkState,
+        observation: TargetObservation,
+    ) -> None:
+        candidate = np.asarray(observation.estimated_world_xy, dtype=np.float32).reshape(2)
+        confirm_max_anchor_jump = max(0.05, float(self._config.confirm_max_anchor_jump_m))
+        confirm_max_depth_jump = max(0.05, float(self._config.confirm_max_depth_jump_m))
+        required = max(1, int(self._config.confirm_min_observations))
+
+        pending = self._pending_confirmed.get(label)
+        if pending is None:
+            pending = _PendingConfirmedCandidate(
+                xy_sum=candidate.copy(), count=1, last_xy=candidate.copy(),
+                last_depth_m=observation.depth_m,
+            )
+            self._pending_confirmed[label] = pending
+            self._logger.info(
+                "[LandmarkConfirm] target=%s candidate=%s confirm_wait=1/%s",
+                label, _format_xy(candidate.tolist()), int(required),
+            )
+            return
+
+        # Check anchor jump from last pending candidate
+        jump = float(np.linalg.norm(candidate - pending.last_xy))
+        if jump > confirm_max_anchor_jump:
+            self._logger.info(
+                "[LandmarkConfirmReject] target=%s reason=anchor_jump jump_m=%.2f max=%.2f",
+                label, jump, confirm_max_anchor_jump,
+            )
+            # Reset pending
+            self._pending_confirmed[label] = _PendingConfirmedCandidate(
+                xy_sum=candidate.copy(), count=1, last_xy=candidate.copy(),
+                last_depth_m=observation.depth_m,
+            )
+            return
+
+        # Check depth jump
+        if pending.last_depth_m is not None and observation.depth_m is not None:
+            depth_jump = abs(float(observation.depth_m) - float(pending.last_depth_m))
+            if depth_jump > confirm_max_depth_jump:
+                self._logger.info(
+                    "[LandmarkConfirmReject] target=%s reason=depth_jump jump_m=%.2f max=%.2f",
+                    label, depth_jump, confirm_max_depth_jump,
+                )
+                self._pending_confirmed[label] = _PendingConfirmedCandidate(
+                    xy_sum=candidate.copy(), count=1, last_xy=candidate.copy(),
+                    last_depth_m=observation.depth_m,
+                )
+                return
+
+        # Accumulate
+        pending.xy_sum = pending.xy_sum + candidate
+        pending.count += 1
+        pending.last_xy = candidate.copy()
+        pending.last_depth_m = observation.depth_m
+
+        if pending.count < required:
+            self._logger.info(
+                "[LandmarkConfirm] target=%s candidate=%s confirm_wait=%s/%s",
+                label, _format_xy(candidate.tolist()), int(pending.count), int(required),
+            )
+            return
+
+        # Confirmed!
+        averaged = pending.xy_sum / float(max(1, pending.count))
+
+        # Check jump from existing confirmed anchor
+        if state.estimated_world_xy is not None:
+            current = np.asarray(state.estimated_world_xy, dtype=np.float32).reshape(2)
+            jump_from_confirmed = float(np.linalg.norm(averaged - current))
+            if jump_from_confirmed > confirm_max_anchor_jump:
+                self._logger.warning(
+                    "[LandmarkConfirmReject] target=%s reason=confirmed_anchor_jump jump_m=%.2f max=%.2f candidate=%s confirmed=%s",
+                    label, jump_from_confirmed, confirm_max_anchor_jump,
+                    _format_xy(averaged.tolist()), _format_xy(state.estimated_world_xy),
+                )
+                self._pending_confirmed.pop(label, None)
+                return
+
+        state.estimated_world_xy = [float(averaged[0]), float(averaged[1])]
+        state.confirmed_observation_count = int(pending.count)
+        state.confirmed_confidence = float(observation.confidence)
+        state.last_confirmed_depth_m = observation.depth_m
+        state.evidence_level = "confirmed"
+        state.confidence = float(observation.confidence)
+        self._pending_confirmed.pop(label, None)
+
+        self._logger.info(
+            "[LandmarkConfirmed] target=%s anchor=%s obs=%s confidence=%.2f depth=%.2f",
+            label,
+            _format_xy(state.estimated_world_xy),
+            int(state.confirmed_observation_count),
+            float(state.confirmed_confidence),
+            float(observation.depth_m) if observation.depth_m is not None else 0.0,
         )
 
     def _update_anchor_candidate(
@@ -283,6 +472,10 @@ class LandmarkTracker:
         if state.behavior_type != "go_to":
             return False, f"behavior_not_implemented:{state.behavior_type}", 0, 0, 0, []
 
+        if not state.can_complete:
+            window_size = max(1, int(self._config.arrival_window_size))
+            return False, "not_confirmed_for_completion", 0, 0, window_size, []
+
         min_visible = max(1, int(self._config.min_visible_count))
         depth_threshold_m = max(0.05, float(self._config.arrival_visible_depth_m))
         anchor_threshold_m = max(0.05, float(self._config.arrival_anchor_radius_m))
@@ -309,11 +502,13 @@ class LandmarkTracker:
             and int(state.visible_count) >= min_visible
             and observation.depth_m is not None
             and float(observation.depth_m) <= depth_threshold_m
+            and state.can_complete
         )
         anchor_reached = (
             state.estimated_world_xy is not None
             and state.anchor_distance_m is not None
             and float(state.anchor_distance_m) <= anchor_threshold_m
+            and state.can_complete
         )
 
         evidence = bool(visible_depth_reached or anchor_reached)
@@ -321,7 +516,7 @@ class LandmarkTracker:
         hits = int(sum(1 for item in reach_window if item))
 
         if visible_depth_reached:
-            reason = f"visible_depth<={depth_threshold_m:.2f}m"
+            reason = f"confirmed_visible_depth<={depth_threshold_m:.2f}m"
         elif anchor_reached:
             reason = f"confirmed_anchor_distance<={anchor_threshold_m:.2f}m"
         else:

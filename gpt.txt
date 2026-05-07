@@ -1,25 +1,75 @@
-我看完 `mimo.txt` 和最新日志了。结论：`mimo` 的方向有参考价值，但第 1 点有一处判断不准；真正问题分三层。
+这个计划方向是对的，可以做。但有几处需要先修正，否则 mimo 实现后还会出现“误完成”或“永远不完成”。
 
-**问题判断**
-1. **LiDAR 点分散不是因为画错了“单帧 raw scan”。** 当前 [nav.py](/home/Lab/qiangsibin/VLM-NAV/src/vln_nav/app/nav.py:850) 传给 `_save_lidar_raw_scan()` 的是 `lidar_scan.beam_endpoints_local_xy`，而这个在 [lidar_sensor.py](/home/Lab/qiangsibin/VLM-NAV/src/vln_nav/navigation/lidar_sensor.py:230) 已经是 merged scan。真正问题是 merged beams 太多、太旧、重复太多。日志里有 `merged_beams=13500`、`merged_hits=10950`，这会让蓝点/雷达点看起来很散。
+**必须修正的点**
+1. `qwen_fallback_confirm_allowed` 不能只放在 `LandmarkTrackerConfig`。  
+因为 `can_confirm` 是在 `target_grounding.py` 里生成 `TargetObservation` 时决定的，所以这个字段必须传进 `TargetGroundingConfig`，否则 `target_grounding.py` 读不到。
 
-2. **面前障碍物略微飘，主要是“旋转扇区 LiDAR + 历史合并 + 局部旋转视图”叠加造成的。** 日志显示单帧 LiDAR 只有 `[-90.0,-30.4]` 约 55 度，而系统靠历史扇区拼到 `111.5` 或 `166.5` 度。只要历史扇区合并过宽，或者调试图随着机器人旋转，墙就会看起来漂。参考 [logs/nav_latest.log](/home/Lab/qiangsibin/VLM-NAV/logs/nav_latest.log:574)。
+2. `vln_policy.py` 不要重复判断一堆阈值。  
+更稳的做法是让 `LandmarkTracker` 输出统一结论：`state.can_complete`。  
+`vln_policy.py` 只看：
+```python
+tracker_state.can_complete
+tracker_state.evidence_level == "confirmed"
+tracker_state.anchor_distance_m <= turn_at_complete_max_distance_m
+```
+否则阈值会在 tracker / map / policy 三处重复，后面很难调。
 
-3. **你说“全局地图”，现在代码实际显示的是机器人中心局部图。** `GlobalOccupancyMap` 底层确实有全局 grid，但 [occupancy_grid.py](/home/Lab/qiangsibin/VLM-NAV/src/vln_nav/navigation/occupancy_grid.py:1121) 的 debug 渲染是以机器人为中心、按机器人 yaw 旋转的局部视图。另一个 [navigation_map_visualizer.py](/home/Lab/qiangsibin/VLM-NAV/src/vln_nav/navigation/navigation_map_visualizer.py:145) 也是 `size_m=8.0` 的局部图。所以你看到的不是稳定的 north-up 全局地图。
+3. `state.confidence = observation.confidence if visible else state.confidence` 有风险。  
+如果已经 confirmed，后面来一个低置信 potential，会把 confirmed confidence 降低。  
+建议改成两个字段：
+```python
+potential_confidence
+confirmed_confidence
+```
+如果不想新增字段，那就规定 `state.confidence` 只代表 confirmed confidence，potential 用 `potential_confidence`。
 
-4. **找到第一个 landmark 后打转，不是单纯 current goal 机制坏了，而是第二阶段目标定义错了。** 日志里 `wheelchair` 到达后切到 `stairs`，但 `stairs` 多次 `target_not_visible / invalid_depth_ratio`，没有 confirmed anchor，然后 LLM 在 `TURN_LEFT / TURN_RIGHT` 间反复切换。更关键的是，“turn left toward the stairs” 不应该被当成 `go_to stairs`，而应该是一个 `turn_at / orient_to` 行为。现在把非 `go_to` 强行降级成 `go_to` 会导致它一直试图找/走向 stairs。
+4. confirmed 累计必须只统计 fresh 当前帧观测。  
+条件里要加：
+```python
+observation.is_current_frame
+"reused" not in observation.source
+observation.reason == "ok"
+```
+否则旧帧结果或复用结果会累计成 confirmed。
 
-**修改计划**
-1. **先修地图显示，不碰导航决策。** 新增真正的 `global_map.png`：north-up、不跟随机器人 yaw、不以机器人为中心旋转；显示全局 occupancy、轨迹、robot、completed/current landmarks、current goal。保留局部图但明确命名为 `local_map.png`，不再把局部图叫 global map。
+5. `LandmarkMap` 不要自己重新判断所有阈值。  
+建议只接受：
+```python
+state.can_complete == True
+state.evidence_level == "confirmed"
+state.estimated_world_xy is not None
+```
+然后把 `confirmed_observation_count` 和 `evidence_level` 存进去。这样 map 不会和 tracker 判断不一致。
 
-2. **重做 LiDAR debug 和建图输入。** `lidar_raw_scan.png` 分成两张或一张两栏：左边画最新单帧 sector，右边画 motion-compensated + angle-binned merged scan。merged scan 不再画 1 万多个历史点，而是按角度 bin 去重，每个角度只保留最新/最近有效 beam。
+6. `turn_at_complete_max_distance_m: 3.0` 可以保留，但不是主要保护。  
+之前误完成时距离是 `2.03m`，如果只加距离上限依然会完成。真正关键是：Qwen fallback 不能 confirm，以及必须多帧 confirmed。
 
-3. **收紧 LiDAR 历史合并。** 不再把大量历史 merged beams 每帧重复喂给 occupancy。建图应该用“当前新扫描扇区”增量更新全局 map；用于显示/候选过滤时再生成 binned merged scan。这样可以减少墙体漂移和点云散开。
+7. 这个计划还没有真正处理“视野里出现两个 landmark”。  
+当前系统一次只 grounding 当前目标，所以不会同时检测多个 landmark。短期可以接受，因为 route index 限制当前目标；长期如果要处理多 landmark，需要新增 multi-target grounding。现在先别做，避免扩大范围。
 
-4. **修正 route behavior。** 恢复 `turn_at` 语义，不再强行当 `go_to`。第一版策略：如果当前 step 是 `turn_at stairs`，只执行有限次数的指定方向转向；看到 stairs 或达到最大转向次数后就完成该 step。如果它是最后一个 step，则 STOP/route complete，不继续原地找路。
+**我建议的修正版**
+- `target_grounding.py` 负责输出 `potential / confirmed_candidate` 和 `can_confirm`。
+- `LandmarkTracker` 负责把 confirmed_candidate 累计成真正 `confirmed`。
+- `LandmarkMap` 只写入 `state.can_complete=True` 的 confirmed landmark。
+- `vln_policy` 只允许 `can_complete=True` 的 landmark 推进 route。
+- SAM 保留，但只做 mask/depth，不参与语义确认。
 
-5. **修正 current goal 生命周期。** 对 `go_to` landmark 才允许 semantic planner 生成可持续目标点；对 `turn_at` 不生成 world goal，不走 topology revisit，不走 semantic planner，只执行 bounded orientation primitive。这样能避免“current goal 在身后/错误 revisit 点导致打转”。
+**关于 GroundingSAM**
+先不要删。当前误识别主要来自 Qwen bbox 或 grounding 语义本身，SAM 只是接着这个 bbox 做分割和深度。正确处理是：`qwen_vl_bbox + sam_vit_h` 仍然只能是 `potential`，不能触发 route complete。
 
-6. **验证顺序。** 先只验证地图：看 `global_map.png` 中墙是否固定、robot 是否沿轨迹移动、landmark 是否保留。然后验证 `turn_at`：到达 wheelchair 后应输出类似 `behavior=turn_at target=stairs action=TURN_LEFT remaining_turns=...`，不能再无限左右切换。
+**可以让 mimo 开始改，但要加这条硬约束**
+所有能触发 `[Landmark] reached=... route=complete` 的路径，必须经过：
+```python
+tracker_state.can_complete == True
+```
 
-如果你确认，我下一步按这个计划改，不会先动代码。
+如果日志里没有出现：
+```text
+evidence=confirmed
+can_complete=1
+confirmed_obs>=3
+```
+就绝不能出现：
+```text
+route_complete=1
+```

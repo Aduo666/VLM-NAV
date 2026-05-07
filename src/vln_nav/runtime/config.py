@@ -98,9 +98,11 @@ class AppConfig:
     target_grounding_sam_model_type: str = "vit_h"
     target_grounding_sam_device: str = "cuda"
     target_grounding_sam_min_mask_area_ratio: float = 0.0005
+    target_grounding_sam_enabled: bool = True
     target_grounding_max_result_age_sec: float = 2.0
     target_grounding_max_result_pose_delta_m: float = 1.5
     target_grounding_max_result_yaw_delta_deg: float = 45.0
+    target_grounding_qwen_fallback_confirm_allowed: bool = False
     landmark_tracker_arrival_visible_depth_m: float = 1.00
     landmark_tracker_arrival_anchor_radius_m: float = 1.00
     landmark_tracker_min_visible_count: int = 2
@@ -109,6 +111,14 @@ class AppConfig:
     landmark_tracker_max_lost_count: int = 6
     landmark_tracker_anchor_update_min_consistent_observations: int = 2
     landmark_tracker_anchor_update_max_jump_m: float = 1.5
+    landmark_tracker_confirm_confidence_threshold: float = 0.90
+    landmark_tracker_potential_confidence_threshold: float = 0.50
+    landmark_tracker_confirm_min_observations: int = 3
+    landmark_tracker_confirm_max_anchor_jump_m: float = 0.50
+    landmark_tracker_confirm_max_depth_jump_m: float = 0.80
+    landmark_tracker_turn_at_complete_requires_confirmed_anchor: bool = True
+    landmark_tracker_turn_at_complete_max_distance_m: float = 3.0
+    landmark_tracker_qwen_fallback_confirm_allowed: bool = False
     landmark_map_enabled: bool = True
     landmark_map_anchor_ttl_sec: float = 120.0
     landmark_map_min_confidence: float = 0.20
@@ -637,6 +647,10 @@ def load_config(config_path: str | None = None) -> AppConfig:
             "SAM_MIN_MASK_AREA_RATIO",
             target_grounding.get("sam_min_mask_area_ratio", 0.0005),
         ),
+        target_grounding_sam_enabled=_bool_env_or_value(
+            "SAM_ENABLED",
+            target_grounding.get("sam_enabled", True),
+        ),
         target_grounding_max_result_age_sec=_float_env_or_value(
             "TARGET_GROUNDING_MAX_RESULT_AGE_SEC",
             target_grounding.get("max_result_age_sec", 2.0),
@@ -648,6 +662,10 @@ def load_config(config_path: str | None = None) -> AppConfig:
         target_grounding_max_result_yaw_delta_deg=_float_env_or_value(
             "TARGET_GROUNDING_MAX_RESULT_YAW_DELTA_DEG",
             target_grounding.get("max_result_yaw_delta_deg", 45.0),
+        ),
+        target_grounding_qwen_fallback_confirm_allowed=_bool_env_or_value(
+            "TARGET_GROUNDING_QWEN_FALLBACK_CONFIRM_ALLOWED",
+            target_grounding.get("qwen_fallback_confirm_allowed", False),
         ),
         landmark_tracker_arrival_visible_depth_m=_float_env_or_value(
             "LANDMARK_TRACKER_ARRIVAL_VISIBLE_DEPTH_M",
@@ -680,6 +698,38 @@ def load_config(config_path: str | None = None) -> AppConfig:
         landmark_tracker_anchor_update_max_jump_m=_float_env_or_value(
             "LANDMARK_TRACKER_ANCHOR_UPDATE_MAX_JUMP_M",
             landmark_tracker.get("anchor_update_max_jump_m", 1.5),
+        ),
+        landmark_tracker_confirm_confidence_threshold=_float_env_or_value(
+            "LANDMARK_TRACKER_CONFIRM_CONFIDENCE_THRESHOLD",
+            landmark_tracker.get("confirm_confidence_threshold", 0.90),
+        ),
+        landmark_tracker_potential_confidence_threshold=_float_env_or_value(
+            "LANDMARK_TRACKER_POTENTIAL_CONFIDENCE_THRESHOLD",
+            landmark_tracker.get("potential_confidence_threshold", 0.50),
+        ),
+        landmark_tracker_confirm_min_observations=_int_env_or_value(
+            "LANDMARK_TRACKER_CONFIRM_MIN_OBSERVATIONS",
+            landmark_tracker.get("confirm_min_observations", 3),
+        ),
+        landmark_tracker_confirm_max_anchor_jump_m=_float_env_or_value(
+            "LANDMARK_TRACKER_CONFIRM_MAX_ANCHOR_JUMP_M",
+            landmark_tracker.get("confirm_max_anchor_jump_m", 0.50),
+        ),
+        landmark_tracker_confirm_max_depth_jump_m=_float_env_or_value(
+            "LANDMARK_TRACKER_CONFIRM_MAX_DEPTH_JUMP_M",
+            landmark_tracker.get("confirm_max_depth_jump_m", 0.80),
+        ),
+        landmark_tracker_turn_at_complete_requires_confirmed_anchor=_bool_env_or_value(
+            "LANDMARK_TRACKER_TURN_AT_COMPLETE_REQUIRES_CONFIRMED_ANCHOR",
+            landmark_tracker.get("turn_at_complete_requires_confirmed_anchor", True),
+        ),
+        landmark_tracker_turn_at_complete_max_distance_m=_float_env_or_value(
+            "LANDMARK_TRACKER_TURN_AT_COMPLETE_MAX_DISTANCE_M",
+            landmark_tracker.get("turn_at_complete_max_distance_m", 3.0),
+        ),
+        landmark_tracker_qwen_fallback_confirm_allowed=_bool_env_or_value(
+            "LANDMARK_TRACKER_QWEN_FALLBACK_CONFIRM_ALLOWED",
+            landmark_tracker.get("qwen_fallback_confirm_allowed", False),
         ),
         landmark_map_enabled=_bool_env_or_value(
             "LANDMARK_MAP_ENABLED",

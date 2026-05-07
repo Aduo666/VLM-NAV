@@ -81,6 +81,7 @@ target_grounding:
   sam_checkpoint_path: "weights/grounded_sam/sam_vit_h_4b8939.pth"
   sam_model_type: "vit_h"
   sam_device: "cuda:1"
+  sam_enabled: false
   sam_min_mask_area_ratio: 0.0005
   max_result_age_sec: 2.0
   max_result_pose_delta_m: 1.5
@@ -99,6 +100,14 @@ landmark_tracker:
   landmark_map_anchor_ttl_sec: 120.0
   landmark_map_min_confidence: 0.20
   landmark_map_log_period_sec: 2.0
+  confirm_confidence_threshold: 0.90
+  potential_confidence_threshold: 0.50
+  confirm_min_observations: 3
+  confirm_max_anchor_jump_m: 0.50
+  confirm_max_depth_jump_m: 0.80
+  turn_at_complete_requires_confirmed_anchor: true
+  turn_at_complete_max_distance_m: 3.0
+  qwen_fallback_confirm_allowed: false
   reacquire_guard_enabled: true
   reacquire_guard_recent_visible_sec: 20.0
   reacquire_guard_override_action: "STOP"

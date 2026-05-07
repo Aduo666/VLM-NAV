@@ -33,6 +33,8 @@ class LandmarkMapEntry:
     robot_forward_m: float | None
     robot_left_m: float | None
     reached: bool = False
+    confirmed_observation_count: int = 0
+    evidence_level: str = "confirmed"
 
     @property
     def confirmed(self) -> bool:
@@ -83,7 +85,8 @@ class LandmarkMap:
         map_anchor_allowed = behavior in {"go_to", "turn_at"}
         has_confirmed_anchor = (
             state.estimated_world_xy is not None
-            and float(state.confidence) >= float(self._config.min_confidence)
+            and bool(state.can_complete)
+            and str(state.evidence_level) == "confirmed"
             and bool(map_anchor_allowed)
         )
 
@@ -110,7 +113,7 @@ class LandmarkMap:
                 label=label,
                 behavior_type=str(state.behavior_type),
                 world_xy=world_xy,
-                confidence=float(state.confidence),
+                confidence=float(state.confirmed_confidence) if state.confirmed_confidence > 0.0 else float(state.confidence),
                 first_seen_time_sec=(
                     float(existing.first_seen_time_sec) if existing is not None else float(timestamp_sec)
                 ),
@@ -124,6 +127,8 @@ class LandmarkMap:
                 robot_forward_m=float(forward_m),
                 robot_left_m=float(left_m),
                 reached=bool(state.reached),
+                confirmed_observation_count=int(state.confirmed_observation_count),
+                evidence_level=str(state.evidence_level),
             )
             self._entries[label] = entry
             self._log_entry_if_needed(entry=entry, timestamp_sec=float(timestamp_sec))

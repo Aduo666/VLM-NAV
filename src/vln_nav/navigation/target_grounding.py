@@ -41,6 +41,9 @@ class TargetObservation:
     request_robot_pose: Pose2D | None = None
     result_age_sec: float = 0.0
     is_current_frame: bool = True
+    evidence_level: str = "none"  # none / potential / confirmed_candidate
+    semantic_source: str = "unknown"  # grounding_dino / qwen_vl_bbox
+    can_confirm: bool = False
 
 
 @dataclass
@@ -78,9 +81,11 @@ class TargetGroundingConfig:
     sam_model_type: str = "vit_h"
     sam_device: str = "cuda"
     sam_min_mask_area_ratio: float = 0.0005
+    sam_enabled: bool = True
     max_result_age_sec: float = 2.0
     max_result_pose_delta_m: float = 1.5
     max_result_yaw_delta_deg: float = 45.0
+    qwen_fallback_confirm_allowed: bool = False
 
 
 @dataclass
@@ -141,6 +146,7 @@ class TargetGrounder:
                 model_type=str(config.sam_model_type),
                 device=str(config.sam_device),
                 min_mask_area_ratio=float(config.sam_min_mask_area_ratio),
+                enabled=bool(config.sam_enabled),
             ),
             logger=logger,
         )
@@ -276,6 +282,9 @@ class TargetGrounder:
             request_robot_pose=self._last_observation.request_robot_pose,
             result_age_sec=float(result_age_sec),
             is_current_frame=is_current,
+            evidence_level=str(self._last_observation.evidence_level),
+            semantic_source=str(self._last_observation.semantic_source),
+            can_confirm=bool(self._last_observation.can_confirm),
         )
 
     def _collect_finished_request(self, *, timestamp_sec: float, wall_time_sec: float, current_robot_pose: Pose2D | None = None) -> TargetObservation | None:
@@ -315,7 +324,7 @@ class TargetGrounder:
         self._last_observation_wall_sec = float(wall_time_sec)
         if observation.visible and self._should_log_observation(observation=observation, wall_time_sec=wall_time_sec):
             self._logger.info(
-                "[Grounding] target=%s visible=1 bbox=%s depth=%.2f valid_ratio=%.2f mask_area=%.3f bearing_deg=%.1f world=%s confidence=%.2f coord=%s seg=%s age=%.2fs current=%s frame=%d",
+                "[Grounding] target=%s visible=1 bbox=%s depth=%.2f valid_ratio=%.2f mask_area=%.3f bearing_deg=%.1f world=%s confidence=%.2f coord=%s seg=%s age=%.2fs current=%s frame=%d evidence=%s semantic_source=%s can_confirm=%s",
                 observation.label,
                 list(observation.bbox or ()),
                 float(observation.depth_m or 0.0),
@@ -329,6 +338,9 @@ class TargetGrounder:
                 float(observation.result_age_sec),
                 int(observation.is_current_frame),
                 int(observation.request_frame_index),
+                observation.evidence_level,
+                observation.semantic_source,
+                int(observation.can_confirm),
             )
         elif not observation.visible and self._should_log_observation(observation=observation, wall_time_sec=wall_time_sec):
             self._logger.info("[GroundingReject] target=%s reason=%s", observation.label, observation.reason)
@@ -608,10 +620,43 @@ class TargetGrounder:
                 mask_min_pixels=int(self._config.depth_mask_min_pixels),
             )
             segmentation_source = str(self._config.depth_region)
-        if valid_ratio < float(self._config.min_depth_valid_ratio):
-            return _empty_observation(request.target_label, request.timestamp_sec, "invalid_depth_ratio")
-        if depth_m is None or not np.isfinite(depth_m):
-            return _empty_observation(request.target_label, request.timestamp_sec, "depth_invalid")
+        semantic_source = source_prefix.split(":", 1)[0]
+        is_dino = semantic_source.startswith("grounding_dino")
+        can_confirm = True
+        if not is_dino and not bool(self._config.qwen_fallback_confirm_allowed):
+            can_confirm = False
+
+        # Depth validation - if failed, still return visible observation as potential
+        if valid_ratio < float(self._config.min_depth_valid_ratio) or depth_m is None or not np.isfinite(depth_m):
+            self._logger.info(
+                "[GroundingNoDepth] target=%s valid_ratio=%.2f depth=%s reason=depth_invalid_but_visible source=%s",
+                request.target_label,
+                float(valid_ratio),
+                "none" if depth_m is None else f"{float(depth_m):.2f}",
+                semantic_source,
+            )
+            return TargetObservation(
+                label=request.target_label,
+                visible=True,
+                bbox=bbox,
+                center_uv=center_uv,
+                confidence=float(confidence),
+                depth_m=None,
+                bearing_rad=None,
+                estimated_world_xy=None,
+                depth_valid_ratio=float(valid_ratio),
+                area_ratio=float(area_ratio),
+                source=f"{source_prefix}:{coordinate_mode}",
+                reason="depth_invalid",
+                timestamp_sec=float(request.timestamp_sec),
+                mask_area_ratio=float(mask_area_ratio),
+                coordinate_mode=str(coordinate_mode),
+                segmentation_source=str(segmentation_source),
+                mask=mask,
+                evidence_level="potential",
+                semantic_source=semantic_source,
+                can_confirm=False,
+            )
         if depth_m < float(self._config.min_depth_m) or depth_m > float(self._config.max_depth_m):
             return _empty_observation(request.target_label, request.timestamp_sec, "depth_out_of_range")
 
@@ -623,6 +668,9 @@ class TargetGrounder:
             horizontal_fov_deg=float(self._config.horizontal_fov_deg),
             robot_pose=request.robot_pose,
         )
+
+        evidence_level = "confirmed_candidate" if can_confirm else "potential"
+
         return TargetObservation(
             label=request.target_label,
             visible=True,
@@ -641,6 +689,9 @@ class TargetGrounder:
             coordinate_mode=str(coordinate_mode),
             segmentation_source=str(segmentation_source),
             mask=mask,
+            evidence_level=evidence_level,
+            semantic_source=semantic_source,
+            can_confirm=can_confirm,
         )
 
 
@@ -663,6 +714,9 @@ def _empty_observation(target_label: str, timestamp_sec: float, reason: str) -> 
         coordinate_mode="none",
         segmentation_source="none",
         mask=None,
+        evidence_level="none",
+        semantic_source="unknown",
+        can_confirm=False,
     )
 
 
@@ -699,6 +753,9 @@ def _copy_observation_with_timestamp(
         request_robot_pose=request_robot_pose if request_robot_pose is not None else observation.request_robot_pose,
         result_age_sec=float(result_age_sec),
         is_current_frame=bool(is_current_frame),
+        evidence_level=str(observation.evidence_level),
+        semantic_source=str(observation.semantic_source),
+        can_confirm=bool(observation.can_confirm),
     )
 
 

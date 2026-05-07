@@ -12,6 +12,7 @@ class SamSegmenterConfig:
     model_type: str = "vit_h"
     device: str = "cuda"
     min_mask_area_ratio: float = 0.0005
+    enabled: bool = True
 
 
 @dataclass
@@ -32,6 +33,8 @@ class SamSegmenter:
         self._oom_cpu_retry_attempted = False
 
     def segment(self, *, rgb: np.ndarray, bbox: tuple[int, int, int, int]) -> SamSegmentation | None:
+        if not bool(self._config.enabled):
+            return None
         if self._predictor is None and not self._load():
             return None
         try:

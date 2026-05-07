@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import atexit
+import signal
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +21,15 @@ class DebugVideoRecorder:
         self._cv2 = None
         self._size: tuple[int, int] | None = None
         self._frame_count = 0
+        self._closed = False
+        atexit.register(self.close)
+        for sig in (getattr(signal, "SIGINT", None), getattr(signal, "SIGTERM", None)):
+            if sig is None:
+                continue
+            try:
+                signal.signal(sig, self._handle_exit_signal)
+            except Exception:
+                pass
 
     @property
     def output_path(self) -> Path:
@@ -46,6 +57,9 @@ class DebugVideoRecorder:
             self._logger.warning("Debug video recorder disabled after write failure: %s", exc)
 
     def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
         if self._writer is None:
             return
         self._writer.release()
@@ -67,7 +81,11 @@ class DebugVideoRecorder:
 
         self._cv2 = cv2
         self._output_path.parent.mkdir(parents=True, exist_ok=True)
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        suffix = self._output_path.suffix.strip().lower()
+        if suffix == ".avi":
+            fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+        else:
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         writer = cv2.VideoWriter(str(self._output_path), fourcc, self._fps, (int(width), int(height)))
         if not writer.isOpened():
             self._enabled = False
@@ -82,6 +100,15 @@ class DebugVideoRecorder:
             int(width),
             int(height),
         )
+
+    def _handle_exit_signal(self, signum, frame) -> None:
+        _ = frame
+        try:
+            self._logger.info("Debug video closing on signal=%s", int(signum))
+        except Exception:
+            pass
+        self.close()
+        raise SystemExit(128 + int(signum))
 
     @staticmethod
     def _to_rgb_array(image: Image.Image | np.ndarray) -> np.ndarray | None:

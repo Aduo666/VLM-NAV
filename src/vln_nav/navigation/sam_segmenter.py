@@ -29,6 +29,7 @@ class SamSegmenter:
         self._logger = logger.getChild("sam")
         self._predictor = None
         self._load_failed_reason: str | None = None
+        self._oom_cpu_retry_attempted = False
 
     def segment(self, *, rgb: np.ndarray, bbox: tuple[int, int, int, int]) -> SamSegmentation | None:
         if self._predictor is None and not self._load():
@@ -63,9 +64,7 @@ class SamSegmenter:
         except Exception as exc:
             message = str(exc)
             if "out of memory" in message.lower() or "cuda oom" in message.lower():
-                self._load_failed_reason = "runtime_cuda_out_of_memory"
                 self._predictor = None
-                self._logger.warning("[SAM] disabled_for_this_run reason=%s error=%s", self._load_failed_reason, exc)
                 try:
                     import torch
 
@@ -73,6 +72,16 @@ class SamSegmenter:
                         torch.cuda.empty_cache()
                 except Exception:
                     pass
+                requested_device = str(self._config.device).strip().lower()
+                if requested_device.startswith("cuda") and not self._oom_cpu_retry_attempted:
+                    self._oom_cpu_retry_attempted = True
+                    self._load_failed_reason = None
+                    self._config.device = "cpu"
+                    self._logger.warning("[SAM] cuda_oom; retrying on cpu error=%s", exc)
+                    if self._load():
+                        return self.segment(rgb=rgb, bbox=bbox)
+                self._load_failed_reason = "runtime_cuda_out_of_memory"
+                self._logger.warning("[SAM] disabled_for_this_run reason=%s error=%s", self._load_failed_reason, exc)
                 return None
             self._logger.warning("[SAMReject] reason=segment_failed error=%s", exc)
             return None

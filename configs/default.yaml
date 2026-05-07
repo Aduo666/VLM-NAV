@@ -20,7 +20,13 @@ llm:
 
 opennav:
   instruction: "go forward to the wheelchair, then turn left toward the stairs"
+  instruction_preparse_enabled: true
+  instruction_preparse_max_tokens: 384
   candidate_slot_bearings_deg: [75.0, 35.0, 0.0, -35.0, -75.0]
+  candidate_adaptive_enabled: true
+  candidate_adaptive_count: 5
+  candidate_adaptive_min_spacing_deg: 18.0
+  candidate_adaptive_smoothing_px: 15
   candidate_min_travel_distance_m: 0.55
   candidate_max_travel_distance_m: 1.35
   candidate_min_free_ratio: 0.28
@@ -29,14 +35,14 @@ opennav:
   target_debug_enabled: true
   target_debug_image_path: "assets/opennav_debug.png"
   debug_video_enabled: true
-  debug_video_path: "assets/opennav_debug.mp4"
+  debug_video_path: "assets/opennav_debug.avi"
   debug_video_fps: 4.0
   debug_image_update_period_sec: 1.0
   progress_history_length: 6
   progress_stall_distance_m: 0.08
   progress_spin_yaw_deg: 85.0
   policy_execution_steps: 24
-  landmark_arrival_distance_m: 1.0
+  landmark_arrival_distance_m: 1.3
   landmark_arrival_confirmations: 2
   recovery_enabled: false
   recovery_trigger_stalled_steps: 3
@@ -81,6 +87,7 @@ landmark_tracker:
   arrival_anchor_radius_m: 1.00
   min_visible_count: 2
   arrival_confirmations: 2
+  arrival_window_size: 5
   max_lost_count: 6
   anchor_update_min_consistent_observations: 2
   anchor_update_max_jump_m: 1.5
@@ -184,6 +191,15 @@ navigation_map:
   depth_sample_stride_px: 16
   max_depth_obstacle_points: 2500
 
+topology:
+  enabled: true
+  node_spacing_m: 1.0
+  turn_threshold_deg: 40.0
+  merge_radius_m: 0.75
+  landmark_bind_radius_m: 1.5
+  max_nodes: 128
+  recent_node_count: 8
+
 occupancy_grid:
   enabled: true
   resolution_m: 0.08
@@ -191,8 +207,8 @@ occupancy_grid:
   update_period_sec: 0.12
   depth_sample_stride_px: 10
   depth_roi_vertical_range: [0.38, 0.72]
-  min_depth_m: 0.20
-  max_depth_m: 5.0
+  min_depth_m: 0.40
+  max_depth_m: 10.0
   inflation_radius_m: 0.26
   occupied_min_neighbors: 3
   robot_radius_m: 0.32
@@ -208,6 +224,12 @@ occupancy_grid:
   debug_view_size_m: 8.0
   debug_show_free_space: false
   lidar_bootstrap_sec: 0.8
+  lidar_bootstrap_min_fov_deg: 165.0
+  lidar_bootstrap_max_wait_sec: 3.0
+  semantic_planner_enabled: true
+  semantic_goal_step_m: 0.9
+  semantic_goal_min_step_m: 0.45
+  semantic_goal_lateral_search_m: 0.8
 
 lidar:
   enabled: true
@@ -221,6 +243,7 @@ lidar:
   min_range_m: 0.40
   max_range_m: 10.0
   yaw_offset_deg: 0.0
+  sector_merge_keep_sec: 1.5
   draw_points: false
   draw_lines: false
 

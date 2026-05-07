@@ -257,6 +257,7 @@ class OpenNavReasoner:
             "## Navigation Context\n"
             f"Instruction: {instruction_context.normalized_text}\n"
             f"Current target: {current_target}\n"
+            f"Route steps: {[{'landmark': step.landmark, 'directive': step.directive, 'behavior_type': step.behavior_type} for step in instruction_context.route_steps]}\n"
             f"Ordered actions: {instruction_context.actions}\n"
             f"Landmarks: {instruction_context.landmarks}\n"
             f"Directional clauses: {instruction_context.directional_clauses}\n"

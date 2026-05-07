@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -24,6 +25,9 @@ class LandmarkState:
     reached: bool
     reach_reason: str
     anchor_distance_m: float | None
+    reach_window_hits: int = 0
+    reach_window_size: int = 0
+    recent_reach_history: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -35,6 +39,7 @@ class LandmarkTrackerConfig:
     max_lost_count: int
     anchor_update_min_consistent_observations: int
     anchor_update_max_jump_m: float
+    arrival_window_size: int
 
 
 @dataclass
@@ -61,15 +66,18 @@ class LandmarkTracker:
         self._last_log_signature_by_label: dict[str, tuple] = {}
         self._last_anchor_log_time_by_label: dict[str, float] = {}
         self._last_anchor_log_xy_by_label: dict[str, list[float]] = {}
+        self._reach_windows: dict[str, deque[bool]] = {}
 
     def reset(self, label: str | None = None) -> None:
         if label is None:
             self._states.clear()
             self._pending_anchors.clear()
+            self._reach_windows.clear()
             return
         key = _normalize_label(label)
         self._states.pop(key, None)
         self._pending_anchors.pop(key, None)
+        self._reach_windows.pop(key, None)
 
     def update(
         self,
@@ -99,6 +107,9 @@ class LandmarkTracker:
                 reached=False,
                 reach_reason="not_reached",
                 anchor_distance_m=None,
+                reach_window_hits=0,
+                reach_window_size=max(1, int(self._config.arrival_window_size)),
+                recent_reach_history=[],
             )
 
         fresh_visible = (
@@ -144,7 +155,8 @@ class LandmarkTracker:
             robot_pose=robot_pose,
             anchor_world_xy=state.estimated_world_xy,
         )
-        state.reached, state.reach_reason, state.reached_count = self._update_reach_state(
+        state.reached, state.reach_reason, state.reached_count, state.reach_window_hits, state.reach_window_size, state.recent_reach_history = self._update_reach_state(
+            label=label,
             state=state,
             observation=observation,
         )
@@ -195,7 +207,7 @@ class LandmarkTracker:
             _format_xy(state.estimated_world_xy),
             _format_optional_float(state.anchor_distance_m),
             int(bool(state.reached)),
-            int(state.reached_count),
+            f"{int(state.reach_window_hits)}/{int(state.reach_window_size)}",
             observation.source,
             state.reach_reason,
         )
@@ -264,22 +276,31 @@ class LandmarkTracker:
     def _update_reach_state(
         self,
         *,
+        label: str,
         state: LandmarkState,
         observation: TargetObservation,
-    ) -> tuple[bool, str, int]:
+    ) -> tuple[bool, str, int, int, int, list[int]]:
         if state.behavior_type != "go_to":
-            return False, f"behavior_not_implemented:{state.behavior_type}", 0
+            return False, f"behavior_not_implemented:{state.behavior_type}", 0, 0, 0, []
 
         min_visible = max(1, int(self._config.min_visible_count))
         depth_threshold_m = max(0.05, float(self._config.arrival_visible_depth_m))
         anchor_threshold_m = max(0.05, float(self._config.arrival_anchor_radius_m))
+        required = max(1, int(self._config.arrival_confirmations))
+        window_size = max(required, int(self._config.arrival_window_size))
+        reach_window = self._reach_windows.get(label)
+        if reach_window is None or reach_window.maxlen != window_size:
+            reach_window = deque(maxlen=window_size)
+            self._reach_windows[label] = reach_window
         if _is_observation_transient(observation):
             if bool(state.reached):
-                return True, state.reach_reason, int(state.reached_count)
-            if int(state.reached_count) > 0:
+                hits = int(sum(1 for item in reach_window if item))
+                return True, state.reach_reason, int(state.reached_count), hits, int(window_size), [int(item) for item in reach_window]
+            if int(sum(1 for item in reach_window if item)) > 0:
                 base_reason = str(state.reach_reason).split("; waiting_fresh_confirmation", 1)[0]
-                return False, f"{base_reason}; waiting_fresh_confirmation", int(state.reached_count)
-            return False, "not_reached", 0
+                hits = int(sum(1 for item in reach_window if item))
+                return False, f"{base_reason}; waiting_fresh_confirmation", hits, hits, int(window_size), [int(item) for item in reach_window]
+            return False, "not_reached", 0, 0, int(window_size), []
 
         visible_depth_reached = (
             bool(observation.visible)
@@ -295,18 +316,19 @@ class LandmarkTracker:
             and float(state.anchor_distance_m) <= anchor_threshold_m
         )
 
+        evidence = bool(visible_depth_reached or anchor_reached)
+        reach_window.append(bool(evidence))
+        hits = int(sum(1 for item in reach_window if item))
+
         if visible_depth_reached:
             reason = f"visible_depth<={depth_threshold_m:.2f}m"
-            reached_count = int(state.reached_count) + 1
         elif anchor_reached:
             reason = f"confirmed_anchor_distance<={anchor_threshold_m:.2f}m"
-            reached_count = int(state.reached_count) + 1
         else:
             reason = "not_reached"
-            reached_count = 0
-
-        required = max(1, int(self._config.arrival_confirmations))
-        return reached_count >= required, reason, reached_count
+        reached = bool(hits >= required)
+        reached_count = hits
+        return reached, reason, reached_count, hits, int(window_size), [int(item) for item in reach_window]
 
 
 def _normalize_label(label: str) -> str:

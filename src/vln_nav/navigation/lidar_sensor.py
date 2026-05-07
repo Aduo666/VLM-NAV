@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections import deque
 
 import numpy as np
 
@@ -20,6 +21,7 @@ class PhysXLidarConfig:
     min_range_m: float
     max_range_m: float
     yaw_offset_deg: float
+    sector_merge_keep_sec: float
     draw_points: bool
     draw_lines: bool
 
@@ -27,7 +29,14 @@ class PhysXLidarConfig:
 @dataclass
 class LidarScan:
     points_local_xy: np.ndarray
+    beam_endpoints_local_xy: np.ndarray
+    beam_hit_mask: np.ndarray
     point_count: int
+    raw_beam_count: int
+    valid_beam_count: int
+    angle_min_deg: float
+    angle_max_deg: float
+    effective_fov_deg: float
     timestamp_sec: float
     sensor_path: str
     source: str
@@ -48,6 +57,8 @@ class PhysXLidarReader:
         self._sensor_origin_robot_xy = np.zeros((2,), dtype=np.float32)
         self._sensor_x_axis_robot_xy = np.asarray([1.0, 0.0], dtype=np.float32)
         self._sensor_y_axis_robot_xy = np.asarray([0.0, 1.0], dtype=np.float32)
+        self._recent_sector_history: deque[dict[str, object]] = deque(maxlen=16)
+        self._last_coverage_log_time_sec = -float("inf")
 
     @property
     def enabled(self) -> bool:
@@ -85,6 +96,7 @@ class PhysXLidarReader:
                     self._sensor_path,
                     requested_path,
                 )
+                self._log_sensor_parameters(stage=stage)
                 self._configure_sensor_to_robot_transform(stage=stage)
                 self._interface = _range_sensor.acquire_lidar_sensor_interface()
                 self._initialized = True
@@ -100,6 +112,7 @@ class PhysXLidarReader:
                     self._sensor_path,
                     parent_path,
                 )
+                self._log_sensor_parameters(stage=stage)
                 self._configure_sensor_to_robot_transform(stage=stage)
                 self._interface = _range_sensor.acquire_lidar_sensor_interface()
                 self._initialized = True
@@ -136,12 +149,12 @@ class PhysXLidarReader:
             )
 
         self._configure_sensor_to_robot_transform(stage=stage)
+        self._log_sensor_parameters(stage=stage)
         self._interface = _range_sensor.acquire_lidar_sensor_interface()
         self._initialized = True
         return True
 
     def read(self, *, pose: Pose2D, timestamp_sec: float) -> LidarScan | None:
-        _ = pose
         if not self._initialized or self._interface is None or not self._sensor_path:
             return None
         try:
@@ -153,20 +166,38 @@ class PhysXLidarReader:
                 self._last_log_time_sec = float(timestamp_sec)
             return None
 
-        sensor_points, projection_debug = _scan_to_local_points(
+        sensor_beam_endpoints, sensor_beam_hit_mask, projection_debug = _scan_to_local_beams(
             depth_raw=depth_raw,
             azimuth=azimuth,
             min_range_m=float(self._config.min_range_m),
             max_range_m=float(self._config.max_range_m),
             yaw_offset_deg=float(self._config.yaw_offset_deg),
         )
-        points = _transform_sensor_points_to_robot(
-            sensor_points=sensor_points,
+        beam_endpoints = _transform_sensor_points_to_robot(
+            sensor_points=sensor_beam_endpoints,
             sensor_origin_robot_xy=self._sensor_origin_robot_xy,
             sensor_x_axis_robot_xy=self._sensor_x_axis_robot_xy,
             sensor_y_axis_robot_xy=self._sensor_y_axis_robot_xy,
         )
+        beam_hit_mask = np.asarray(sensor_beam_hit_mask, dtype=bool)
+        if beam_endpoints.shape[0] != beam_hit_mask.shape[0]:
+            beam_hit_mask = np.zeros((beam_endpoints.shape[0],), dtype=bool)
+        points = beam_endpoints[beam_hit_mask] if beam_endpoints.size else np.zeros((0, 2), dtype=np.float32)
         projection_debug = _with_point_extents(projection_debug, points)
+        self._update_sector_history(
+            angle_min_deg=float(projection_debug["normalized_min_deg"]),
+            angle_max_deg=float(projection_debug["normalized_max_deg"]),
+            beam_endpoints_local_xy=beam_endpoints,
+            beam_hit_mask=beam_hit_mask,
+            pose=pose,
+            timestamp_sec=float(timestamp_sec),
+        )
+        merged_beam_endpoints, merged_beam_hit_mask, coverage_debug = self._merged_sector_scan(latest_pose=pose)
+        merged_points = (
+            merged_beam_endpoints[merged_beam_hit_mask]
+            if merged_beam_endpoints.size and merged_beam_hit_mask.size
+            else np.zeros((0, 2), dtype=np.float32)
+        )
         if not self._diagnostic_logged:
             self._logger.info(
                 "[LidarDebug] path=%s depth_shape=%s azimuth_count=%s raw_range=[%.3f,%.3f] "
@@ -188,21 +219,142 @@ class PhysXLidarReader:
                 int(points.shape[0]),
             )
             self._diagnostic_logged = True
-        if points.size == 0:
+        if float(timestamp_sec) - self._last_coverage_log_time_sec >= 2.0:
+            self._logger.info(
+                "[LidarCoverage] raw_beams=%s valid_beams=%s sector_deg=[%.1f,%.1f] effective_fov_deg=%.1f merged_beams=%s merged_hits=%s",
+                int(projection_debug["raw_beam_count"]),
+                int(projection_debug["valid_beam_count"]),
+                float(projection_debug["normalized_min_deg"]),
+                float(projection_debug["normalized_max_deg"]),
+                float(coverage_debug["effective_fov_deg"]),
+                int(merged_beam_endpoints.shape[0]),
+                int(np.count_nonzero(merged_beam_hit_mask)),
+            )
+            self._last_coverage_log_time_sec = float(timestamp_sec)
+        if merged_beam_endpoints.size == 0:
             if float(timestamp_sec) - self._last_log_time_sec >= 2.0:
                 self._logger.info("[Lidar] no_valid_points path=%s raw_shape=%s", self._sensor_path, depth_raw.shape)
                 self._last_log_time_sec = float(timestamp_sec)
             return None
         if float(timestamp_sec) - self._last_log_time_sec >= 2.0:
-            self._logger.info("[Lidar] scan path=%s points=%s", self._sensor_path, int(points.shape[0]))
+            self._logger.info(
+                "[Lidar] scan path=%s points=%s beams=%s fov_deg=%.1f",
+                self._sensor_path,
+                int(merged_points.shape[0]),
+                int(merged_beam_endpoints.shape[0]),
+                float(coverage_debug["effective_fov_deg"]),
+            )
             self._last_log_time_sec = float(timestamp_sec)
         return LidarScan(
-            points_local_xy=points,
-            point_count=int(points.shape[0]),
+            points_local_xy=merged_points,
+            beam_endpoints_local_xy=merged_beam_endpoints,
+            beam_hit_mask=merged_beam_hit_mask,
+            point_count=int(merged_points.shape[0]),
+            raw_beam_count=int(projection_debug["raw_beam_count"]),
+            valid_beam_count=int(projection_debug["valid_beam_count"]),
+            angle_min_deg=float(coverage_debug["angle_min_deg"]),
+            angle_max_deg=float(coverage_debug["angle_max_deg"]),
+            effective_fov_deg=float(coverage_debug["effective_fov_deg"]),
             timestamp_sec=float(timestamp_sec),
             sensor_path=self._sensor_path,
-            source="physx_lidar",
+            source="physx_lidar_sector_merged",
         )
+
+    def _update_sector_history(
+        self,
+        *,
+        angle_min_deg: float,
+        angle_max_deg: float,
+        beam_endpoints_local_xy: np.ndarray,
+        beam_hit_mask: np.ndarray,
+        pose: Pose2D,
+        timestamp_sec: float,
+    ) -> None:
+        if beam_endpoints_local_xy.ndim != 2 or beam_endpoints_local_xy.shape[0] == 0:
+            return
+        self._recent_sector_history.append(
+            {
+                "angle_min_deg": float(angle_min_deg),
+                "angle_max_deg": float(angle_max_deg),
+                "beam_endpoints_local_xy": np.asarray(beam_endpoints_local_xy, dtype=np.float32).copy(),
+                "beam_hit_mask": np.asarray(beam_hit_mask, dtype=bool).copy(),
+                "pose": Pose2D(float(pose.x), float(pose.y), float(pose.yaw_rad)),
+                "timestamp_sec": float(timestamp_sec),
+            }
+        )
+
+    def _merged_sector_scan(self, *, latest_pose: Pose2D) -> tuple[np.ndarray, np.ndarray, dict[str, float]]:
+        if not self._recent_sector_history:
+            return (
+                np.zeros((0, 2), dtype=np.float32),
+                np.zeros((0,), dtype=bool),
+                {
+                    "angle_min_deg": 0.0,
+                    "angle_max_deg": 0.0,
+                    "effective_fov_deg": 0.0,
+                },
+            )
+        latest_time = float(self._recent_sector_history[-1]["timestamp_sec"])
+        keep_sec = max(
+            0.10,
+            float(self._config.sector_merge_keep_sec),
+            2.5 / max(1.0, float(self._config.rotation_rate_hz)),
+        )
+        max_pose_delta_m = 0.08
+        max_yaw_delta_deg = 4.0
+        selected = [
+            sector
+            for sector in self._recent_sector_history
+            if latest_time - float(sector["timestamp_sec"]) <= keep_sec
+            and _pose_distance_m(latest_pose, sector["pose"]) <= max_pose_delta_m
+            and _pose_yaw_delta_deg(latest_pose, sector["pose"]) <= max_yaw_delta_deg
+        ]
+        if not selected:
+            selected = [self._recent_sector_history[-1]]
+        beam_arrays = [np.asarray(sector["beam_endpoints_local_xy"], dtype=np.float32) for sector in selected]
+        hit_arrays = [np.asarray(sector["beam_hit_mask"], dtype=bool) for sector in selected]
+        merged_beams = np.concatenate(beam_arrays, axis=0) if beam_arrays else np.zeros((0, 2), dtype=np.float32)
+        merged_hits = np.concatenate(hit_arrays, axis=0) if hit_arrays else np.zeros((0,), dtype=bool)
+        angle_min_deg = min(float(sector["angle_min_deg"]) for sector in selected)
+        angle_max_deg = max(float(sector["angle_max_deg"]) for sector in selected)
+        return merged_beams, merged_hits, {
+            "angle_min_deg": float(angle_min_deg),
+            "angle_max_deg": float(angle_max_deg),
+            "effective_fov_deg": float(max(0.0, angle_max_deg - angle_min_deg)),
+        }
+
+    def _log_sensor_parameters(self, *, stage) -> None:
+        try:
+            prim = stage.GetPrimAtPath(self._sensor_path)
+            if not prim.IsValid():
+                return
+            def _attr_value(name: str):
+                attr = prim.GetAttribute(name)
+                return None if attr is None or not attr.IsValid() else attr.Get()
+
+            horizontal_fov = _attr_value("horizontalFov")
+            vertical_fov = _attr_value("verticalFov")
+            horizontal_resolution = _attr_value("horizontalResolution")
+            vertical_resolution = _attr_value("verticalResolution")
+            rotation_rate = _attr_value("rotationRate")
+            yaw_offset = _attr_value("yawOffset")
+            min_range = _attr_value("minRange")
+            max_range = _attr_value("maxRange")
+            self._logger.info(
+                "[LidarConfig] path=%s horizontal_fov=%s vertical_fov=%s horizontal_resolution=%s vertical_resolution=%s rotation_rate=%s min_range=%s max_range=%s yaw_offset=%s merge_keep_sec=%.2f",
+                self._sensor_path,
+                horizontal_fov,
+                vertical_fov,
+                horizontal_resolution,
+                vertical_resolution,
+                rotation_rate,
+                min_range,
+                max_range,
+                yaw_offset,
+                float(self._config.sector_merge_keep_sec),
+            )
+        except Exception as exc:
+            self._logger.warning("[LidarConfig] read_failed path=%s error=%s", self._sensor_path, exc)
 
     def _configure_sensor_to_robot_transform(self, *, stage) -> None:
         try:
@@ -257,32 +409,32 @@ class PhysXLidarReader:
             self._logger.warning("[Lidar] sensor_to_robot_transform_failed error=%s", exc)
 
 
-def _scan_to_local_points(
+def _scan_to_local_beams(
     *,
     depth_raw: np.ndarray,
     azimuth: np.ndarray,
     min_range_m: float,
     max_range_m: float,
     yaw_offset_deg: float,
-) -> tuple[np.ndarray, dict[str, object]]:
+) -> tuple[np.ndarray, np.ndarray, dict[str, object]]:
     depth = np.asarray(depth_raw)
     empty_debug = _projection_debug(
         depth_shape=tuple(depth.shape),
         azimuth_count=int(np.asarray(azimuth).size),
     )
     if depth.size == 0 or azimuth.size == 0:
-        return np.zeros((0, 2), dtype=np.float32), empty_debug
+        return np.zeros((0, 2), dtype=np.float32), np.zeros((0,), dtype=bool), empty_debug
     if depth.ndim == 1:
         depth = depth.reshape((-1, 1))
     if depth.ndim != 2:
-        return np.zeros((0, 2), dtype=np.float32), empty_debug
+        return np.zeros((0, 2), dtype=np.float32), np.zeros((0,), dtype=bool), empty_debug
 
     rows, cols = depth.shape
     if azimuth.size != rows:
         if azimuth.size == depth.size:
             angles = azimuth.reshape(depth.shape)
         else:
-            return np.zeros((0, 2), dtype=np.float32), empty_debug
+            return np.zeros((0, 2), dtype=np.float32), np.zeros((0,), dtype=bool), empty_debug
     else:
         angles = np.repeat(azimuth[:, None], cols, axis=1)
 
@@ -295,45 +447,55 @@ def _scan_to_local_points(
     else:
         ranges = depth_f
     angle, angle_debug = _normalize_lidar_azimuth(angles=angles, yaw_offset_deg=yaw_offset_deg)
-    valid = (
+    any_beam = np.isfinite(angle)
+    hit = (
         np.isfinite(ranges)
         & ~invalid_raw
         & np.isfinite(angle)
         & (ranges >= max(0.01, float(min_range_m)))
         & (ranges <= max(float(min_range_m) + 0.1, float(max_range_m)))
     )
-    if not np.any(valid):
+    if not np.any(any_beam):
         debug = _projection_debug(
             depth_shape=tuple(depth.shape),
             azimuth_count=int(azimuth.size),
+            raw_beam_count=int(angle.size),
+            valid_beam_count=0,
             **angle_debug,
         )
-        return np.zeros((0, 2), dtype=np.float32), debug
+        return np.zeros((0, 2), dtype=np.float32), np.zeros((0,), dtype=bool), debug
 
-    selected_ranges = ranges[valid]
-    selected_angles = angle[valid]
+    endpoint_ranges = np.where(hit, ranges, float(max_range_m)).astype(np.float32)
+    selected_ranges = endpoint_ranges[any_beam]
+    selected_angles = angle[any_beam]
+    selected_hits = hit[any_beam]
     forward = selected_ranges * np.cos(selected_angles)
     left = selected_ranges * np.sin(selected_angles)
     points = np.stack([forward, left], axis=1).astype(np.float32)
     finite = np.isfinite(points).all(axis=1)
     points = points[finite]
+    selected_hits = np.asarray(selected_hits[finite], dtype=bool)
     if points.size == 0:
         debug = _projection_debug(
             depth_shape=tuple(depth.shape),
             azimuth_count=int(azimuth.size),
+            raw_beam_count=int(angle.size),
+            valid_beam_count=0,
             **angle_debug,
         )
-        return points, debug
+        return points, np.zeros((0,), dtype=bool), debug
     debug = _projection_debug(
         depth_shape=tuple(depth.shape),
         azimuth_count=int(azimuth.size),
+        raw_beam_count=int(angle.size),
+        valid_beam_count=int(np.count_nonzero(selected_hits)),
         forward_min=float(np.min(points[:, 0])),
         forward_max=float(np.max(points[:, 0])),
         left_min=float(np.min(points[:, 1])),
         left_max=float(np.max(points[:, 1])),
         **angle_debug,
     )
-    return points, debug
+    return points, selected_hits, debug
 
 
 def _normalize_lidar_azimuth(*, angles: np.ndarray, yaw_offset_deg: float) -> tuple[np.ndarray, dict[str, object]]:
@@ -439,6 +601,8 @@ def _projection_debug(
     *,
     depth_shape: tuple[int, ...],
     azimuth_count: int,
+    raw_beam_count: int = 0,
+    valid_beam_count: int = 0,
     raw_min: float = 0.0,
     raw_max: float = 0.0,
     unit: str = "unknown",
@@ -453,6 +617,8 @@ def _projection_debug(
     return {
         "depth_shape": depth_shape,
         "azimuth_count": int(azimuth_count),
+        "raw_beam_count": int(raw_beam_count),
+        "valid_beam_count": int(valid_beam_count),
         "raw_min": float(raw_min),
         "raw_max": float(raw_max),
         "unit": str(unit),
@@ -489,3 +655,13 @@ def _find_child_lidar_path(*, stage, root_path: str) -> str:
         if nested:
             return nested
     return ""
+
+
+def _pose_distance_m(first: Pose2D, second: Pose2D) -> float:
+    return float(np.hypot(float(first.x) - float(second.x), float(first.y) - float(second.y)))
+
+
+def _pose_yaw_delta_deg(first: Pose2D, second: Pose2D) -> float:
+    delta = float(first.yaw_rad) - float(second.yaw_rad)
+    delta = (delta + float(np.pi)) % float(2.0 * np.pi) - float(np.pi)
+    return float(abs(np.degrees(delta)))

@@ -30,6 +30,7 @@ from ..navigation.progress_manager import ProgressManager
 from ..navigation.spatial_transform import log_spatial_transform_self_check
 from ..navigation.stuck_detector import StuckDetector, StuckDetectorConfig
 from ..navigation.target_grounding import TargetGrounder, TargetGroundingConfig, TargetObservation
+from ..navigation.topological_memory import TopologicalMemory, TopologicalMemoryConfig
 from ..navigation.vln_policy import ExecutionFeedback, OpenNavPolicyConfig, OpenNavVLNPolicy, PolicyStepResult
 from ..navigation.vln_reasoner import OpenNavReasoner
 from ..runtime.config import DEFAULT_CONFIG_PATH, PROJECT_ROOT, AppConfig, load_config, setup_logging
@@ -110,9 +111,28 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
         image_detail=config.camera_image_detail,
         logger=logger,
     )
-    instruction_manager = InstructionManager(llm_client=llm_client, logger=logger)
+    instruction_manager = InstructionManager(
+        llm_client=llm_client,
+        logger=logger,
+        preparse_enabled=bool(config.instruction_preparse_enabled),
+        max_tokens=int(config.instruction_preparse_max_tokens),
+    )
     instruction_context = instruction_manager.parse(config.instruction)
     logger.info("[Goal] instruction=%s", instruction_context.raw_text)
+    logger.info(
+        "[Goal] parse_source=%s parse_reason=%s task_type=%s route_steps=%s",
+        instruction_context.parsing_source,
+        instruction_context.parsing_reason,
+        instruction_context.task_type,
+        [
+            {
+                "landmark": step.landmark,
+                "directive": step.directive,
+                "behavior_type": step.behavior_type,
+            }
+            for step in instruction_context.route_steps
+        ],
+    )
     logger.info("[Goal] actions=%s", instruction_context.actions)
     logger.info("[Goal] landmarks=%s", instruction_context.landmarks)
     logger.info(
@@ -179,6 +199,10 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
             min_free_ratio=float(config.candidate_min_free_ratio),
             column_half_width_px=int(config.candidate_column_half_width_px),
             debug_image_path=str(config.candidate_debug_image_path),
+            adaptive_enabled=bool(config.candidate_adaptive_enabled),
+            adaptive_count=int(config.candidate_adaptive_count),
+            adaptive_min_spacing_deg=float(config.candidate_adaptive_min_spacing_deg),
+            adaptive_smoothing_px=int(config.candidate_adaptive_smoothing_px),
         ),
         logger=logger,
     )
@@ -258,6 +282,7 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
             arrival_anchor_radius_m=float(config.landmark_tracker_arrival_anchor_radius_m),
             min_visible_count=int(config.landmark_tracker_min_visible_count),
             arrival_confirmations=int(config.landmark_tracker_arrival_confirmations),
+            arrival_window_size=int(config.landmark_tracker_arrival_window_size),
             max_lost_count=int(config.landmark_tracker_max_lost_count),
             anchor_update_min_consistent_observations=int(
                 config.landmark_tracker_anchor_update_min_consistent_observations
@@ -272,6 +297,18 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
             anchor_ttl_sec=float(config.landmark_map_anchor_ttl_sec),
             min_confidence=float(config.landmark_map_min_confidence),
             log_period_sec=float(config.landmark_map_log_period_sec),
+        ),
+        logger=logger,
+    )
+    topological_memory = TopologicalMemory(
+        config=TopologicalMemoryConfig(
+            enabled=bool(config.topology_enabled),
+            node_spacing_m=float(config.topology_node_spacing_m),
+            turn_threshold_deg=float(config.topology_turn_threshold_deg),
+            merge_radius_m=float(config.topology_merge_radius_m),
+            landmark_bind_radius_m=float(config.topology_landmark_bind_radius_m),
+            max_nodes=int(config.topology_max_nodes),
+            recent_node_count=int(config.topology_recent_node_count),
         ),
         logger=logger,
     )
@@ -303,6 +340,10 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
             debug_height=int(config.occupancy_grid_debug_height),
             debug_view_size_m=float(config.occupancy_grid_debug_view_size_m),
             debug_show_free_space=bool(config.occupancy_grid_debug_show_free_space),
+            semantic_planner_enabled=bool(config.occupancy_grid_semantic_planner_enabled),
+            semantic_goal_step_m=float(config.occupancy_grid_semantic_goal_step_m),
+            semantic_goal_min_step_m=float(config.occupancy_grid_semantic_goal_min_step_m),
+            semantic_goal_lateral_search_m=float(config.occupancy_grid_semantic_goal_lateral_search_m),
         ),
         logger=logger,
     )
@@ -319,6 +360,7 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
             min_range_m=float(config.lidar_min_range_m),
             max_range_m=float(config.lidar_max_range_m),
             yaw_offset_deg=float(config.lidar_yaw_offset_deg),
+            sector_merge_keep_sec=float(config.lidar_sector_merge_keep_sec),
             draw_points=bool(config.lidar_draw_points),
             draw_lines=bool(config.lidar_draw_lines),
         ),
@@ -364,6 +406,7 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
             active_track_min_duration_sec=float(config.active_track_min_duration_sec),
             use_discrete_action_primitives=bool(config.use_discrete_action_primitives),
             landmark_arrival_confirmations=int(config.landmark_arrival_confirmations),
+            landmark_arrival_window_size=int(config.landmark_tracker_arrival_window_size),
             reacquire_guard_enabled=bool(config.reacquire_guard_enabled),
             reacquire_guard_recent_visible_sec=float(config.reacquire_guard_recent_visible_sec),
             reacquire_guard_override_action=str(config.reacquire_guard_override_action),
@@ -589,6 +632,16 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
         logger.info("Depth debug output: %s", depth_debug_output_path)
     if config.navigation_map_enabled:
         logger.info("Navigation map output: %s", navigation_map_visualizer.output_path)
+    if config.topology_enabled:
+        logger.info(
+            "[TopologyConfig] enabled=1 node_spacing=%.2fm turn_threshold=%.1fdeg merge_radius=%.2fm bind_radius=%.2fm max_nodes=%s recent_nodes=%s",
+            float(config.topology_node_spacing_m),
+            float(config.topology_turn_threshold_deg),
+            float(config.topology_merge_radius_m),
+            float(config.topology_landmark_bind_radius_m),
+            int(config.topology_max_nodes),
+            int(config.topology_recent_node_count),
+        )
     if config.occupancy_grid_enabled:
         logger.info(
             "[OccupancyGridConfig] enabled=1 source=%s resolution=%.2fm size=%.1fm inflation=%.2fm min_neighbors=%s path_corridor=%.2fm roi=%s debug=%s",
@@ -641,10 +694,16 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
         drive_controller.apply("STOP", speed_scale=0.0)
     logger.info("Warmup complete, controller is armed.")
     occupancy_bootstrap_end_sec = sim_time_sec
+    occupancy_bootstrap_deadline_sec = sim_time_sec
     occupancy_bootstrap_logged = False
     occupancy_bootstrap_done_logged = False
+    occupancy_bootstrap_last_fov_bucket = -1
     if bool(config.occupancy_grid_enabled) and bool(config.lidar_enabled):
         occupancy_bootstrap_end_sec = sim_time_sec + max(0.0, float(config.occupancy_grid_lidar_bootstrap_sec))
+        occupancy_bootstrap_deadline_sec = occupancy_bootstrap_end_sec + max(
+            0.0,
+            float(config.occupancy_grid_lidar_bootstrap_max_wait_sec),
+        )
 
     while simulation_app.is_running():
         world.step(render=True)
@@ -715,6 +774,8 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
             occupancy_grid.update_from_lidar(
                 robot_pose=observation.pose,
                 points_local_xy=lidar_scan.points_local_xy,
+                beam_endpoints_local_xy=lidar_scan.beam_endpoints_local_xy,
+                beam_hit_mask=lidar_scan.beam_hit_mask,
                 timestamp_sec=sim_time_sec,
             )
             observation.meta["lidar"] = {
@@ -722,6 +783,9 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
                 "source": lidar_scan.source,
                 "sensor_path": lidar_scan.sensor_path,
                 "point_count": int(lidar_scan.point_count),
+                "raw_beam_count": int(lidar_scan.raw_beam_count),
+                "valid_beam_count": int(lidar_scan.valid_beam_count),
+                "effective_fov_deg": float(lidar_scan.effective_fov_deg),
             }
         elif bool(config.lidar_enabled):
             observation.meta["lidar"] = {
@@ -739,24 +803,50 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
                 "point_count": 0,
             }
 
-        if sim_time_sec < float(occupancy_bootstrap_end_sec):
+        current_lidar_fov_deg = 0.0 if lidar_scan is None else float(lidar_scan.effective_fov_deg)
+        bootstrap_min_fov_deg = max(0.0, float(config.occupancy_grid_lidar_bootstrap_min_fov_deg))
+        bootstrap_fov_ready = (
+            not bool(config.lidar_enabled)
+            or bootstrap_min_fov_deg <= 0.0
+            or current_lidar_fov_deg >= bootstrap_min_fov_deg
+        )
+        bootstrap_time_ready = sim_time_sec >= float(occupancy_bootstrap_end_sec)
+        bootstrap_deadline_reached = sim_time_sec >= float(occupancy_bootstrap_deadline_sec)
+        if not (bootstrap_time_ready and (bootstrap_fov_ready or bootstrap_deadline_reached)):
             if not occupancy_bootstrap_logged:
                 logger.info(
-                    "[OccupancyBootstrap] accumulating initial lidar map before first policy step duration_sec=%.2f",
+                    "[OccupancyBootstrap] accumulating initial lidar map before first policy step duration_sec=%.2f min_fov_deg=%.1f max_wait_sec=%.2f",
                     max(0.0, float(config.occupancy_grid_lidar_bootstrap_sec)),
+                    float(bootstrap_min_fov_deg),
+                    float(config.occupancy_grid_lidar_bootstrap_max_wait_sec),
                 )
                 occupancy_bootstrap_logged = True
+            fov_bucket = int(current_lidar_fov_deg // 10.0)
+            if fov_bucket != occupancy_bootstrap_last_fov_bucket:
+                logger.info(
+                    "[OccupancyBootstrap] waiting time_ready=%s fov_ready=%s deadline=%s current_fov_deg=%.1f threshold_deg=%.1f",
+                    int(bool(bootstrap_time_ready)),
+                    int(bool(bootstrap_fov_ready)),
+                    int(bool(bootstrap_deadline_reached)),
+                    float(current_lidar_fov_deg),
+                    float(bootstrap_min_fov_deg),
+                )
+                occupancy_bootstrap_last_fov_bucket = fov_bucket
             drive_controller.apply("STOP", speed_scale=0.0)
             last_action_name = "STOP"
             continue
         if occupancy_bootstrap_logged and not occupancy_bootstrap_done_logged:
-            logger.info("[OccupancyBootstrap] complete; starting VLN policy.")
+            logger.info(
+                "[OccupancyBootstrap] complete; starting VLN policy. fov_deg=%.1f deadline_reached=%s",
+                float(current_lidar_fov_deg),
+                int(bool(bootstrap_deadline_reached)),
+            )
             occupancy_bootstrap_done_logged = True
 
         current_landmark = policy.current_landmark
         target_observation: TargetObservation | None = None
-        grounding_enabled_this_frame = not _is_executing_motion_step(active_step_result)
-        if current_landmark and grounding_enabled_this_frame:
+        landmark_map_entry = None
+        if current_landmark:
             target_observation = target_grounder.observe(
                 rgb=front_rgb,
                 depth=last_depth_image,
@@ -766,7 +856,7 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
             )
             landmark_state = landmark_tracker.update(
                 target_label=current_landmark,
-                behavior_type="go_to",
+                behavior_type=policy.current_behavior_type,
                 observation=target_observation,
                 robot_pose=observation.pose,
                 timestamp_sec=sim_time_sec,
@@ -785,18 +875,30 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
                     timestamp_sec=sim_time_sec,
                 )
             )
-        elif current_landmark:
-            policy.set_landmark_map_summary(
-                landmark_map.summary(
-                    target_label=current_landmark,
-                    robot_pose=observation.pose,
-                    timestamp_sec=sim_time_sec,
-                )
-            )
         else:
             policy.set_landmark_state(None)
             policy.set_landmark_map_entry(None)
             policy.set_landmark_map_summary("")
+
+        topological_memory.update(
+            robot_pose=observation.pose,
+            timestamp_sec=sim_time_sec,
+            current_landmark=current_landmark,
+            landmark_entry=landmark_map_entry if current_landmark else None,
+            progress_signal=progress_manager.state.progress_signal,
+        )
+        policy.set_topology_summary(
+            topological_memory.summary(
+                current_target=current_landmark,
+                robot_pose=observation.pose,
+            )
+        )
+        policy.set_topology_revisit_world_xy(
+            topological_memory.suggest_revisit_world_xy(
+                current_target=current_landmark,
+                robot_pose=observation.pose,
+            )
+        )
 
         should_refresh_policy = True
         recovery_command = stuck_detector.recovery_command(now_sec=sim_time_sec)
@@ -1305,6 +1407,7 @@ def _draw_grounded_target_overlay(
     visible = bool(observation.visible)
     reason = str(observation.reason)
     source = str(observation.source)
+    segmentation_source = str(getattr(observation, "segmentation_source", "none"))
     depth_text = "none" if observation.depth_m is None else f"{float(observation.depth_m):.2f}m"
     if visible and observation.bbox is not None:
         xmin, ymin, xmax, ymax = [int(value) for value in observation.bbox]
@@ -1318,11 +1421,14 @@ def _draw_grounded_target_overlay(
             center_u, center_v = [int(round(float(value))) for value in observation.center_uv]
             draw.line((center_u - 10, center_v, center_u + 10, center_v), fill=color, width=3)
             draw.line((center_u, center_v - 10, center_u, center_v + 10), fill=color, width=3)
-        label = f"grounded {observation.label} depth={depth_text} conf={observation.confidence:.2f}"
-        draw.rectangle((xmin, max(0, ymin - 28), min(width, xmin + 500), ymin), fill=(0, 0, 0))
-        draw.text((xmin + 4, max(0, ymin - 24)), label, fill=color, font=label_font)
+        label = f"grounded {observation.label} depth={depth_text} conf={observation.confidence:.2f} seg={segmentation_source}"
+        draw.rectangle((xmin, max(0, ymin - 28), min(width, xmin + 620), ymin), fill=(0, 0, 0))
+        draw.text((xmin + 4, max(0, ymin - 24)), label[:110], fill=color, font=label_font)
         return
-    text = f"grounding: lost/hidden label={observation.label} reason={reason} source={source} depth={depth_text}"
+    text = (
+        f"grounding: lost/hidden label={observation.label} reason={reason} "
+        f"source={source} seg={segmentation_source} depth={depth_text}"
+    )
     draw.rectangle((0, height - 44, width, height), fill=(0, 0, 0))
     draw.text((12, height - 32), text[:120], fill=(255, 110, 90), font=label_font)
 

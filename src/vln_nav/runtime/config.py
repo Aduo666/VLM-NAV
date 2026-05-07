@@ -34,7 +34,13 @@ class AppConfig:
     llm_upload_max_edge_px: int = 512
     camera_image_detail: str = "low"
     instruction: str = "find the wheelchair"
+    instruction_preparse_enabled: bool = True
+    instruction_preparse_max_tokens: int = 384
     candidate_slot_bearings_deg: list[float] = field(default_factory=lambda: [75.0, 35.0, 0.0, -35.0, -75.0])
+    candidate_adaptive_enabled: bool = True
+    candidate_adaptive_count: int = 5
+    candidate_adaptive_min_spacing_deg: float = 18.0
+    candidate_adaptive_smoothing_px: int = 15
     candidate_min_travel_distance_m: float = 0.55
     candidate_max_travel_distance_m: float = 1.35
     candidate_min_free_ratio: float = 0.28
@@ -43,7 +49,7 @@ class AppConfig:
     target_debug_enabled: bool = True
     target_debug_image_path: str = "assets/opennav_debug.png"
     debug_video_enabled: bool = True
-    debug_video_path: str = "assets/opennav_debug.mp4"
+    debug_video_path: str = "assets/opennav_debug.avi"
     debug_video_fps: float = 4.0
     debug_image_update_period_sec: float = 1.0
     progress_history_length: int = 6
@@ -95,6 +101,7 @@ class AppConfig:
     landmark_tracker_arrival_anchor_radius_m: float = 1.00
     landmark_tracker_min_visible_count: int = 2
     landmark_tracker_arrival_confirmations: int = 2
+    landmark_tracker_arrival_window_size: int = 5
     landmark_tracker_max_lost_count: int = 6
     landmark_tracker_anchor_update_min_consistent_observations: int = 2
     landmark_tracker_anchor_update_max_jump_m: float = 1.5
@@ -184,6 +191,13 @@ class AppConfig:
     navigation_map_height: int = 900
     navigation_map_depth_sample_stride_px: int = 16
     navigation_map_max_depth_obstacle_points: int = 2500
+    topology_enabled: bool = True
+    topology_node_spacing_m: float = 1.0
+    topology_turn_threshold_deg: float = 40.0
+    topology_merge_radius_m: float = 0.75
+    topology_landmark_bind_radius_m: float = 1.50
+    topology_max_nodes: int = 128
+    topology_recent_node_count: int = 8
     occupancy_grid_enabled: bool = True
     occupancy_grid_resolution_m: float = 0.08
     occupancy_grid_size_m: float = 24.0
@@ -191,7 +205,7 @@ class AppConfig:
     occupancy_grid_depth_sample_stride_px: int = 10
     occupancy_grid_depth_roi_vertical_range: list[float] = field(default_factory=lambda: [0.38, 0.72])
     occupancy_grid_min_depth_m: float = 0.20
-    occupancy_grid_max_depth_m: float = 5.0
+    occupancy_grid_max_depth_m: float = 10.0
     occupancy_grid_inflation_radius_m: float = 0.26
     occupancy_grid_occupied_min_neighbors: int = 3
     occupancy_grid_robot_radius_m: float = 0.32
@@ -207,6 +221,12 @@ class AppConfig:
     occupancy_grid_debug_view_size_m: float = 8.0
     occupancy_grid_debug_show_free_space: bool = False
     occupancy_grid_lidar_bootstrap_sec: float = 0.8
+    occupancy_grid_lidar_bootstrap_min_fov_deg: float = 165.0
+    occupancy_grid_lidar_bootstrap_max_wait_sec: float = 3.0
+    occupancy_grid_semantic_planner_enabled: bool = True
+    occupancy_grid_semantic_goal_step_m: float = 0.90
+    occupancy_grid_semantic_goal_min_step_m: float = 0.45
+    occupancy_grid_semantic_goal_lateral_search_m: float = 0.80
     lidar_enabled: bool = True
     lidar_prim_path: str = "dummy_base_link/base_link/Lidar_link"
     lidar_child_name: str = "lidar_sensor"
@@ -218,6 +238,7 @@ class AppConfig:
     lidar_min_range_m: float = 0.20
     lidar_max_range_m: float = 6.0
     lidar_yaw_offset_deg: float = 0.0
+    lidar_sector_merge_keep_sec: float = 1.5
     lidar_draw_points: bool = False
     lidar_draw_lines: bool = False
     stuck_detection_enabled: bool = True
@@ -308,6 +329,7 @@ def load_config(config_path: str | None = None) -> AppConfig:
     navigation_map = _section(file_data, "navigation_map")
     occupancy_grid = _section(file_data, "occupancy_grid")
     lidar = _section(file_data, "lidar")
+    topology = _section(file_data, "topology")
     scene = _section(file_data, "scene")
     logging_section = _section(file_data, "logging")
 
@@ -341,9 +363,33 @@ def load_config(config_path: str | None = None) -> AppConfig:
             "INSTRUCTION",
             opennav.get("instruction", "find the wheelchair"),
         ),
+        instruction_preparse_enabled=_bool_env_or_value(
+            "INSTRUCTION_PREPARSE_ENABLED",
+            opennav.get("instruction_preparse_enabled", True),
+        ),
+        instruction_preparse_max_tokens=_int_env_or_value(
+            "INSTRUCTION_PREPARSE_MAX_TOKENS",
+            opennav.get("instruction_preparse_max_tokens", 384),
+        ),
         candidate_slot_bearings_deg=_list_env_or_value(
             "CANDIDATE_SLOT_BEARINGS_DEG",
             opennav.get("candidate_slot_bearings_deg", [75.0, 35.0, 0.0, -35.0, -75.0]),
+        ),
+        candidate_adaptive_enabled=_bool_env_or_value(
+            "CANDIDATE_ADAPTIVE_ENABLED",
+            opennav.get("candidate_adaptive_enabled", True),
+        ),
+        candidate_adaptive_count=_int_env_or_value(
+            "CANDIDATE_ADAPTIVE_COUNT",
+            opennav.get("candidate_adaptive_count", 5),
+        ),
+        candidate_adaptive_min_spacing_deg=_float_env_or_value(
+            "CANDIDATE_ADAPTIVE_MIN_SPACING_DEG",
+            opennav.get("candidate_adaptive_min_spacing_deg", 18.0),
+        ),
+        candidate_adaptive_smoothing_px=_int_env_or_value(
+            "CANDIDATE_ADAPTIVE_SMOOTHING_PX",
+            opennav.get("candidate_adaptive_smoothing_px", 15),
         ),
         candidate_min_travel_distance_m=_float_env_or_value(
             "CANDIDATE_MIN_TRAVEL_DISTANCE_M",
@@ -379,7 +425,7 @@ def load_config(config_path: str | None = None) -> AppConfig:
         ),
         debug_video_path=_env_or_value(
             "DEBUG_VIDEO_PATH",
-            opennav.get("debug_video_path", "assets/opennav_debug.mp4"),
+            opennav.get("debug_video_path", "assets/opennav_debug.avi"),
         ),
         debug_video_fps=_float_env_or_value(
             "DEBUG_VIDEO_FPS",
@@ -593,6 +639,10 @@ def load_config(config_path: str | None = None) -> AppConfig:
         landmark_tracker_arrival_confirmations=_int_env_or_value(
             "LANDMARK_TRACKER_ARRIVAL_CONFIRMATIONS",
             landmark_tracker.get("arrival_confirmations", 2),
+        ),
+        landmark_tracker_arrival_window_size=_int_env_or_value(
+            "LANDMARK_TRACKER_ARRIVAL_WINDOW_SIZE",
+            landmark_tracker.get("arrival_window_size", 5),
         ),
         landmark_tracker_max_lost_count=_int_env_or_value(
             "LANDMARK_TRACKER_MAX_LOST_COUNT",
@@ -885,6 +935,34 @@ def load_config(config_path: str | None = None) -> AppConfig:
             "NAVIGATION_MAP_MAX_DEPTH_OBSTACLE_POINTS",
             navigation_map.get("max_depth_obstacle_points", 2500),
         ),
+        topology_enabled=_bool_env_or_value(
+            "TOPOLOGY_ENABLED",
+            topology.get("enabled", True),
+        ),
+        topology_node_spacing_m=_float_env_or_value(
+            "TOPOLOGY_NODE_SPACING_M",
+            topology.get("node_spacing_m", 1.0),
+        ),
+        topology_turn_threshold_deg=_float_env_or_value(
+            "TOPOLOGY_TURN_THRESHOLD_DEG",
+            topology.get("turn_threshold_deg", 40.0),
+        ),
+        topology_merge_radius_m=_float_env_or_value(
+            "TOPOLOGY_MERGE_RADIUS_M",
+            topology.get("merge_radius_m", 0.75),
+        ),
+        topology_landmark_bind_radius_m=_float_env_or_value(
+            "TOPOLOGY_LANDMARK_BIND_RADIUS_M",
+            topology.get("landmark_bind_radius_m", 1.50),
+        ),
+        topology_max_nodes=_int_env_or_value(
+            "TOPOLOGY_MAX_NODES",
+            topology.get("max_nodes", 128),
+        ),
+        topology_recent_node_count=_int_env_or_value(
+            "TOPOLOGY_RECENT_NODE_COUNT",
+            topology.get("recent_node_count", 8),
+        ),
         occupancy_grid_enabled=_bool_env_or_value(
             "OCCUPANCY_GRID_ENABLED",
             occupancy_grid.get("enabled", True),
@@ -915,7 +993,7 @@ def load_config(config_path: str | None = None) -> AppConfig:
         ),
         occupancy_grid_max_depth_m=_float_env_or_value(
             "OCCUPANCY_GRID_MAX_DEPTH_M",
-            occupancy_grid.get("max_depth_m", 5.0),
+            occupancy_grid.get("max_depth_m", 10.0),
         ),
         occupancy_grid_inflation_radius_m=_float_env_or_value(
             "OCCUPANCY_GRID_INFLATION_RADIUS_M",
@@ -977,6 +1055,30 @@ def load_config(config_path: str | None = None) -> AppConfig:
             "OCCUPANCY_GRID_LIDAR_BOOTSTRAP_SEC",
             occupancy_grid.get("lidar_bootstrap_sec", 0.8),
         ),
+        occupancy_grid_lidar_bootstrap_min_fov_deg=_float_env_or_value(
+            "OCCUPANCY_GRID_LIDAR_BOOTSTRAP_MIN_FOV_DEG",
+            occupancy_grid.get("lidar_bootstrap_min_fov_deg", 165.0),
+        ),
+        occupancy_grid_lidar_bootstrap_max_wait_sec=_float_env_or_value(
+            "OCCUPANCY_GRID_LIDAR_BOOTSTRAP_MAX_WAIT_SEC",
+            occupancy_grid.get("lidar_bootstrap_max_wait_sec", 3.0),
+        ),
+        occupancy_grid_semantic_planner_enabled=_bool_env_or_value(
+            "OCCUPANCY_GRID_SEMANTIC_PLANNER_ENABLED",
+            occupancy_grid.get("semantic_planner_enabled", True),
+        ),
+        occupancy_grid_semantic_goal_step_m=_float_env_or_value(
+            "OCCUPANCY_GRID_SEMANTIC_GOAL_STEP_M",
+            occupancy_grid.get("semantic_goal_step_m", 0.90),
+        ),
+        occupancy_grid_semantic_goal_min_step_m=_float_env_or_value(
+            "OCCUPANCY_GRID_SEMANTIC_GOAL_MIN_STEP_M",
+            occupancy_grid.get("semantic_goal_min_step_m", 0.45),
+        ),
+        occupancy_grid_semantic_goal_lateral_search_m=_float_env_or_value(
+            "OCCUPANCY_GRID_SEMANTIC_GOAL_LATERAL_SEARCH_M",
+            occupancy_grid.get("semantic_goal_lateral_search_m", 0.80),
+        ),
         lidar_enabled=_bool_env_or_value("LIDAR_ENABLED", lidar.get("enabled", True)),
         lidar_prim_path=_env_or_value(
             "LIDAR_PRIM_PATH",
@@ -1017,6 +1119,10 @@ def load_config(config_path: str | None = None) -> AppConfig:
         lidar_yaw_offset_deg=_float_env_or_value(
             "LIDAR_YAW_OFFSET_DEG",
             lidar.get("yaw_offset_deg", 0.0),
+        ),
+        lidar_sector_merge_keep_sec=_float_env_or_value(
+            "LIDAR_SECTOR_MERGE_KEEP_SEC",
+            lidar.get("sector_merge_keep_sec", 1.5),
         ),
         lidar_draw_points=_bool_env_or_value("LIDAR_DRAW_POINTS", lidar.get("draw_points", False)),
         lidar_draw_lines=_bool_env_or_value("LIDAR_DRAW_LINES", lidar.get("draw_lines", False)),

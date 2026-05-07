@@ -1,355 +1,64 @@
-对，你现在这个结论是对的：**只靠 VLM 返回 `visible/bearing` 不够，必须引入更强的视觉 grounding/segmentation，并且要有地图/记忆。**
+这轮已经按 Claude 的提议把主链改了，不是只加日志或占位文件。
 
-你现在的问题已经不是“左转过头”那种局部决策 bug，而是系统缺两类基础能力：
+已实现的内容：
 
-1. **语义感知能力**：稳定知道 landmark 在图像里的哪里。
-2. **空间记忆能力**：当 landmark 暂时看不到时，还知道它大概在世界坐标里的哪里。
+- P0 指令预处理
+  - [instruction_manager.py](/home/Lab/qiangsibin/VLM-NAV/src/vln_nav/navigation/instruction_manager.py) 改成“一次性 LLM 预解析”。
+  - 输出 `task_type / landmarks / actions / directional_clauses / route_steps`。
+  - `nav.py` 已接入配置项 `instruction_preparse_enabled / instruction_preparse_max_tokens`。
+  - `vln_reasoner.py` 现在会把 `route_steps` 一起发给模型，不再只是正则结果写日志。
 
----
+- P1 拓扑/语义记忆
+  - 新增 [topological_memory.py](/home/Lab/qiangsibin/VLM-NAV/src/vln_nav/navigation/topological_memory.py)。
+  - `nav.py` 每帧更新拓扑记忆，并把：
+    - `topology summary`
+    - `topology revisit world_xy`
+    传给 policy。
+  - `vln_policy.py` 新增 `TOPOLOGY_REVISIT` 分支。
+  - 在 `STALLED/SPINNING` 或 `LLM_BLOCKED` 时，会优先尝试回到拓扑记忆里的可回退节点，而不是原地死等。
 
-## 1. 为什么到了 landmark 脸上还显示没到达
+- P2 自适应候选点
+  - [candidate_waypoint_predictor.py](/home/Lab/qiangsibin/VLM-NAV/src/vln_nav/navigation/candidate_waypoint_predictor.py) 不再死用固定 5 个角度。
+  - 现在是“基准槽位 + 深度图列方向 profile 微调”。
+  - 新增配置：
+    - `candidate_adaptive_enabled`
+    - `candidate_adaptive_count`
+    - `candidate_adaptive_min_spacing_deg`
+    - `candidate_adaptive_smoothing_px`
 
-因为你现在的到达判定依赖：
+- P3 Route contradiction 不再只记日志
+  - [vln_policy.py](/home/Lab/qiangsibin/VLM-NAV/src/vln_nav/navigation/vln_policy.py) 现在会先用当前 grounded landmark anchor 做 `RouteCheck`。
+  - 如果检测到矛盾：
+    - 先尝试按预期方向挑一个有效候选做 `RouteCorrection`
+    - 不行就走 `TOPOLOGY_REVISIT`
+    - 再不行就 `STOP + REPLAN`
+  - 不再是之前那种只打一条 warning。
 
-```text
-target_grounding visible
-+ bbox/depth
-+ LandmarkTracker anchor
+- P4 到达判定改成滑窗
+  - [landmark_tracker.py](/home/Lab/qiangsibin/VLM-NAV/src/vln_nav/navigation/landmark_tracker.py) 已从“连续命中”改成“滑动窗口确认”。
+  - `LandmarkMap` 的 fallback 到达确认在 [vln_policy.py](/home/Lab/qiangsibin/VLM-NAV/src/vln_nav/navigation/vln_policy.py) 里也改成滑窗。
+  - 新增配置 `landmark_tracker.arrival_window_size`。
+
+同时补了主链接线：
+
+- [nav.py](/home/Lab/qiangsibin/VLM-NAV/src/vln_nav/app/nav.py)
+  - 传入 `policy.current_behavior_type`
+  - 记录 `parse_source / route_steps`
+  - 初始化 `TopologicalMemory`
+- [config.py](/home/Lab/qiangsibin/VLM-NAV/src/vln_nav/runtime/config.py) 和 [default.yaml](/home/Lab/qiangsibin/VLM-NAV/configs/default.yaml)
+  - 已补齐上述新配置项
+
+本轮没有改底层控制器、occupancy 主体、Grounding/SAM 主链，保持了你之前要求的边界。
+
+验证已做：
+
+```bash
+python3 -m compileall -q src/vln_nav
+python3 -c "from src.vln_nav.runtime.config import load_config; c=load_config('configs/default.yaml'); print(c.instruction_preparse_enabled, c.candidate_adaptive_enabled, c.landmark_tracker_arrival_window_size, c.topology_enabled)"
 ```
 
-但如果 grounding 不稳定，系统就会认为：
-
-```text
-没看到目标
-没有可靠 bbox
-没有 depth
-没有 confirmed anchor
-所以没到达
-```
-
-即使肉眼看图里有 landmark，大模型或 bbox grounding 失败，系统也不会承认它可见。
-
-这说明你现在的目标识别链路太弱。特别是 wheelchair、stairs、chair 这类物体：
-
-* 形状复杂；
-* 深度空洞多；
-* 局部结构细；
-* 可能被遮挡；
-* 贴近后只看到一部分；
-* 大模型 bbox 容易框错或输出越界。
-
-所以 `Qwen-VL bbox + strict depth check` 作为唯一目标感知，确实不够稳。
-
----
-
-## 2. 为什么需要 SAM / Grounded SAM 这类模型
-
-SAM 本身只做 segmentation，不知道“这是 wheelchair 还是 stairs”。
-所以更合理的是：
-
-```text
-Grounding model 找目标 bbox
-+ SAM / SAM2 根据 bbox 分割目标 mask
-+ depth 在 mask 内统计目标距离
-+ 反投影得到目标 world anchor
-```
-
-这比只用 bbox 中心 patch 取深度稳很多。
-
-现在常见组合是 **Grounding DINO / Florence-2 / DINO-X 负责开放词汇检测，SAM2 负责分割和视频跟踪**。Grounded-SAM-2 官方仓库就支持把 Grounding DINO、Grounding DINO 1.5/1.6、Florence-2、DINO-X 和 SAM2 组合起来做 open-world grounding、segmentation 和 tracking；SAM2 本身也是面向图像和视频的 promptable segmentation model，有 streaming memory，适合连续帧目标跟踪。([GitHub][1])
-
-这对你很有意义，因为你不只是要“单帧找到目标”，还要：
-
-* 第一帧看到 wheelchair；
-* 后面即使部分遮挡、角度变化，也能持续跟踪；
-* 用 mask 内 depth 估距离；
-* 把目标位置写入 landmark memory。
-
----
-
-## 3. 推荐你改成这个感知链
-
-我建议不要让 VLM 直接输出 bbox 作为主感知。改成三层：
-
-```text
-Open-vocabulary detector
-    -> bbox
-SAM / SAM2
-    -> mask
-Depth
-    -> target distance
-Spatial transform
-    -> world anchor
-LandmarkTracker
-    -> visible / lost / reached
-```
-
-### 模块上可以这样设计
-
-新增或重构：
-
-```text
-semantic_perception/
-  open_vocab_detector.py
-  sam_segmenter.py
-  target_tracker.py
-  depth_mask_estimator.py
-  semantic_observation.py
-```
-
-输出统一成：
-
-```python
-SemanticTargetObservation(
-    label="wheelchair",
-    visible=True,
-    bbox=(xmin, ymin, xmax, ymax),
-    mask=np.ndarray,
-    mask_area_ratio=...,
-    depth_m=...,
-    depth_valid_ratio=...,
-    center_uv=...,
-    bearing_rad=...,
-    estimated_world_xy=...,
-    confidence=...,
-    track_id=...
-)
-```
-
-其中 `depth_m` 不再取 bbox 中心 patch，而是在 mask 内取稳健统计：
-
-```text
-mask 内有效 depth 的 20%~50% 分位数 / median / trimmed mean
-```
-
-这对轮椅、椅子、楼梯这种非实心物体更可靠。
-
----
-
-## 4. 地图有没有必要？有，而且现在必须上
-
-你说的“看不到的时候也知道在哪里”，这就不是单帧视觉问题，而是地图/记忆问题。
-
-但我建议你分两层做，不要一上来做完整语义 SLAM。
-
-### 第一层：Landmark Map / Semantic Anchor Map
-
-先做一个轻量 landmark anchor map：
-
-```python
-landmark_map = {
-    "wheelchair": {
-        "world_xy": [x, y],
-        "confidence": 0.82,
-        "last_seen_time": ...,
-        "seen_count": ...,
-        "source": "grounded_sam2",
-        "status": "visible/lost/reached"
-    }
-}
-```
-
-作用：
-
-* 看见目标时更新 anchor；
-* 看不见目标时仍知道它大概在哪；
-* 到达判定可以用机器人到 anchor 的距离；
-* reacquire 可以朝 anchor 方向找；
-* landmark 顺序任务可以可靠切换。
-
-这一步比稠密语义地图简单很多，但收益非常大。
-
-### 第二层：Local Occupancy Map
-
-再做局部 2D 占用图：
-
-```text
-范围：机器人周围 4m x 4m 或 6m x 6m
-分辨率：0.05m / 0.1m
-内容：unknown / free / occupied
-来源：depth 点云投影
-用途：避障、候选过滤、近场盲区、stuck recovery
-```
-
-这解决“脚下看不到”和“卡在一个地方”的问题。
-
-### 第三层：Semantic Occupancy Map，后面再做
-
-等前两层稳定后，再把 mask 投影到 2D map，做：
-
-```text
-occupied cell
-semantic label = wheelchair / chair / stairs / door
-confidence
-last_seen_time
-```
-
-这才是你说的 2D 语义图。
-但不要第一步就做完整语义栅格，否则工程复杂度很高。
-
----
-
-## 5. 我建议的最小改造路线
-
-不要一次性上完整地图和 SAM2 tracking。按这个顺序：
-
-### Phase A：先替换 grounding
-
-把当前 `Qwen bbox` 改成：
-
-```text
-GroundingDINO / Florence-2 / Grounded-SAM2 detector
-+ SAM2 mask
-+ mask-depth distance
-```
-
-目标：稳定输出 bbox/mask/depth/world anchor。
-
-### Phase B：改 LandmarkTracker
-
-让 tracker 只信：
-
-```text
-SemanticTargetObservation.confirmed == True
-```
-
-而不是信 VLM 的 `target_visible`。
-
-到达条件改成：
-
-```text
-当前 mask 可见且 depth <= threshold
-或
-最近真实 anchor 存在且 robot 到 anchor 距离 <= threshold
-```
-
-### Phase C：加 LandmarkMap
-
-把每个 landmark 的 confirmed anchor 存起来。
-目标短暂不可见时，不再忘掉。
-
-### Phase D：加 LocalOccupancyMap
-
-用 depth 投影局部 2D 占用。
-目标：避免脚下盲区、候选穿墙、恢复乱转。
-
-### Phase E：再做 SemanticMap
-
-把 SAM mask 投影到地图上，给 occupied/free cell 加语义标签。
-这一步放后面。
-
----
-
-## 6. 现在给 Codex 的方向应该改
-
-你可以直接让 Codex停止继续修 Qwen bbox prompt，转成这条路线：
-
-当前 Phase 1/2 使用 Qwen-VL 输出 bbox 后，效果仍然很差：即使机器人已经接近 landmark，系统仍然经常判定 landmark 不可见或未到达。原因是当前 target grounding 不稳定，只有 VLM bbox，没有可靠的 segmentation/mask，也没有真正的地图记忆。
-
-现在请不要继续调 candidate prompt，也不要继续只修 Qwen bbox prompt。需要把感知和记忆升级为：
-
-1. Open-vocabulary grounding + segmentation
-2. Landmark semantic anchor memory
-3. Local occupancy map
-
-目标是让系统具备：
-
-* 图中有 landmark 时能稳定定位它；
-* landmark 暂时不在视野里时，仍记得它的世界位置；
-* 接近 landmark 后，即使目标从相机下沿消失，也能通过 anchor 判定到达；
-* 近场障碍和脚下盲区能通过 local occupancy map 处理。
-
-请按以下阶段规划，不要一次性大改所有主链：
-
-Phase A：新增 `semantic_perception` 模块
-
-* 支持 GroundingDINO / Florence-2 / Grounded-SAM2 这类 open-vocabulary detector。
-* 支持 SAM/SAM2 根据 bbox 生成 mask。
-* 统一输出 `SemanticTargetObservation`：
-
-  * label
-  * visible
-  * bbox
-  * mask
-  * confidence
-  * mask_area_ratio
-  * depth_m
-  * depth_valid_ratio
-  * center_uv
-  * bearing_rad
-  * estimated_world_xy
-  * source
-* depth_m 必须从 mask 内有效 depth 统计得到，不再只用 bbox center patch。
-* 第一版可以把模型调用封装成接口，允许先用 mock/manual/oracle 模式测试 pipeline。
-
-Phase B：重构 LandmarkTracker / LandmarkMap
-
-* 只用 confirmed semantic observation 更新 anchor。
-* 维护每个 landmark 的 world_xy、confidence、last_seen_time、seen_count、lost_count、status。
-* 到达判定：
-
-  * 当前 mask 可见且 depth <= threshold；
-  * 或最近 confirmed anchor 存在，robot 到 anchor 距离 <= threshold。
-* 不再依赖 candidate direction 或 VLM target_visible 更新 landmark anchor。
-
-Phase C：实现 LocalOccupancyMap
-
-* 先做机器人周围 rolling local map，不做全局 SLAM。
-* 范围 4m x 4m 或 6m x 6m。
-* 分辨率 0.05m 或 0.1m。
-* 由 depth 投影更新 free/occupied/unknown。
-* 用于候选过滤、近场安全、stuck recovery。
-* 不要一开始做复杂 semantic map。
-
-Phase D：后续再做 SemanticMap
-
-* 把 mask 投影到 2D map，给局部 cell 加 semantic label。
-* 这一步等 Phase A/B/C 稳定后再做。
-
-重要约束：
-
-* 不要直接删掉当前主链。
-* 先把 semantic perception 输出接入 debug 和 LandmarkTracker。
-* 保留旧 Qwen bbox 作为 fallback，但不要作为主感知来源。
-* 所有感知模块都要支持 `mock/manual/oracle` 模式，方便验证坐标和到达判定。
-* 先验证“看到目标 -> mask/depth/world anchor 正确 -> 到达判定正确”，再谈完整 VLN。
-
----
-
-## 7. 关于模型选型的建议
-
-如果你要开源本地方案，优先考虑：
-
-* **Grounded-SAM-2**：现成整合了 Grounding DINO / Florence-2 / DINO-X 和 SAM2，适合 open-vocabulary grounding + segmentation + tracking。([GitHub][1])
-* **Grounding DINO + SAM2**：检测和分割分开，结构清晰。Grounded-SAM 技术报告也说明了用 Grounding DINO 作为 open-set detector，再结合 SAM 做 segmentation 的路线。([arXiv][2])
-* **Florence-2 + SAM2**：一些工具链也用 Florence-2 做 open-vocabulary detection，再接 SAM2 做 mask。([GitHub][3])
-
-如果只是为了快速验证，可以先不用完整部署 SAM2，先做：
-
-```text
-manual/oracle bbox -> SAM/mask 或 bbox depth -> LandmarkMap
-```
-
-确认地图和到达判定逻辑对，再接真实模型。
-
----
-
-## 一句话结论
-
-你的判断是对的：**现在必须引入更可靠的语义感知和地图记忆。**
-
-但建议路径是：
-
-```text
-Grounded segmentation
--> mask-depth target anchor
--> LandmarkMap
--> LocalOccupancyMap
--> 再做 SemanticMap
-```
-
-不要继续让 Qwen-VL 单独承担 bbox grounding，也不要继续依赖“当前帧 target_visible”做 landmark 到达判定。
-
-[1]: https://github.com/IDEA-Research/Grounded-SAM-2?utm_source=chatgpt.com "Grounded SAM 2: Ground and Track Anything in Videos"
-[2]: https://arxiv.org/abs/2401.14159?utm_source=chatgpt.com "Grounded SAM: Assembling Open-World Models for ..."
-[3]: https://github.com/autodistill/autodistill-grounded-sam-2?utm_source=chatgpt.com "Autodistill: Grounded SAM 2 Base Model"
+结果正常。Isaac Sim 运行级验证这轮还没替你完整跑。下一步如果你要，我就直接针对这版主链看运行日志，重点检查三件事：
+
+- `InstructionParse` 是否稳定输出合理 `route_steps`
+- `TOPOLOGY_REVISIT` 是否在卡死时真的触发
+- `RouteCorrection` 是否能压住“看见目标但选错方向”这类问题

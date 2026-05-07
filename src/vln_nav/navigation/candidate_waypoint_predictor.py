@@ -48,6 +48,10 @@ class CandidateWaypointPredictorConfig:
     min_free_ratio: float
     column_half_width_px: int
     debug_image_path: str
+    adaptive_enabled: bool = True
+    adaptive_count: int = 5
+    adaptive_min_spacing_deg: float = 18.0
+    adaptive_smoothing_px: int = 15
 
 
 class CandidateWaypointPredictor:
@@ -90,9 +94,18 @@ class CandidateWaypointPredictor:
         v_start, v_end = roi
 
         valid_min, valid_max = [float(value) for value in self._config.valid_depth_range]
+        candidate_bearings_deg = self._base_bearings_deg()
+        if bool(self._config.adaptive_enabled):
+            candidate_bearings_deg = self._adaptive_bearings_deg(
+                depth_image=depth_np,
+                v_start=v_start,
+                v_end=v_end,
+                valid_min=valid_min,
+                valid_max=valid_max,
+            )
         candidates: list[WaypointCandidate] = []
         valid_count = 0
-        for slot_id, bearing_deg in enumerate(self._config.slot_bearings_deg):
+        for slot_id, bearing_deg in enumerate(candidate_bearings_deg):
             candidate = self._candidate_for_slot(
                 depth_image=depth_np,
                 bearing_deg=float(bearing_deg),
@@ -111,6 +124,7 @@ class CandidateWaypointPredictor:
             predictor_debug={
                 "roi": [int(v_start), int(v_end)],
                 "valid_count": int(valid_count),
+                "candidate_bearings_deg": [round(float(value), 1) for value in candidate_bearings_deg],
             },
         )
 
@@ -162,7 +176,7 @@ class CandidateWaypointPredictor:
 
     def _empty_candidates(self) -> list[WaypointCandidate]:
         result: list[WaypointCandidate] = []
-        for slot_id, bearing_deg in enumerate(self._config.slot_bearings_deg):
+        for slot_id, bearing_deg in enumerate(self._base_bearings_deg()):
             result.append(
                 WaypointCandidate(
                     slot_id=slot_id,
@@ -274,12 +288,107 @@ class CandidateWaypointPredictor:
             return None
         return v_start, v_end
 
+    def _base_bearings_deg(self) -> list[float]:
+        configured = [float(value) for value in self._config.slot_bearings_deg]
+        count = max(3, int(self._config.adaptive_count))
+        if len(configured) == count:
+            return configured
+        if not configured:
+            max_bearing = 75.0
+            return [float(value) for value in np.linspace(max_bearing, -max_bearing, count)]
+        left_bound = max(configured)
+        right_bound = min(configured)
+        return [float(value) for value in np.linspace(left_bound, right_bound, count)]
+
+    def _adaptive_bearings_deg(
+        self,
+        *,
+        depth_image: np.ndarray,
+        v_start: int,
+        v_end: int,
+        valid_min: float,
+        valid_max: float,
+    ) -> list[float]:
+        base_bearings = self._base_bearings_deg()
+        if depth_image.ndim != 2 or depth_image.size == 0:
+            return base_bearings
+        depth_profile = self._depth_profile(
+            depth_image=depth_image,
+            v_start=v_start,
+            v_end=v_end,
+            valid_min=valid_min,
+            valid_max=valid_max,
+        )
+        if depth_profile is None:
+            return base_bearings
+        width = int(depth_image.shape[1])
+        if width <= 4:
+            return base_bearings
+        base_columns = [self._bearing_to_column(value, width) for value in base_bearings]
+        search_radius_cols = max(6, int(round(width * 0.10)))
+        min_spacing_cols = max(
+            4,
+            int(round(width * float(self._config.adaptive_min_spacing_deg) / max(10.0, float(self._config.horizontal_fov_deg)))),
+        )
+        chosen_columns: list[int] = []
+        for index, base_column in enumerate(base_columns):
+            lower = max(0, base_column - search_radius_cols)
+            upper = min(width - 1, base_column + search_radius_cols)
+            if lower > upper:
+                lower = upper = int(np.clip(base_column, 0, width - 1))
+            window = depth_profile[lower : upper + 1]
+            if window.size == 0 or not np.isfinite(window).any():
+                best_column = int(np.clip(base_column, 0, width - 1))
+            else:
+                local_offset = int(np.nanargmax(window))
+                best_column = lower + local_offset
+            if chosen_columns:
+                best_column = max(best_column, chosen_columns[-1] + min_spacing_cols)
+            remaining = len(base_columns) - index - 1
+            max_allowed = (width - 1) - remaining * min_spacing_cols
+            best_column = int(np.clip(best_column, 0, max_allowed))
+            chosen_columns.append(best_column)
+        return [self._column_to_bearing(column, width) for column in chosen_columns]
+
     def _bearing_to_column(self, bearing_deg: float, image_width: int) -> int:
         bearing_rad = float(np.deg2rad(bearing_deg))
         normalized = np.tan(bearing_rad) / max(np.tan(self._hfov_rad * 0.5), 1e-6)
         # Robot local +Y is left, while image u increases to the right.
         u = int(round(self._cx - normalized * self._cx))
         return max(0, min(int(image_width) - 1, u))
+
+    def _column_to_bearing(self, column: int, image_width: int) -> float:
+        normalized = (float(column) - self._cx) / max(self._cx, 1.0)
+        bearing_rad = float(np.arctan(normalized * np.tan(self._hfov_rad * 0.5)))
+        return float(np.rad2deg(-bearing_rad))
+
+    def _depth_profile(
+        self,
+        *,
+        depth_image: np.ndarray,
+        v_start: int,
+        v_end: int,
+        valid_min: float,
+        valid_max: float,
+    ) -> np.ndarray | None:
+        patch = np.asarray(depth_image[v_start:v_end, :], dtype=np.float32)
+        if patch.ndim != 2 or patch.size == 0:
+            return None
+        valid_mask = np.isfinite(patch) & (patch >= float(valid_min)) & (patch <= float(valid_max))
+        if not np.any(valid_mask):
+            return None
+        column_score = np.zeros(patch.shape[1], dtype=np.float32)
+        for column in range(patch.shape[1]):
+            valid_values = patch[:, column][valid_mask[:, column]]
+            if valid_values.size == 0:
+                column_score[column] = 0.0
+                continue
+            column_score[column] = float(np.percentile(valid_values, 60.0))
+        smooth_window = max(3, int(self._config.adaptive_smoothing_px))
+        if smooth_window % 2 == 0:
+            smooth_window += 1
+        kernel = np.ones(smooth_window, dtype=np.float32) / float(smooth_window)
+        return np.convolve(column_score, kernel, mode="same")
 
     def _render_candidate_costmap_panel(
         self,
@@ -455,7 +564,7 @@ def _load_left_panel_image(*, image_path: str | Path | None, width: int, height:
 
 
 def _overlay_fresh_target_mask(*, image: Image.Image, target_observation) -> None:
-    if not _fresh_visible_target(target_observation):
+    if not _visible_target_with_bbox(target_observation):
         return
     mask = getattr(target_observation, "mask", None)
     if mask is None:
@@ -479,9 +588,10 @@ def _draw_target_overlay(*, draw: ImageDraw.ImageDraw, image_size: tuple[int, in
     label = str(getattr(target_observation, "label", "target"))
     reason = str(getattr(target_observation, "reason", "unknown"))
     source = str(getattr(target_observation, "source", "unknown"))
+    segmentation_source = str(getattr(target_observation, "segmentation_source", "none"))
     depth_m = getattr(target_observation, "depth_m", None)
     depth_text = "none" if depth_m is None else f"{float(depth_m):.2f}m"
-    if _fresh_visible_target(target_observation):
+    if _visible_target_with_bbox(target_observation):
         bbox = getattr(target_observation, "bbox", None)
         if bbox is not None:
             xmin, ymin, xmax, ymax = [int(value) for value in bbox]
@@ -496,12 +606,16 @@ def _draw_target_overlay(*, draw: ImageDraw.ImageDraw, image_size: tuple[int, in
                 center_u, center_v = [int(round(float(value))) for value in center_uv]
                 draw.line((center_u - 12, center_v, center_u + 12, center_v), fill=color, width=3)
                 draw.line((center_u, center_v - 12, center_u, center_v + 12), fill=color, width=3)
-            text = f"fresh grounded {label} depth={depth_text} source={source}"
+            freshness = "fresh" if _fresh_visible_target(target_observation) else "reused"
+            text = f"{freshness} grounded {label} depth={depth_text} seg={segmentation_source} source={source}"
             draw.rectangle((xmin, max(0, ymin - 26), min(width, xmin + 520), ymin), fill=(0, 0, 0))
             draw.text((xmin + 4, max(0, ymin - 21)), text[:95], fill=color)
             return
 
-    status = f"target grounding: not overlaid label={label} reason={reason} source={source} depth={depth_text}"
+    status = (
+        f"target grounding: not overlaid label={label} reason={reason} "
+        f"seg={segmentation_source} source={source} depth={depth_text}"
+    )
     draw.rectangle((0, height - 38, width, height), fill=(0, 0, 0))
     draw.text((12, height - 26), status[:125], fill=(255, 130, 90))
 
@@ -516,6 +630,14 @@ def _fresh_visible_target(target_observation) -> bool:
     source = str(getattr(target_observation, "source", "")).lower()
     reason = str(getattr(target_observation, "reason", "")).lower()
     return "reused" not in source and reason == "ok"
+
+
+def _visible_target_with_bbox(target_observation) -> bool:
+    if target_observation is None:
+        return False
+    if not bool(getattr(target_observation, "visible", False)):
+        return False
+    return getattr(target_observation, "bbox", None) is not None
 
 
 def _save_image_atomic(image: Image.Image, target: Path) -> None:

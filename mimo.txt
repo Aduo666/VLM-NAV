@@ -1,0 +1,33 @@
+分析和方案：
+
+一、建图效果好
+当前 LiDAR 建图已经稳定，没有偏移。视野短是因为 PhysX 旋转扇区每帧只有 ~55°，靠历史合并拼到 ~110-165°。要进一步扩大视野可以增大 sector_merge_keep_sec（当前 1.5s），但会增加旧扇区的漂移风险。建议先不改，当前效果够用。
+
+二、误识别导致提前结束导航
+根因分析：到达 wheelchair 后，current_landmark 切到 stairs。GroundingSAM 误把画面中的某个区域（可能是轮椅本身或前景）识别成 stairs，confidence 超过阈值，LandmarkTracker 判定 stairs 已到达（depth 很浅），然后 route_complete。
+
+关键链路：
+  wheelchair 到达 → target 切到 stairs → GroundingSAM 误检 stairs → tracker.reached=True → _advance_current_landmark → index 超限 → route_complete
+
+去掉 GroundingSAM 的影响：
+- 好处：GroundingDINO 单独用 bbox 深度统计，不依赖 SAM mask，深度估计更保守，不容易把前景误判成近距离目标
+- 坏处：可能漏检一些目标
+- 建议：可以尝试去掉 SAM（target_grounding.backend 设成 "dino_only" 或类似），但更好的方案是加强到达判定的严格性
+
+三、置信度阈值机制
+用户提出的需求：confidence >= 0.9 才确认目标，否则作为潜在目标靠近。
+
+当前系统的问题：confidence 只要超过 min_confidence（0.50）就可以进入 tracker，tracker 的 reached 判定主要看 depth，不看 confidence。
+
+方案：
+
+| 改动 | 文件 | 说明 |
+|------|------|------|
+| 1. 到达判定加 confidence 门槛 | landmark_tracker.py | tracker.reached 只有在 confidence >= 0.85 时才允许。低于 0.85 的检测只更新 anchor 位置，不触发到达 |
+| 2. 增加"潜在目标"机制 | vln_policy.py / nav.py | 如果当前 landmark 的最高观测 confidence < 0.9，policy 不走 semantic planner 直接到达，而是以最高 confidence 的观测为方向线索，用 VLM 选择候选靠近。直到 confidence >= 0.9 才切换到直接到达模式 |
+| 3. 到达确认窗口加强 | vln_policy.py | _maybe_advance_landmark 的 confirmation_window 要求连续 N 次（如 3 次）都满足 confidence >= 0.85 + depth 在范围内，才允许推进 |
+| 4. 跨 landmark 防污染 | landmark_map.py | 已有 cross_label_guard，但还需要：如果当前检测的 bbox 和已到达 landmark 的 anchor 位置重叠（IoU > 0.3），拒绝该检测 |
+| 5. 可选：去掉 SAM | configs/default.yaml | 如果以上改动后仍有误识别，再尝试去掉 SAM。先不改，保留作为后备方案 |
+
+四、实现顺序建议
+先做第 3 项的改动 1 和 3（到达判定加 confidence 门槛 + 确认窗口加强），这两个改动最小、效果最直接。如果还有问题再加改动 2（潜在目标机制）和 4（跨 landmark 防污染）。最后才考虑去掉 SAM。

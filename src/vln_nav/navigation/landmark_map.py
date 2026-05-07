@@ -79,10 +79,26 @@ class LandmarkMap:
         self._drop_expired(timestamp_sec=float(timestamp_sec))
         existing = self._entries.get(label)
 
+        behavior = str(state.behavior_type).strip().lower()
+        map_anchor_allowed = behavior in {"go_to", "turn_at"}
         has_confirmed_anchor = (
             state.estimated_world_xy is not None
             and float(state.confidence) >= float(self._config.min_confidence)
+            and bool(map_anchor_allowed)
         )
+
+        if has_confirmed_anchor:
+            cross_label_block = self._cross_label_guard(
+                label=label,
+                world_xy=[float(state.estimated_world_xy[0]), float(state.estimated_world_xy[1])],
+                confidence=float(state.confidence),
+            )
+            if cross_label_block:
+                self._logger.info(
+                    "[LandmarkMap] cross_label_guard target=%s block=%s confidence=%.2f",
+                    label, cross_label_block, float(state.confidence),
+                )
+                has_confirmed_anchor = False
         if has_confirmed_anchor:
             world_xy = [float(state.estimated_world_xy[0]), float(state.estimated_world_xy[1])]
             forward_m, left_m, distance_m = _relative_to_robot(
@@ -134,6 +150,16 @@ class LandmarkMap:
     def entries(self) -> list[LandmarkMapEntry]:
         return list(self._entries.values())
 
+    def mark_reached(self, label: str, *, timestamp_sec: float) -> None:
+        key = _normalize_label(label)
+        entry = self._entries.get(key)
+        if entry is None:
+            return
+        entry.reached = True
+        entry.status = "reached"
+        entry.last_seen_time_sec = float(timestamp_sec)
+        self._log_entry_if_needed(entry=entry, timestamp_sec=float(timestamp_sec))
+
     def summary(
         self,
         *,
@@ -160,6 +186,29 @@ class LandmarkMap:
             f"bearing_hint={bearing} age_sec={age_sec:.1f} updates={entry.update_count} "
             f"reached={int(entry.reached)}"
         )
+
+    def _cross_label_guard(
+        self,
+        *,
+        label: str,
+        world_xy: list[float],
+        confidence: float,
+    ) -> str:
+        guard_radius_m = 1.0
+        high_confidence_threshold = 0.50
+        for existing_label, entry in self._entries.items():
+            if existing_label == label:
+                continue
+            if not bool(entry.reached):
+                continue
+            if not bool(entry.world_xy):
+                continue
+            dx = float(world_xy[0]) - float(entry.world_xy[0])
+            dy = float(world_xy[1]) - float(entry.world_xy[1])
+            dist = float(np.hypot(dx, dy))
+            if dist < guard_radius_m and float(confidence) < high_confidence_threshold:
+                return f"near_completed_{existing_label}_dist={dist:.2f}m_conf={confidence:.2f}"
+        return ""
 
     def _drop_expired(self, *, timestamp_sec: float) -> None:
         ttl = float(self._config.anchor_ttl_sec)

@@ -20,7 +20,13 @@ from ..navigation.depth_safety import DepthSafetyConfig, DepthSafetyMonitor
 from ..navigation.instruction_manager import InstructionManager
 from ..navigation.landmark_map import LandmarkMap, LandmarkMapConfig
 from ..navigation.landmark_tracker import LandmarkTracker, LandmarkTrackerConfig
-from ..navigation.lidar_sensor import PhysXLidarConfig, PhysXLidarReader
+from ..navigation.lidar_sensor import (
+    MultiLidarConfig,
+    MultiLidarReader,
+    MultiLidarSectorConfig,
+    PhysXLidarConfig,
+    PhysXLidarReader,
+)
 from ..navigation.navigation_map_visualizer import NavigationMapConfig, NavigationMapVisualizer
 from ..navigation.occupancy_grid import OccupancyGridConfig, OccupancyGridMapper
 from ..navigation.observation_adapter import ObservationAdapter
@@ -272,6 +278,9 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
             sam_model_type=str(config.target_grounding_sam_model_type),
             sam_device=str(config.target_grounding_sam_device),
             sam_min_mask_area_ratio=float(config.target_grounding_sam_min_mask_area_ratio),
+            max_result_age_sec=float(config.target_grounding_max_result_age_sec),
+            max_result_pose_delta_m=float(config.target_grounding_max_result_pose_delta_m),
+            max_result_yaw_delta_deg=float(config.target_grounding_max_result_yaw_delta_deg),
         ),
         llm_client=target_grounding_llm_client,
         logger=logger,
@@ -347,26 +356,59 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
         ),
         logger=logger,
     )
-    lidar_reader = PhysXLidarReader(
-        config=PhysXLidarConfig(
-            enabled=bool(config.lidar_enabled),
-            prim_path=str(config.lidar_prim_path),
-            child_name=str(config.lidar_child_name),
-            horizontal_fov_deg=float(config.lidar_horizontal_fov_deg),
-            vertical_fov_deg=float(config.lidar_vertical_fov_deg),
-            horizontal_resolution_deg=float(config.lidar_horizontal_resolution_deg),
-            vertical_resolution_deg=float(config.lidar_vertical_resolution_deg),
-            rotation_rate_hz=float(config.lidar_rotation_rate_hz),
-            min_range_m=float(config.lidar_min_range_m),
-            max_range_m=float(config.lidar_max_range_m),
-            yaw_offset_deg=float(config.lidar_yaw_offset_deg),
-            sector_merge_keep_sec=float(config.lidar_sector_merge_keep_sec),
-            draw_points=bool(config.lidar_draw_points),
-            draw_lines=bool(config.lidar_draw_lines),
-        ),
-        robot_root_path=str(config.robot_prim_path),
-        logger=logger,
-    )
+    _lidar_mode = str(config.lidar_mode).strip().lower()
+    if _lidar_mode == "multi" and bool(config.lidar_enabled):
+        _sector_count = min(
+            int(config.lidar_multi_sector_count),
+            len(config.lidar_multi_child_names),
+            len(config.lidar_multi_sector_yaw_offsets_deg),
+        )
+        multi_sectors = [
+            MultiLidarSectorConfig(
+                child_name=str(config.lidar_multi_child_names[i]),
+                yaw_offset_deg=float(config.lidar_multi_sector_yaw_offsets_deg[i]),
+                horizontal_fov_deg=float(config.lidar_multi_sector_fov_deg),
+            )
+            for i in range(_sector_count)
+        ]
+        lidar_reader: PhysXLidarReader | MultiLidarReader = MultiLidarReader(
+            config=MultiLidarConfig(
+                enabled=bool(config.lidar_enabled),
+                prim_path=str(config.lidar_prim_path),
+                vertical_fov_deg=float(config.lidar_vertical_fov_deg),
+                horizontal_resolution_deg=float(config.lidar_horizontal_resolution_deg),
+                vertical_resolution_deg=float(config.lidar_vertical_resolution_deg),
+                rotation_rate_hz=float(config.lidar_rotation_rate_hz),
+                min_range_m=float(config.lidar_min_range_m),
+                max_range_m=float(config.lidar_max_range_m),
+                draw_points=bool(config.lidar_draw_points),
+                draw_lines=bool(config.lidar_draw_lines),
+                sectors=multi_sectors,
+            ),
+            robot_root_path=str(config.robot_prim_path),
+            logger=logger,
+        )
+    else:
+        lidar_reader = PhysXLidarReader(
+            config=PhysXLidarConfig(
+                enabled=bool(config.lidar_enabled),
+                prim_path=str(config.lidar_prim_path),
+                child_name=str(config.lidar_child_name),
+                horizontal_fov_deg=float(config.lidar_horizontal_fov_deg),
+                vertical_fov_deg=float(config.lidar_vertical_fov_deg),
+                horizontal_resolution_deg=float(config.lidar_horizontal_resolution_deg),
+                vertical_resolution_deg=float(config.lidar_vertical_resolution_deg),
+                rotation_rate_hz=float(config.lidar_rotation_rate_hz),
+                min_range_m=float(config.lidar_min_range_m),
+                max_range_m=float(config.lidar_max_range_m),
+                yaw_offset_deg=float(config.lidar_yaw_offset_deg),
+                sector_merge_keep_sec=float(config.lidar_sector_merge_keep_sec),
+                draw_points=bool(config.lidar_draw_points),
+                draw_lines=bool(config.lidar_draw_lines),
+            ),
+            robot_root_path=str(config.robot_prim_path),
+            logger=logger,
+        )
     navigation_map_visualizer = NavigationMapVisualizer(
         config=NavigationMapConfig(
             enabled=bool(config.navigation_map_enabled),
@@ -405,6 +447,7 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
             active_track_max_yaw_deg=float(config.active_track_max_yaw_deg),
             active_track_min_duration_sec=float(config.active_track_min_duration_sec),
             use_discrete_action_primitives=bool(config.use_discrete_action_primitives),
+            turn_at_max_turns=int(config.turn_at_max_turns),
             landmark_arrival_confirmations=int(config.landmark_arrival_confirmations),
             landmark_arrival_window_size=int(config.landmark_tracker_arrival_window_size),
             reacquire_guard_enabled=bool(config.reacquire_guard_enabled),
@@ -617,6 +660,8 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
     depth_debug_output_path = _resolve_output_path(config.depth_debug_image_path)
     target_debug_output_path = _resolve_output_path(config.target_debug_image_path)
     target_debug_video_path = _resolve_output_path(config.debug_video_path)
+    global_map_output_path = _resolve_output_path("assets/global_map.png")
+    lidar_debug_output_path = _resolve_output_path("assets/lidar_raw_scan.png")
     debug_video_recorder = DebugVideoRecorder(
         enabled=bool(config.debug_video_enabled) and bool(config.target_debug_enabled),
         output_path=target_debug_video_path,
@@ -630,6 +675,8 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
         logger.info("Runtime debug video output: %s", target_debug_video_path)
     if config.depth_debug_enabled:
         logger.info("Depth debug output: %s", depth_debug_output_path)
+    if config.occupancy_grid_enabled:
+        logger.info("Global occupancy map output: %s", global_map_output_path)
     if config.navigation_map_enabled:
         logger.info("Navigation map output: %s", navigation_map_visualizer.output_path)
     if config.topology_enabled:
@@ -655,18 +702,34 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
             occupancy_grid.output_path,
         )
     if config.lidar_enabled:
-        logger.info(
-            "[LidarConfig] prim_path=%s child=%s fov=[%.1f,%.1f] res=[%.2f,%.2f] range=[%.2f,%.2f] yaw_offset=%.1f",
-            str(config.lidar_prim_path),
-            str(config.lidar_child_name),
-            float(config.lidar_horizontal_fov_deg),
-            float(config.lidar_vertical_fov_deg),
-            float(config.lidar_horizontal_resolution_deg),
-            float(config.lidar_vertical_resolution_deg),
-            float(config.lidar_min_range_m),
-            float(config.lidar_max_range_m),
-            float(config.lidar_yaw_offset_deg),
-        )
+        if _lidar_mode == "multi":
+            logger.info(
+                "[LidarConfig] mode=multi prim_path=%s sector_count=%s sector_fov=%.1f "
+                "total_fov=%.1f res=[%.2f,%.2f] range=[%.2f,%.2f] yaw_offsets=%s child_names=%s",
+                str(config.lidar_prim_path),
+                int(config.lidar_multi_sector_count),
+                float(config.lidar_multi_sector_fov_deg),
+                float(config.lidar_multi_sector_count) * float(config.lidar_multi_sector_fov_deg),
+                float(config.lidar_horizontal_resolution_deg),
+                float(config.lidar_vertical_resolution_deg),
+                float(config.lidar_min_range_m),
+                float(config.lidar_max_range_m),
+                config.lidar_multi_sector_yaw_offsets_deg,
+                config.lidar_multi_child_names,
+            )
+        else:
+            logger.info(
+                "[LidarConfig] mode=single prim_path=%s child=%s fov=[%.1f,%.1f] res=[%.2f,%.2f] range=[%.2f,%.2f] yaw_offset=%.1f",
+                str(config.lidar_prim_path),
+                str(config.lidar_child_name),
+                float(config.lidar_horizontal_fov_deg),
+                float(config.lidar_vertical_fov_deg),
+                float(config.lidar_horizontal_resolution_deg),
+                float(config.lidar_vertical_resolution_deg),
+                float(config.lidar_min_range_m),
+                float(config.lidar_max_range_m),
+                float(config.lidar_yaw_offset_deg),
+            )
 
     last_depth_image: np.ndarray | None = None
     last_depth_eval_time = 0.0
@@ -687,6 +750,10 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
     last_nav_debug_save_time = 0.0
     last_depth_debug_save_time = 0.0
     sim_time_sec = 0.0
+    route_complete_handled = False
+    navigation_finished = False
+    landmark_map_reached_synced: set[str] = set()
+    global_pose_trace: list[tuple[float, float]] = []
 
     for _ in range(config.warmup_steps):
         world.step(render=True)
@@ -739,6 +806,11 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
                 drive_controller.apply("STOP", speed_scale=0.0)
                 break
 
+        if navigation_finished:
+            drive_controller.apply("STOP", speed_scale=0.0)
+            last_action_name = "STOP"
+            continue
+
         if last_depth_image is None or (loop_now - last_depth_eval_time) >= float(config.depth_eval_period_sec):
             last_depth_image = _get_depth_image(camera=camera, logger=logger)
             last_depth_eval_time = loop_now
@@ -771,11 +843,28 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
         )
         lidar_scan = lidar_reader.read(pose=observation.pose, timestamp_sec=sim_time_sec) if bool(config.lidar_enabled) else None
         if bool(config.lidar_enabled) and lidar_scan is not None:
+            current_beam_endpoints = getattr(lidar_scan, "current_beam_endpoints_local_xy", lidar_scan.beam_endpoints_local_xy)
+            current_beam_hits = getattr(lidar_scan, "current_beam_hit_mask", lidar_scan.beam_hit_mask)
+            current_points = getattr(lidar_scan, "current_points_local_xy", lidar_scan.points_local_xy)
+            current_beam_endpoints_np = np.asarray(current_beam_endpoints, dtype=np.float32)
+            current_beam_hits_np = np.asarray(current_beam_hits, dtype=bool).reshape(-1)
+            if (
+                current_beam_endpoints_np.ndim == 2
+                and current_beam_endpoints_np.shape[0] == current_beam_hits_np.shape[0]
+                and np.any(current_beam_hits_np)
+            ):
+                map_beam_endpoints = current_beam_endpoints_np[current_beam_hits_np]
+                map_beam_hits = np.ones((map_beam_endpoints.shape[0],), dtype=bool)
+                map_points = map_beam_endpoints
+            else:
+                map_beam_endpoints = np.zeros((0, 2), dtype=np.float32)
+                map_beam_hits = np.zeros((0,), dtype=bool)
+                map_points = np.zeros((0, 2), dtype=np.float32)
             occupancy_grid.update_from_lidar(
                 robot_pose=observation.pose,
-                points_local_xy=lidar_scan.points_local_xy,
-                beam_endpoints_local_xy=lidar_scan.beam_endpoints_local_xy,
-                beam_hit_mask=lidar_scan.beam_hit_mask,
+                points_local_xy=map_points,
+                beam_endpoints_local_xy=map_beam_endpoints,
+                beam_hit_mask=map_beam_hits,
                 timestamp_sec=sim_time_sec,
             )
             observation.meta["lidar"] = {
@@ -783,10 +872,21 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
                 "source": lidar_scan.source,
                 "sensor_path": lidar_scan.sensor_path,
                 "point_count": int(lidar_scan.point_count),
+                "current_point_count": int(getattr(lidar_scan, "current_point_count", lidar_scan.point_count)),
+                "merged_beam_count": int(lidar_scan.beam_endpoints_local_xy.shape[0]),
                 "raw_beam_count": int(lidar_scan.raw_beam_count),
                 "valid_beam_count": int(lidar_scan.valid_beam_count),
                 "effective_fov_deg": float(lidar_scan.effective_fov_deg),
             }
+            if frame_index % 10 == 0:
+                _save_lidar_raw_scan(
+                    beam_endpoints=lidar_scan.beam_endpoints_local_xy,
+                    beam_hits=lidar_scan.beam_hit_mask,
+                    current_beam_endpoints=current_beam_endpoints,
+                    current_beam_hits=current_beam_hits,
+                    output_path=lidar_debug_output_path,
+                    fov_deg=float(lidar_scan.effective_fov_deg),
+                )
         elif bool(config.lidar_enabled):
             observation.meta["lidar"] = {
                 "enabled": True,
@@ -853,6 +953,7 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
                 target_label=current_landmark,
                 robot_pose=observation.pose,
                 timestamp_sec=sim_time_sec,
+                frame_index=frame_index,
             )
             landmark_state = landmark_tracker.update(
                 target_label=current_landmark,
@@ -879,6 +980,7 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
             policy.set_landmark_state(None)
             policy.set_landmark_map_entry(None)
             policy.set_landmark_map_summary("")
+        policy.set_all_landmark_map_entries(landmark_map.entries())
 
         topological_memory.update(
             robot_pose=observation.pose,
@@ -928,6 +1030,12 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
         active_step_result = proposed_step_result
         active_command_token = proposed_command_token
         step_result = active_step_result
+        for completed_label in step_result.completed_landmarks:
+            completed_key = str(completed_label).strip().lower()
+            if completed_key and completed_key not in landmark_map_reached_synced:
+                landmark_map.mark_reached(completed_key, timestamp_sec=sim_time_sec)
+                landmark_map_reached_synced.add(completed_key)
+        policy.set_all_landmark_map_entries(landmark_map.entries())
         safety_decision = depth_safety_monitor.apply(
             observation=observation,
             action_name=step_result.action_name,
@@ -1044,12 +1152,25 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
             timestamp_sec=sim_time_sec,
             occupancy_snapshot=occupancy_grid.snapshot() if bool(config.occupancy_grid_enabled) else None,
         )
+        if bool(config.occupancy_grid_enabled):
+            global_pose_trace.append((float(observation.pose.x), float(observation.pose.y)))
+            if len(global_pose_trace) > 8000:
+                del global_pose_trace[: len(global_pose_trace) - 8000]
+            if frame_index % 10 == 0:
+                _save_global_occupancy_debug(
+                    occupancy_snapshot=occupancy_grid.snapshot(),
+                    robot_pose=observation.pose,
+                    trajectory_xy=global_pose_trace,
+                    landmark_entries=landmark_map.entries(),
+                    step_result=step_result,
+                    output_path=global_map_output_path,
+                )
 
         debug_update_period_sec = max(0.10, float(config.debug_image_update_period_sec))
+        force_final_debug_frame = bool(step_result.route_complete and not route_complete_handled)
         should_save_target_debug = (
             bool(config.target_debug_enabled)
-            and not bool(step_result.replanned)
-            and (loop_now - last_nav_debug_save_time) >= debug_update_period_sec
+            and (force_final_debug_frame or (loop_now - last_nav_debug_save_time) >= debug_update_period_sec)
         )
         if should_save_target_debug:
             debug_image = _save_current_target_debug_image(
@@ -1061,12 +1182,22 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
                 map_image_path=(
                     navigation_map_visualizer.output_path
                     if bool(config.navigation_map_enabled)
-                    else occupancy_grid.output_path if bool(config.occupancy_grid_enabled) else None
+                    else global_map_output_path if bool(config.occupancy_grid_enabled) else None
                 ),
                 horizontal_fov_deg=float(config.camera_horizontal_fov_deg),
             )
             debug_video_recorder.append(debug_image)
             last_nav_debug_save_time = loop_now
+
+        if step_result.route_complete and not route_complete_handled:
+            route_complete_handled = True
+            navigation_finished = True
+            drive_controller.apply("STOP", speed_scale=0.0)
+            last_action_name = "STOP"
+            target_grounder.close()
+            debug_video_recorder.close()
+            logger.info("Route complete — navigation stopped; Isaac Sim scene remains open. Debug video saved: %s", target_debug_video_path)
+            continue
 
         if (
             config.depth_debug_enabled
@@ -1384,6 +1515,8 @@ def _save_current_target_debug_image(
 def _overlay_target_mask(*, image: Image.Image, observation: TargetObservation | None) -> None:
     if observation is None or observation.mask is None:
         return
+    if not observation.is_current_frame:
+        return
     mask = np.asarray(observation.mask, dtype=bool)
     if mask.ndim != 2 or mask.shape[0] != image.height or mask.shape[1] != image.width:
         return
@@ -1410,20 +1543,32 @@ def _draw_grounded_target_overlay(
     segmentation_source = str(getattr(observation, "segmentation_source", "none"))
     depth_text = "none" if observation.depth_m is None else f"{float(observation.depth_m):.2f}m"
     if visible and observation.bbox is not None:
-        xmin, ymin, xmax, ymax = [int(value) for value in observation.bbox]
-        xmin = max(0, min(width - 1, xmin))
-        ymin = max(0, min(height - 1, ymin))
-        xmax = max(0, min(width, xmax))
-        ymax = max(0, min(height, ymax))
-        color = (70, 255, 120)
-        draw.rectangle((xmin, ymin, xmax, ymax), outline=color, width=4)
-        if observation.center_uv is not None:
-            center_u, center_v = [int(round(float(value))) for value in observation.center_uv]
-            draw.line((center_u - 10, center_v, center_u + 10, center_v), fill=color, width=3)
-            draw.line((center_u, center_v - 10, center_u, center_v + 10), fill=color, width=3)
-        label = f"grounded {observation.label} depth={depth_text} conf={observation.confidence:.2f} seg={segmentation_source}"
-        draw.rectangle((xmin, max(0, ymin - 28), min(width, xmin + 620), ymin), fill=(0, 0, 0))
-        draw.text((xmin + 4, max(0, ymin - 24)), label[:110], fill=color, font=label_font)
+        is_current = bool(observation.is_current_frame)
+        if is_current:
+            xmin, ymin, xmax, ymax = [int(value) for value in observation.bbox]
+            xmin = max(0, min(width - 1, xmin))
+            ymin = max(0, min(height - 1, ymin))
+            xmax = max(0, min(width, xmax))
+            ymax = max(0, min(height, ymax))
+            color = (70, 255, 120)
+            draw.rectangle((xmin, ymin, xmax, ymax), outline=color, width=4)
+            if observation.center_uv is not None:
+                center_u, center_v = [int(round(float(value))) for value in observation.center_uv]
+                draw.line((center_u - 10, center_v, center_u + 10, center_v), fill=color, width=3)
+                draw.line((center_u, center_v - 10, center_u, center_v + 10), fill=color, width=3)
+            label = f"grounded {observation.label} depth={depth_text} conf={observation.confidence:.2f} seg={segmentation_source}"
+            draw.rectangle((xmin, max(0, ymin - 28), min(width, xmin + 620), ymin), fill=(0, 0, 0))
+            draw.text((xmin + 4, max(0, ymin - 24)), label[:110], fill=color, font=label_font)
+        else:
+            stale_color = (255, 160, 60)
+            age_text = f"{float(observation.result_age_sec):.1f}s" if observation.result_age_sec > 0.0 else "?"
+            stale_text = (
+                f"STALE grounding: {observation.label} age={age_text} "
+                f"depth={depth_text} conf={observation.confidence:.2f} "
+                f"frame={observation.request_frame_index}"
+            )
+            draw.rectangle((0, height - 44, width, height), fill=(0, 0, 0))
+            draw.text((12, height - 32), stale_text[:120], fill=stale_color, font=label_font)
         return
     text = (
         f"grounding: lost/hidden label={observation.label} reason={reason} "
@@ -1447,7 +1592,7 @@ def _load_occupancy_debug_panel(*, occupancy_image_path: Path | None, width: int
         panel = Image.new("RGB", (int(width), int(height)), (14, 18, 22))
     draw = ImageDraw.Draw(panel)
     draw.rectangle((0, 0, int(width), 34), fill=(0, 0, 0))
-    draw.text((12, 8), "ROBOT-CENTERED LIDAR OCCUPANCY MAP", fill=(245, 245, 245), font=_debug_font(16))
+    draw.text((12, 8), "NORTH-UP GLOBAL OCCUPANCY MAP", fill=(245, 245, 245), font=_debug_font(16))
     return panel
 
 
@@ -1810,6 +1955,222 @@ def _get_world_pose(robot) -> tuple[np.ndarray, np.ndarray]:
     else:
         raise RuntimeError("Unexpected world pose return value from articulation.")
     return np.asarray(position, dtype=np.float32), np.asarray(orientation, dtype=np.float32)
+
+
+def _save_global_occupancy_debug(
+    *,
+    occupancy_snapshot,
+    robot_pose,
+    trajectory_xy: list[tuple[float, float]],
+    landmark_entries,
+    step_result: PolicyStepResult,
+    output_path: Path,
+) -> None:
+    if occupancy_snapshot is None:
+        return
+    log_odds = np.asarray(getattr(occupancy_snapshot, "log_odds", None), dtype=np.float32)
+    if log_odds.ndim != 2 or log_odds.size == 0:
+        return
+
+    resolution = max(1.0e-6, float(getattr(occupancy_snapshot, "resolution_m", 0.08)))
+    origin_x = float(getattr(occupancy_snapshot, "origin_x", 0.0))
+    origin_y = float(getattr(occupancy_snapshot, "origin_y", 0.0))
+    free_mask = np.asarray(getattr(occupancy_snapshot, "free_mask", log_odds <= -0.5), dtype=bool)
+    occupied_mask = log_odds >= 1.2
+    known_mask = np.abs(log_odds) >= 0.20
+
+    world_points: list[tuple[float, float]] = [(float(robot_pose.x), float(robot_pose.y))]
+    world_points.extend((float(x), float(y)) for x, y in trajectory_xy[-2000:])
+    if step_result.world_goal_xy is not None:
+        world_points.append((float(step_result.world_goal_xy[0]), float(step_result.world_goal_xy[1])))
+    for entry in landmark_entries or []:
+        world_xy = getattr(entry, "world_xy", None)
+        if world_xy:
+            world_points.append((float(world_xy[0]), float(world_xy[1])))
+
+    if np.any(known_mask):
+        rows, cols = np.where(known_mask)
+        world_points.append((origin_x + float(np.min(cols)) * resolution, origin_y + float(np.min(rows)) * resolution))
+        world_points.append((origin_x + float(np.max(cols) + 1) * resolution, origin_y + float(np.max(rows) + 1) * resolution))
+
+    xs = [item[0] for item in world_points]
+    ys = [item[1] for item in world_points]
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+    span = max(max_x - min_x, max_y - min_y, 12.0)
+    cx = 0.5 * (min_x + max_x)
+    cy = 0.5 * (min_y + max_y)
+    padding = max(1.5, 0.08 * span)
+    span = span + 2.0 * padding
+    min_x = cx - 0.5 * span
+    max_x = cx + 0.5 * span
+    min_y = cy - 0.5 * span
+    max_y = cy + 0.5 * span
+
+    width = 900
+    height = 900
+    header_h = 82
+    map_px = min(width - 24, height - header_h - 18)
+    map_x0 = (width - map_px) // 2
+    map_y0 = header_h + (height - header_h - map_px) // 2
+    scale = float(map_px) / max(span, 1.0e-6)
+
+    canvas = np.full((height, width, 3), 180, dtype=np.uint8)
+    canvas[:header_h, :, :] = 20
+    yy, xx = np.indices((map_px, map_px), dtype=np.float32)
+    world_x = min_x + (xx + 0.5) / max(scale, 1.0e-6)
+    world_y = max_y - (yy + 0.5) / max(scale, 1.0e-6)
+    cols = np.floor((world_x - origin_x) / resolution).astype(np.intp)
+    rows = np.floor((world_y - origin_y) / resolution).astype(np.intp)
+    inside = (rows >= 0) & (rows < log_odds.shape[0]) & (cols >= 0) & (cols < log_odds.shape[1])
+    sub = np.full((map_px, map_px, 3), 180, dtype=np.uint8)
+    sampled_free = np.zeros((map_px, map_px), dtype=bool)
+    sampled_occupied = np.zeros((map_px, map_px), dtype=bool)
+    sampled_free[inside] = free_mask[rows[inside], cols[inside]]
+    sampled_occupied[inside] = occupied_mask[rows[inside], cols[inside]]
+    sub[sampled_free] = 255
+    sub[sampled_occupied] = 0
+    canvas[map_y0 : map_y0 + map_px, map_x0 : map_x0 + map_px, :] = sub
+
+    image = Image.fromarray(canvas, mode="RGB")
+    draw = ImageDraw.Draw(image)
+    font_title = _debug_font(22)
+    font_label = _debug_font(15)
+    font_small = _debug_font(12)
+
+    def world_to_px(x_m: float, y_m: float) -> tuple[int, int]:
+        px = int(round(map_x0 + (float(x_m) - min_x) * scale))
+        py = int(round(map_y0 + (max_y - float(y_m)) * scale))
+        return px, py
+
+    draw.text((12, 10), "NORTH-UP GLOBAL OCCUPANCY MAP", fill=(245, 245, 245), font=font_title)
+    draw.text(
+        (12, 42),
+        "black=occupied  white=free  gray=unknown  cyan=trajectory  blue=robot  magenta=landmark  yellow=active_goal",
+        fill=(210, 220, 230),
+        font=font_label,
+    )
+
+    for gx in np.arange(np.floor(min_x), np.ceil(max_x) + 0.01, 1.0):
+        px0, py0 = world_to_px(float(gx), min_y)
+        px1, py1 = world_to_px(float(gx), max_y)
+        draw.line((px0, py0, px1, py1), fill=(150, 150, 150), width=1)
+    for gy in np.arange(np.floor(min_y), np.ceil(max_y) + 0.01, 1.0):
+        px0, py0 = world_to_px(min_x, float(gy))
+        px1, py1 = world_to_px(max_x, float(gy))
+        draw.line((px0, py0, px1, py1), fill=(150, 150, 150), width=1)
+    draw.rectangle((map_x0, map_y0, map_x0 + map_px, map_y0 + map_px), outline=(35, 35, 35), width=2)
+
+    if len(trajectory_xy) >= 2:
+        points_px = [world_to_px(float(x), float(y)) for x, y in trajectory_xy[-2000:]]
+        draw.line(points_px, fill=(0, 190, 220), width=3)
+
+    if step_result.world_goal_xy is not None:
+        gx, gy = world_to_px(float(step_result.world_goal_xy[0]), float(step_result.world_goal_xy[1]))
+        draw.ellipse((gx - 8, gy - 8, gx + 8, gy + 8), fill=(255, 220, 0), outline=(0, 0, 0), width=2)
+        draw.text((gx + 10, gy - 9), "active_goal", fill=(255, 220, 0), font=font_label)
+
+    for entry in landmark_entries or []:
+        world_xy = getattr(entry, "world_xy", None)
+        if not world_xy:
+            continue
+        lx, ly = world_to_px(float(world_xy[0]), float(world_xy[1]))
+        reached = bool(getattr(entry, "reached", False))
+        color = (255, 150, 30) if reached else (220, 60, 220)
+        draw.ellipse((lx - 9, ly - 9, lx + 9, ly + 9), fill=color, outline=(255, 255, 255), width=2)
+        draw.text((lx + 11, ly - 10), str(getattr(entry, "label", "landmark")), fill=color, font=font_label)
+
+    yaw = float(robot_pose.yaw_rad)
+    robot_x = float(robot_pose.x)
+    robot_y = float(robot_pose.y)
+    tip = world_to_px(robot_x + np.cos(yaw) * 0.40, robot_y + np.sin(yaw) * 0.40)
+    rear_left = world_to_px(
+        robot_x - np.cos(yaw) * 0.25 - np.sin(yaw) * 0.20,
+        robot_y - np.sin(yaw) * 0.25 + np.cos(yaw) * 0.20,
+    )
+    rear_right = world_to_px(
+        robot_x - np.cos(yaw) * 0.25 + np.sin(yaw) * 0.20,
+        robot_y - np.sin(yaw) * 0.25 - np.cos(yaw) * 0.20,
+    )
+    draw.polygon([tip, rear_left, rear_right], fill=(40, 140, 255), outline=(255, 255, 255))
+    rx, ry = world_to_px(robot_x, robot_y)
+    draw.text((rx + 12, ry + 8), "robot", fill=(40, 140, 255), font=font_label)
+    draw.text(
+        (12, height - 22),
+        f"view=[{min_x:.1f},{max_x:.1f}]x[{min_y:.1f},{max_y:.1f}]m  pose=({robot_x:.2f},{robot_y:.2f}) yaw={np.degrees(yaw):+.1f}deg",
+        fill=(20, 20, 20),
+        font=font_small,
+    )
+
+    _save_image_atomic(image, output_path)
+
+
+def _save_lidar_raw_scan(
+    *,
+    beam_endpoints: np.ndarray,
+    beam_hits: np.ndarray,
+    current_beam_endpoints: np.ndarray | None = None,
+    current_beam_hits: np.ndarray | None = None,
+    output_path: Path,
+    fov_deg: float,
+) -> None:
+    if beam_endpoints.size == 0:
+        return
+    size = 620
+    margin = 40
+    max_range = 8.0
+    img = Image.new("RGB", (size, size), (14, 18, 22))
+    draw = ImageDraw.Draw(img)
+    cx, cy = size // 2, size // 2
+    scale = (size - 2 * margin) / (2.0 * max_range)
+
+    def to_pixel(fwd: float, left: float) -> tuple[int, int]:
+        px = int(cx + left * scale)
+        py = int(cy - fwd * scale)
+        return max(0, min(size - 1, px)), max(0, min(size - 1, py))
+
+    # Grid circles
+    for r_m in [2.0, 4.0, 6.0, 8.0]:
+        r_px = int(r_m * scale)
+        draw.ellipse((cx - r_px, cy - r_px, cx + r_px, cy + r_px), outline=(40, 45, 50), width=1)
+    # Forward line
+    draw.line((cx, cy, cx, margin), fill=(60, 65, 70), width=1)
+    draw.text((cx + 4, margin), "FWD", fill=(80, 90, 100), font=_debug_font(12))
+
+    # Draw merged binned endpoints first, then current-sector endpoints on top.
+    hits = beam_hits.astype(bool) if beam_hits.size else np.zeros((beam_endpoints.shape[0],), dtype=bool)
+    for i in range(beam_endpoints.shape[0]):
+        fwd, left = float(beam_endpoints[i, 0]), float(beam_endpoints[i, 1])
+        px, py = to_pixel(fwd, left)
+        if i < len(hits) and hits[i]:
+            draw.ellipse((px - 2, py - 2, px + 2, py + 2), fill=(70, 210, 255))
+        else:
+            draw.ellipse((px - 1, py - 1, px + 1, py + 1), fill=(60, 60, 70))
+
+    current_endpoints = np.asarray(current_beam_endpoints, dtype=np.float32) if current_beam_endpoints is not None else np.zeros((0, 2), dtype=np.float32)
+    current_hits = np.asarray(current_beam_hits, dtype=bool).reshape(-1) if current_beam_hits is not None else np.zeros((0,), dtype=bool)
+    if current_endpoints.ndim == 2 and current_endpoints.shape[1] >= 2:
+        for i in range(current_endpoints.shape[0]):
+            fwd, left = float(current_endpoints[i, 0]), float(current_endpoints[i, 1])
+            px, py = to_pixel(fwd, left)
+            if i < len(current_hits) and current_hits[i]:
+                draw.ellipse((px - 3, py - 3, px + 3, py + 3), fill=(40, 245, 100))
+            else:
+                draw.ellipse((px - 2, py - 2, px + 2, py + 2), fill=(120, 120, 130))
+
+    # Robot marker
+    draw.ellipse((cx - 6, cy - 6, cx + 6, cy + 6), fill=(220, 220, 220), outline=(255, 80, 80), width=2)
+
+    # Info text
+    merged_hit_count = int(np.count_nonzero(hits))
+    merged_total = int(beam_endpoints.shape[0])
+    current_hit_count = int(np.count_nonzero(current_hits))
+    current_total = int(current_endpoints.shape[0]) if current_endpoints.ndim == 2 else 0
+    draw.rectangle((0, 0, size, 50), fill=(0, 0, 0))
+    draw.text((8, 6), f"LIDAR DEBUG  merged_binned={merged_total}/{merged_hit_count} current={current_total}/{current_hit_count} fov={fov_deg:.0f}deg", fill=(230, 230, 230), font=_debug_font(13))
+    draw.text((8, 27), "green=current hits  cyan=motion-compensated binned hits  gray=miss/max-range", fill=(190, 200, 210), font=_debug_font(12))
+
+    _save_image_atomic(img, output_path)
 
 
 def _format_joint_map(values: dict[str, float]) -> str:

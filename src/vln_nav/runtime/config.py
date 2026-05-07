@@ -56,6 +56,7 @@ class AppConfig:
     progress_stall_distance_m: float = 0.08
     progress_spin_yaw_deg: float = 85.0
     policy_execution_steps: int = 24
+    turn_at_max_turns: int = 6
     landmark_arrival_distance_m: float = 1.0
     landmark_arrival_confirmations: int = 2
     recovery_enabled: bool = True
@@ -76,7 +77,7 @@ class AppConfig:
     target_grounding_center_patch_ratio: float = 0.25
     target_grounding_min_depth_m: float = 0.20
     target_grounding_max_depth_m: float = 6.0
-    target_grounding_min_confidence: float = 0.20
+    target_grounding_min_confidence: float = 0.50
     target_grounding_coordinate_mode: str = "auto"
     target_grounding_allow_normalized_bbox: bool = True
     target_grounding_normalized_bbox_scale: float = 1000.0
@@ -91,12 +92,15 @@ class AppConfig:
         PROJECT_ROOT / "weights" / "grounded_sam" / "groundingdino_swint_ogc.pth"
     )
     target_grounding_dino_device: str = "cuda"
-    target_grounding_dino_box_threshold: float = 0.30
+    target_grounding_dino_box_threshold: float = 0.45
     target_grounding_dino_text_threshold: float = 0.25
     target_grounding_sam_checkpoint_path: str = str(PROJECT_ROOT / "weights" / "grounded_sam" / "sam_vit_h_4b8939.pth")
     target_grounding_sam_model_type: str = "vit_h"
     target_grounding_sam_device: str = "cuda"
     target_grounding_sam_min_mask_area_ratio: float = 0.0005
+    target_grounding_max_result_age_sec: float = 2.0
+    target_grounding_max_result_pose_delta_m: float = 1.5
+    target_grounding_max_result_yaw_delta_deg: float = 45.0
     landmark_tracker_arrival_visible_depth_m: float = 1.00
     landmark_tracker_arrival_anchor_radius_m: float = 1.00
     landmark_tracker_min_visible_count: int = 2
@@ -200,7 +204,7 @@ class AppConfig:
     topology_recent_node_count: int = 8
     occupancy_grid_enabled: bool = True
     occupancy_grid_resolution_m: float = 0.08
-    occupancy_grid_size_m: float = 24.0
+    occupancy_grid_size_m: float = 80.0
     occupancy_grid_update_period_sec: float = 0.12
     occupancy_grid_depth_sample_stride_px: int = 10
     occupancy_grid_depth_roi_vertical_range: list[float] = field(default_factory=lambda: [0.38, 0.72])
@@ -214,7 +218,7 @@ class AppConfig:
     occupancy_grid_unknown_is_traversable: bool = True
     occupancy_grid_unknown_cell_cost: float = 0.10
     occupancy_grid_debug_enabled: bool = True
-    occupancy_grid_debug_image_path: str = "assets/occupancy_grid.png"
+    occupancy_grid_debug_image_path: str = "assets/local_map.png"
     occupancy_grid_debug_update_period_sec: float = 0.5
     occupancy_grid_debug_width: int = 900
     occupancy_grid_debug_height: int = 900
@@ -241,6 +245,11 @@ class AppConfig:
     lidar_sector_merge_keep_sec: float = 1.5
     lidar_draw_points: bool = False
     lidar_draw_lines: bool = False
+    lidar_mode: str = "single"
+    lidar_multi_sector_count: int = 3
+    lidar_multi_sector_fov_deg: float = 60.0
+    lidar_multi_sector_yaw_offsets_deg: list[float] = field(default_factory=lambda: [-60.0, 0.0, 60.0])
+    lidar_multi_child_names: list[str] = field(default_factory=lambda: ["LidarLeft", "LidarCenter", "LidarRight"])
     stuck_detection_enabled: bool = True
     stuck_window_sec: float = 2.0
     stuck_displacement_threshold_m: float = 0.05
@@ -451,6 +460,10 @@ def load_config(config_path: str | None = None) -> AppConfig:
             "POLICY_EXECUTION_STEPS",
             opennav.get("policy_execution_steps", 24),
         ),
+        turn_at_max_turns=_int_env_or_value(
+            "TURN_AT_MAX_TURNS",
+            opennav.get("turn_at_max_turns", 6),
+        ),
         landmark_arrival_distance_m=_float_env_or_value(
             "LANDMARK_ARRIVAL_DISTANCE_M",
             opennav.get("landmark_arrival_distance_m", 1.0),
@@ -533,7 +546,7 @@ def load_config(config_path: str | None = None) -> AppConfig:
         ),
         target_grounding_min_confidence=_float_env_or_value(
             "TARGET_GROUNDING_MIN_CONFIDENCE",
-            target_grounding.get("min_confidence", 0.20),
+            target_grounding.get("min_confidence", 0.50),
         ),
         target_grounding_coordinate_mode=_env_or_value(
             "TARGET_GROUNDING_COORDINATE_MODE",
@@ -595,7 +608,7 @@ def load_config(config_path: str | None = None) -> AppConfig:
         ),
         target_grounding_dino_box_threshold=_float_env_or_value(
             "GROUNDING_DINO_BOX_THRESHOLD",
-            target_grounding.get("grounding_dino_box_threshold", 0.30),
+            target_grounding.get("grounding_dino_box_threshold", 0.45),
         ),
         target_grounding_dino_text_threshold=_float_env_or_value(
             "GROUNDING_DINO_TEXT_THRESHOLD",
@@ -623,6 +636,18 @@ def load_config(config_path: str | None = None) -> AppConfig:
         target_grounding_sam_min_mask_area_ratio=_float_env_or_value(
             "SAM_MIN_MASK_AREA_RATIO",
             target_grounding.get("sam_min_mask_area_ratio", 0.0005),
+        ),
+        target_grounding_max_result_age_sec=_float_env_or_value(
+            "TARGET_GROUNDING_MAX_RESULT_AGE_SEC",
+            target_grounding.get("max_result_age_sec", 2.0),
+        ),
+        target_grounding_max_result_pose_delta_m=_float_env_or_value(
+            "TARGET_GROUNDING_MAX_RESULT_POSE_DELTA_M",
+            target_grounding.get("max_result_pose_delta_m", 1.5),
+        ),
+        target_grounding_max_result_yaw_delta_deg=_float_env_or_value(
+            "TARGET_GROUNDING_MAX_RESULT_YAW_DELTA_DEG",
+            target_grounding.get("max_result_yaw_delta_deg", 45.0),
         ),
         landmark_tracker_arrival_visible_depth_m=_float_env_or_value(
             "LANDMARK_TRACKER_ARRIVAL_VISIBLE_DEPTH_M",
@@ -1029,7 +1054,7 @@ def load_config(config_path: str | None = None) -> AppConfig:
         ),
         occupancy_grid_debug_image_path=_env_or_value(
             "OCCUPANCY_GRID_DEBUG_IMAGE_PATH",
-            occupancy_grid.get("debug_image_path", "assets/occupancy_grid.png"),
+            occupancy_grid.get("debug_image_path", "assets/local_map.png"),
         ),
         occupancy_grid_debug_update_period_sec=_float_env_or_value(
             "OCCUPANCY_GRID_DEBUG_UPDATE_PERIOD_SEC",
@@ -1126,6 +1151,21 @@ def load_config(config_path: str | None = None) -> AppConfig:
         ),
         lidar_draw_points=_bool_env_or_value("LIDAR_DRAW_POINTS", lidar.get("draw_points", False)),
         lidar_draw_lines=_bool_env_or_value("LIDAR_DRAW_LINES", lidar.get("draw_lines", False)),
+        lidar_mode=_env_or_value("LIDAR_MODE", lidar.get("mode", "single")),
+        lidar_multi_sector_count=_int_env_or_value(
+            "LIDAR_MULTI_SECTOR_COUNT", lidar.get("multi_sector_count", 3),
+        ),
+        lidar_multi_sector_fov_deg=_float_env_or_value(
+            "LIDAR_MULTI_SECTOR_FOV_DEG", lidar.get("multi_sector_fov_deg", 60.0),
+        ),
+        lidar_multi_sector_yaw_offsets_deg=_list_env_or_value(
+            "LIDAR_MULTI_SECTOR_YAW_OFFSETS_DEG",
+            lidar.get("multi_sector_yaw_offsets_deg", [-60.0, 0.0, 60.0]),
+        ),
+        lidar_multi_child_names=_list_env_or_value(
+            "LIDAR_MULTI_CHILD_NAMES",
+            lidar.get("multi_child_names", ["LidarLeft", "LidarCenter", "LidarRight"]),
+        ),
         stuck_detection_enabled=_bool_env_or_value(
             "STUCK_DETECTION_ENABLED",
             control.get("stuck_detection_enabled", True),

@@ -201,7 +201,8 @@ class NavigationMapVisualizer:
             return
         rows, cols = log_odds.shape
         resolution = max(1e-6, float(snapshot.resolution_m))
-        half_size = 0.5 * float(snapshot.size_m)
+        origin_x = float(getattr(snapshot, "origin_x", 0.0))
+        origin_y = float(getattr(snapshot, "origin_y", 0.0))
         occupied = log_odds >= 1.0
         inflated_only = inflated & ~occupied
         _ = free
@@ -212,7 +213,8 @@ class NavigationMapVisualizer:
             rows=rows,
             cols=cols,
             resolution=resolution,
-            half_size=half_size,
+            origin_x=origin_x,
+            origin_y=origin_y,
             color=(85, 28, 28),
             max_cells=4500,
         )
@@ -223,7 +225,8 @@ class NavigationMapVisualizer:
             rows=rows,
             cols=cols,
             resolution=resolution,
-            half_size=half_size,
+            origin_x=origin_x,
+            origin_y=origin_y,
             color=(205, 52, 42),
             max_cells=4500,
         )
@@ -237,7 +240,9 @@ class NavigationMapVisualizer:
         rows: int,
         cols: int,
         resolution: float,
-        half_size: float,
+        origin_x: float = 0.0,
+        origin_y: float = 0.0,
+        half_size: float = 0.0,
         color: tuple[int, int, int],
         max_cells: int,
     ) -> None:
@@ -248,11 +253,18 @@ class NavigationMapVisualizer:
             stride = int(np.ceil(len(indices) / max(1, int(max_cells))))
             indices = indices[::stride]
         radius = max(1, int(round(transform.scale * float(resolution) * 0.45)))
+        # Use origin-based conversion when origin is provided, otherwise
+        # fall back to the legacy half_size centred-at-origin conversion.
+        use_origin = origin_x != 0.0 or origin_y != 0.0
         for row, col in indices:
             if row < 0 or row >= rows or col < 0 or col >= cols:
                 continue
-            world_x = (float(col) + 0.5) * float(resolution) - float(half_size)
-            world_y = (float(row) + 0.5) * float(resolution) - float(half_size)
+            if use_origin:
+                world_x = origin_x + (float(col) + 0.5) * float(resolution)
+                world_y = origin_y + (float(row) + 0.5) * float(resolution)
+            else:
+                world_x = (float(col) + 0.5) * float(resolution) - float(half_size)
+                world_y = (float(row) + 0.5) * float(resolution) - float(half_size)
             x, y = transform.to_px(float(world_x), float(world_y))
             draw.rectangle((x - radius, y - radius, x + radius, y + radius), fill=color)
 

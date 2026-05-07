@@ -53,6 +53,7 @@ class OpenNavPolicyConfig:
     reacquire_guard_enabled: bool
     reacquire_guard_recent_visible_sec: float
     reacquire_guard_override_action: str
+    turn_at_max_turns: int = 4
 
 
 @dataclass
@@ -137,6 +138,7 @@ class OpenNavVLNPolicy:
         self._target_memory = TargetMemory(target_text=self._current_target_text())
         self._landmark_tracker_state: LandmarkState | None = None
         self._landmark_map_entry: LandmarkMapEntry | None = None
+        self._all_landmark_map_entries: list[LandmarkMapEntry] = []
         self._landmark_map_summary = ""
         self._previous_semantic_visible = False
         self._previous_grounded_visible = False
@@ -157,6 +159,9 @@ class OpenNavVLNPolicy:
         self._last_semantic_plan_signature: tuple | None = None
         self._topology_summary = ""
         self._topology_revisit_world_xy: list[float] | None = None
+        self._turn_at_landmark_index: int | None = None
+        self._turn_at_steps_taken = 0
+        self._turn_at_exhausted_landmark_index: int | None = None
 
     def step(
         self,
@@ -200,6 +205,14 @@ class OpenNavVLNPolicy:
                 ),
                 **self._route_result_kwargs(),
             )
+
+        turn_at_result = self._turn_at_step(
+            observation=observation,
+            progress_signal=progress_state.progress_signal,
+            now=now,
+        )
+        if turn_at_result is not None:
+            return turn_at_result
 
         if self._recovery_action_name is not None:
             return self._recovery_step(observation=observation, progress_signal=progress_state.progress_signal, now=now)
@@ -347,7 +360,7 @@ class OpenNavVLNPolicy:
             saved_occupancy_path = self._occupancy_grid.save_debug(
                 observation=observation,
                 candidate_set=candidate_set,
-                semantic_entries=[] if semantic_landmark_entry is None else [semantic_landmark_entry],
+                semantic_entries=list(self._all_landmark_map_entries),
                 semantic_plan=semantic_plan,
             )
             occupancy_debug_path = saved_occupancy_path or getattr(self._occupancy_grid, "output_path", None)
@@ -762,6 +775,9 @@ class OpenNavVLNPolicy:
     def set_landmark_map_entry(self, entry: LandmarkMapEntry | None) -> None:
         self._landmark_map_entry = entry
 
+    def set_all_landmark_map_entries(self, entries: list[LandmarkMapEntry]) -> None:
+        self._all_landmark_map_entries = list(entries)
+
     def set_landmark_map_summary(self, text: str) -> None:
         self._landmark_map_summary = str(text).strip()
 
@@ -774,7 +790,156 @@ class OpenNavVLNPolicy:
             return
         self._topology_revisit_world_xy = [float(value[0]), float(value[1])]
 
+    def _turn_at_step(
+        self,
+        *,
+        observation: VLNObservation,
+        progress_signal: str,
+        now: float,
+    ) -> PolicyStepResult | None:
+        if self.current_behavior_type != "turn_at":
+            return None
+
+        if self._turn_at_landmark_index != self._current_landmark_index:
+            self._turn_at_landmark_index = int(self._current_landmark_index)
+            self._turn_at_steps_taken = 0
+            self._turn_at_exhausted_landmark_index = None
+            self._logger.info(
+                "[TurnAt] start target=%s directive=%s max_turns=%s",
+                self._current_target_text(),
+                self._current_direction_clause() or "none",
+                int(self._config.turn_at_max_turns),
+            )
+
+        if (
+            self._active_candidate_label == "turn_at"
+            and self._active_world_goal_xy is not None
+            and self._execution_steps_remaining > 0
+        ):
+            local_goal = _world_waypoint_to_local_xy(
+                robot_pose=observation.pose,
+                world_goal_xy=self._active_world_goal_xy,
+            )
+            return self._motion_primitive_step(
+                observation=observation,
+                local_goal=local_goal,
+                progress_signal=progress_signal,
+                now=now,
+            )
+
+        tracker_state = self._landmark_tracker_state
+        tracker_observation = None if tracker_state is None else tracker_state.last_observation
+        current_grounded_visible = bool(
+            tracker_observation is not None and _is_fresh_grounded_observation(tracker_observation)
+            and tracker_state is not None and tracker_state.estimated_world_xy is not None
+        )
+        _, grounded_reason = self._current_grounded_visibility()
+        if current_grounded_visible:
+            grounded_reason = "fresh_grounding_confirmed_anchor"
+        if bool(current_grounded_visible):
+            anchor_world_xy, anchor_source = self._current_route_anchor()
+            self._logger.info(
+                "[TurnAt] complete target=%s reason=target_visible anchor_source=%s turns=%s",
+                self._current_target_text(),
+                anchor_source,
+                int(self._turn_at_steps_taken),
+            )
+            self._advance_current_landmark(
+                observation=observation,
+                anchor_world_xy=anchor_world_xy,
+                distance_m=None,
+                source="TurnAt",
+                reason=f"target_visible:{grounded_reason}",
+                visible_now=True,
+                lost_count=0,
+            )
+            self._clear_active_goal()
+            return PolicyStepResult(
+                action_name="STOP",
+                speed_scale=0.0,
+                decision_source="TURN_AT_COMPLETE",
+                selected_candidate_id=None,
+                local_goal_xy=[0.0, 0.0],
+                world_goal_xy=anchor_world_xy,
+                execution_steps_remaining=0,
+                reasoning_summary=f"turn_at completed because target became visible ({grounded_reason})",
+                progress_signal=progress_signal,
+                replanned=False,
+                debug_image_path=(
+                    None if self._candidate_predictor.last_saved_debug_path is None
+                    else str(self._candidate_predictor.last_saved_debug_path)
+                ),
+                **self._route_result_kwargs(),
+            )
+
+        if self._turn_at_exhausted_landmark_index == self._current_landmark_index:
+            return None
+
+        max_turns = max(1, int(self._config.turn_at_max_turns))
+        if int(self._turn_at_steps_taken) >= max_turns:
+            self._logger.warning(
+                "[TurnAt] exhausted target=%s reason=max_turns_reached turns=%s grounded_reason=%s next=LLM_SEARCH",
+                self._current_target_text(),
+                int(self._turn_at_steps_taken),
+                grounded_reason,
+            )
+            self._clear_active_goal()
+            self._turn_at_exhausted_landmark_index = int(self._current_landmark_index)
+            return None
+
+        action_name = self._turn_at_direction_action()
+        self._turn_at_steps_taken += 1
+        self._active_world_goal_xy = [float(observation.pose.x), float(observation.pose.y)]
+        self._active_candidate_id = None
+        self._active_candidate_label = "turn_at"
+        self._execution_steps_remaining = max(1, int(self._config.execution_steps))
+        self._active_action_name = str(action_name)
+        self._active_goal_started_sec = float(now)
+        self._active_start_yaw_rad = float(observation.pose.yaw_rad)
+        self._active_start_pose = observation.pose
+        self._last_decision_summary = (
+            f"turn_at primitive {self._turn_at_steps_taken}/{max_turns}; "
+            f"directive={self._current_direction_clause() or 'none'}; "
+            f"target_visible=0 reason={grounded_reason}"
+        )
+        self._logger.info(
+            "[TurnAt] action=%s target=%s turn=%s/%s directive=%s grounded_reason=%s",
+            action_name,
+            self._current_target_text(),
+            int(self._turn_at_steps_taken),
+            int(max_turns),
+            self._current_direction_clause() or "none",
+            grounded_reason,
+        )
+        return PolicyStepResult(
+            action_name=action_name,
+            speed_scale=float(_primitive_speed_scale(action_name, self._config)),
+            decision_source="TURN_AT",
+            selected_candidate_id=None,
+            local_goal_xy=[0.0, 0.0],
+            world_goal_xy=list(self._active_world_goal_xy),
+            execution_steps_remaining=int(self._execution_steps_remaining),
+            reasoning_summary=self._last_decision_summary,
+            progress_signal=progress_signal,
+            replanned=True,
+            debug_image_path=(
+                None if self._candidate_predictor.last_saved_debug_path is None
+                else str(self._candidate_predictor.last_saved_debug_path)
+            ),
+            **self._route_result_kwargs(),
+        )
+
+    def _turn_at_direction_action(self) -> str:
+        text = f"{self._current_direction_clause()} {self._current_target_text()}".lower()
+        if "left" in text:
+            return "TURN_LEFT"
+        if "right" in text:
+            return "TURN_RIGHT"
+        return self._preferred_search_turn_action()
+
     def _semantic_landmark_entry(self) -> LandmarkMapEntry | None:
+        if self.current_behavior_type != "go_to":
+            return None
         if self._landmark_map_entry is not None and bool(self._landmark_map_entry.world_xy):
             return self._landmark_map_entry
         state = self._landmark_tracker_state
@@ -1382,6 +1547,7 @@ class OpenNavVLNPolicy:
             and str(map_entry.label).strip().lower() == self._current_target_text().strip().lower()
             and bool(map_entry.confirmed)
             and map_entry.anchor_distance_m is not None
+            and self.current_behavior_type == "go_to"
         ):
             threshold_m = max(0.05, float(self._config.landmark_arrival_distance_m))
             if float(map_entry.anchor_distance_m) <= threshold_m:
@@ -1435,6 +1601,9 @@ class OpenNavVLNPolicy:
         if reached_landmark not in self._completed_landmarks:
             self._completed_landmarks.append(reached_landmark)
         self._current_landmark_index += 1
+        self._turn_at_landmark_index = None
+        self._turn_at_steps_taken = 0
+        self._turn_at_exhausted_landmark_index = None
 
         distance_text = "none" if distance_m is None else f"{float(distance_m):.2f}"
         if self._current_landmark_index >= len(self._ordered_landmarks):
@@ -1472,10 +1641,12 @@ class OpenNavVLNPolicy:
         current_target = self._current_target_text()
         current_index = self._current_landmark_index
         expected_words = self._expected_direction_words()
-        route_steps = [
-            f"{getattr(step, 'behavior_type', 'go_to')}:{getattr(step, 'landmark', '')}:{getattr(step, 'directive', '')}"
-            for step in getattr(self._instruction_context, "route_steps", [])
-        ]
+        route_steps = []
+        for step in getattr(self._instruction_context, "route_steps", []):
+            raw_behavior = str(getattr(step, "behavior_type", "go_to")).strip().lower() or "go_to"
+            route_steps.append(
+                f"{raw_behavior}:{getattr(step, 'landmark', '')}:{getattr(step, 'directive', '')}"
+            )
         lines = [
             f"ordered_landmarks={self._ordered_landmarks}",
             f"route_steps={route_steps or ['none']}",

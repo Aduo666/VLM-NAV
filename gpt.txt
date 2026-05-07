@@ -1,64 +1,25 @@
-这轮已经按 Claude 的提议把主链改了，不是只加日志或占位文件。
+我看完 `mimo.txt` 和最新日志了。结论：`mimo` 的方向有参考价值，但第 1 点有一处判断不准；真正问题分三层。
 
-已实现的内容：
+**问题判断**
+1. **LiDAR 点分散不是因为画错了“单帧 raw scan”。** 当前 [nav.py](/home/Lab/qiangsibin/VLM-NAV/src/vln_nav/app/nav.py:850) 传给 `_save_lidar_raw_scan()` 的是 `lidar_scan.beam_endpoints_local_xy`，而这个在 [lidar_sensor.py](/home/Lab/qiangsibin/VLM-NAV/src/vln_nav/navigation/lidar_sensor.py:230) 已经是 merged scan。真正问题是 merged beams 太多、太旧、重复太多。日志里有 `merged_beams=13500`、`merged_hits=10950`，这会让蓝点/雷达点看起来很散。
 
-- P0 指令预处理
-  - [instruction_manager.py](/home/Lab/qiangsibin/VLM-NAV/src/vln_nav/navigation/instruction_manager.py) 改成“一次性 LLM 预解析”。
-  - 输出 `task_type / landmarks / actions / directional_clauses / route_steps`。
-  - `nav.py` 已接入配置项 `instruction_preparse_enabled / instruction_preparse_max_tokens`。
-  - `vln_reasoner.py` 现在会把 `route_steps` 一起发给模型，不再只是正则结果写日志。
+2. **面前障碍物略微飘，主要是“旋转扇区 LiDAR + 历史合并 + 局部旋转视图”叠加造成的。** 日志显示单帧 LiDAR 只有 `[-90.0,-30.4]` 约 55 度，而系统靠历史扇区拼到 `111.5` 或 `166.5` 度。只要历史扇区合并过宽，或者调试图随着机器人旋转，墙就会看起来漂。参考 [logs/nav_latest.log](/home/Lab/qiangsibin/VLM-NAV/logs/nav_latest.log:574)。
 
-- P1 拓扑/语义记忆
-  - 新增 [topological_memory.py](/home/Lab/qiangsibin/VLM-NAV/src/vln_nav/navigation/topological_memory.py)。
-  - `nav.py` 每帧更新拓扑记忆，并把：
-    - `topology summary`
-    - `topology revisit world_xy`
-    传给 policy。
-  - `vln_policy.py` 新增 `TOPOLOGY_REVISIT` 分支。
-  - 在 `STALLED/SPINNING` 或 `LLM_BLOCKED` 时，会优先尝试回到拓扑记忆里的可回退节点，而不是原地死等。
+3. **你说“全局地图”，现在代码实际显示的是机器人中心局部图。** `GlobalOccupancyMap` 底层确实有全局 grid，但 [occupancy_grid.py](/home/Lab/qiangsibin/VLM-NAV/src/vln_nav/navigation/occupancy_grid.py:1121) 的 debug 渲染是以机器人为中心、按机器人 yaw 旋转的局部视图。另一个 [navigation_map_visualizer.py](/home/Lab/qiangsibin/VLM-NAV/src/vln_nav/navigation/navigation_map_visualizer.py:145) 也是 `size_m=8.0` 的局部图。所以你看到的不是稳定的 north-up 全局地图。
 
-- P2 自适应候选点
-  - [candidate_waypoint_predictor.py](/home/Lab/qiangsibin/VLM-NAV/src/vln_nav/navigation/candidate_waypoint_predictor.py) 不再死用固定 5 个角度。
-  - 现在是“基准槽位 + 深度图列方向 profile 微调”。
-  - 新增配置：
-    - `candidate_adaptive_enabled`
-    - `candidate_adaptive_count`
-    - `candidate_adaptive_min_spacing_deg`
-    - `candidate_adaptive_smoothing_px`
+4. **找到第一个 landmark 后打转，不是单纯 current goal 机制坏了，而是第二阶段目标定义错了。** 日志里 `wheelchair` 到达后切到 `stairs`，但 `stairs` 多次 `target_not_visible / invalid_depth_ratio`，没有 confirmed anchor，然后 LLM 在 `TURN_LEFT / TURN_RIGHT` 间反复切换。更关键的是，“turn left toward the stairs” 不应该被当成 `go_to stairs`，而应该是一个 `turn_at / orient_to` 行为。现在把非 `go_to` 强行降级成 `go_to` 会导致它一直试图找/走向 stairs。
 
-- P3 Route contradiction 不再只记日志
-  - [vln_policy.py](/home/Lab/qiangsibin/VLM-NAV/src/vln_nav/navigation/vln_policy.py) 现在会先用当前 grounded landmark anchor 做 `RouteCheck`。
-  - 如果检测到矛盾：
-    - 先尝试按预期方向挑一个有效候选做 `RouteCorrection`
-    - 不行就走 `TOPOLOGY_REVISIT`
-    - 再不行就 `STOP + REPLAN`
-  - 不再是之前那种只打一条 warning。
+**修改计划**
+1. **先修地图显示，不碰导航决策。** 新增真正的 `global_map.png`：north-up、不跟随机器人 yaw、不以机器人为中心旋转；显示全局 occupancy、轨迹、robot、completed/current landmarks、current goal。保留局部图但明确命名为 `local_map.png`，不再把局部图叫 global map。
 
-- P4 到达判定改成滑窗
-  - [landmark_tracker.py](/home/Lab/qiangsibin/VLM-NAV/src/vln_nav/navigation/landmark_tracker.py) 已从“连续命中”改成“滑动窗口确认”。
-  - `LandmarkMap` 的 fallback 到达确认在 [vln_policy.py](/home/Lab/qiangsibin/VLM-NAV/src/vln_nav/navigation/vln_policy.py) 里也改成滑窗。
-  - 新增配置 `landmark_tracker.arrival_window_size`。
+2. **重做 LiDAR debug 和建图输入。** `lidar_raw_scan.png` 分成两张或一张两栏：左边画最新单帧 sector，右边画 motion-compensated + angle-binned merged scan。merged scan 不再画 1 万多个历史点，而是按角度 bin 去重，每个角度只保留最新/最近有效 beam。
 
-同时补了主链接线：
+3. **收紧 LiDAR 历史合并。** 不再把大量历史 merged beams 每帧重复喂给 occupancy。建图应该用“当前新扫描扇区”增量更新全局 map；用于显示/候选过滤时再生成 binned merged scan。这样可以减少墙体漂移和点云散开。
 
-- [nav.py](/home/Lab/qiangsibin/VLM-NAV/src/vln_nav/app/nav.py)
-  - 传入 `policy.current_behavior_type`
-  - 记录 `parse_source / route_steps`
-  - 初始化 `TopologicalMemory`
-- [config.py](/home/Lab/qiangsibin/VLM-NAV/src/vln_nav/runtime/config.py) 和 [default.yaml](/home/Lab/qiangsibin/VLM-NAV/configs/default.yaml)
-  - 已补齐上述新配置项
+4. **修正 route behavior。** 恢复 `turn_at` 语义，不再强行当 `go_to`。第一版策略：如果当前 step 是 `turn_at stairs`，只执行有限次数的指定方向转向；看到 stairs 或达到最大转向次数后就完成该 step。如果它是最后一个 step，则 STOP/route complete，不继续原地找路。
 
-本轮没有改底层控制器、occupancy 主体、Grounding/SAM 主链，保持了你之前要求的边界。
+5. **修正 current goal 生命周期。** 对 `go_to` landmark 才允许 semantic planner 生成可持续目标点；对 `turn_at` 不生成 world goal，不走 topology revisit，不走 semantic planner，只执行 bounded orientation primitive。这样能避免“current goal 在身后/错误 revisit 点导致打转”。
 
-验证已做：
+6. **验证顺序。** 先只验证地图：看 `global_map.png` 中墙是否固定、robot 是否沿轨迹移动、landmark 是否保留。然后验证 `turn_at`：到达 wheelchair 后应输出类似 `behavior=turn_at target=stairs action=TURN_LEFT remaining_turns=...`，不能再无限左右切换。
 
-```bash
-python3 -m compileall -q src/vln_nav
-python3 -c "from src.vln_nav.runtime.config import load_config; c=load_config('configs/default.yaml'); print(c.instruction_preparse_enabled, c.candidate_adaptive_enabled, c.landmark_tracker_arrival_window_size, c.topology_enabled)"
-```
-
-结果正常。Isaac Sim 运行级验证这轮还没替你完整跑。下一步如果你要，我就直接针对这版主链看运行日志，重点检查三件事：
-
-- `InstructionParse` 是否稳定输出合理 `route_steps`
-- `TOPOLOGY_REVISIT` 是否在卡死时真的触发
-- `RouteCorrection` 是否能压住“看见目标但选错方向”这类问题
+如果你确认，我下一步按这个计划改，不会先动代码。

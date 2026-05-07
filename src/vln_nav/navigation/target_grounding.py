@@ -36,6 +36,11 @@ class TargetObservation:
     coordinate_mode: str = "unknown"
     segmentation_source: str = "none"
     mask: np.ndarray | None = None
+    request_frame_index: int = -1
+    request_sim_time_sec: float = 0.0
+    request_robot_pose: Pose2D | None = None
+    result_age_sec: float = 0.0
+    is_current_frame: bool = True
 
 
 @dataclass
@@ -67,12 +72,15 @@ class TargetGroundingConfig:
     grounding_dino_config_path: str = "../GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py"
     grounding_dino_checkpoint_path: str = "../GroundingDINO/weights/groundingdino_swint_ogc.pth"
     grounding_dino_device: str = "cuda"
-    grounding_dino_box_threshold: float = 0.30
+    grounding_dino_box_threshold: float = 0.45
     grounding_dino_text_threshold: float = 0.25
     sam_checkpoint_path: str = "weights/grounded_sam/sam_vit_h_4b8939.pth"
     sam_model_type: str = "vit_h"
     sam_device: str = "cuda"
     sam_min_mask_area_ratio: float = 0.0005
+    max_result_age_sec: float = 2.0
+    max_result_pose_delta_m: float = 1.5
+    max_result_yaw_delta_deg: float = 45.0
 
 
 @dataclass
@@ -86,6 +94,7 @@ class _GroundingRequest:
     upload_size: tuple[int, int]
     original_size: tuple[int, int]
     image_png_bytes: bytes
+    frame_index: int = -1
 
 
 @dataclass
@@ -148,12 +157,14 @@ class TargetGrounder:
         target_label: str,
         robot_pose: Pose2D,
         timestamp_sec: float,
+        frame_index: int = -1,
     ) -> TargetObservation:
         target_label = str(target_label).strip() or "target"
         wall_time_sec = time.monotonic()
         completed_observation = self._collect_finished_request(
             timestamp_sec=timestamp_sec,
             wall_time_sec=wall_time_sec,
+            current_robot_pose=robot_pose,
         )
         if completed_observation is not None and completed_observation.label == target_label:
             return completed_observation
@@ -167,6 +178,7 @@ class TargetGrounder:
             target_label=target_label,
             timestamp_sec=timestamp_sec,
             wall_time_sec=wall_time_sec,
+            current_robot_pose=robot_pose,
         )
         if self._future is not None:
             return reusable or _empty_observation(
@@ -189,6 +201,7 @@ class TargetGrounder:
                 target_label=target_label,
                 robot_pose=robot_pose,
                 timestamp_sec=timestamp_sec,
+                frame_index=frame_index,
             )
         except Exception as exc:
             self._logger.warning("[GroundingReject] target=%s reason=image_prepare_failed error=%s", target_label, exc)
@@ -222,6 +235,7 @@ class TargetGrounder:
         target_label: str,
         timestamp_sec: float,
         wall_time_sec: float,
+        current_robot_pose: Pose2D | None = None,
     ) -> TargetObservation | None:
         if self._last_observation is None:
             return None
@@ -230,6 +244,13 @@ class TargetGrounder:
         age_sec = float(wall_time_sec) - float(self._last_observation_wall_sec)
         if age_sec > max(0.0, float(self._config.reuse_last_observation_sec)):
             return None
+        result_age_sec = float(timestamp_sec) - float(self._last_observation.request_sim_time_sec) if self._last_observation.request_sim_time_sec > 0.0 else age_sec
+        is_current = _is_current_frame(
+            result_age_sec=result_age_sec,
+            request_pose=self._last_observation.request_robot_pose,
+            current_pose=current_robot_pose,
+            config=self._config,
+        )
         return TargetObservation(
             label=self._last_observation.label,
             visible=self._last_observation.visible,
@@ -250,9 +271,14 @@ class TargetGrounder:
             coordinate_mode=self._last_observation.coordinate_mode,
             segmentation_source=self._last_observation.segmentation_source,
             mask=None if self._last_observation.mask is None else np.asarray(self._last_observation.mask, dtype=bool).copy(),
+            request_frame_index=self._last_observation.request_frame_index,
+            request_sim_time_sec=self._last_observation.request_sim_time_sec,
+            request_robot_pose=self._last_observation.request_robot_pose,
+            result_age_sec=float(result_age_sec),
+            is_current_frame=is_current,
         )
 
-    def _collect_finished_request(self, *, timestamp_sec: float, wall_time_sec: float) -> TargetObservation | None:
+    def _collect_finished_request(self, *, timestamp_sec: float, wall_time_sec: float, current_robot_pose: Pose2D | None = None) -> TargetObservation | None:
         if self._future is None or not self._future.done():
             return None
         future = self._future
@@ -269,15 +295,27 @@ class TargetGrounder:
         if reason != "ok":
             self._logger.warning("[GroundingReject] target=%s reason=%s", request.target_label, reason)
             return None
+        result_age_sec = float(timestamp_sec) - float(request.timestamp_sec)
+        is_current = _is_current_frame(
+            result_age_sec=result_age_sec,
+            request_pose=request.robot_pose,
+            current_pose=current_robot_pose,
+            config=self._config,
+        )
         observation = _copy_observation_with_timestamp(
             self._parse_and_validate(content=content, request=request),
             timestamp_sec=timestamp_sec,
+            request_frame_index=request.frame_index,
+            request_sim_time_sec=request.timestamp_sec,
+            request_robot_pose=request.robot_pose,
+            result_age_sec=result_age_sec,
+            is_current_frame=is_current,
         )
         self._last_observation = observation
         self._last_observation_wall_sec = float(wall_time_sec)
         if observation.visible and self._should_log_observation(observation=observation, wall_time_sec=wall_time_sec):
             self._logger.info(
-                "[Grounding] target=%s visible=1 bbox=%s depth=%.2f valid_ratio=%.2f mask_area=%.3f bearing_deg=%.1f world=%s confidence=%.2f coord=%s seg=%s",
+                "[Grounding] target=%s visible=1 bbox=%s depth=%.2f valid_ratio=%.2f mask_area=%.3f bearing_deg=%.1f world=%s confidence=%.2f coord=%s seg=%s age=%.2fs current=%s frame=%d",
                 observation.label,
                 list(observation.bbox or ()),
                 float(observation.depth_m or 0.0),
@@ -288,6 +326,9 @@ class TargetGrounder:
                 float(observation.confidence),
                 observation.coordinate_mode,
                 observation.segmentation_source,
+                float(observation.result_age_sec),
+                int(observation.is_current_frame),
+                int(observation.request_frame_index),
             )
         elif not observation.visible and self._should_log_observation(observation=observation, wall_time_sec=wall_time_sec):
             self._logger.info("[GroundingReject] target=%s reason=%s", observation.label, observation.reason)
@@ -371,6 +412,7 @@ class TargetGrounder:
         target_label: str,
         robot_pose: Pose2D,
         timestamp_sec: float,
+        frame_index: int = -1,
     ) -> _GroundingRequest:
         image = Image.fromarray(rgb[:, :, :3].copy()).convert("RGB")
         original_size = (int(image.width), int(image.height))
@@ -397,6 +439,7 @@ class TargetGrounder:
             upload_size=(int(upload.width), int(upload.height)),
             original_size=original_size,
             image_png_bytes=buffer.getvalue(),
+            frame_index=int(frame_index),
         )
 
     def _parse_and_validate(self, *, content: str, request: _GroundingRequest) -> TargetObservation:
@@ -623,7 +666,16 @@ def _empty_observation(target_label: str, timestamp_sec: float, reason: str) -> 
     )
 
 
-def _copy_observation_with_timestamp(observation: TargetObservation, *, timestamp_sec: float) -> TargetObservation:
+def _copy_observation_with_timestamp(
+    observation: TargetObservation,
+    *,
+    timestamp_sec: float,
+    request_frame_index: int = -1,
+    request_sim_time_sec: float = 0.0,
+    request_robot_pose: Pose2D | None = None,
+    result_age_sec: float = 0.0,
+    is_current_frame: bool = True,
+) -> TargetObservation:
     return TargetObservation(
         label=observation.label,
         visible=observation.visible,
@@ -637,12 +689,44 @@ def _copy_observation_with_timestamp(observation: TargetObservation, *, timestam
         area_ratio=observation.area_ratio,
         source=observation.source,
         reason=observation.reason,
-        timestamp_sec=float(timestamp_sec),
+        timestamp_sec=float(observation.timestamp_sec) if observation.timestamp_sec > 0.0 else float(timestamp_sec),
         mask_area_ratio=observation.mask_area_ratio,
         coordinate_mode=observation.coordinate_mode,
         segmentation_source=observation.segmentation_source,
         mask=None if observation.mask is None else np.asarray(observation.mask, dtype=bool).copy(),
+        request_frame_index=int(request_frame_index) if request_frame_index >= 0 else int(observation.request_frame_index),
+        request_sim_time_sec=float(request_sim_time_sec) if request_sim_time_sec > 0.0 else float(observation.request_sim_time_sec),
+        request_robot_pose=request_robot_pose if request_robot_pose is not None else observation.request_robot_pose,
+        result_age_sec=float(result_age_sec),
+        is_current_frame=bool(is_current_frame),
     )
+
+
+def _is_current_frame(
+    *,
+    result_age_sec: float,
+    request_pose: Pose2D | None,
+    current_pose: Pose2D | None,
+    config: TargetGroundingConfig,
+) -> bool:
+    max_age = float(config.max_result_age_sec)
+    if max_age > 0.0 and result_age_sec > max_age:
+        return False
+    max_pose_delta = float(config.max_result_pose_delta_m)
+    max_yaw_delta = float(config.max_result_yaw_delta_deg)
+    if request_pose is not None and current_pose is not None:
+        pos_delta = float(np.hypot(
+            float(current_pose.x) - float(request_pose.x),
+            float(current_pose.y) - float(request_pose.y),
+        ))
+        if max_pose_delta > 0.0 and pos_delta > max_pose_delta:
+            return False
+        if max_yaw_delta > 0.0:
+            yaw_delta = abs(float(np.degrees(float(current_pose.yaw_rad) - float(request_pose.yaw_rad))))
+            yaw_delta = min(yaw_delta, 360.0 - yaw_delta)
+            if yaw_delta > max_yaw_delta:
+                return False
+    return True
 
 
 def _parse_json_object(content: str) -> dict[str, Any]:

@@ -1,5 +1,5 @@
 sim:
-  headless: true
+  headless: false
   width: 1280
   height: 720
   active_gpu: 1
@@ -19,7 +19,7 @@ llm:
   camera_image_detail: "high"
 
 opennav:
-  instruction: "go forward to the wheelchair, then turn left toward the stairs"
+  instruction: "go forward to the vending machine, then turn left toward the stairs"
   instruction_preparse_enabled: true
   instruction_preparse_max_tokens: 384
   candidate_slot_bearings_deg: [75.0, 35.0, 0.0, -35.0, -75.0]
@@ -42,6 +42,7 @@ opennav:
   progress_stall_distance_m: 0.08
   progress_spin_yaw_deg: 85.0
   policy_execution_steps: 24
+  turn_at_max_turns: 6
   landmark_arrival_distance_m: 1.3
   landmark_arrival_confirmations: 2
   recovery_enabled: false
@@ -64,7 +65,7 @@ target_grounding:
   center_patch_ratio: 0.25
   min_depth_m: 0.20
   max_depth_m: 6.0
-  min_confidence: 0.20
+  min_confidence: 0.50
   coordinate_mode: "auto"
   allow_normalized_bbox: true
   normalized_bbox_scale: 1000.0
@@ -75,12 +76,15 @@ target_grounding:
   grounding_dino_config_path: "weights/grounded_sam/GroundingDINO_SwinT_OGC.py"
   grounding_dino_checkpoint_path: "weights/grounded_sam/groundingdino_swint_ogc.pth"
   grounding_dino_device: "cuda:1"
-  grounding_dino_box_threshold: 0.30
+  grounding_dino_box_threshold: 0.45
   grounding_dino_text_threshold: 0.25
   sam_checkpoint_path: "weights/grounded_sam/sam_vit_h_4b8939.pth"
   sam_model_type: "vit_h"
   sam_device: "cuda:1"
   sam_min_mask_area_ratio: 0.0005
+  max_result_age_sec: 2.0
+  max_result_pose_delta_m: 1.5
+  max_result_yaw_delta_deg: 45.0
 
 landmark_tracker:
   arrival_visible_depth_m: 1.00
@@ -203,7 +207,7 @@ topology:
 occupancy_grid:
   enabled: true
   resolution_m: 0.08
-  size_m: 24.0
+  size_m: 80.0
   update_period_sec: 0.12
   depth_sample_stride_px: 10
   depth_roi_vertical_range: [0.38, 0.72]
@@ -217,7 +221,7 @@ occupancy_grid:
   unknown_is_traversable: true
   unknown_cell_cost: 0.10
   debug_enabled: true
-  debug_image_path: "assets/occupancy_grid.png"
+  debug_image_path: "assets/local_map.png"
   debug_update_period_sec: 0.5
   debug_width: 900
   debug_height: 900
@@ -246,6 +250,11 @@ lidar:
   sector_merge_keep_sec: 1.5
   draw_points: false
   draw_lines: false
+  mode: "single"
+  multi_sector_count: 3
+  multi_sector_fov_deg: 60.0
+  multi_sector_yaw_offsets_deg: [60.0, 0.0, -60.0]
+  multi_child_names: ["LidarLeft", "LidarCenter", "LidarRight"]
 
 scene:
   usd_path: "usd/hospital.usd"

@@ -36,7 +36,7 @@ class DebugVideoRecorder:
         return self._output_path
 
     def append(self, image: Image.Image | np.ndarray | None) -> None:
-        if not self._enabled or image is None:
+        if not self._enabled or self._closed or image is None:
             return
         try:
             frame_rgb = self._to_rgb_array(image)

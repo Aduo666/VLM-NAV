@@ -30,6 +30,11 @@ class LandmarkState:
     recent_reach_history: list[int] = field(default_factory=list)
     potential_world_xy: list[float] | None = None
     potential_confidence: float = 0.0
+    potential_bbox: tuple[int, int, int, int] | None = None
+    potential_center_uv: tuple[float, float] | None = None
+    potential_bearing_rad: float | None = None
+    potential_last_seen_time_sec: float | None = None
+    potential_source: str = "unknown"
     confirmed_confidence: float = 0.0
     confirmed_observation_count: int = 0
     last_confirmed_depth_m: float | None = None
@@ -51,7 +56,6 @@ class LandmarkTrackerConfig:
     confirm_min_observations: int = 3
     confirm_max_anchor_jump_m: float = 0.50
     confirm_max_depth_jump_m: float = 0.80
-    qwen_fallback_confirm_allowed: bool = False
     potential_confidence_threshold: float = 0.50
 
 
@@ -136,6 +140,11 @@ class LandmarkTracker:
                 recent_reach_history=[],
                 potential_world_xy=None,
                 potential_confidence=0.0,
+                potential_bbox=None,
+                potential_center_uv=None,
+                potential_bearing_rad=None,
+                potential_last_seen_time_sec=None,
+                potential_source="unknown",
                 confirmed_confidence=0.0,
                 confirmed_observation_count=0,
                 last_confirmed_depth_m=None,
@@ -143,20 +152,12 @@ class LandmarkTracker:
                 can_complete=False,
             )
 
-        fresh_visible = (
-            bool(observation.visible)
-            and str(observation.reason).strip().lower() in {"ok", "depth_invalid"}
-            and "reused" not in str(observation.source).strip().lower()
-        )
-        has_valid_depth = (
-            fresh_visible
-            and str(observation.reason).strip().lower() == "ok"
-            and observation.depth_m is not None
-        )
-        current_fresh = (
-            has_valid_depth
-            and bool(getattr(observation, "is_current_frame", True))
-        )
+        is_ok = str(observation.reason).strip().lower() == "ok"
+        is_depth_invalid = str(observation.reason).strip().lower() == "depth_invalid"
+        is_reused = "reused" in str(observation.source).strip().lower()
+        fresh_visible = bool(observation.visible) and (is_ok or is_depth_invalid) and not is_reused
+        has_valid_depth = fresh_visible and is_ok and observation.depth_m is not None
+        current_fresh = has_valid_depth and bool(getattr(observation, "is_current_frame", True))
         transient_observation = _is_observation_transient(observation)
 
         if bool(observation.visible):
@@ -166,12 +167,62 @@ class LandmarkTracker:
             state.last_observation = observation
             state.last_seen_time_sec = float(timestamp_sec)
 
-            # All visible observations update potential
-            if observation.estimated_world_xy is not None:
-                state.potential_world_xy = list(observation.estimated_world_xy)
+            # --- Image-level potential (depth_invalid ok, no world_xy) ---
+            has_bbox = observation.bbox is not None
+            meets_potential_conf = float(observation.confidence) >= float(self._config.potential_confidence_threshold)
+            if has_bbox and meets_potential_conf and not is_reused:
+                state.potential_bbox = tuple(observation.bbox) if observation.bbox is not None else None
+                state.potential_center_uv = (
+                    None if observation.center_uv is None
+                    else (float(observation.center_uv[0]), float(observation.center_uv[1]))
+                )
+                state.potential_bearing_rad = (
+                    None if observation.bearing_rad is None else float(observation.bearing_rad)
+                )
                 state.potential_confidence = max(float(state.potential_confidence), float(observation.confidence))
+                state.potential_last_seen_time_sec = float(timestamp_sec)
+                state.potential_source = str(getattr(observation, "semantic_source", "unknown"))
+                if is_depth_invalid:
+                    self._logger.info(
+                        "[LandmarkPotentialImageOnly] target=%s reason=depth_invalid bbox=%s center=%s confidence=%.2f",
+                        label,
+                        list(observation.bbox),
+                        _format_xy(observation.center_uv) if observation.center_uv is not None else "none",
+                        float(observation.confidence),
+                    )
+
+            # --- World-level potential (only ok + depth + world_xy + threshold) ---
+            can_update_world_potential = (
+                is_ok
+                and bool(getattr(observation, "is_current_frame", True))
+                and observation.depth_m is not None
+                and observation.estimated_world_xy is not None
+                and meets_potential_conf
+            )
+            if can_update_world_potential:
+                state.potential_world_xy = list(observation.estimated_world_xy)
                 if state.evidence_level == "none":
                     state.evidence_level = "potential"
+            elif fresh_visible and not is_depth_invalid and not is_reused:
+                # Log why world potential was not updated
+                reasons = []
+                if not is_ok:
+                    reasons.append("reason_not_ok")
+                if not bool(getattr(observation, "is_current_frame", True)):
+                    reasons.append("stale")
+                if observation.depth_m is None:
+                    reasons.append("no_depth")
+                if observation.estimated_world_xy is None:
+                    reasons.append("no_world_xy")
+                if not meets_potential_conf:
+                    reasons.append("low_confidence")
+                if reasons:
+                    self._logger.info(
+                        "[LandmarkPotentialReject] target=%s reason=%s confidence=%.2f",
+                        label,
+                        "_".join(reasons),
+                        float(observation.confidence),
+                    )
 
             state.candidate_world_xy = (
                 None if observation.estimated_world_xy is None else list(observation.estimated_world_xy)
@@ -189,7 +240,6 @@ class LandmarkTracker:
                     observation=observation,
                 )
             elif current_fresh and has_world:
-                # Log rejection reason
                 reasons = []
                 if not high_conf:
                     reasons.append("low_confidence")
@@ -279,7 +329,8 @@ class LandmarkTracker:
         self._logger.info(
             "[LandmarkTracker] target=%s behavior=%s status=%s visible=%s visible_count=%s lost_count=%s "
             "depth=%s candidate_anchor=%s confirmed_anchor=%s anchor_dist=%s reached=%s confirm=%s obs_source=%s reason=%s "
-            "evidence=%s can_confirm=%s can_complete=%s potential_anchor=%s confirmed_obs=%s confidence=%.2f",
+            "evidence=%s can_confirm=%s can_complete=%s potential_anchor=%s potential_image_bbox=%s "
+            "potential_bearing=%s confirmed_obs=%s confidence=%.2f",
             state.label,
             state.behavior_type,
             state.status,
@@ -298,6 +349,8 @@ class LandmarkTracker:
             int(can_confirm),
             int(state.can_complete),
             _format_xy(state.potential_world_xy),
+            list(state.potential_bbox) if state.potential_bbox is not None else "none",
+            _format_optional_float(None if state.potential_bearing_rad is None else float(np.degrees(state.potential_bearing_rad))),
             int(state.confirmed_observation_count),
             float(state.confidence),
         )
@@ -523,6 +576,20 @@ class LandmarkTracker:
             reason = "not_reached"
         reached = bool(hits >= required)
         reached_count = hits
+        self._logger.info(
+            "[ReachCheck] target=%s behavior=%s reached=%s can_complete=%s distance=%s depth=%s "
+            "reason=%s confirm=%s/%s evidence_level=%s",
+            label,
+            state.behavior_type,
+            int(reached),
+            int(bool(state.can_complete)),
+            _format_optional_float(state.anchor_distance_m),
+            _format_optional_float(observation.depth_m),
+            reason,
+            int(hits),
+            int(window_size),
+            state.evidence_level,
+        )
         return reached, reason, reached_count, hits, int(window_size), [int(item) for item in reach_window]
 
 

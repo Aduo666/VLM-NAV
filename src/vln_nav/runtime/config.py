@@ -118,7 +118,6 @@ class AppConfig:
     landmark_tracker_confirm_max_depth_jump_m: float = 0.80
     landmark_tracker_turn_at_complete_requires_confirmed_anchor: bool = True
     landmark_tracker_turn_at_complete_max_distance_m: float = 3.0
-    landmark_tracker_qwen_fallback_confirm_allowed: bool = False
     landmark_map_enabled: bool = True
     landmark_map_anchor_ttl_sec: float = 120.0
     landmark_map_min_confidence: float = 0.20
@@ -726,10 +725,6 @@ def load_config(config_path: str | None = None) -> AppConfig:
         landmark_tracker_turn_at_complete_max_distance_m=_float_env_or_value(
             "LANDMARK_TRACKER_TURN_AT_COMPLETE_MAX_DISTANCE_M",
             landmark_tracker.get("turn_at_complete_max_distance_m", 3.0),
-        ),
-        landmark_tracker_qwen_fallback_confirm_allowed=_bool_env_or_value(
-            "LANDMARK_TRACKER_QWEN_FALLBACK_CONFIRM_ALLOWED",
-            landmark_tracker.get("qwen_fallback_confirm_allowed", False),
         ),
         landmark_map_enabled=_bool_env_or_value(
             "LANDMARK_MAP_ENABLED",

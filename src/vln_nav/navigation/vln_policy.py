@@ -55,6 +55,9 @@ class OpenNavPolicyConfig:
     reacquire_guard_override_action: str
     turn_at_max_turns: int = 4
     turn_at_complete_max_distance_m: float = 3.0
+    turn_at_complete_requires_confirmed_anchor: bool = True
+    confirm_min_observations: int = 3
+    confirm_confidence_threshold: float = 0.90
 
 
 @dataclass
@@ -832,17 +835,32 @@ class OpenNavVLNPolicy:
         tracker_observation = None if tracker_state is None else tracker_state.last_observation
 
         # Check if target is confirmed for turn_at completion
-        confirmed_turn_at = (
-            tracker_state is not None
-            and tracker_state.estimated_world_xy is not None
-            and str(tracker_state.evidence_level) == "confirmed"
-            and bool(tracker_state.can_complete)
-        )
+        if bool(self._config.turn_at_complete_requires_confirmed_anchor):
+            confirmed_turn_at = (
+                tracker_state is not None
+                and tracker_state.estimated_world_xy is not None
+                and str(tracker_state.evidence_level) == "confirmed"
+                and bool(tracker_state.can_complete)
+                and int(getattr(tracker_state, "confirmed_observation_count", 0)) >= max(1, int(self._config.confirm_min_observations))
+                and float(getattr(tracker_state, "confirmed_confidence", 0.0)) >= float(self._config.confirm_confidence_threshold)
+            )
+        else:
+            confirmed_turn_at = (
+                tracker_state is not None
+                and tracker_state.estimated_world_xy is not None
+            )
 
         # Distance limit
         if confirmed_turn_at and tracker_state is not None:
             max_dist = max(0.5, float(self._config.turn_at_complete_max_distance_m))
             if tracker_state.anchor_distance_m is not None and float(tracker_state.anchor_distance_m) > max_dist:
+                self._logger.info(
+                    "[TurnAt] not_complete target=%s reason=too_far distance=%.2f max=%.2f evidence=%s",
+                    self._current_target_text(),
+                    float(tracker_state.anchor_distance_m),
+                    max_dist,
+                    str(getattr(tracker_state, "evidence_level", "unknown")),
+                )
                 confirmed_turn_at = False
 
         _, grounded_reason = self._current_grounded_visibility()
@@ -851,12 +869,23 @@ class OpenNavVLNPolicy:
         if (
             tracker_state is not None
             and tracker_observation is not None
-            and _is_fresh_grounded_observation(tracker_observation)
             and not confirmed_turn_at
         ):
+            not_confirmed_reasons = []
+            if str(getattr(tracker_state, "evidence_level", "none")) != "confirmed":
+                not_confirmed_reasons.append(f"evidence={tracker_state.evidence_level}")
+            if not bool(getattr(tracker_state, "can_complete", False)):
+                not_confirmed_reasons.append("can_complete=false")
+            obs_count = int(getattr(tracker_state, "confirmed_observation_count", 0))
+            if obs_count < max(1, int(self._config.confirm_min_observations)):
+                not_confirmed_reasons.append(f"obs={obs_count}")
+            conf = float(getattr(tracker_state, "confirmed_confidence", 0.0))
+            if conf < float(self._config.confirm_confidence_threshold):
+                not_confirmed_reasons.append(f"conf={conf:.2f}")
             self._logger.info(
-                "[TurnAt] potential target=%s confidence=%.2f source=%s anchor=%s action=continue_search",
+                "[TurnAt] not_complete target=%s reason=%s confidence=%.2f source=%s anchor=%s action=continue_search",
                 self._current_target_text(),
+                ",".join(not_confirmed_reasons) if not_confirmed_reasons else "unknown",
                 float(tracker_state.confidence) if tracker_state else 0.0,
                 str(getattr(tracker_observation, "semantic_source", "unknown")),
                 _format_optional_float(tracker_state.anchor_distance_m) if tracker_state else "none",
@@ -1576,6 +1605,8 @@ class OpenNavVLNPolicy:
             and str(map_entry.label).strip().lower() == self._current_target_text().strip().lower()
             and bool(map_entry.confirmed)
             and str(getattr(map_entry, "evidence_level", "confirmed")) == "confirmed"
+            and int(getattr(map_entry, "confirmed_observation_count", 0)) >= max(1, int(self._config.confirm_min_observations))
+            and float(getattr(map_entry, "confidence", 0.0)) >= float(self._config.confirm_confidence_threshold)
             and map_entry.anchor_distance_m is not None
             and self.current_behavior_type == "go_to"
         ):
@@ -1844,8 +1875,11 @@ def _ordered_landmarks(instruction_context: InstructionContext) -> list[str]:
 def _is_fresh_grounded_observation(observation) -> bool:
     return (
         bool(getattr(observation, "visible", False))
-        and str(getattr(observation, "reason", "")).strip().lower() in {"ok", "depth_invalid"}
+        and str(getattr(observation, "reason", "")).strip().lower() == "ok"
         and "reused" not in str(getattr(observation, "source", "")).strip().lower()
+        and bool(getattr(observation, "is_current_frame", True))
+        and getattr(observation, "depth_m", None) is not None
+        and getattr(observation, "estimated_world_xy", None) is not None
     )
 
 

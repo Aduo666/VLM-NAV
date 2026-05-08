@@ -1,33 +1,265 @@
-分析和方案：
+================================================================================
+VLM-NAV Phase 1 + Phase 2 改动汇总 + 问题分析
+日期: 2026-05-07
+================================================================================
 
-一、建图效果好
-当前 LiDAR 建图已经稳定，没有偏移。视野短是因为 PhysX 旋转扇区每帧只有 ~55°，靠历史合并拼到 ~110-165°。要进一步扩大视野可以增大 sector_merge_keep_sec（当前 1.5s），但会增加旧扇区的漂移风险。建议先不改，当前效果够用。
+一、改动汇总
+============
 
-二、误识别导致提前结束导航
-根因分析：到达 wheelchair 后，current_landmark 切到 stairs。GroundingSAM 误把画面中的某个区域（可能是轮椅本身或前景）识别成 stairs，confidence 超过阈值，LandmarkTracker 判定 stairs 已到达（depth 很浅），然后 route_complete。
+1. 核心：证据等级系统 (potential vs confirmed)
+---------------------------------------------
 
-关键链路：
-  wheelchair 到达 → target 切到 stairs → GroundingSAM 误检 stairs → tracker.reached=True → _advance_current_landmark → index 超限 → route_complete
+目标：防止低置信度/误检目标触发 route_complete，只允许经过多帧稳定确认的目标完成导航。
 
-去掉 GroundingSAM 的影响：
-- 好处：GroundingDINO 单独用 bbox 深度统计，不依赖 SAM mask，深度估计更保守，不容易把前景误判成近距离目标
-- 坏处：可能漏检一些目标
-- 建议：可以尝试去掉 SAM（target_grounding.backend 设成 "dino_only" 或类似），但更好的方案是加强到达判定的严格性
+新增 evidence_level 字段贯穿整个管线：
+  - "none": 未检测到
+  - "potential": 低置信度/Qwen来源/无深度 → 可见但不能触发完成
+  - "confirmed_candidate": DINO来源且有深度，但尚未累积足够帧数
+  - "confirmed": 已通过 N 帧一致性验证 → 可以触发到达判定和 route_complete
 
-三、置信度阈值机制
-用户提出的需求：confidence >= 0.9 才确认目标，否则作为潜在目标靠近。
+can_complete 门控：只有 confirmed + estimated_world_xy != None + confirmed_observation_count >= N 时才为 True。
 
-当前系统的问题：confidence 只要超过 min_confidence（0.50）就可以进入 tracker，tracker 的 reached 判定主要看 depth，不看 confidence。
 
-方案：
+2. 文件级改动详情
+-----------------
 
-| 改动 | 文件 | 说明 |
-|------|------|------|
-| 1. 到达判定加 confidence 门槛 | landmark_tracker.py | tracker.reached 只有在 confidence >= 0.85 时才允许。低于 0.85 的检测只更新 anchor 位置，不触发到达 |
-| 2. 增加"潜在目标"机制 | vln_policy.py / nav.py | 如果当前 landmark 的最高观测 confidence < 0.9，policy 不走 semantic planner 直接到达，而是以最高 confidence 的观测为方向线索，用 VLM 选择候选靠近。直到 confidence >= 0.9 才切换到直接到达模式 |
-| 3. 到达确认窗口加强 | vln_policy.py | _maybe_advance_landmark 的 confirmation_window 要求连续 N 次（如 3 次）都满足 confidence >= 0.85 + depth 在范围内，才允许推进 |
-| 4. 跨 landmark 防污染 | landmark_map.py | 已有 cross_label_guard，但还需要：如果当前检测的 bbox 和已到达 landmark 的 anchor 位置重叠（IoU > 0.3），拒绝该检测 |
-| 5. 可选：去掉 SAM | configs/default.yaml | 如果以上改动后仍有误识别，再尝试去掉 SAM。先不改，保留作为后备方案 |
+configs/default.yaml:
+  - landmark_tracker 新增 8 个配置项：
+    confirm_confidence_threshold: 0.90
+    potential_confidence_threshold: 0.50
+    confirm_min_observations: 3
+    confirm_max_anchor_jump_m: 0.50
+    confirm_max_depth_jump_m: 0.80
+    turn_at_complete_requires_confirmed_anchor: true
+    turn_at_complete_max_distance_m: 3.0
+    qwen_fallback_confirm_allowed: false
+  - target_grounding.sam_enabled: false  (禁用SAM)
 
-四、实现顺序建议
-先做第 3 项的改动 1 和 3（到达判定加 confidence 门槛 + 确认窗口加强），这两个改动最小、效果最直接。如果还有问题再加改动 2（潜在目标机制）和 4（跨 landmark 防污染）。最后才考虑去掉 SAM。
+src/vln_nav/runtime/config.py:
+  - AppConfig 新增所有上述配置字段的读取
+
+src/vln_nav/navigation/target_grounding.py:
+  - TargetObservation 新增: evidence_level, semantic_source, can_confirm
+  - TargetGroundingConfig 新增: qwen_fallback_confirm_allowed, sam_enabled
+  - _validate_original_bbox() 重大改动：
+    · DINO来源 → can_confirm=True; Qwen来源 → can_confirm=False
+    · 深度验证失败不再拒绝，返回 visible=True, depth_m=None, evidence_level="potential"
+    · 深度有效 → evidence_level="confirmed_candidate"(DINO) 或 "potential"(Qwen)
+  - 所有 copy/reuse/empty 函数同步更新新字段
+
+src/vln_nav/navigation/landmark_tracker.py:
+  - LandmarkState 新增 7 个字段：potential_world_xy, potential_confidence, confirmed_confidence,
+    confirmed_observation_count, last_confirmed_depth_m, evidence_level, can_complete
+  - LandmarkTrackerConfig 新增 6 个字段（对应 yaml 中的 confirm_* 系列）
+  - 新增 _PendingConfirmedCandidate 数据类
+  - update() 重写：
+    · 所有可见观测更新 potential_world_xy / potential_confidence
+    · 只有 high_conf + can_confirm + current_fresh + has_world 的观测进入确认流水线
+    · can_complete 由 estimated_world_xy + confirmed_observation_count >= N + evidence_level=="confirmed" 决定
+  - 新增 _try_confirm_candidate()：
+    · 累积一致性观测，检查 anchor jump / depth jump
+    · 达到 N 帧后写入 estimated_world_xy，evidence_level="confirmed"
+  - _update_reach_state()：
+    · 顶部增加 if not can_complete: return False
+    · visible_depth_reached 和 anchor_reached 均要求 can_complete
+
+src/vln_nav/navigation/landmark_map.py:
+  - LandmarkMapEntry 新增: confirmed_observation_count, evidence_level
+  - has_confirmed_anchor 条件：estimated_world_xy + can_complete + evidence_level=="confirmed" + map_anchor_allowed
+  - 存储 confirmed_confidence 而非被污染的 state.confidence
+
+src/vln_nav/navigation/vln_policy.py:
+  - OpenNavPolicyConfig 新增: turn_at_complete_max_distance_m
+  - _maybe_advance_landmark()：增加 and bool(tracker_state.can_complete) 条件
+  - _turn_at_step()：重写完成逻辑，只允许 confirmed + can_complete 的目标触发 turn_at 完成
+    · 增加距离上限检查
+    · 增加 potential target 日志
+  - _is_fresh_grounded_observation()：接受 reason in {"ok", "depth_invalid"}
+
+src/vln_nav/navigation/sam_segmenter.py:
+  - SamSegmenterConfig 新增: enabled: bool = True
+  - segment() 增加 early return: if not enabled → return None
+
+src/vln_nav/app/nav.py:
+  - 构造 TargetGroundingConfig 时传入 qwen_fallback_confirm_allowed, sam_enabled
+  - 构造 LandmarkTrackerConfig 时传入所有 confirm_* 字段
+  - 构造 OpenNavPolicyConfig 时传入 turn_at_complete_max_distance_m
+
+
+3. SAM 禁用
+-----------
+
+问题：SAM vit_h 模型约 2.4GB，加载到 GPU 导致 OOM → 回退 CPU → 每次调用 10-20秒，
+阻塞整个控制循环，车几乎不动。
+
+解决：configs/default.yaml 设置 sam_enabled: false，完全跳过 SAM。
+GroundingDINO 独立完成检测，深度估算回退到 bbox-based approach。
+
+
+4. depth_invalid 透传
+---------------------
+
+问题：GroundingDINO 检测到目标但深度验证（valid_ratio < 0.12）拒绝所有观测。
+
+解决：深度验证失败不再返回空观测，而是返回：
+  visible=True, depth_m=None, evidence_level="potential", reason="depth_invalid"
+机器人至少知道目标在视野中。tracker 的 fresh_visible 也更新为接受 reason="depth_invalid"。
+
+
+================================================================================
+
+二、问题分析
+============
+
+问题1：为什么直走的好好的会右转，ground在左边？
+--------------------------------------------
+
+### 可能原因分析
+
+(a) VLM决策覆盖grounding信号
+
+  决策流程：
+  1. GroundingDINO 检测目标 → 得到 bbox center_uv → 计算 bearing_rad
+  2. VLM reasoner 接收带标注的图像 + 候选列表
+  3. VLM 选择一个 candidate → 得到 selected_action
+  4. 如果 VLM 返回 selected_action="TURN_RIGHT"，即使 grounding 显示目标在左边，
+     最终执行的仍然是 TURN_RIGHT
+
+  代码位置：vln_policy.py L568-579
+  action_name 优先级：route_corrected > decision.selected_action > _candidate_to_primitive_action()
+  VLM 的 selected_action 会直接覆盖 candidate 自身的 heading 推断。
+
+  VLM 看到的图像可能与 grounding bbox 不一致：
+  - 图像中目标可能在右侧（相机视角）
+  - grounding bbox 可能标记在左侧（可能是旧帧或坐标映射问题）
+
+(b) Grounding结果与VLM图像的时间差
+
+  GroundingDINO 是异步执行的（ThreadPoolExecutor），返回结果可能延迟 1-2秒。
+  收集结果时使用 _collect_finished_request()，得到的是之前的帧的检测结果。
+  而 VLM reasoner 看到的是当前帧的图像。
+  如果机器人在这段时间内已经转向，grounding 的 bearing 可能已经过时。
+
+  关键日志需要关注：
+  - [Grounding] 日志中的 bearing_deg 和 bbox 位置
+  - [PrimitiveDecision] 日志中的 action 和 semantic_visible
+  - 结果中的 result_age_sec 和 is_current_frame
+
+(c) ReacquireGuard 可能干扰
+
+  如果目标刚从视野中消失，ReacquireGuard 会禁止重复之前的转向方向。
+  如果之前执行了 TURN_LEFT，目标消失后，Guard 会禁止 TURN_LEFT，
+  即使目标最后一次出现在左边，也可能被迫选择 TURN_RIGHT。
+
+  代码位置：vln_policy.py L1224-1244
+  如果 guard.lost_after_visible=True 且 selected == guard.forbidden_action，
+  会覆盖为 STOP 或 reacquire_guard_override_action（默认"STOP"）。
+
+(d) Occupancy grid 语义规划器干扰
+
+  如果 semantic_planner_enabled=true，语义规划器可能基于占据栅格计算出一条
+  绕过障碍物的路径，该路径可能向右绕行，即使目标在左边。
+
+  代码位置：vln_policy.py L655-735 (_semantic_planner_step)
+  语义规划器优先级高于 VLM reasoner，会直接覆盖决策。
+
+### 排查建议
+
+  1. 查看运行日志中的 [PrimitiveDecision] 行，确认 action 来源（LLM_PRIMITIVE / SEMANTIC_LOCAL_PLANNER / REACQUIRE_GUARD）
+  2. 对比 [Grounding] 日志中的 bearing_deg 和最终执行的 action
+  3. 检查 [ReacquireGuard] 日志是否有 override
+  4. 检查 [SemanticPlanner] 日志是否触发了语义路径规划
+  5. 如果 grounding bbox 在图像左侧但 VLM 选了右侧候选，
+     可能是 VLM 的 prompt 中对 left/right candidate 的描述不够清晰
+
+
+问题2：阈值不够的目标会有记忆吗？视野消失后为什么朝着更低置信度去了？
+----------------------------------------------------------------
+
+### 问题根因
+
+当前实现中，只有 evidence_level="confirmed" 的目标才会写入 LandmarkMap（持久记忆）。
+
+代码位置：landmark_map.py L86-91
+```python
+has_confirmed_anchor = (
+    state.estimated_world_xy is not None
+    and bool(state.can_complete)
+    and str(state.evidence_level) == "confirmed"
+    and bool(map_anchor_allowed)
+)
+```
+
+对于 potential 级别的目标：
+- state.estimated_world_xy 不会更新（只有 confirmed 流水线才会写入）
+- state.potential_world_xy 会更新，但 LandmarkMap 不读取它
+- 目标离开视野后，LandmarkMap 中没有该目标的条目
+- VLM 只能靠 target_memory（历史文本描述）和 last_seen_bearing_hint 来搜索
+
+### 具体流程
+
+1. 目标A（置信度0.75，DINO来源）被检测到
+   → evidence_level="confirmed_candidate"（高置信度+DINO+有深度）
+   → 但需要3帧一致性才能 confirmed
+   → 只看了1-2帧，还没来得及确认
+
+2. 目标A离开视野
+   → state.lost_count 增加
+   → state.evidence_level 仍为 "confirmed_candidate" 或 "potential"
+   → LandmapMap 不创建条目（因为 can_complete=False）
+
+3. 机器人继续搜索，遇到目标B（置信度0.55，也在视野中）
+   → 目标B 是另一个物体，被 VLM 误认为目标
+   → VLM 选择了朝目标B移动的候选
+
+4. 结果：机器人忘记了之前看到的目标A，转向了更低置信度的目标B
+
+### 核心缺陷
+
+- potential_world_xy 有位置信息，但不参与 LandmarkMap 和导航决策
+- VLM reasoner 只能看到当前帧的 grounding 结果 + 文本形式的 target_memory
+- 没有"我之前在左边看到过目标"这种几何记忆传给 VLM
+
+### 可能的改进方向
+
+方向A：将 potential 目标也写入 LandmarkMap（标记为 potential）
+  - LandmarkMap 新增 potential_entries
+  - VLM prompt 中增加 potential target 的位置信息
+  - 风险：低置信度目标可能干扰导航
+
+方向B：在 target_memory 中增加几何位置信息
+  - 不改 LandmarkMap，而是在 _combined_target_memory_text() 中
+    加入 potential_world_xy 和 bearing 信息
+  - VLM prompt: "potential target last seen at bearing=left, distance=3.2m"
+  - 风险较低，但 VLM 是否能有效利用这些信息不确定
+
+方向C：降低 confirm_min_observations 到 1-2
+  - 让高置信度目标更快达到 confirmed 状态
+  - 代价：可能增加误确认的风险
+  - 当前阈值 confirm_confidence_threshold=0.90 已经很高，
+    配合 confirm_min_observations=2 可能是合理的折中
+
+方向D：在 _turn_at_step 和 _maybe_advance_landmark 中增加 potential 搜索逻辑
+  - 如果当前没有 confirmed 目标，但有 potential 目标的位置信息，
+    可以尝试朝那个方向搜索
+  - 这不需要改 LandmarkMap，只需在 policy 层面利用 potential_world_xy
+
+### 建议优先级
+
+1. 先做方向B（最小改动，增加几何记忆文本）
+2. 如果效果不够，做方向D（policy层面利用potential位置）
+3. 方向C（降低确认帧数）可以同时尝试
+4. 方向A（potential写入LandmarkMap）改动最大，最后考虑
+
+================================================================================
+
+三、待验证事项
+==============
+
+1. 确认 SAM 禁用后 GroundingDINO 的检测质量是否足够
+2. 确认 depth_invalid 透传不会导致大量噪声观测干扰 tracker
+3. 观察 confirmed 确认流水线在实际运行中的收敛速度
+4. 收集 turn 方向错误的具体日志，定位是 VLM 问题还是坐标问题
+5. 测试 potential 目标丢失后的实际行为
+
+================================================================================

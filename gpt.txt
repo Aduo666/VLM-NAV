@@ -1,75 +1,173 @@
-这个计划方向是对的，可以做。但有几处需要先修正，否则 mimo 实现后还会出现“误完成”或“永远不完成”。
+把下面这段直接发给 mimo。重点是：**只补 P1/P2 的收口问题，不扩展新功能。**
 
-**必须修正的点**
-1. `qwen_fallback_confirm_allowed` 不能只放在 `LandmarkTrackerConfig`。  
-因为 `can_confirm` 是在 `target_grounding.py` 里生成 `TargetObservation` 时决定的，所以这个字段必须传进 `TargetGroundingConfig`，否则 `target_grounding.py` 读不到。
-
-2. `vln_policy.py` 不要重复判断一堆阈值。  
-更稳的做法是让 `LandmarkTracker` 输出统一结论：`state.can_complete`。  
-`vln_policy.py` 只看：
-```python
-tracker_state.can_complete
-tracker_state.evidence_level == "confirmed"
-tracker_state.anchor_distance_m <= turn_at_complete_max_distance_m
-```
-否则阈值会在 tracker / map / policy 三处重复，后面很难调。
-
-3. `state.confidence = observation.confidence if visible else state.confidence` 有风险。  
-如果已经 confirmed，后面来一个低置信 potential，会把 confirmed confidence 降低。  
-建议改成两个字段：
-```python
-potential_confidence
-confirmed_confidence
-```
-如果不想新增字段，那就规定 `state.confidence` 只代表 confirmed confidence，potential 用 `potential_confidence`。
-
-4. confirmed 累计必须只统计 fresh 当前帧观测。  
-条件里要加：
-```python
-observation.is_current_frame
-"reused" not in observation.source
-observation.reason == "ok"
-```
-否则旧帧结果或复用结果会累计成 confirmed。
-
-5. `LandmarkMap` 不要自己重新判断所有阈值。  
-建议只接受：
-```python
-state.can_complete == True
-state.evidence_level == "confirmed"
-state.estimated_world_xy is not None
-```
-然后把 `confirmed_observation_count` 和 `evidence_level` 存进去。这样 map 不会和 tracker 判断不一致。
-
-6. `turn_at_complete_max_distance_m: 3.0` 可以保留，但不是主要保护。  
-之前误完成时距离是 `2.03m`，如果只加距离上限依然会完成。真正关键是：Qwen fallback 不能 confirm，以及必须多帧 confirmed。
-
-7. 这个计划还没有真正处理“视野里出现两个 landmark”。  
-当前系统一次只 grounding 当前目标，所以不会同时检测多个 landmark。短期可以接受，因为 route index 限制当前目标；长期如果要处理多 landmark，需要新增 multi-target grounding。现在先别做，避免扩大范围。
-
-**我建议的修正版**
-- `target_grounding.py` 负责输出 `potential / confirmed_candidate` 和 `can_confirm`。
-- `LandmarkTracker` 负责把 confirmed_candidate 累计成真正 `confirmed`。
-- `LandmarkMap` 只写入 `state.can_complete=True` 的 confirmed landmark。
-- `vln_policy` 只允许 `can_complete=True` 的 landmark 推进 route。
-- SAM 保留，但只做 mask/depth，不参与语义确认。
-
-**关于 GroundingSAM**
-先不要删。当前误识别主要来自 Qwen bbox 或 grounding 语义本身，SAM 只是接着这个 bbox 做分割和深度。正确处理是：`qwen_vl_bbox + sam_vit_h` 仍然只能是 `potential`，不能触发 route complete。
-
-**可以让 mimo 开始改，但要加这条硬约束**
-所有能触发 `[Landmark] reached=... route=complete` 的路径，必须经过：
-```python
-tracker_state.can_complete == True
-```
-
-如果日志里没有出现：
 ```text
+请基于当前版本只做 P1/P2 收口修复，不改 controller、不改候选点数量、不改地图、不改 recovery、不改 prompt 主逻辑。
+
+目标：让 potential / confirmed / can_complete 这套机制真正闭环，避免低置信、无深度、Qwen fallback 或 turn_at 误判导致 landmark 提前完成。
+
+需要补 6 个点：
+
+1. 让 potential_confidence_threshold 真正生效
+
+文件：
+src/vln_nav/navigation/landmark_tracker.py
+
+现在 potential_confidence_threshold 配了但没有真正过滤 potential 更新。
+
+修改要求：
+只有满足以下条件时才允许更新 potential_world_xy：
+
+- observation.visible == True
+- observation.reason == "ok"
+- observation.is_current_frame == True
+- observation.estimated_world_xy is not None
+- observation.depth_m is not None
+- observation.confidence >= config.potential_confidence_threshold
+
+如果不满足，不能更新 potential_world_xy，也不能更新 potential_confidence。
+
+建议增加日志：
+[LandmarkPotentialReject] target=... reason=low_confidence/depth_invalid/stale/no_world_xy confidence=...
+
+2. depth_invalid 不能进入策略正反馈
+
+文件：
+src/vln_nav/navigation/landmark_tracker.py
+src/vln_nav/navigation/vln_policy.py
+
+现在 depth_invalid 会被当作 visible/potential 使用，虽然不能 confirmed，但仍可能误导策略。
+
+修改要求：
+target_grounding 可以继续返回 reason="depth_invalid" 的 observation，方便 debug。
+但 tracker 和 policy 中：
+
+- depth_invalid 不能更新 potential anchor
+- depth_invalid 不能增加 confirmed candidate count
+- depth_invalid 不能触发 reached
+- depth_invalid 不能被 _is_fresh_grounded_observation() 认为是可用于决策的 fresh target
+
+也就是说，vln_policy.py 里的 _is_fresh_grounded_observation() 只接受：
+
+reason == "ok"
+visible == True
+is_current_frame == True
+depth_m is not None
+estimated_world_xy is not None
+
+不要再把 "depth_invalid" 放进 fresh observation 集合。
+
+3. 统一 qwen_fallback_confirm_allowed 配置来源
+
+文件：
+configs/default.yaml
+src/vln_nav/runtime/config.py
+src/vln_nav/app/nav.py
+src/vln_nav/navigation/target_grounding.py
+src/vln_nav/navigation/landmark_tracker.py
+
+现在 qwen_fallback_confirm_allowed 在 grounding 和 tracker 之间容易漂移。
+
+修改要求：
+以 target_grounding.qwen_fallback_confirm_allowed 作为唯一有效来源。
+
+configs/default.yaml 中放在：
+
+target_grounding:
+  qwen_fallback_confirm_allowed: false
+
+runtime/config.py 只读取这一份。
+
+nav.py 把这个值传给 TargetGroundingConfig。
+
+LandmarkTracker 不应该再自己决定 Qwen 是否能 confirm；它只看 observation.can_confirm。
+
+如果 LandmarkTrackerConfig 里还保留 qwen_fallback_confirm_allowed 字段，请标记为 deprecated 或删除，避免两个开关不一致。
+
+验收标准：
+Qwen bbox 默认只能 evidence_level="potential"，can_confirm=False。
+GroundingDINO bbox 才能 can_confirm=True。
+
+4. turn_at_complete_requires_confirmed_anchor 不能是死配置
+
+文件：
+src/vln_nav/navigation/vln_policy.py
+src/vln_nav/app/nav.py
+src/vln_nav/runtime/config.py
+
+现在 turn_at_complete_requires_confirmed_anchor 配了，但策略里是硬编码行为。
+
+修改要求：
+OpenNavPolicyConfig 增加：
+
+turn_at_complete_requires_confirmed_anchor: bool = True
+
+nav.py 从 AppConfig 传入。
+
+_turn_at_step() 中显式使用这个配置。
+
+默认 true 时：
+turn_at 只能在 tracker_state 满足以下条件时完成：
+
+- tracker_state.evidence_level == "confirmed"
+- tracker_state.can_complete == True
+- tracker_state.estimated_world_xy is not None
+- tracker_state.confirmed_observation_count >= confirm_min_observations
+- tracker_state.confidence 或 confirmed_confidence >= confirm_confidence_threshold
+- anchor_distance_m <= turn_at_complete_max_distance_m
+
+如果是 potential，只能继续搜索或继续 turn_at，不能 advance landmark。
+
+完成日志必须包含：
+[TurnAt] complete target=... reason=confirmed_anchor confidence=... obs=... distance=...
+
+如果没完成，日志必须包含：
+[TurnAt] not_complete target=... reason=potential/not_confirmed/too_far/no_anchor ...
+
+5. LandmarkMap 距离 fallback 也要检查确认质量
+
+文件：
+src/vln_nav/navigation/vln_policy.py
+src/vln_nav/navigation/landmark_map.py
+
+虽然 LandmarkMap 已经只写 confirmed entry，但 vln_policy 中的距离 fallback 还要再加一层保险。
+
+go_to 的 LandmarkMap fallback 到达条件必须同时满足：
+
+- map_entry.confirmed == True
+- map_entry.evidence_level == "confirmed"
+- map_entry.confirmed_observation_count >= confirm_min_observations
+- map_entry.confidence >= confirm_confidence_threshold
+- distance <= reach_threshold
+
+不要只凭 map_entry 存在和距离近就 advance landmark。
+
+6. 增加 P1/P2 验收日志
+
+文件：
+src/vln_nav/navigation/landmark_tracker.py
+src/vln_nav/navigation/vln_policy.py
+
+日志不要太多，但关键路径必须清楚。
+
+每次 landmark 状态更新时输出一条摘要：
+
+[LandmarkState] target=... visible=... evidence=... can_confirm=... confirmed_obs=... can_complete=... potential_xy=... confirmed_xy=... depth=... confidence=...
+
+每次拒绝 confirmed 时输出：
+
+[LandmarkConfirmReject] target=... reason=... confidence=... depth=... source=...
+
+每次到达判定时输出：
+
+[ReachCheck] target=... behavior=... reached=... can_complete=... distance=... depth=... reason=...
+
+route_complete 前必须能在日志里看到对应 landmark 的：
+
 evidence=confirmed
-can_complete=1
-confirmed_obs>=3
+can_complete=True
+confirmed_obs >= confirm_min_observations
+
+不要出现 potential 或 depth_invalid 直接导致 route_complete。
 ```
-就绝不能出现：
-```text
-route_complete=1
-```
+
+我的判断是，mimo 按这 6 点补完后，P1/P2 才算真正收口。现在这版“结构搭起来了”，但还有几个字段没有真正参与决策，所以容易继续出现“看到了但没确认 / 误确认 / turn_at 提前完成”的问题。

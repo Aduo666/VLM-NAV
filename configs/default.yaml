@@ -107,7 +107,6 @@ landmark_tracker:
   confirm_max_depth_jump_m: 0.80
   turn_at_complete_requires_confirmed_anchor: true
   turn_at_complete_max_distance_m: 3.0
-  qwen_fallback_confirm_allowed: false
   reacquire_guard_enabled: true
   reacquire_guard_recent_visible_sec: 20.0
   reacquire_guard_override_action: "STOP"

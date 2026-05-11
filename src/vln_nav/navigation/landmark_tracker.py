@@ -52,7 +52,7 @@ class LandmarkTrackerConfig:
     anchor_update_min_consistent_observations: int
     anchor_update_max_jump_m: float
     arrival_window_size: int
-    confirm_confidence_threshold: float = 0.90
+    confirm_confidence_threshold: float = 0.50
     confirm_min_observations: int = 3
     confirm_max_anchor_jump_m: float = 0.50
     confirm_max_depth_jump_m: float = 0.80

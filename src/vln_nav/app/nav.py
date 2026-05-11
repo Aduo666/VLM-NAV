@@ -18,8 +18,8 @@ from ..control.controller import (
 from ..navigation.candidate_waypoint_predictor import CandidateWaypointPredictor, CandidateWaypointPredictorConfig
 from ..navigation.depth_safety import DepthSafetyConfig, DepthSafetyMonitor
 from ..navigation.instruction_manager import InstructionManager
-from ..navigation.landmark_map import LandmarkMap, LandmarkMapConfig
-from ..navigation.landmark_tracker import LandmarkTracker, LandmarkTrackerConfig
+from ..navigation.landmark_map import LandmarkMap, LandmarkMapConfig, LandmarkMapEntry
+from ..navigation.landmark_tracker import LandmarkState, LandmarkTracker, LandmarkTrackerConfig
 from ..navigation.lidar_sensor import (
     MultiLidarConfig,
     MultiLidarReader,
@@ -991,7 +991,14 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
             policy.set_landmark_state(None)
             policy.set_landmark_map_entry(None)
             policy.set_landmark_map_summary("")
-        policy.set_all_landmark_map_entries(landmark_map.entries())
+        # Merge confirmed landmarks with current detection overlays
+        all_entries = list(landmark_map.entries())
+        detection_entries = _collect_detection_entries(
+            landmark_state=landmark_state if current_landmark else None,
+            timestamp_sec=sim_time_sec,
+        )
+        all_entries.extend(detection_entries)
+        policy.set_all_landmark_map_entries(all_entries)
 
         topological_memory.update(
             robot_pose=observation.pose,
@@ -1251,6 +1258,43 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
 
     target_grounder.close()
     debug_video_recorder.close()
+
+
+def _collect_detection_entries(
+    *,
+    landmark_state: LandmarkState | None,
+    timestamp_sec: float,
+) -> list[LandmarkMapEntry]:
+    """Convert potential tracker observations into detection overlays for the map."""
+    if landmark_state is None:
+        return []
+    state = landmark_state
+    # Only show detections that have a potential world position and are not confirmed
+    world_xy = state.potential_world_xy or state.candidate_world_xy
+    if world_xy is None:
+        return []
+    if str(state.evidence_level) == "confirmed":
+        return []  # confirmed entries already come from LandmarkMap
+    obs = state.last_observation
+    return [LandmarkMapEntry(
+        label=str(state.label),
+        behavior_type=str(state.behavior_type),
+        world_xy=[float(world_xy[0]), float(world_xy[1])],
+        confidence=float(state.potential_confidence),
+        first_seen_time_sec=float(state.last_seen_time_sec or timestamp_sec),
+        last_seen_time_sec=float(state.last_seen_time_sec or timestamp_sec),
+        update_count=0,
+        status="detection",
+        source=str(state.potential_source) if state.potential_source != "unknown" else "tracker",
+        depth_m=None if obs is None else obs.depth_m,
+        bbox=state.potential_bbox,
+        anchor_distance_m=float(state.anchor_distance_m) if state.anchor_distance_m is not None else None,
+        robot_forward_m=None,
+        robot_left_m=None,
+        reached=False,
+        confirmed_observation_count=0,
+        evidence_level="detection",
+    )]
 
 
 def _load_environment(*, stage, add_reference_to_stage, config: AppConfig, logger) -> bool:

@@ -1,9 +1,9 @@
 sim:
-  headless: false
+  headless: true
   width: 1280
   height: 720
-  active_gpu: 1
-  physics_gpu: 1
+  active_gpu: 0
+  physics_gpu: 0
   multi_gpu: false
   physics_dt: 0.0166667
   rendering_dt: 0.0166667
@@ -19,7 +19,7 @@ llm:
   camera_image_detail: "high"
 
 opennav:
-  instruction: "go forward to the vending machine, then turn left toward the stairs"
+  instruction: "向前走找到轮椅，然后向右绕过轮椅之后向左前进，再直走找到楼梯"
   instruction_preparse_enabled: true
   instruction_preparse_max_tokens: 384
   candidate_slot_bearings_deg: [75.0, 35.0, 0.0, -35.0, -75.0]
@@ -75,12 +75,12 @@ target_grounding:
   grounding_dino_repo_path: "third_party/GroundingDINO"
   grounding_dino_config_path: "weights/grounded_sam/GroundingDINO_SwinT_OGC.py"
   grounding_dino_checkpoint_path: "weights/grounded_sam/groundingdino_swint_ogc.pth"
-  grounding_dino_device: "cuda:1"
+  grounding_dino_device: "cuda:0"
   grounding_dino_box_threshold: 0.45
   grounding_dino_text_threshold: 0.25
   sam_checkpoint_path: "weights/grounded_sam/sam_vit_h_4b8939.pth"
   sam_model_type: "vit_h"
-  sam_device: "cuda:1"
+  sam_device: "cuda:0"
   sam_enabled: false
   sam_min_mask_area_ratio: 0.0005
   max_result_age_sec: 2.0
@@ -100,7 +100,7 @@ landmark_tracker:
   landmark_map_anchor_ttl_sec: 120.0
   landmark_map_min_confidence: 0.20
   landmark_map_log_period_sec: 2.0
-  confirm_confidence_threshold: 0.90
+  confirm_confidence_threshold: 0.50
   potential_confidence_threshold: 0.50
   confirm_min_observations: 3
   confirm_max_anchor_jump_m: 0.50

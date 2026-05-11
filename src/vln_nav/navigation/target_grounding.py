@@ -166,6 +166,8 @@ class TargetGrounder:
         frame_index: int = -1,
     ) -> TargetObservation:
         target_label = str(target_label).strip() or "target"
+        if target_label.lower() in {"none", "null", "unknown", "n/a", "na", "target", "object", "thing", "place", "location"}:
+            return _empty_observation(target_label=target_label, timestamp_sec=timestamp_sec, reason="invalid_label")
         wall_time_sec = time.monotonic()
         completed_observation = self._collect_finished_request(
             timestamp_sec=timestamp_sec,

@@ -57,7 +57,7 @@ class OpenNavPolicyConfig:
     turn_at_complete_max_distance_m: float = 3.0
     turn_at_complete_requires_confirmed_anchor: bool = True
     confirm_min_observations: int = 3
-    confirm_confidence_threshold: float = 0.90
+    confirm_confidence_threshold: float = 0.50
 
 
 @dataclass
@@ -997,26 +997,40 @@ class OpenNavVLNPolicy:
     def _semantic_landmark_entry(self) -> LandmarkMapEntry | None:
         if self.current_behavior_type != "go_to":
             return None
+        current_target = self._current_target_text().strip().lower()
+        if not current_target or current_target in {"none", "null", "unknown", "n/a", "na", "target", "object", "thing", "place", "location"}:
+            return None
         if self._landmark_map_entry is not None and bool(self._landmark_map_entry.world_xy):
             return self._landmark_map_entry
         state = self._landmark_tracker_state
-        if state is None or not bool(state.candidate_world_xy):
+        if state is None:
             return None
-        observation = state.last_observation
-        if observation is None or not bool(observation.visible):
+        # Semantic planner only chases confirmed anchors, not detections/potential
+        if str(state.evidence_level) != "confirmed" or not bool(state.can_complete):
+            if state.potential_world_xy is not None or state.candidate_world_xy is not None:
+                obs_source = "unknown"
+                if state.last_observation is not None:
+                    obs_source = str(getattr(state.last_observation, "semantic_source", "unknown"))
+                self._logger.info(
+                    "[SemanticPlanner] skip target=%s evidence=%s can_complete=%s source=%s reason=not_confirmed",
+                    state.label, state.evidence_level, int(bool(state.can_complete)), obs_source,
+                )
+            return None
+        world_xy = state.estimated_world_xy
+        if world_xy is None:
             return None
         return LandmarkMapEntry(
             label=str(state.label),
             behavior_type=str(state.behavior_type),
-            world_xy=[float(state.candidate_world_xy[0]), float(state.candidate_world_xy[1])],
-            confidence=float(state.confidence),
+            world_xy=[float(world_xy[0]), float(world_xy[1])],
+            confidence=float(state.confirmed_confidence),
             first_seen_time_sec=float(state.last_seen_time_sec or 0.0),
             last_seen_time_sec=float(state.last_seen_time_sec or 0.0),
             update_count=0,
-            status=f"{state.status}_candidate",
-            source="LandmarkTracker.candidate_anchor",
-            depth_m=None if observation is None else observation.depth_m,
-            bbox=None if observation is None else observation.bbox,
+            status=f"{state.status}_confirmed",
+            source="LandmarkTracker.confirmed",
+            depth_m=state.last_confirmed_depth_m,
+            bbox=None if state.last_observation is None else state.last_observation.bbox,
             anchor_distance_m=float(state.anchor_distance_m) if state.anchor_distance_m is not None else None,
             robot_forward_m=None,
             robot_left_m=None,
@@ -1855,19 +1869,30 @@ def _find_candidate(candidate_set: CandidateSet, slot_id: int | None) -> Waypoin
     return None
 
 
+_INVALID_LANDMARKS: set[str] = {
+    "none", "null", "unknown", "n/a", "na", "target", "object", "thing",
+    "place", "location", "area", "destination", "goal", "",
+}
+
+
+def _is_valid_landmark(label: str) -> bool:
+    text = str(label).strip().lower()
+    return bool(text) and text not in _INVALID_LANDMARKS and len(text) >= 2
+
+
 def _ordered_landmarks(instruction_context: InstructionContext) -> list[str]:
     ordered: list[str] = []
     for route_step in getattr(instruction_context, "route_steps", []) or []:
         landmark = str(getattr(route_step, "landmark", "")).strip().lower()
-        if landmark and landmark not in ordered:
+        if _is_valid_landmark(landmark) and landmark not in ordered:
             ordered.append(landmark)
     for raw_landmark in instruction_context.landmarks:
         landmark = str(raw_landmark).strip().lower()
-        if landmark and landmark not in ordered:
+        if _is_valid_landmark(landmark) and landmark not in ordered:
             ordered.append(landmark)
     if not ordered:
         fallback = str(instruction_context.goal_phrase or instruction_context.normalized_text).strip()
-        if fallback:
+        if fallback and _is_valid_landmark(fallback):
             ordered.append(fallback)
     return ordered
 

@@ -283,9 +283,18 @@ class NavigationMapVisualizer:
     ) -> None:
         for entry in entries:
             x, y = transform.to_px(float(entry.world_xy[0]), float(entry.world_xy[1]))
-            color = (70, 220, 120) if bool(entry.reached) else (255, 190, 55)
-            draw.ellipse((x - 10, y - 10, x + 10, y + 10), fill=color, outline=(255, 255, 255), width=2)
-            draw.text((x + 13, y - 10), f"{entry.label} {entry.status}", fill=color)
+            evidence = str(getattr(entry, "evidence_level", "")).strip().lower()
+            if bool(entry.reached):
+                color = (70, 220, 120)
+                radius = 11
+            elif evidence == "confirmed":
+                color = (255, 190, 55)
+                radius = 10
+            else:
+                color = (190, 120, 255)
+                radius = 8
+            draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=color, outline=(255, 255, 255), width=2)
+            draw.text((x + 13, y - 10), f"{entry.label} {entry.status} {entry.confidence:.2f}", fill=color)
 
     def _draw_goal(self, *, draw: ImageDraw.ImageDraw, transform: "_MapTransform", step_result, robot_pose: Pose2D) -> None:
         if step_result.world_goal_xy is None:
@@ -317,7 +326,7 @@ class NavigationMapVisualizer:
             f"landmark={step_result.current_landmark or 'none'} completed={step_result.completed_landmarks}",
             f"policy={step_result.action_name} executed={executed_action} source={step_result.decision_source}",
             f"odom=({pose.x:.2f},{pose.y:.2f}) yaw={np.degrees(pose.yaw_rad):+.1f}deg",
-            "cyan=trajectory/robot yellow=active goal orange=landmark green=reached red=LiDAR occupancy gray=depth fallback",
+            "cyan=trajectory/robot yellow=active goal purple=potential orange=confirmed green=reached red=LiDAR occupancy",
         ]
         line_height = 18
         box_h = 12 + len(lines) * line_height

@@ -111,7 +111,7 @@ class AppConfig:
     landmark_tracker_max_lost_count: int = 6
     landmark_tracker_anchor_update_min_consistent_observations: int = 2
     landmark_tracker_anchor_update_max_jump_m: float = 1.5
-    landmark_tracker_confirm_confidence_threshold: float = 0.90
+    landmark_tracker_confirm_confidence_threshold: float = 0.50
     landmark_tracker_potential_confidence_threshold: float = 0.50
     landmark_tracker_confirm_min_observations: int = 3
     landmark_tracker_confirm_max_anchor_jump_m: float = 0.50
@@ -700,7 +700,7 @@ def load_config(config_path: str | None = None) -> AppConfig:
         ),
         landmark_tracker_confirm_confidence_threshold=_float_env_or_value(
             "LANDMARK_TRACKER_CONFIRM_CONFIDENCE_THRESHOLD",
-            landmark_tracker.get("confirm_confidence_threshold", 0.90),
+            landmark_tracker.get("confirm_confidence_threshold", 0.50),
         ),
         landmark_tracker_potential_confidence_threshold=_float_env_or_value(
             "LANDMARK_TRACKER_POTENTIAL_CONFIDENCE_THRESHOLD",

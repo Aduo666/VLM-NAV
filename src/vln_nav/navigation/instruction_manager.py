@@ -136,6 +136,7 @@ def _heuristic_parse(*, raw_text: str, normalized: str) -> InstructionContext:
         for clause in actions
         if re.search(r"\b(left|right|forward|backward|back|straight|ahead|through|past|toward|to|into)\b", clause, flags=re.IGNORECASE)
     ]
+    landmarks = [lm for lm in landmarks if _is_valid_landmark(lm)]
     route_steps = _heuristic_route_steps(actions=actions, landmarks=landmarks, normalized=normalized)
     goal_phrase = route_steps[0].landmark if route_steps else (landmarks[0] if landmarks else normalized)
     instruction_id = re.sub(r"[^a-z0-9]+", "-", normalized.lower()).strip("-") or "instruction"
@@ -167,11 +168,16 @@ def _context_from_payload(
     actions = _normalize_text_list(payload.get("actions")) or list(fallback.actions)
     landmarks = _normalize_text_list(payload.get("landmarks")) or list(fallback.landmarks)
     directional_clauses = _normalize_text_list(payload.get("directional_clauses")) or list(fallback.directional_clauses)
-    route_steps = _normalize_route_steps(payload.get("route_steps"))
+    route_steps, extra_directionals = _normalize_route_steps(payload.get("route_steps"))
+    if extra_directionals:
+        for d in extra_directionals:
+            if d not in directional_clauses:
+                directional_clauses.append(d)
     if not route_steps:
         route_steps = _heuristic_route_steps(actions=actions, landmarks=landmarks, normalized=normalized)
     if not landmarks:
         landmarks = [step.landmark for step in route_steps if step.landmark]
+    landmarks = [lm for lm in landmarks if _is_valid_landmark(lm)]
     landmarks = _dedupe_keep_order(landmarks)
     if not actions:
         actions = [step.directive for step in route_steps if step.directive]
@@ -234,7 +240,7 @@ def _heuristic_route_steps(*, actions: list[str], landmarks: list[str], normaliz
     if not actions and not landmarks:
         return [RouteStep(landmark=normalized, directive=normalized, behavior_type="go_to")]
     steps: list[RouteStep] = []
-    remaining_landmarks = list(landmarks)
+    remaining_landmarks = [lm for lm in landmarks if _is_valid_landmark(lm)]
     for clause in actions:
         clause_lower = clause.lower()
         clause_landmark = ""
@@ -246,16 +252,21 @@ def _heuristic_route_steps(*, actions: list[str], landmarks: list[str], normaliz
             clause_landmark = remaining_landmarks[0]
         if clause_landmark in remaining_landmarks:
             remaining_landmarks.remove(clause_landmark)
-        if clause_landmark:
+        behavior = _infer_behavior_type(str(clause))
+        # turn_at with no valid landmark → skip (becomes directional only)
+        if behavior == "turn_at" and not _is_valid_landmark(clause_landmark):
+            continue
+        if _is_valid_landmark(clause_landmark):
             steps.append(
                 RouteStep(
                     landmark=clause_landmark,
                     directive=str(clause).strip(),
-                    behavior_type=_infer_behavior_type(str(clause)),
+                    behavior_type=behavior,
                 )
             )
     for landmark in remaining_landmarks:
-        steps.append(RouteStep(landmark=landmark, directive=f"go to the {landmark}", behavior_type="go_to"))
+        if _is_valid_landmark(landmark):
+            steps.append(RouteStep(landmark=landmark, directive=f"go to the {landmark}", behavior_type="go_to"))
     if not steps and normalized:
         steps.append(RouteStep(landmark=normalized, directive=normalized, behavior_type="go_to"))
     return steps
@@ -283,10 +294,16 @@ def _normalize_text_list(value) -> list[str]:
     return _dedupe_keep_order(result)
 
 
-def _normalize_route_steps(value) -> list[RouteStep]:
+def _normalize_route_steps(value) -> tuple[list[RouteStep], list[str]]:
+    """Return (valid_steps, extracted_directional_clauses).
+
+    turn_at steps with invalid landmarks are converted to directional
+    clauses rather than route steps.
+    """
     if not isinstance(value, list):
-        return []
+        return [], []
     steps: list[RouteStep] = []
+    extracted_directionals: list[str] = []
     for item in value:
         if not isinstance(item, dict):
             continue
@@ -301,8 +318,27 @@ def _normalize_route_steps(value) -> list[RouteStep]:
             landmark = directive.lower()
         if not directive:
             directive = f"go to the {landmark}"
+        # turn_at with invalid landmark → convert to directional clause
+        if behavior_type == "turn_at" and not _is_valid_landmark(landmark):
+            if directive and directive not in extracted_directionals:
+                extracted_directionals.append(directive)
+            continue
+        # skip steps with invalid landmarks
+        if not _is_valid_landmark(landmark):
+            continue
         steps.append(RouteStep(landmark=landmark, directive=directive, behavior_type=behavior_type))
-    return steps
+    return steps, extracted_directionals
+
+
+_INVALID_LANDMARKS: set[str] = {
+    "none", "null", "unknown", "n/a", "na", "target", "object", "thing",
+    "place", "location", "area", "destination", "goal", "",
+}
+
+
+def _is_valid_landmark(label: str) -> bool:
+    text = str(label).strip().lower()
+    return bool(text) and text not in _INVALID_LANDMARKS and len(text) >= 2
 
 
 def _dedupe_keep_order(items: list[str]) -> list[str]:

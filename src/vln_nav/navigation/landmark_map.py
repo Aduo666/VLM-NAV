@@ -38,7 +38,7 @@ class LandmarkMapEntry:
 
     @property
     def confirmed(self) -> bool:
-        return bool(self.world_xy)
+        return bool(self.world_xy) and str(self.evidence_level).strip().lower() == "confirmed"
 
 
 class LandmarkMap:
@@ -134,6 +134,47 @@ class LandmarkMap:
             self._log_entry_if_needed(entry=entry, timestamp_sec=float(timestamp_sec))
             return entry
 
+        has_potential_anchor = (
+            state.potential_world_xy is not None
+            and bool(map_anchor_allowed)
+            and float(state.potential_confidence) >= float(self._config.min_confidence)
+        )
+        existing_is_confirmed = (
+            existing is not None
+            and str(getattr(existing, "evidence_level", "")).strip().lower() == "confirmed"
+        )
+        if has_potential_anchor and not existing_is_confirmed:
+            world_xy = [float(state.potential_world_xy[0]), float(state.potential_world_xy[1])]
+            forward_m, left_m, distance_m = _relative_to_robot(
+                robot_pose=robot_pose,
+                world_xy=world_xy,
+            )
+            observation = state.last_observation
+            entry = LandmarkMapEntry(
+                label=label,
+                behavior_type=str(state.behavior_type),
+                world_xy=world_xy,
+                confidence=float(state.potential_confidence),
+                first_seen_time_sec=(
+                    float(existing.first_seen_time_sec) if existing is not None else float(timestamp_sec)
+                ),
+                last_seen_time_sec=float(state.potential_last_seen_time_sec or state.last_seen_time_sec or timestamp_sec),
+                update_count=1 if existing is None else int(existing.update_count) + 1,
+                status="potential",
+                source="LandmarkTracker.potential_anchor",
+                depth_m=None if observation is None else observation.depth_m,
+                bbox=state.potential_bbox,
+                anchor_distance_m=float(distance_m),
+                robot_forward_m=float(forward_m),
+                robot_left_m=float(left_m),
+                reached=False,
+                confirmed_observation_count=int(state.confirmed_observation_count),
+                evidence_level="potential",
+            )
+            self._entries[label] = entry
+            self._log_entry_if_needed(entry=entry, timestamp_sec=float(timestamp_sec))
+            return entry
+
         if existing is None:
             return None
 
@@ -184,12 +225,13 @@ class LandmarkMap:
         )
         bearing = _bearing_hint(left_m=left_m)
         age_sec = max(0.0, float(timestamp_sec) - float(entry.last_seen_time_sec))
+        confirmed = int(str(getattr(entry, "evidence_level", "")).strip().lower() == "confirmed")
         return (
-            f"landmark_map target={label} confirmed=1 status={entry.status} "
+            f"landmark_map target={label} confirmed={confirmed} evidence={entry.evidence_level} status={entry.status} "
             f"world_xy={_format_xy(entry.world_xy)} distance_m={distance_m:.2f} "
             f"robot_forward_m={forward_m:.2f} robot_left_m={left_m:.2f} "
             f"bearing_hint={bearing} age_sec={age_sec:.1f} updates={entry.update_count} "
-            f"reached={int(entry.reached)}"
+            f"confidence={entry.confidence:.2f} reached={int(entry.reached)}"
         )
 
     def _cross_label_guard(
@@ -245,9 +287,11 @@ class LandmarkMap:
         self._last_log_signature_by_label[entry.label] = signature
         self._last_log_time_by_label[entry.label] = float(timestamp_sec)
         self._logger.info(
-            "[LandmarkMap] target=%s status=%s world=%s distance=%s forward=%s left=%s updates=%s reached=%s source=%s",
+            "[LandmarkMap] target=%s status=%s evidence=%s confidence=%.2f world=%s distance=%s forward=%s left=%s updates=%s reached=%s source=%s",
             entry.label,
             entry.status,
+            entry.evidence_level,
+            float(entry.confidence),
             _format_xy(entry.world_xy),
             _format_optional_float(entry.anchor_distance_m),
             _format_optional_float(entry.robot_forward_m),

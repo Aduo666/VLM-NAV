@@ -1159,7 +1159,7 @@ class GlobalOccupancyMap:
         legend = (
             "up=front | image-left=robot-left | "
             "black=occupied  white=free  gray=unknown  "
-            "cyan=lidar  yellow=candidate  magenta=semantic  green=subgoal"
+            "cyan=lidar  yellow=candidate  magenta=potential  orange=confirmed  green=reached/subgoal"
         )
         draw.text((12, 34), legend, fill=(30, 30, 30), font=label_font)
 
@@ -1312,14 +1312,25 @@ class GlobalOccupancyMap:
             if not bool(entry.world_xy):
                 continue
             x, y = transform.to_px(float(entry.world_xy[0]), float(entry.world_xy[1]))
-            color = (80, 235, 125) if bool(entry.reached) else (220, 60, 220)
+            evidence = str(getattr(entry, "evidence_level", "")).strip().lower()
+            if bool(entry.reached):
+                color = (80, 235, 125)
+            elif evidence == "confirmed":
+                color = (245, 175, 40)
+            else:
+                color = (220, 60, 220)
             draw.ellipse(
                 (x - 10, y - 10, x + 10, y + 10),
                 fill=color,
                 outline=(255, 255, 255),
                 width=2,
             )
-            draw.text((x + 12, y - 9), str(entry.label), fill=color, font=anchor_font)
+            draw.text(
+                (x + 12, y - 9),
+                f"{entry.label} {evidence or entry.status} {entry.confidence:.2f}",
+                fill=color,
+                font=anchor_font,
+            )
 
         plan = semantic_plan
         if plan is None:

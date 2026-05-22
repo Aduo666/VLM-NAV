@@ -102,6 +102,7 @@ class MapCandidateGenerator:
         ranked = self._rank_candidates(
             base_candidates=merged,
             generated_candidates=generated,
+            progress_signal=progress_signal,
         )
         valid_count = sum(1 for candidate in ranked if candidate.valid)
         debug = dict(base_candidate_set.predictor_debug)
@@ -136,9 +137,6 @@ class MapCandidateGenerator:
         elif landmark_state is not None and landmark_state.estimated_world_xy is not None:
             anchor_world_xy = [float(landmark_state.estimated_world_xy[0]), float(landmark_state.estimated_world_xy[1])]
             anchor_confidence = float(landmark_state.confirmed_confidence or landmark_state.confidence)
-        elif landmark_state is not None and landmark_state.potential_world_xy is not None:
-            anchor_world_xy = [float(landmark_state.potential_world_xy[0]), float(landmark_state.potential_world_xy[1])]
-            anchor_confidence = float(landmark_state.potential_confidence)
         if anchor_world_xy is None:
             return None
 
@@ -201,7 +199,7 @@ class MapCandidateGenerator:
         if landmark_entry is not None and bool(landmark_entry.world_xy):
             anchor_local = _world_to_local_xy(robot_pose=observation.pose, world_xy=landmark_entry.world_xy)
         for bearing_deg in self._config.frontier_bearings_deg:
-            best: WaypointCandidate | None = None
+            bearing_candidates: list[WaypointCandidate] = []
             for distance_m in self._config.frontier_distances_m:
                 heading_rad = float(np.deg2rad(float(bearing_deg)))
                 local_goal = [
@@ -220,10 +218,16 @@ class MapCandidateGenerator:
                     local_goal_xy=local_goal,
                     anchor_local_xy=anchor_local,
                 )
+                semantic_weight = float(self._config.semantic_weight) if anchor_local is not None else 0.0
+                free_weight = 0.40 + (0.40 * float(self._config.semantic_weight) if anchor_local is None else 0.0)
+                unknown_weight = (
+                    float(self._config.unknown_gain_weight)
+                    + (0.60 * float(self._config.semantic_weight) if anchor_local is None else 0.0)
+                )
                 score = float(
-                    0.40 * evaluation["free_ratio"]
-                    + float(self._config.unknown_gain_weight) * evaluation["unknown_gain"]
-                    + float(self._config.semantic_weight) * semantic_alignment
+                    free_weight * evaluation["free_ratio"]
+                    + unknown_weight * evaluation["unknown_gain"]
+                    + semantic_weight * semantic_alignment
                     + 0.15 * np.clip(float(distance_m) / max(0.1, float(self._config.max_distance_m)), 0.0, 1.0)
                 )
                 support = {
@@ -248,11 +252,18 @@ class MapCandidateGenerator:
                     depth_support=support,
                     image_uv=_local_goal_to_image_uv(local_goal_xy=local_goal, observation=observation),
                 )
-                if best is None or candidate.clearance_score > best.clearance_score:
-                    best = candidate
-            if best is not None:
-                best.slot_id = slot_id
-                candidates.append(best)
+                bearing_candidates.append(candidate)
+            for candidate in sorted(
+                bearing_candidates,
+                key=lambda item: (
+                    float(item.clearance_score),
+                    float(item.depth_support.get("unknown_gain", 0.0)),
+                    float(item.travel_distance_m),
+                ),
+                reverse=True,
+            )[:2]:
+                candidate.slot_id = slot_id
+                candidates.append(candidate)
                 slot_id += 1
         return candidates
 
@@ -265,7 +276,7 @@ class MapCandidateGenerator:
     ) -> list[WaypointCandidate]:
         candidates: list[WaypointCandidate] = []
         for offset, bearing_deg in enumerate((70.0, -70.0)):
-            local_goal = [0.28, float(np.sin(np.deg2rad(bearing_deg)) * 0.55)]
+            local_goal = [0.45, float(np.sin(np.deg2rad(bearing_deg)) * 0.75)]
             evaluation = _evaluate_local_goal(
                 snapshot=snapshot,
                 robot_pose=observation.pose,
@@ -301,6 +312,7 @@ class MapCandidateGenerator:
         *,
         base_candidates: list[WaypointCandidate],
         generated_candidates: list[WaypointCandidate],
+        progress_signal: str,
     ) -> list[WaypointCandidate]:
         max_candidates = max(3, int(self._config.max_candidates))
         valid_generated = [item for item in generated_candidates if item.valid]
@@ -309,7 +321,7 @@ class MapCandidateGenerator:
         ordered = sorted(
             valid_generated,
             key=lambda item: (
-                _candidate_priority(item),
+                _candidate_priority(item, progress_signal=progress_signal),
                 float(item.clearance_score),
                 float(item.depth_support.get("unknown_gain", 0.0)),
             ),
@@ -393,7 +405,8 @@ def _evaluate_local_goal(
             free_hits += 1
         else:
             unknown_hits += 1
-    if blocked > 0:
+    allowed_blocked = max(1, int(round(0.08 * float(len(path_cells)))))
+    if blocked > allowed_blocked:
         return _eval_result(False, "path_blocked", 0.0, 0.0, 0.0, 0.0)
     local_distance = float(np.hypot(float(local_goal_xy[0]), float(local_goal_xy[1])))
     free_ratio = float(free_hits) / float(max(1, len(path_cells)))
@@ -511,8 +524,16 @@ def _semantic_alignment_score(
     return float(np.clip(float(np.dot(goal, anchor) / (goal_norm * anchor_norm)), -1.0, 1.0) * 0.5 + 0.5)
 
 
-def _candidate_priority(candidate: WaypointCandidate) -> float:
+def _candidate_priority(candidate: WaypointCandidate, *, progress_signal: str) -> float:
     kind = str(candidate.depth_support.get("map_candidate_type", "depth"))
+    progress = str(progress_signal).strip().upper()
+    if progress in {"STALLED", "SPINNING"} or progress.startswith("SAFETY_BLOCKED"):
+        if kind == "escape_turn":
+            return 5.0
+        if kind == "frontier":
+            return 3.0
+        if kind == "semantic_approach":
+            return 2.5
     if kind == "semantic_approach":
         return 4.0
     if kind == "escape_turn":

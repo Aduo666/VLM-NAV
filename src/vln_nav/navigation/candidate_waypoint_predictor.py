@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 
 from .observation_adapter import VLNObservation
 from ..runtime.config import PROJECT_ROOT
@@ -145,11 +145,16 @@ class CandidateWaypointPredictor:
         _draw_target_overlay(draw=draw, image_size=rgb_panel.size, target_observation=target_observation)
         for candidate in candidate_set.candidates:
             u, v = candidate.image_uv
-            fill = (220, 40, 40) if candidate.valid else (100, 100, 100)
-            draw.ellipse((u - 14, v - 14, u + 14, v + 14), fill=fill, outline=(255, 255, 255), width=2)
-            draw.text((u - 6, v - 7), str(candidate.slot_id), fill=(255, 255, 255))
-            label = f"{candidate.label} d={candidate.travel_distance_m:.2f}"
-            draw.text((u + 18, max(0, v - 8)), label, fill=(20, 20, 20))
+            fill = (220, 40, 40) if candidate.valid else (85, 85, 85)
+            radius = 12
+            draw.ellipse((u - radius, v - radius, u + radius, v + radius), fill=fill, outline=(255, 255, 255), width=2)
+            _draw_centered_text(
+                draw=draw,
+                xy=(u, v),
+                text=str(candidate.slot_id),
+                font=_debug_font(15, bold=True),
+                fill=(255, 255, 255),
+            )
 
         rgb_width, rgb_height = rgb_panel.size
         costmap_width = max(360, int(rgb_height * 0.78))
@@ -413,13 +418,13 @@ class CandidateWaypointPredictor:
         for meter in np.arange(0.5, meters_forward + 0.01, 0.5):
             y = int(round(robot_y - meter * scale))
             draw.line((margin, y, width - margin, y), fill=grid_color, width=1)
-            draw.text((margin, y - 8), f"{meter:.1f}m", fill=(105, 118, 128))
+            draw.text((margin, y - 8), f"{meter:.1f}m", fill=(105, 118, 128), font=_debug_font(12))
         for side_meter in np.arange(-meters_side, meters_side + 0.01, 0.5):
             x = int(round(robot_x - side_meter * scale))
             draw.line((x, robot_y, x, max(28, robot_y - meters_forward * scale)), fill=grid_color, width=1)
 
         draw.rectangle((0, 0, width, 34), fill=(0, 0, 0))
-        draw.text((12, 10), "LOCAL CANDIDATE COSTMAP", fill=(255, 255, 255))
+        draw.text((12, 10), "LOCAL CANDIDATE COSTMAP", fill=(255, 255, 255), font=_debug_font(16, bold=True))
         draw.line((robot_x, robot_y, robot_x, max(28, robot_y - meters_forward * scale)), fill=(130, 145, 155), width=2)
         half_fov_rad = max(1e-6, self._hfov_rad * 0.5)
         fov_len = meters_forward * scale
@@ -454,7 +459,7 @@ class CandidateWaypointPredictor:
             fill=(80, 180, 255),
             outline=(210, 240, 255),
         )
-        draw.text((robot_x + 16, robot_y - 10), "robot", fill=(210, 240, 255))
+        draw.text((robot_x + 16, robot_y - 10), "robot", fill=(210, 240, 255), font=_debug_font(14, bold=True))
 
         for candidate in candidate_set.candidates:
             heading_rad = float(np.deg2rad(candidate.heading_delta_deg))
@@ -472,9 +477,19 @@ class CandidateWaypointPredictor:
             x = int(round(np.clip(robot_x - left_m * scale, margin, width - margin)))
             y = int(round(np.clip(robot_y - forward_m * scale, 42, robot_y + 20)))
             draw.line((robot_x, robot_y, x, y), fill=color, width=2)
-            draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=color, outline=(255, 255, 255), width=2)
-            draw.text((x - 4, y - 7), str(candidate.slot_id), fill=(255, 255, 255))
-            draw.text((x + radius + 4, max(38, y - 8)), candidate.label, fill=color)
+            draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=color, outline=(255, 255, 255), width=3)
+            _draw_centered_text(
+                draw=draw,
+                xy=(x, y),
+                text=str(candidate.slot_id),
+                font=_debug_font(22, bold=True),
+                fill=(255, 255, 255),
+            )
+            _draw_candidate_tag(
+                draw=draw,
+                xy=(x + radius + 6, max(38, y - 18)),
+                candidate=candidate,
+            )
 
         return panel
 
@@ -489,6 +504,70 @@ def _slot_label(bearing_deg: float) -> str:
     if bearing_deg > 10.0:
         return "LEFT"
     return "CENTER"
+
+
+def _candidate_action_text(candidate: WaypointCandidate) -> str:
+    heading = float(candidate.heading_delta_deg)
+    if heading > 10.0:
+        return "LEFT"
+    if heading < -10.0:
+        return "RIGHT"
+    return "FORWARD"
+
+
+def _draw_candidate_tag(
+    *,
+    draw: ImageDraw.ImageDraw,
+    xy: tuple[int, int],
+    candidate: WaypointCandidate,
+) -> None:
+    text = f"{int(candidate.slot_id)} {_candidate_action_text(candidate)}"
+    font = _debug_font(18, bold=True)
+    x, y = int(xy[0]), int(xy[1])
+    try:
+        bbox = draw.textbbox((x, y), text, font=font)
+        w = int(bbox[2] - bbox[0])
+        h = int(bbox[3] - bbox[1])
+    except Exception:
+        w = max(80, 10 * len(text))
+        h = 22
+    fill = (25, 25, 25) if candidate.valid else (75, 75, 75)
+    outline = (255, 255, 255) if candidate.valid else (150, 150, 150)
+    draw.rectangle((x - 3, y - 3, x + w + 7, y + h + 5), fill=fill, outline=outline, width=2)
+    draw.text((x, y), text, fill=(255, 255, 255), font=font)
+
+
+def _draw_centered_text(
+    *,
+    draw: ImageDraw.ImageDraw,
+    xy: tuple[int, int],
+    text: str,
+    font,
+    fill: tuple[int, int, int],
+) -> None:
+    x, y = int(xy[0]), int(xy[1])
+    try:
+        bbox = draw.textbbox((0, 0), str(text), font=font)
+        w = int(bbox[2] - bbox[0])
+        h = int(bbox[3] - bbox[1])
+    except Exception:
+        w = 8 * len(str(text))
+        h = 14
+    draw.text((x - w // 2, y - h // 2 - 1), str(text), fill=fill, font=font)
+
+
+def _debug_font(size: int, *, bold: bool = False):
+    names = (
+        ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"]
+        if bold
+        else ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"]
+    )
+    for name in names:
+        try:
+            return ImageFont.truetype(name, int(size))
+        except Exception:
+            continue
+    return ImageFont.load_default()
 
 
 def _draw_depth_costmap_points(

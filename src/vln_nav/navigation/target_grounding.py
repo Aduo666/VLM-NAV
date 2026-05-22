@@ -44,6 +44,9 @@ class TargetObservation:
     evidence_level: str = "none"  # none / potential / confirmed_candidate
     semantic_source: str = "unknown"  # grounding_dino / qwen_vl_bbox
     can_confirm: bool = False
+    vlm_verified: bool = False
+    vlm_verification_confidence: float = 0.0
+    vlm_verification_reason: str = ""
 
 
 @dataclass
@@ -86,6 +89,10 @@ class TargetGroundingConfig:
     max_result_pose_delta_m: float = 1.5
     max_result_yaw_delta_deg: float = 45.0
     qwen_fallback_confirm_allowed: bool = False
+    semantic_verification_enabled: bool = True
+    semantic_verification_min_confidence: float = 0.70
+    semantic_verification_max_edge_px: int = 768
+    semantic_verification_auto_accept_confidence: float = 1.01
 
 
 @dataclass
@@ -164,6 +171,7 @@ class TargetGrounder:
         robot_pose: Pose2D,
         timestamp_sec: float,
         frame_index: int = -1,
+        allow_new_request: bool = True,
     ) -> TargetObservation:
         target_label = str(target_label).strip() or "target"
         if target_label.lower() in {"none", "null", "unknown", "n/a", "na", "target", "object", "thing", "place", "location"}:
@@ -188,6 +196,12 @@ class TargetGrounder:
             wall_time_sec=wall_time_sec,
             current_robot_pose=robot_pose,
         )
+        if not bool(allow_new_request):
+            return reusable or _empty_observation(
+                target_label=target_label,
+                timestamp_sec=timestamp_sec,
+                reason="grounding_paused",
+            )
         if self._future is not None:
             return reusable or _empty_observation(
                 target_label=target_label,
@@ -287,6 +301,9 @@ class TargetGrounder:
             evidence_level=str(self._last_observation.evidence_level),
             semantic_source=str(self._last_observation.semantic_source),
             can_confirm=bool(self._last_observation.can_confirm),
+            vlm_verified=bool(self._last_observation.vlm_verified),
+            vlm_verification_confidence=float(self._last_observation.vlm_verification_confidence),
+            vlm_verification_reason=str(self._last_observation.vlm_verification_reason),
         )
 
     def _collect_finished_request(self, *, timestamp_sec: float, wall_time_sec: float, current_robot_pose: Pose2D | None = None) -> TargetObservation | None:
@@ -326,7 +343,7 @@ class TargetGrounder:
         self._last_observation_wall_sec = float(wall_time_sec)
         if observation.visible and self._should_log_observation(observation=observation, wall_time_sec=wall_time_sec):
             self._logger.info(
-                "[Grounding] target=%s visible=1 bbox=%s depth=%.2f valid_ratio=%.2f mask_area=%.3f bearing_deg=%.1f world=%s confidence=%.2f coord=%s seg=%s age=%.2fs current=%s frame=%d evidence=%s semantic_source=%s can_confirm=%s",
+                "[Grounding] target=%s visible=1 bbox=%s depth=%.2f valid_ratio=%.2f mask_area=%.3f bearing_deg=%.1f world=%s confidence=%.2f coord=%s seg=%s age=%.2fs current=%s frame=%d evidence=%s semantic_source=%s can_confirm=%s vlm_verified=%s vlm_conf=%.2f vlm_reason=%s",
                 observation.label,
                 list(observation.bbox or ()),
                 float(observation.depth_m or 0.0),
@@ -343,6 +360,9 @@ class TargetGrounder:
                 observation.evidence_level,
                 observation.semantic_source,
                 int(observation.can_confirm),
+                int(observation.vlm_verified),
+                float(observation.vlm_verification_confidence),
+                observation.vlm_verification_reason[:80],
             )
         elif not observation.visible and self._should_log_observation(observation=observation, wall_time_sec=wall_time_sec):
             self._logger.info("[GroundingReject] target=%s reason=%s", observation.label, observation.reason)
@@ -627,6 +647,9 @@ class TargetGrounder:
         can_confirm = True
         if not is_dino and not bool(self._config.qwen_fallback_confirm_allowed):
             can_confirm = False
+        vlm_verified = False
+        vlm_verification_confidence = 0.0
+        vlm_verification_reason = "not_run"
 
         # Depth validation - if failed, still return visible observation as potential
         if valid_ratio < float(self._config.min_depth_valid_ratio) or depth_m is None or not np.isfinite(depth_m):
@@ -658,6 +681,9 @@ class TargetGrounder:
                 evidence_level="potential",
                 semantic_source=semantic_source,
                 can_confirm=False,
+                vlm_verified=False,
+                vlm_verification_confidence=0.0,
+                vlm_verification_reason="depth_invalid",
             )
         if depth_m < float(self._config.min_depth_m) or depth_m > float(self._config.max_depth_m):
             return _empty_observation(request.target_label, request.timestamp_sec, "depth_out_of_range")
@@ -670,6 +696,29 @@ class TargetGrounder:
             horizontal_fov_deg=float(self._config.horizontal_fov_deg),
             robot_pose=request.robot_pose,
         )
+
+        if can_confirm and bool(self._config.semantic_verification_enabled):
+            if float(confidence) >= float(self._config.semantic_verification_auto_accept_confidence):
+                vlm_verified = True
+                vlm_verification_confidence = 1.0
+                vlm_verification_reason = "auto_accept_high_detector_confidence"
+            else:
+                vlm_verified, vlm_verification_confidence, vlm_verification_reason = self._verify_detection_semantics(
+                    request=request,
+                    bbox=bbox,
+                    detector_confidence=float(confidence),
+                    semantic_source=semantic_source,
+                )
+            if not vlm_verified or vlm_verification_confidence < float(self._config.semantic_verification_min_confidence):
+                can_confirm = False
+                self._logger.info(
+                    "[GroundingVerifyReject] target=%s source=%s detector_conf=%.2f vlm_conf=%.2f reason=%s",
+                    request.target_label,
+                    semantic_source,
+                    float(confidence),
+                    float(vlm_verification_confidence),
+                    vlm_verification_reason,
+                )
 
         evidence_level = "confirmed_candidate" if can_confirm else "potential"
 
@@ -694,7 +743,65 @@ class TargetGrounder:
             evidence_level=evidence_level,
             semantic_source=semantic_source,
             can_confirm=can_confirm,
+            vlm_verified=vlm_verified,
+            vlm_verification_confidence=float(vlm_verification_confidence),
+            vlm_verification_reason=str(vlm_verification_reason),
         )
+
+    def _verify_detection_semantics(
+        self,
+        *,
+        request: _GroundingRequest,
+        bbox: tuple[int, int, int, int],
+        detector_confidence: float,
+        semantic_source: str,
+    ) -> tuple[bool, float, str]:
+        image_bytes = _build_verification_image_bytes(
+            rgb=request.rgb,
+            bbox=bbox,
+            max_edge_px=int(self._config.semantic_verification_max_edge_px),
+        )
+        system_prompt = (
+            "You are a strict visual verification module for robot navigation. "
+            "You must decide whether the marked region is actually the requested target. "
+            "Return strict JSON only."
+        )
+        user_prompt = (
+            f"Target label: {request.target_label}\n"
+            f"Detector source: {semantic_source}\n"
+            f"Detector confidence: {float(detector_confidence):.2f}\n"
+            "The image shows the full camera view with a red bbox and a zoomed crop of the same bbox. "
+            "Verify the marked region semantically. Reject shadows, floor texture, reflections, wall patterns, or unrelated objects.\n"
+            "Return exactly one JSON object:\n"
+            '{"is_target": true, "confidence": 0.0, "reason": "short reason"}'
+        )
+        result = self._llm.chat(
+            request_name="target_semantic_verify",
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            image_png_bytes=image_bytes,
+            max_tokens=96,
+            temperature=0.0,
+        )
+        if result.used_fallback or not result.content:
+            return False, 0.0, result.reason or "verification_llm_failed"
+        try:
+            payload = _parse_json_object(result.content)
+            verified = _parse_bool(payload.get("is_target"))
+            confidence = float(np.clip(_parse_float(payload.get("confidence"), default=0.0), 0.0, 1.0))
+            reason = str(payload.get("reason", "")).strip() or "no_reason"
+        except Exception as exc:
+            return False, 0.0, f"verification_invalid_json:{exc}"
+        self._logger.info(
+            "[GroundingVerify] target=%s source=%s detector_conf=%.2f verified=%s vlm_conf=%.2f reason=%s",
+            request.target_label,
+            semantic_source,
+            float(detector_confidence),
+            int(bool(verified)),
+            float(confidence),
+            reason[:120],
+        )
+        return bool(verified), float(confidence), reason
 
 
 def _empty_observation(target_label: str, timestamp_sec: float, reason: str) -> TargetObservation:
@@ -719,6 +826,9 @@ def _empty_observation(target_label: str, timestamp_sec: float, reason: str) -> 
         evidence_level="none",
         semantic_source="unknown",
         can_confirm=False,
+        vlm_verified=False,
+        vlm_verification_confidence=0.0,
+        vlm_verification_reason="",
     )
 
 
@@ -758,6 +868,9 @@ def _copy_observation_with_timestamp(
         evidence_level=str(observation.evidence_level),
         semantic_source=str(observation.semantic_source),
         can_confirm=bool(observation.can_confirm),
+        vlm_verified=bool(observation.vlm_verified),
+        vlm_verification_confidence=float(observation.vlm_verification_confidence),
+        vlm_verification_reason=str(observation.vlm_verification_reason),
     )
 
 
@@ -890,6 +1003,64 @@ def _map_bbox_to_original(
     if not (x0 < x1 and y0 < y1):
         return None
     return _MappedBbox(bbox=(x0, y0, x1, y1), coordinate_mode=coordinate_mode)
+
+
+def _build_verification_image_bytes(
+    *,
+    rgb: np.ndarray,
+    bbox: tuple[int, int, int, int],
+    max_edge_px: int,
+) -> bytes:
+    image = Image.fromarray(np.asarray(rgb, dtype=np.uint8)[:, :, :3].copy()).convert("RGB")
+    width, height = image.size
+    xmin, ymin, xmax, ymax = [int(value) for value in bbox]
+    xmin = max(0, min(width - 1, xmin))
+    ymin = max(0, min(height - 1, ymin))
+    xmax = max(xmin + 1, min(width, xmax))
+    ymax = max(ymin + 1, min(height, ymax))
+
+    margin_x = int(round((xmax - xmin) * 0.35))
+    margin_y = int(round((ymax - ymin) * 0.35))
+    crop_box = (
+        max(0, xmin - margin_x),
+        max(0, ymin - margin_y),
+        min(width, xmax + margin_x),
+        min(height, ymax + margin_y),
+    )
+
+    full = image.copy()
+    from PIL import ImageDraw
+
+    draw = ImageDraw.Draw(full)
+    for offset in range(4):
+        draw.rectangle(
+            (xmin - offset, ymin - offset, xmax + offset, ymax + offset),
+            outline=(255, 0, 0),
+        )
+    crop = image.crop(crop_box)
+    resampling = Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
+    crop_height = height
+    if crop.height > 0:
+        crop_width = max(1, int(round(crop.width * (float(crop_height) / float(crop.height)))))
+        crop = crop.resize((crop_width, crop_height), resampling)
+
+    canvas = Image.new("RGB", (full.width + crop.width, height), (0, 0, 0))
+    canvas.paste(full, (0, 0))
+    canvas.paste(crop, (full.width, 0))
+    max_edge = max(canvas.size)
+    max_edge_px = max(1, int(max_edge_px))
+    if max_edge > max_edge_px:
+        scale = float(max_edge_px) / float(max_edge)
+        canvas = canvas.resize(
+            (
+                max(1, int(round(canvas.width * scale))),
+                max(1, int(round(canvas.height * scale))),
+            ),
+            resampling,
+        )
+    buffer = io.BytesIO()
+    canvas.save(buffer, format="PNG", optimize=True)
+    return buffer.getvalue()
 
 
 def _bbox_depth_mask_statistic(

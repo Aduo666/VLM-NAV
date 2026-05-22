@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import subprocess
 import tempfile
 import time
 from pathlib import Path
@@ -37,6 +38,7 @@ from ..navigation.progress_manager import ProgressManager
 from ..navigation.spatial_transform import log_spatial_transform_self_check
 from ..navigation.stuck_detector import StuckDetector, StuckDetectorConfig
 from ..navigation.target_grounding import TargetGrounder, TargetGroundingConfig, TargetObservation
+from ..navigation.target_tracker import TargetTracker, TargetTrackerConfig
 from ..navigation.topological_memory import TopologicalMemory, TopologicalMemoryConfig
 from ..navigation.vln_policy import ExecutionFeedback, OpenNavPolicyConfig, OpenNavVLNPolicy, PolicyStepResult
 from ..navigation.vln_reasoner import OpenNavReasoner
@@ -70,19 +72,11 @@ def main() -> int:
         return 2
 
     os.environ.setdefault("OMNI_KIT_ACCEPT_EULA", "YES")
+    simulation_settings = _build_simulation_app_settings(config=config, logger=logger)
 
     from isaacsim import SimulationApp
 
-    simulation_app = SimulationApp(
-        {
-            "headless": config.headless,
-            "width": config.sim_width,
-            "height": config.sim_height,
-            "active_gpu": config.active_gpu,
-            "physics_gpu": config.physics_gpu,
-            "multi_gpu": config.multi_gpu,
-        }
-    )
+    simulation_app = SimulationApp(simulation_settings)
 
     try:
         run_navigation(simulation_app=simulation_app, config=config)
@@ -93,6 +87,97 @@ def main() -> int:
         simulation_app.close()
 
     return 0
+
+
+def _build_simulation_app_settings(*, config: AppConfig, logger) -> dict:
+    active_gpu = _resolve_active_gpu_for_display(config=config, logger=logger)
+    settings = {
+        "headless": bool(config.headless),
+        "width": int(config.sim_width),
+        "height": int(config.sim_height),
+        "multi_gpu": bool(config.multi_gpu),
+    }
+    if active_gpu is not None:
+        settings["active_gpu"] = int(active_gpu)
+    if config.physics_gpu is not None:
+        settings["physics_gpu"] = int(config.physics_gpu)
+    logger.info(
+        "[SimulationApp] headless=%s active_gpu=%s physics_gpu=%s multi_gpu=%s DISPLAY=%s WAYLAND_DISPLAY=%s CUDA_VISIBLE_DEVICES=%s",
+        int(bool(config.headless)),
+        "auto" if active_gpu is None else int(active_gpu),
+        "auto" if config.physics_gpu is None else int(config.physics_gpu),
+        int(bool(config.multi_gpu)),
+        os.environ.get("DISPLAY", "<unset>"),
+        os.environ.get("WAYLAND_DISPLAY", "<unset>"),
+        os.environ.get("CUDA_VISIBLE_DEVICES", "<unset>"),
+    )
+    return settings
+
+
+def _resolve_active_gpu_for_display(*, config: AppConfig, logger) -> int | None:
+    configured_gpu = config.active_gpu
+    if bool(config.headless):
+        return configured_gpu
+
+    display_env = os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
+    if not display_env:
+        raise RuntimeError(
+            "Non-headless Isaac Sim requires DISPLAY or WAYLAND_DISPLAY, but neither is set. "
+            "Run from a desktop/NoMachine/VNC terminal, export DISPLAY correctly, or use --headless."
+        )
+
+    display_gpu = _detect_display_active_gpu(logger=logger)
+    if configured_gpu is not None:
+        if display_gpu is not None and int(configured_gpu) != int(display_gpu):
+            logger.warning(
+                "[DisplayGPU] configured active_gpu=%s but nvidia-smi reports display_active GPU=%s. "
+                "Non-headless windows usually require active_gpu to match the display GPU.",
+                int(configured_gpu),
+                int(display_gpu),
+            )
+        return int(configured_gpu)
+
+    if display_gpu is not None:
+        logger.info("[DisplayGPU] auto-selected active_gpu=%s from nvidia-smi display_active.", int(display_gpu))
+        return int(display_gpu)
+
+    logger.warning(
+        "[DisplayGPU] could not auto-detect a display-active GPU. Isaac Sim will choose its default renderer GPU. "
+        "If the window does not appear, set ACTIVE_GPU to the GPU with Disp.A/Display Active enabled."
+    )
+    return None
+
+
+def _detect_display_active_gpu(*, logger) -> int | None:
+    try:
+        completed = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,display_active",
+                "--format=csv,noheader,nounits",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+    except Exception as exc:
+        logger.warning("[DisplayGPU] nvidia-smi display query failed: %s", exc)
+        return None
+    if completed.returncode != 0:
+        logger.warning("[DisplayGPU] nvidia-smi display query failed: %s", completed.stderr.strip())
+        return None
+    for line in completed.stdout.splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) < 2:
+            continue
+        state = parts[1].strip().lower()
+        if state in {"enabled", "active", "yes", "on", "1", "true"}:
+            try:
+                return int(parts[0])
+            except ValueError:
+                continue
+    return None
 
 
 def run_navigation(*, simulation_app, config: AppConfig) -> None:
@@ -152,20 +237,32 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
         int(config.recovery_trigger_stalled_steps),
     )
     logger.info(
-        "[GroundingConfig] enabled=%s backend=%s call_period_sec=%.2f reuse_sec=%.2f min_conf=%.2f depth_range=[%.2f, %.2f] coord=%s depth_region=%s min_depth_valid_ratio=%.2f dino_checkpoint=%s sam_checkpoint=%s sam_model=%s",
+        "[GroundingConfig] enabled=%s backend=%s call_period_sec=%.2f reuse_sec=%.2f pause_active=%s min_conf=%.2f depth_range=[%.2f, %.2f] coord=%s depth_region=%s min_depth_valid_ratio=%.2f semantic_verify=%s verify_min=%.2f dino_checkpoint=%s sam_enabled=%s sam_checkpoint=%s sam_model=%s",
         int(bool(config.target_grounding_enabled)),
         str(config.target_grounding_backend),
         float(config.target_grounding_call_period_sec),
         float(config.target_grounding_reuse_last_observation_sec),
+        int(bool(config.target_grounding_pause_during_active_primitive)),
         float(config.target_grounding_min_confidence),
         float(config.target_grounding_min_depth_m),
         float(config.target_grounding_max_depth_m),
         str(config.target_grounding_coordinate_mode),
         str(config.target_grounding_depth_region),
         float(config.target_grounding_min_depth_valid_ratio),
+        int(bool(config.target_grounding_semantic_verification_enabled)),
+        float(config.target_grounding_semantic_verification_min_confidence),
         str(config.target_grounding_dino_checkpoint_path),
+        int(bool(config.target_grounding_sam_enabled)),
         str(config.target_grounding_sam_checkpoint_path),
         str(config.target_grounding_sam_model_type),
+    )
+    logger.info(
+        "[TargetTrackerConfig] enabled=%s type=%s lost_frames=%s lost_sec=%.2f min_depth_valid_ratio=%.2f",
+        int(bool(config.target_tracker_enabled)),
+        str(config.target_tracker_type),
+        int(config.target_tracker_max_lost_frames),
+        float(config.target_tracker_lost_confirmed_sec),
+        float(config.target_tracker_min_depth_valid_ratio),
     )
     logger.info(
         "[LandmarkTrackerConfig] visible_depth=%.2f anchor_radius=%.2f min_visible=%s confirmations=%s landmark_map=%s map_ttl=%.1f reacquire_guard=%s recent_visible_sec=%.1f override=%s",
@@ -284,8 +381,30 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
             max_result_pose_delta_m=float(config.target_grounding_max_result_pose_delta_m),
             max_result_yaw_delta_deg=float(config.target_grounding_max_result_yaw_delta_deg),
             qwen_fallback_confirm_allowed=bool(config.target_grounding_qwen_fallback_confirm_allowed),
+            semantic_verification_enabled=bool(config.target_grounding_semantic_verification_enabled),
+            semantic_verification_min_confidence=float(config.target_grounding_semantic_verification_min_confidence),
+            semantic_verification_max_edge_px=int(config.target_grounding_semantic_verification_max_edge_px),
+            semantic_verification_auto_accept_confidence=float(config.target_grounding_semantic_verification_auto_accept_confidence),
         ),
         llm_client=target_grounding_llm_client,
+        logger=logger,
+    )
+    target_tracker = TargetTracker(
+        config=TargetTrackerConfig(
+            enabled=bool(config.target_tracker_enabled),
+            tracker_type=str(config.target_tracker_type),
+            max_lost_frames=int(config.target_tracker_max_lost_frames),
+            lost_confirmed_sec=float(config.target_tracker_lost_confirmed_sec),
+            min_depth_valid_ratio=float(config.target_tracker_min_depth_valid_ratio),
+            center_patch_ratio=float(config.target_tracker_center_patch_ratio),
+            min_depth_m=float(config.target_grounding_min_depth_m),
+            max_depth_m=float(config.target_grounding_max_depth_m),
+            horizontal_fov_deg=float(config.camera_horizontal_fov_deg),
+            min_bbox_area_ratio=float(config.target_grounding_min_bbox_area_ratio),
+            max_bbox_area_ratio=float(config.target_grounding_max_bbox_area_ratio),
+            confidence_decay_per_lost_frame=float(config.target_tracker_confidence_decay_per_lost_frame),
+            min_tracking_confidence=float(config.target_tracker_min_tracking_confidence),
+        ),
         logger=logger,
     )
     landmark_tracker = LandmarkTracker(
@@ -295,6 +414,7 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
             min_visible_count=int(config.landmark_tracker_min_visible_count),
             arrival_confirmations=int(config.landmark_tracker_arrival_confirmations),
             arrival_window_size=int(config.landmark_tracker_arrival_window_size),
+            arrival_recent_visible_sec=float(config.landmark_tracker_arrival_recent_visible_sec),
             max_lost_count=int(config.landmark_tracker_max_lost_count),
             anchor_update_min_consistent_observations=int(
                 config.landmark_tracker_anchor_update_min_consistent_observations
@@ -688,8 +808,6 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
     depth_debug_output_path = _resolve_output_path(config.depth_debug_image_path)
     target_debug_output_path = _resolve_output_path(config.target_debug_image_path)
     target_debug_video_path = _resolve_output_path(config.debug_video_path)
-    global_map_output_path = _resolve_output_path("assets/global_map.png")
-    lidar_debug_output_path = _resolve_output_path("assets/lidar_raw_scan.png")
     debug_video_recorder = DebugVideoRecorder(
         enabled=bool(config.debug_video_enabled) and bool(config.target_debug_enabled),
         output_path=target_debug_video_path,
@@ -703,8 +821,6 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
         logger.info("Runtime debug video output: %s", debug_video_recorder.output_path)
     if config.depth_debug_enabled:
         logger.info("Depth debug output: %s", depth_debug_output_path)
-    if config.occupancy_grid_enabled:
-        logger.info("Global occupancy map output: %s", global_map_output_path)
     if config.navigation_map_enabled:
         logger.info("Navigation map output: %s", navigation_map_visualizer.output_path)
     if config.topology_enabled:
@@ -782,6 +898,7 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
     navigation_finished = False
     landmark_map_reached_synced: set[str] = set()
     global_pose_trace: list[tuple[float, float]] = []
+    latest_global_map_image: Image.Image | None = None
 
     for _ in range(config.warmup_steps):
         world.step(render=True)
@@ -906,15 +1023,6 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
                 "valid_beam_count": int(lidar_scan.valid_beam_count),
                 "effective_fov_deg": float(lidar_scan.effective_fov_deg),
             }
-            if frame_index % 10 == 0:
-                _save_lidar_raw_scan(
-                    beam_endpoints=lidar_scan.beam_endpoints_local_xy,
-                    beam_hits=lidar_scan.beam_hit_mask,
-                    current_beam_endpoints=current_beam_endpoints,
-                    current_beam_hits=current_beam_hits,
-                    output_path=lidar_debug_output_path,
-                    fov_deg=float(lidar_scan.effective_fov_deg),
-                )
         elif bool(config.lidar_enabled):
             observation.meta["lidar"] = {
                 "enabled": True,
@@ -975,14 +1083,52 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
         target_observation: TargetObservation | None = None
         landmark_map_entry = None
         if current_landmark:
-            target_observation = target_grounder.observe(
+            target_tracker.set_target_label(current_landmark)
+            perception_motion_active = (
+                bool(config.target_grounding_pause_during_active_primitive)
+                and _is_executing_motion_step(active_step_result)
+            )
+            allow_new_grounding = (
+                not perception_motion_active
+                and target_tracker.should_request_grounding(
+                    target_label=current_landmark,
+                    timestamp_sec=sim_time_sec,
+                )
+            )
+            grounding_observation = target_grounder.observe(
                 rgb=front_rgb,
                 depth=last_depth_image,
                 target_label=current_landmark,
                 robot_pose=observation.pose,
                 timestamp_sec=sim_time_sec,
                 frame_index=frame_index,
+                allow_new_request=allow_new_grounding,
             )
+            if bool(grounding_observation.visible) and bool(getattr(grounding_observation, "can_confirm", False)):
+                target_tracker.initialize_from_grounding(
+                    observation=grounding_observation,
+                    rgb=front_rgb,
+                    timestamp_sec=sim_time_sec,
+                )
+            tracker_observation = target_tracker.update(
+                rgb=front_rgb,
+                depth=last_depth_image,
+                robot_pose=observation.pose,
+                timestamp_sec=sim_time_sec,
+                frame_index=frame_index,
+            )
+            target_observation = _select_target_observation(
+                grounding_observation=grounding_observation,
+                tracker_observation=tracker_observation,
+            )
+            if perception_motion_active and frame_index % 30 == 0:
+                logger.info(
+                    "[PerceptionScheduler] target=%s grounding=paused_during_active_primitive tracker=%s selected=%s reason=%s",
+                    current_landmark,
+                    target_tracker.lifecycle,
+                    target_observation.source if target_observation is not None else "none",
+                    target_observation.reason if target_observation is not None else "none",
+                )
             landmark_state = landmark_tracker.update(
                 target_label=current_landmark,
                 behavior_type=policy.current_behavior_type,
@@ -1005,6 +1151,7 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
                 )
             )
         else:
+            target_tracker.reset()
             policy.set_landmark_state(None)
             policy.set_landmark_map_entry(None)
             policy.set_landmark_map_summary("")
@@ -1197,15 +1344,6 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
             global_pose_trace.append((float(observation.pose.x), float(observation.pose.y)))
             if len(global_pose_trace) > 8000:
                 del global_pose_trace[: len(global_pose_trace) - 8000]
-            if frame_index % 10 == 0:
-                _save_global_occupancy_debug(
-                    occupancy_snapshot=occupancy_grid.snapshot(),
-                    robot_pose=observation.pose,
-                    trajectory_xy=global_pose_trace,
-                    landmark_entries=landmark_map.entries(),
-                    step_result=step_result,
-                    output_path=global_map_output_path,
-                )
 
         debug_update_period_sec = max(0.10, float(config.debug_image_update_period_sec))
         force_final_debug_frame = bool(step_result.route_complete and not route_complete_handled)
@@ -1214,17 +1352,23 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
             and (force_final_debug_frame or (loop_now - last_nav_debug_save_time) >= debug_update_period_sec)
         )
         if should_save_target_debug:
+            if bool(config.occupancy_grid_enabled):
+                latest_global_map_image = _save_global_occupancy_debug(
+                    occupancy_snapshot=occupancy_grid.snapshot(),
+                    robot_pose=observation.pose,
+                    trajectory_xy=global_pose_trace,
+                    landmark_entries=landmark_map.entries(),
+                    step_result=step_result,
+                    output_path=None,
+                )
             debug_image = _save_current_target_debug_image(
                 rgb=front_rgb,
                 step_result=step_result,
                 target_observation=target_observation,
                 executed_action=safety_decision.action_name,
                 output_path=target_debug_output_path,
-                map_image_path=(
-                    navigation_map_visualizer.output_path
-                    if bool(config.navigation_map_enabled)
-                    else global_map_output_path if bool(config.occupancy_grid_enabled) else None
-                ),
+                map_image=latest_global_map_image,
+                map_image_path=navigation_map_visualizer.output_path if bool(config.navigation_map_enabled) else None,
                 horizontal_fov_deg=float(config.camera_horizontal_fov_deg),
             )
             debug_video_recorder.append(debug_image)
@@ -1504,9 +1648,41 @@ def _is_executing_motion_step(step_result) -> bool:
     action = str(getattr(step_result, "action_name", "STOP")).strip().upper()
     if action not in {"FORWARD", "BACKWARD", "TURN_LEFT", "TURN_RIGHT", "TRACK_TARGET"}:
         return False
-    source = str(getattr(step_result, "decision_source", "")).strip().upper()
     remaining = int(getattr(step_result, "execution_steps_remaining", 0) or 0)
-    return remaining > 0 and source in {"LLM_PRIMITIVE", "ACTIVE_PRIMITIVE", "ACTIVE_GOAL", "RECOVERY"}
+    return remaining > 0
+
+
+def _select_target_observation(
+    *,
+    grounding_observation: TargetObservation,
+    tracker_observation: TargetObservation,
+) -> TargetObservation:
+    if bool(grounding_observation.visible) and bool(getattr(grounding_observation, "can_confirm", False)):
+        return grounding_observation
+    if bool(tracker_observation.visible):
+        return tracker_observation
+    if _is_transient_grounding_observation(grounding_observation):
+        return tracker_observation if bool(tracker_observation.visible) else grounding_observation
+    return grounding_observation
+
+
+def _is_transient_grounding_observation(observation: TargetObservation | None) -> bool:
+    if observation is None:
+        return False
+    reason = str(observation.reason).strip().lower()
+    source = str(observation.source).strip().lower()
+    return (
+        "reused" in source
+        or reason
+        in {
+            "grounding_request_started",
+            "grounding_request_in_flight",
+            "grounding_call_period",
+            "grounding_paused",
+            "rgb_unavailable",
+            "image_prepare_failed",
+        }
+    )
 
 
 def _save_rgb_debug_image(image_rgb: np.ndarray, output_path: Path) -> None:
@@ -1521,6 +1697,7 @@ def _save_current_target_debug_image(
     target_observation: TargetObservation | None,
     executed_action: str,
     output_path: Path,
+    map_image: Image.Image | None,
     map_image_path: Path | None,
     horizontal_fov_deg: float,
 ) -> Image.Image | None:
@@ -1578,6 +1755,7 @@ def _save_current_target_debug_image(
 
     occ_width = max(540, int(fp_width))
     occ_image = _load_occupancy_debug_panel(
+        occupancy_image=map_image,
         occupancy_image_path=map_image_path,
         width=occ_width,
         height=fp_height,
@@ -1628,13 +1806,21 @@ def _draw_grounded_target_overlay(
             ymin = max(0, min(height - 1, ymin))
             xmax = max(0, min(width, xmax))
             ymax = max(0, min(height, ymax))
-            color = (70, 255, 120)
+            can_confirm = bool(getattr(observation, "can_confirm", False))
+            color = (70, 255, 120) if can_confirm else (255, 190, 55)
             draw.rectangle((xmin, ymin, xmax, ymax), outline=color, width=4)
             if observation.center_uv is not None:
                 center_u, center_v = [int(round(float(value))) for value in observation.center_uv]
                 draw.line((center_u - 10, center_v, center_u + 10, center_v), fill=color, width=3)
                 draw.line((center_u, center_v - 10, center_u, center_v + 10), fill=color, width=3)
-            label = f"grounded {observation.label} depth={depth_text} conf={observation.confidence:.2f} seg={segmentation_source}"
+            verify_text = (
+                f"verify={int(bool(getattr(observation, 'vlm_verified', False)))}"
+                f"/{float(getattr(observation, 'vlm_verification_confidence', 0.0)):.2f}"
+            )
+            label = (
+                f"grounded {observation.label} depth={depth_text} conf={observation.confidence:.2f} "
+                f"can_confirm={int(can_confirm)} {verify_text} seg={segmentation_source}"
+            )
             draw.rectangle((xmin, max(0, ymin - 28), min(width, xmin + 620), ymin), fill=(0, 0, 0))
             draw.text((xmin + 4, max(0, ymin - 24)), label[:110], fill=color, font=label_font)
         else:
@@ -1656,8 +1842,23 @@ def _draw_grounded_target_overlay(
     draw.text((12, height - 32), text[:120], fill=(255, 110, 90), font=label_font)
 
 
-def _load_occupancy_debug_panel(*, occupancy_image_path: Path | None, width: int, height: int) -> Image.Image:
-    if occupancy_image_path is not None and Path(occupancy_image_path).exists():
+def _load_occupancy_debug_panel(
+    *,
+    occupancy_image: Image.Image | None = None,
+    occupancy_image_path: Path | None,
+    width: int,
+    height: int,
+) -> Image.Image:
+    if occupancy_image is not None:
+        try:
+            source = occupancy_image.convert("RGB")
+            source.thumbnail((int(width), int(height)), Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS)
+            panel = Image.new("RGB", (int(width), int(height)), (14, 18, 22))
+            offset = ((int(width) - source.width) // 2, (int(height) - source.height) // 2)
+            panel.paste(source, offset)
+        except Exception:
+            panel = Image.new("RGB", (int(width), int(height)), (14, 18, 22))
+    elif occupancy_image_path is not None and Path(occupancy_image_path).exists():
         try:
             source = Image.open(occupancy_image_path).convert("RGB")
             source.thumbnail((int(width), int(height)), Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS)
@@ -2042,13 +2243,13 @@ def _save_global_occupancy_debug(
     trajectory_xy: list[tuple[float, float]],
     landmark_entries,
     step_result: PolicyStepResult,
-    output_path: Path,
-) -> None:
+    output_path: Path | None,
+) -> Image.Image | None:
     if occupancy_snapshot is None:
-        return
+        return None
     log_odds = np.asarray(getattr(occupancy_snapshot, "log_odds", None), dtype=np.float32)
     if log_odds.ndim != 2 or log_odds.size == 0:
-        return
+        return None
 
     resolution = max(1.0e-6, float(getattr(occupancy_snapshot, "resolution_m", 0.08)))
     origin_x = float(getattr(occupancy_snapshot, "origin_x", 0.0))
@@ -2180,7 +2381,9 @@ def _save_global_occupancy_debug(
         font=font_small,
     )
 
-    _save_image_atomic(image, output_path)
+    if output_path is not None:
+        _save_image_atomic(image, output_path)
+    return image
 
 
 def _save_lidar_raw_scan(

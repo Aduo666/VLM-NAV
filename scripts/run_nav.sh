@@ -22,5 +22,6 @@ mkdir -p "$(dirname "${LOG_PATH}")"
 : > "${LOG_PATH}"
 exec > >(tee -a "${LOG_PATH}") 2>&1
 echo "Logging to ${LOG_PATH}"
+echo "DISPLAY=${DISPLAY:-<unset>} WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-<unset>} CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>} ACTIVE_GPU=${ACTIVE_GPU:-<config>} PHYSICS_GPU=${PHYSICS_GPU:-<config>}"
 
 python -m vln_nav.app.nav --config "${CONFIG_PATH}" "$@"

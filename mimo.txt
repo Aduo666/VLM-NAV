@@ -1,265 +1,215 @@
-================================================================================
-VLM-NAV Phase 1 + Phase 2 改动汇总 + 问题分析
-日期: 2026-05-07
-================================================================================
-
-一、改动汇总
-============
-
-1. 核心：证据等级系统 (potential vs confirmed)
----------------------------------------------
-
-目标：防止低置信度/误检目标触发 route_complete，只允许经过多帧稳定确认的目标完成导航。
-
-新增 evidence_level 字段贯穿整个管线：
-  - "none": 未检测到
-  - "potential": 低置信度/Qwen来源/无深度 → 可见但不能触发完成
-  - "confirmed_candidate": DINO来源且有深度，但尚未累积足够帧数
-  - "confirmed": 已通过 N 帧一致性验证 → 可以触发到达判定和 route_complete
-
-can_complete 门控：只有 confirmed + estimated_world_xy != None + confirmed_observation_count >= N 时才为 True。
+================================================================
+三个致命问题分析与建议
+================================================================
+
+问题 1：误识别严重（影子→楼梯，0.58 置信度就到达）
+问题 2：没有全局方位感（landmark 之间的方向关系）
+问题 3：给大模型的图片太模糊（看不清小字）
+
 
-
-2. 文件级改动详情
------------------
-
-configs/default.yaml:
-  - landmark_tracker 新增 8 个配置项：
-    confirm_confidence_threshold: 0.90
-    potential_confidence_threshold: 0.50
-    confirm_min_observations: 3
-    confirm_max_anchor_jump_m: 0.50
-    confirm_max_depth_jump_m: 0.80
-    turn_at_complete_requires_confirmed_anchor: true
-    turn_at_complete_max_distance_m: 3.0
-    qwen_fallback_confirm_allowed: false
-  - target_grounding.sam_enabled: false  (禁用SAM)
-
-src/vln_nav/runtime/config.py:
-  - AppConfig 新增所有上述配置字段的读取
-
-src/vln_nav/navigation/target_grounding.py:
-  - TargetObservation 新增: evidence_level, semantic_source, can_confirm
-  - TargetGroundingConfig 新增: qwen_fallback_confirm_allowed, sam_enabled
-  - _validate_original_bbox() 重大改动：
-    · DINO来源 → can_confirm=True; Qwen来源 → can_confirm=False
-    · 深度验证失败不再拒绝，返回 visible=True, depth_m=None, evidence_level="potential"
-    · 深度有效 → evidence_level="confirmed_candidate"(DINO) 或 "potential"(Qwen)
-  - 所有 copy/reuse/empty 函数同步更新新字段
-
-src/vln_nav/navigation/landmark_tracker.py:
-  - LandmarkState 新增 7 个字段：potential_world_xy, potential_confidence, confirmed_confidence,
-    confirmed_observation_count, last_confirmed_depth_m, evidence_level, can_complete
-  - LandmarkTrackerConfig 新增 6 个字段（对应 yaml 中的 confirm_* 系列）
-  - 新增 _PendingConfirmedCandidate 数据类
-  - update() 重写：
-    · 所有可见观测更新 potential_world_xy / potential_confidence
-    · 只有 high_conf + can_confirm + current_fresh + has_world 的观测进入确认流水线
-    · can_complete 由 estimated_world_xy + confirmed_observation_count >= N + evidence_level=="confirmed" 决定
-  - 新增 _try_confirm_candidate()：
-    · 累积一致性观测，检查 anchor jump / depth jump
-    · 达到 N 帧后写入 estimated_world_xy，evidence_level="confirmed"
-  - _update_reach_state()：
-    · 顶部增加 if not can_complete: return False
-    · visible_depth_reached 和 anchor_reached 均要求 can_complete
+================================================================
+问题 1：误识别 — 低置信度照样确认+到达
+================================================================
 
-src/vln_nav/navigation/landmark_map.py:
-  - LandmarkMapEntry 新增: confirmed_observation_count, evidence_level
-  - has_confirmed_anchor 条件：estimated_world_xy + can_complete + evidence_level=="confirmed" + map_anchor_allowed
-  - 存储 confirmed_confidence 而非被污染的 state.confidence
+【根因链】
+
+GroundingDINO 检测到 "楼梯" 置信度 0.58
+  → confirm_confidence_threshold = 0.50（默认值），0.58 > 0.50，通过
+  → 连续 3 次（confirm_min_observations=3）都检测到"楼梯"
+  → _try_confirm_candidate() 累积 3 次，坐标稳定 → evidence_level="confirmed"
+  → can_complete=True
+  → 到达判定：anchor_distance_m <= 1.4m → 触发到达
+  → _advance_current_landmark() → 进入下一个 landmark
 
-src/vln_nav/navigation/vln_policy.py:
-  - OpenNavPolicyConfig 新增: turn_at_complete_max_distance_m
-  - _maybe_advance_landmark()：增加 and bool(tracker_state.can_complete) 条件
-  - _turn_at_step()：重写完成逻辑，只允许 confirmed + can_complete 的目标触发 turn_at 完成
-    · 增加距离上限检查
-    · 增加 potential target 日志
-  - _is_fresh_grounded_observation()：接受 reason in {"ok", "depth_invalid"}
+问题在于：DINO 是一个通用目标检测器，它不理解"楼梯"在语义上是什么样的。
+地面的阴影、墙上的图案、甚至垃圾桶都可能被检测为 "stairs" 且置信度 > 0.50。
+3 次连续误检就能 confirmed，太容易了。
 
-src/vln_nav/navigation/sam_segmenter.py:
-  - SamSegmenterConfig 新增: enabled: bool = True
-  - segment() 增加 early return: if not enabled → return None
+【建议方案】
 
-src/vln_nav/app/nav.py:
-  - 构造 TargetGroundingConfig 时传入 qwen_fallback_confirm_allowed, sam_enabled
-  - 构造 LandmarkTrackerConfig 时传入所有 confirm_* 字段
-  - 构造 OpenNavPolicyConfig 时传入 turn_at_complete_max_distance_m
+A. 提高 confirm_confidence_threshold（最简单）
+   - 当前 0.50 → 建议 0.65 或 0.70
+   - 0.58 的误检会被直接过滤掉
+   - 代价：真正的低置信度正确检测也会被延迟确认
+   - 风险低，立即可做
 
+B. 加入 "一致性惩罚" 机制（更精细）
+   - 如果同一个 label 的检测在短时间内 bbox 位置大幅跳动（比如影子随光照移动），
+     说明不是稳定目标，应该 reset pending confirmed
+   - 当前已有 anchor_jump 检查（confirm_max_anchor_jump_m=0.50），
+     但影子可能在 0.5m 内反复跳动，刚好不触发 reset
+   - 建议：加入 bbox 面积一致性检查 — 如果面积变化 > 50%，说明不是同一物体
 
-3. SAM 禁用
------------
+C. 加入"视觉验证"层（最可靠但最贵）
+   - 在 confirmed 之前，用 VLM 做一次验证：发送裁剪区域 + prompt
+     "Is this image showing a staircase? Answer yes or no."
+   - 只对 DINO 检测到但置信度 < 0.70 的情况触发
+   - 代价：额外一次 API 调用，延迟 ~1-2s
 
-问题：SAM vit_h 模型约 2.4GB，加载到 GPU 导致 OOM → 回退 CPU → 每次调用 10-20秒，
-阻塞整个控制循环，车几乎不动。
+D. 到达时增加视觉确认（推荐结合 A）
+   - 当前到达判定只看距离，不看当前帧是否还能看到目标
+   - 建议：到达条件增加 "当前帧可见 或 最近 N 帧内见过"
+   - 这样即使之前的 confirmed 是误检，到达时如果看不到也不会触发
 
-解决：configs/default.yaml 设置 sam_enabled: false，完全跳过 SAM。
-GroundingDINO 独立完成检测，深度估算回退到 bbox-based approach。
+E. 针对特定 landmark 类型设置不同阈值
+   - "楼梯" 这类容易和阴影混淆的目标，阈值设更高（0.70）
+   - "轮椅" 这类形状独特的目标，阈值可以低一些（0.55）
+   - 实现方式：在 config 中加 landmark_confidence_overrides 字典
+
+【推荐组合】A + D（提高阈值 + 到达时视觉确认）
+
+
+================================================================
+问题 2：没有全局方位感
+================================================================
+
+【当前状态】
+
+VLM 收到的信息：
+  - 当前目标："楼梯"
+  - Route steps: [{"landmark": "轮椅", "directive": "向前走"}, {"landmark": "楼梯", "directive": "向左前进"}]
+  - Directional clauses: ["向前走", "向右绕过", "向左前进", "直走"]
+  - Route context: "completed: 轮椅; current: 楼梯"（仅此而已）
+
+问题：VLM 不知道"楼梯"相对于"轮椅"在什么方向。
+它只知道当前目标是"楼梯"，但不知道应该往哪个大致方向找。
+
+例如：指令说"找到轮椅，然后向右绕过轮椅之后向左前进，再直走找到楼梯"
+- 轮椅在前方 → 右绕 → 左转 → 直走 → 楼梯
+- 如果轮椅已确认在 (3.0, 4.0)，那么楼梯大致在 (3.0 + delta_x, 4.0 + delta_y)
+- 但 VLM 完全不知道这个全局关系
+
+【建议方案】
+
+A. 在 route_context_text 中加入已完成 landmark 的世界坐标（最简单）
+   - "completed: 轮椅 at (3.0, 4.0); current: 楼梯; direction from previous: forward-left"
+   - VLM 可以据此推断搜索方向
+   - 实现：修改 _build_route_context_text()，加入 confirmed anchor 坐标
+
+B. 构建 landmark 方向图（更系统）
+   - 解析指令中的方向链：向前走→轮椅 → 右绕→轮椅 → 左转前进 → 直走→楼梯
+   - 推算每个 landmark 相对于前一个的大概方向
+   - 存为 InstructionContext.landmark_direction_hints
+   - 在 prompt 中提供："Based on instruction analysis: stairs should be roughly FORWARD-LEFT relative to wheelchair location"
+
+C. 用已完成 landmark 的历史轨迹推算（最精确）
+   - 记录机器人从 start → landmark1 → landmark2 的轨迹
+   - 当前位置相对于 landmark1 的方位 + 指令中的转向信息 → 推算 landmark2 的大概方向
+   - 作为 VLM prompt 的 "expected_direction" 字段
+
+D. 在 occupancy map 上标记全局方向提示（视觉化）
+   - 在 debug 图像上，从当前位置画一条虚线指向下一个 landmark 的推算方向
+   - VLM 看图就能知道大致方向
+   - 代价：需要在图像上叠加标注
 
-
-4. depth_invalid 透传
----------------------
+【推荐组合】A + B（坐标 + 方向推算，成本最低效果最好）
+
+【具体实现思路】
 
-问题：GroundingDINO 检测到目标但深度验证（valid_ratio < 0.12）拒绝所有观测。
+在 vln_policy.py 的 _build_route_context_text() 中：
+  已完成 landmark 的 confirmed anchor 坐标 → 计算相对方位
+  当前目标的推算方向（基于指令中的方向链）
 
-解决：深度验证失败不再返回空观测，而是返回：
-  visible=True, depth_m=None, evidence_level="potential", reason="depth_invalid"
-机器人至少知道目标在视野中。tracker 的 fresh_visible 也更新为接受 reason="depth_invalid"。
-
-
-================================================================================
-
-二、问题分析
-============
-
-问题1：为什么直走的好好的会右转，ground在左边？
---------------------------------------------
-
-### 可能原因分析
-
-(a) VLM决策覆盖grounding信号
-
-  决策流程：
-  1. GroundingDINO 检测目标 → 得到 bbox center_uv → 计算 bearing_rad
-  2. VLM reasoner 接收带标注的图像 + 候选列表
-  3. VLM 选择一个 candidate → 得到 selected_action
-  4. 如果 VLM 返回 selected_action="TURN_RIGHT"，即使 grounding 显示目标在左边，
-     最终执行的仍然是 TURN_RIGHT
-
-  代码位置：vln_policy.py L568-579
-  action_name 优先级：route_corrected > decision.selected_action > _candidate_to_primitive_action()
-  VLM 的 selected_action 会直接覆盖 candidate 自身的 heading 推断。
-
-  VLM 看到的图像可能与 grounding bbox 不一致：
-  - 图像中目标可能在右侧（相机视角）
-  - grounding bbox 可能标记在左侧（可能是旧帧或坐标映射问题）
-
-(b) Grounding结果与VLM图像的时间差
-
-  GroundingDINO 是异步执行的（ThreadPoolExecutor），返回结果可能延迟 1-2秒。
-  收集结果时使用 _collect_finished_request()，得到的是之前的帧的检测结果。
-  而 VLM reasoner 看到的是当前帧的图像。
-  如果机器人在这段时间内已经转向，grounding 的 bearing 可能已经过时。
-
-  关键日志需要关注：
-  - [Grounding] 日志中的 bearing_deg 和 bbox 位置
-  - [PrimitiveDecision] 日志中的 action 和 semantic_visible
-  - 结果中的 result_age_sec 和 is_current_frame
-
-(c) ReacquireGuard 可能干扰
-
-  如果目标刚从视野中消失，ReacquireGuard 会禁止重复之前的转向方向。
-  如果之前执行了 TURN_LEFT，目标消失后，Guard 会禁止 TURN_LEFT，
-  即使目标最后一次出现在左边，也可能被迫选择 TURN_RIGHT。
-
-  代码位置：vln_policy.py L1224-1244
-  如果 guard.lost_after_visible=True 且 selected == guard.forbidden_action，
-  会覆盖为 STOP 或 reacquire_guard_override_action（默认"STOP"）。
-
-(d) Occupancy grid 语义规划器干扰
-
-  如果 semantic_planner_enabled=true，语义规划器可能基于占据栅格计算出一条
-  绕过障碍物的路径，该路径可能向右绕行，即使目标在左边。
-
-  代码位置：vln_policy.py L655-735 (_semantic_planner_step)
-  语义规划器优先级高于 VLM reasoner，会直接覆盖决策。
-
-### 排查建议
-
-  1. 查看运行日志中的 [PrimitiveDecision] 行，确认 action 来源（LLM_PRIMITIVE / SEMANTIC_LOCAL_PLANNER / REACQUIRE_GUARD）
-  2. 对比 [Grounding] 日志中的 bearing_deg 和最终执行的 action
-  3. 检查 [ReacquireGuard] 日志是否有 override
-  4. 检查 [SemanticPlanner] 日志是否触发了语义路径规划
-  5. 如果 grounding bbox 在图像左侧但 VLM 选了右侧候选，
-     可能是 VLM 的 prompt 中对 left/right candidate 的描述不够清晰
-
-
-问题2：阈值不够的目标会有记忆吗？视野消失后为什么朝着更低置信度去了？
-----------------------------------------------------------------
-
-### 问题根因
-
-当前实现中，只有 evidence_level="confirmed" 的目标才会写入 LandmarkMap（持久记忆）。
-
-代码位置：landmark_map.py L86-91
-```python
-has_confirmed_anchor = (
-    state.estimated_world_xy is not None
-    and bool(state.can_complete)
-    and str(state.evidence_level) == "confirmed"
-    and bool(map_anchor_allowed)
-)
-```
-
-对于 potential 级别的目标：
-- state.estimated_world_xy 不会更新（只有 confirmed 流水线才会写入）
-- state.potential_world_xy 会更新，但 LandmarkMap 不读取它
-- 目标离开视野后，LandmarkMap 中没有该目标的条目
-- VLM 只能靠 target_memory（历史文本描述）和 last_seen_bearing_hint 来搜索
-
-### 具体流程
-
-1. 目标A（置信度0.75，DINO来源）被检测到
-   → evidence_level="confirmed_candidate"（高置信度+DINO+有深度）
-   → 但需要3帧一致性才能 confirmed
-   → 只看了1-2帧，还没来得及确认
-
-2. 目标A离开视野
-   → state.lost_count 增加
-   → state.evidence_level 仍为 "confirmed_candidate" 或 "potential"
-   → LandmapMap 不创建条目（因为 can_complete=False）
-
-3. 机器人继续搜索，遇到目标B（置信度0.55，也在视野中）
-   → 目标B 是另一个物体，被 VLM 误认为目标
-   → VLM 选择了朝目标B移动的候选
-
-4. 结果：机器人忘记了之前看到的目标A，转向了更低置信度的目标B
-
-### 核心缺陷
-
-- potential_world_xy 有位置信息，但不参与 LandmarkMap 和导航决策
-- VLM reasoner 只能看到当前帧的 grounding 结果 + 文本形式的 target_memory
-- 没有"我之前在左边看到过目标"这种几何记忆传给 VLM
-
-### 可能的改进方向
-
-方向A：将 potential 目标也写入 LandmarkMap（标记为 potential）
-  - LandmarkMap 新增 potential_entries
-  - VLM prompt 中增加 potential target 的位置信息
-  - 风险：低置信度目标可能干扰导航
-
-方向B：在 target_memory 中增加几何位置信息
-  - 不改 LandmarkMap，而是在 _combined_target_memory_text() 中
-    加入 potential_world_xy 和 bearing 信息
-  - VLM prompt: "potential target last seen at bearing=left, distance=3.2m"
-  - 风险较低，但 VLM 是否能有效利用这些信息不确定
-
-方向C：降低 confirm_min_observations 到 1-2
-  - 让高置信度目标更快达到 confirmed 状态
-  - 代价：可能增加误确认的风险
-  - 当前阈值 confirm_confidence_threshold=0.90 已经很高，
-    配合 confirm_min_observations=2 可能是合理的折中
-
-方向D：在 _turn_at_step 和 _maybe_advance_landmark 中增加 potential 搜索逻辑
-  - 如果当前没有 confirmed 目标，但有 potential 目标的位置信息，
-    可以尝试朝那个方向搜索
-  - 这不需要改 LandmarkMap，只需在 policy 层面利用 potential_world_xy
-
-### 建议优先级
-
-1. 先做方向B（最小改动，增加几何记忆文本）
-2. 如果效果不够，做方向D（policy层面利用potential位置）
-3. 方向C（降低确认帧数）可以同时尝试
-4. 方向A（potential写入LandmarkMap）改动最大，最后考虑
-
-================================================================================
-
-三、待验证事项
-==============
-
-1. 确认 SAM 禁用后 GroundingDINO 的检测质量是否足够
-2. 确认 depth_invalid 透传不会导致大量噪声观测干扰 tracker
-3. 观察 confirmed 确认流水线在实际运行中的收敛速度
-4. 收集 turn 方向错误的具体日志，定位是 VLM 问题还是坐标问题
-5. 测试 potential 目标丢失后的实际行为
-
-================================================================================
+示例 prompt 增强：
+  "Route context: completed landmarks: wheelchair at (3.0, 4.0).
+   Instruction analysis: after wheelchair, turn right then go left then straight → stairs expected roughly FORWARD-LEFT from current heading.
+   Current robot heading: 45°. Expected stairs direction: approximately -30° to +30° relative to current heading."
+
+
+================================================================
+问题 3：给大模型的图片太模糊
+================================================================
+
+【当前配置】
+
+camera.width = 640, camera.height = 480
+llm.upload_max_edge_px = 512  ← 最大边 512px
+llm.camera_image_detail = "high"
+
+上传流程：
+  640x480 原图 → 最大边 512px → 缩放到 512x384 → PNG 压缩 → base64 → API
+
+问题：
+1. 512px 太小。640x480 本身就不大，再缩到 512x384，细节严重丢失
+2. "high" detail 在 512px 下效果有限 — detail 参数控制的是 API 端的处理方式，
+   但如果输入图片本身就糊，high detail 也救不回来
+3. 小字（比如标识牌上的文字、远处的目标）在 512px 下基本不可读
+
+【建议方案】
+
+A. 提高 upload_max_edge_px（最直接）
+   - 512 → 1024 或 1280
+   - 代价：token 消耗增加（约 4x），API 延迟略增
+   - Qwen3-VL 支持高分辨率输入，1024px 是合理范围
+   - 建议先试 1024，观察 token 用量和延迟
+
+B. 提高相机原始分辨率
+   - camera.width = 640 → 1280, camera.height = 480 → 720
+   - 代价：Isaac Sim 渲染负载增加，GPU 显存占用增加
+   - 但这样原图就有足够细节，缩放到 1024 仍然清晰
+   - 注意：可能加剧你之前遇到的 GPU OOM 问题
+
+C. 分辨率自适应（精细方案）
+   - 近距离目标（depth < 2m）：用高分辨率 crop + 高 upload_max_edge
+   - 远距离目标（depth > 4m）：用全图 + 标准 upload_max_edge
+   - 实现：在 _prepare_image_upload() 中根据目标距离选择策略
+
+D. 裁剪感兴趣区域（ROI）
+   - 如果 DINO 已经给出了目标 bbox，裁剪 bbox 区域（放大 1.5x margin）
+   - 单独发送 ROI 给 VLM 做细节判断
+   - 全图用于全局导航，ROI 用于目标确认
+   - 代价：可能需要两次 VLM 调用，或在 prompt 中说明 ROI 位置
+
+E. 使用 JPEG 代替 PNG（压缩效率）
+   - 当前用 PNG optimize=True，无损压缩
+   - JPEG quality=85 视觉上几乎无损，但文件小很多
+   - 这样同样的文件大小可以传更高分辨率的图
+   - 改动小：_prepare_image_upload() 中 format="JPEG", quality=85
+
+【推荐组合】A（提高 upload_max_edge 到 1024）+ E（JPEG 代替 PNG）
+
+【注意】
+提高 upload_max_edge 会增加 token 消耗。Qwen3-VL-30B 的 token 计费：
+  - 512x384 ≈ 约 800-1200 image tokens
+  - 1024x768 ≈ 约 2500-3500 image tokens
+  - 差异约 3x，但在 SiliconFlow 上费用应该可控
+
+建议先在 configs/default.yaml 中改为：
+  llm:
+    upload_max_edge_px: 1024
+测试一下效果和延迟，再决定是否继续提高。
+
+
+================================================================
+优先级总结
+================================================================
+
+问题 1（误识别）：
+  P0: 提高 confirm_confidence_threshold 到 0.65-0.70
+  P1: 到达时增加"当前帧可见"检查
+  P2: bbox 面积一致性检查
+
+问题 2（全局方位感）：
+  P0: 在 route_context 中加入已完成 landmark 的世界坐标
+  P1: 构建指令方向链，推算下一个 landmark 的预期方向
+  P2: 在 occupancy map 图像上叠加方向提示
+
+问题 3（图片模糊）：
+  P0: upload_max_edge_px 512 → 1024
+  P1: PNG → JPEG (quality=85)
+  P2: 相机分辨率 640x480 → 1280x720（需评估 GPU 影响）
+  P3: ROI 裁剪方案
+
+
+================================================================
+三个问题的相互关系
+================================================================
+
+问题 1 和问题 3 是关联的：
+  图片模糊 → DINO 看不清 → 低置信度误检 → 但阈值太低仍然通过 → 误到达
+  提高图片分辨率 + 提高确认阈值，双管齐下效果最好
+
+问题 2 和问题 3 也是关联的：
+  图片模糊 → VLM 看不清远处标识 → 方向判断失误
+  如果有了全局方位提示，即使看不清，VLM 也能根据方向推断
+  → 问题 2 的方案 B 可以部分缓解问题 3

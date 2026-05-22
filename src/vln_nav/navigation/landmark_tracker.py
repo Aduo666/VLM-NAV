@@ -52,6 +52,7 @@ class LandmarkTrackerConfig:
     anchor_update_min_consistent_observations: int
     anchor_update_max_jump_m: float
     arrival_window_size: int
+    arrival_recent_visible_sec: float = 3.0
     confirm_confidence_threshold: float = 0.50
     confirm_min_observations: int = 3
     confirm_max_anchor_jump_m: float = 0.50
@@ -576,7 +577,12 @@ class LandmarkTracker:
             and state.anchor_distance_m is not None
             and float(state.anchor_distance_m) <= anchor_threshold_m
             and state.can_complete
+            and state.last_seen_time_sec is not None
+            and float(observation.timestamp_sec) - float(state.last_seen_time_sec) <= max(0.0, float(self._config.arrival_recent_visible_sec))
         )
+        recent_visible_age = None
+        if state.last_seen_time_sec is not None:
+            recent_visible_age = float(observation.timestamp_sec) - float(state.last_seen_time_sec)
 
         evidence = bool(visible_depth_reached or anchor_reached)
         reach_window.append(bool(evidence))
@@ -592,13 +598,14 @@ class LandmarkTracker:
         reached_count = hits
         self._logger.info(
             "[ReachCheck] target=%s behavior=%s reached=%s can_complete=%s distance=%s depth=%s "
-            "reason=%s confirm=%s/%s evidence_level=%s",
+            "recent_visible_age=%s reason=%s confirm=%s/%s evidence_level=%s",
             label,
             state.behavior_type,
             int(reached),
             int(bool(state.can_complete)),
             _format_optional_float(state.anchor_distance_m),
             _format_optional_float(observation.depth_m),
+            _format_optional_float(recent_visible_age),
             reason,
             int(hits),
             int(window_size),
@@ -632,6 +639,7 @@ def _is_observation_transient(observation: TargetObservation) -> bool:
             "grounding_request_started",
             "grounding_request_in_flight",
             "grounding_call_period",
+            "grounding_paused",
             "rgb_unavailable",
             "image_prepare_failed",
         }

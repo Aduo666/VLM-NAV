@@ -45,11 +45,11 @@ class AppConfig:
     candidate_max_travel_distance_m: float = 1.35
     candidate_min_free_ratio: float = 0.28
     candidate_column_half_width_px: int = 26
-    candidate_debug_image_path: str = "assets/vln_request.png"
+    candidate_debug_image_path: str = "debug/llm_request.png"
     target_debug_enabled: bool = True
-    target_debug_image_path: str = "assets/vln_debug.png"
+    target_debug_image_path: str = "debug/vln_debug.png"
     debug_video_enabled: bool = True
-    debug_video_path: str = "assets/vln_debug.mp4"
+    debug_video_path: str = "debug/videos/vln_debug.mp4"
     debug_video_fps: float = 4.0
     debug_image_update_period_sec: float = 1.0
     progress_history_length: int = 6
@@ -103,11 +103,25 @@ class AppConfig:
     target_grounding_max_result_pose_delta_m: float = 1.5
     target_grounding_max_result_yaw_delta_deg: float = 45.0
     target_grounding_qwen_fallback_confirm_allowed: bool = False
+    target_grounding_semantic_verification_enabled: bool = True
+    target_grounding_semantic_verification_min_confidence: float = 0.70
+    target_grounding_semantic_verification_max_edge_px: int = 768
+    target_grounding_semantic_verification_auto_accept_confidence: float = 1.01
+    target_grounding_pause_during_active_primitive: bool = True
+    target_tracker_enabled: bool = True
+    target_tracker_type: str = "CSRT"
+    target_tracker_max_lost_frames: int = 8
+    target_tracker_lost_confirmed_sec: float = 2.0
+    target_tracker_min_depth_valid_ratio: float = 0.08
+    target_tracker_center_patch_ratio: float = 0.35
+    target_tracker_confidence_decay_per_lost_frame: float = 0.06
+    target_tracker_min_tracking_confidence: float = 0.35
     landmark_tracker_arrival_visible_depth_m: float = 1.00
     landmark_tracker_arrival_anchor_radius_m: float = 1.00
     landmark_tracker_min_visible_count: int = 2
     landmark_tracker_arrival_confirmations: int = 2
     landmark_tracker_arrival_window_size: int = 5
+    landmark_tracker_arrival_recent_visible_sec: float = 3.0
     landmark_tracker_max_lost_count: int = 6
     landmark_tracker_anchor_update_min_consistent_observations: int = 2
     landmark_tracker_anchor_update_max_jump_m: float = 1.5
@@ -126,7 +140,7 @@ class AppConfig:
     reacquire_guard_recent_visible_sec: float = 20.0
     reacquire_guard_override_action: str = "STOP"
     depth_debug_enabled: bool = True
-    depth_debug_image_path: str = "assets/depth_debug.png"
+    depth_debug_image_path: str = "debug/depth_debug.png"
 
     headless: bool = False
     sim_width: int = 1280
@@ -227,7 +241,7 @@ class AppConfig:
     occupancy_grid_unknown_is_traversable: bool = True
     occupancy_grid_unknown_cell_cost: float = 0.10
     occupancy_grid_debug_enabled: bool = True
-    occupancy_grid_debug_image_path: str = "assets/local_map.png"
+    occupancy_grid_debug_image_path: str = "debug/local_map.png"
     occupancy_grid_debug_update_period_sec: float = 0.5
     occupancy_grid_debug_width: int = 900
     occupancy_grid_debug_height: int = 900
@@ -438,7 +452,7 @@ def load_config(config_path: str | None = None) -> AppConfig:
         ),
         candidate_debug_image_path=_env_or_value(
             "CANDIDATE_DEBUG_IMAGE_PATH",
-            opennav.get("candidate_debug_image_path", "assets/vln_request.png"),
+            opennav.get("candidate_debug_image_path", "debug/llm_request.png"),
         ),
         target_debug_enabled=_bool_env_or_value(
             "TARGET_DEBUG_ENABLED",
@@ -446,7 +460,7 @@ def load_config(config_path: str | None = None) -> AppConfig:
         ),
         target_debug_image_path=_env_or_value(
             "TARGET_DEBUG_IMAGE_PATH",
-            opennav.get("target_debug_image_path", "assets/vln_debug.png"),
+            opennav.get("target_debug_image_path", "debug/vln_debug.png"),
         ),
         debug_video_enabled=_bool_env_or_value(
             "DEBUG_VIDEO_ENABLED",
@@ -454,7 +468,7 @@ def load_config(config_path: str | None = None) -> AppConfig:
         ),
         debug_video_path=_env_or_value(
             "DEBUG_VIDEO_PATH",
-            opennav.get("debug_video_path", "assets/vln_debug.mp4"),
+            opennav.get("debug_video_path", "debug/videos/vln_debug.mp4"),
         ),
         debug_video_fps=_float_env_or_value(
             "DEBUG_VIDEO_FPS",
@@ -677,6 +691,58 @@ def load_config(config_path: str | None = None) -> AppConfig:
             "TARGET_GROUNDING_QWEN_FALLBACK_CONFIRM_ALLOWED",
             target_grounding.get("qwen_fallback_confirm_allowed", False),
         ),
+        target_grounding_semantic_verification_enabled=_bool_env_or_value(
+            "TARGET_GROUNDING_SEMANTIC_VERIFICATION_ENABLED",
+            target_grounding.get("semantic_verification_enabled", True),
+        ),
+        target_grounding_semantic_verification_min_confidence=_float_env_or_value(
+            "TARGET_GROUNDING_SEMANTIC_VERIFICATION_MIN_CONFIDENCE",
+            target_grounding.get("semantic_verification_min_confidence", 0.70),
+        ),
+        target_grounding_semantic_verification_max_edge_px=_int_env_or_value(
+            "TARGET_GROUNDING_SEMANTIC_VERIFICATION_MAX_EDGE_PX",
+            target_grounding.get("semantic_verification_max_edge_px", 768),
+        ),
+        target_grounding_semantic_verification_auto_accept_confidence=_float_env_or_value(
+            "TARGET_GROUNDING_SEMANTIC_VERIFICATION_AUTO_ACCEPT_CONFIDENCE",
+            target_grounding.get("semantic_verification_auto_accept_confidence", 1.01),
+        ),
+        target_grounding_pause_during_active_primitive=_bool_env_or_value(
+            "TARGET_GROUNDING_PAUSE_DURING_ACTIVE_PRIMITIVE",
+            target_grounding.get("pause_during_active_primitive", True),
+        ),
+        target_tracker_enabled=_bool_env_or_value(
+            "TARGET_TRACKER_ENABLED",
+            target_grounding.get("tracker_enabled", target_grounding.get("target_tracker_enabled", True)),
+        ),
+        target_tracker_type=_env_or_value(
+            "TARGET_TRACKER_TYPE",
+            target_grounding.get("tracker_type", "CSRT"),
+        ),
+        target_tracker_max_lost_frames=_int_env_or_value(
+            "TARGET_TRACKER_MAX_LOST_FRAMES",
+            target_grounding.get("tracker_max_lost_frames", 8),
+        ),
+        target_tracker_lost_confirmed_sec=_float_env_or_value(
+            "TARGET_TRACKER_LOST_CONFIRMED_SEC",
+            target_grounding.get("tracker_lost_confirmed_sec", 2.0),
+        ),
+        target_tracker_min_depth_valid_ratio=_float_env_or_value(
+            "TARGET_TRACKER_MIN_DEPTH_VALID_RATIO",
+            target_grounding.get("tracker_min_depth_valid_ratio", target_grounding.get("min_depth_valid_ratio", 0.08)),
+        ),
+        target_tracker_center_patch_ratio=_float_env_or_value(
+            "TARGET_TRACKER_CENTER_PATCH_RATIO",
+            target_grounding.get("tracker_center_patch_ratio", 0.35),
+        ),
+        target_tracker_confidence_decay_per_lost_frame=_float_env_or_value(
+            "TARGET_TRACKER_CONFIDENCE_DECAY_PER_LOST_FRAME",
+            target_grounding.get("tracker_confidence_decay_per_lost_frame", 0.06),
+        ),
+        target_tracker_min_tracking_confidence=_float_env_or_value(
+            "TARGET_TRACKER_MIN_TRACKING_CONFIDENCE",
+            target_grounding.get("tracker_min_tracking_confidence", 0.35),
+        ),
         landmark_tracker_arrival_visible_depth_m=_float_env_or_value(
             "LANDMARK_TRACKER_ARRIVAL_VISIBLE_DEPTH_M",
             landmark_tracker.get("arrival_visible_depth_m", 1.00),
@@ -696,6 +762,10 @@ def load_config(config_path: str | None = None) -> AppConfig:
         landmark_tracker_arrival_window_size=_int_env_or_value(
             "LANDMARK_TRACKER_ARRIVAL_WINDOW_SIZE",
             landmark_tracker.get("arrival_window_size", 5),
+        ),
+        landmark_tracker_arrival_recent_visible_sec=_float_env_or_value(
+            "LANDMARK_TRACKER_ARRIVAL_RECENT_VISIBLE_SEC",
+            landmark_tracker.get("arrival_recent_visible_sec", 3.0),
         ),
         landmark_tracker_max_lost_count=_int_env_or_value(
             "LANDMARK_TRACKER_MAX_LOST_COUNT",
@@ -771,7 +841,7 @@ def load_config(config_path: str | None = None) -> AppConfig:
         ),
         depth_debug_image_path=_env_or_value(
             "DEPTH_DEBUG_IMAGE_PATH",
-            camera.get("depth_debug_image_path", "assets/depth_debug.png"),
+            camera.get("depth_debug_image_path", "debug/depth_debug.png"),
         ),
         headless=_bool_env_or_value("HEADLESS", sim.get("headless", False)),
         sim_width=_int_env_or_value("SIM_WIDTH", sim.get("width", 1280)),
@@ -1110,7 +1180,7 @@ def load_config(config_path: str | None = None) -> AppConfig:
         ),
         occupancy_grid_debug_image_path=_env_or_value(
             "OCCUPANCY_GRID_DEBUG_IMAGE_PATH",
-            occupancy_grid.get("debug_image_path", "assets/local_map.png"),
+            occupancy_grid.get("debug_image_path", "debug/local_map.png"),
         ),
         occupancy_grid_debug_update_period_sec=_float_env_or_value(
             "OCCUPANCY_GRID_DEBUG_UPDATE_PERIOD_SEC",
@@ -1382,16 +1452,17 @@ def _int_env_or_value(name: str, default: int) -> int:
     return int(raw) if raw is not None else int(default)
 
 
-def _optional_int_env_or_value(name: str, default: int | None) -> int | None:
+def _optional_int_env_or_value(name: str, default: Any) -> int | None:
     raw = os.getenv(name)
-    if raw is not None:
-        candidate = raw.strip()
-        if candidate == "" or candidate.lower() == "none":
-            return None
-        return int(candidate)
-    if default is None:
+    candidate = raw if raw is not None else default
+    if candidate is None:
         return None
-    return int(default)
+    if isinstance(candidate, str):
+        text = candidate.strip().lower()
+        if text in {"", "none", "null", "auto", "display"}:
+            return None
+        return int(text)
+    return int(candidate)
 
 
 def _float_env_or_value(name: str, default: float) -> float:

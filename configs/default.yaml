@@ -2,7 +2,7 @@ sim:
   headless: false
   width: 1280
   height: 720
-  active_gpu: 0
+  active_gpu: auto
   physics_gpu: 0
   multi_gpu: false
   physics_dt: 0.0166667
@@ -15,7 +15,7 @@ llm:
   model_name: "Qwen/Qwen3-VL-30B-A3B-Instruct"
   timeout_sec: 30
   retry_cooldown_sec: 0
-  upload_max_edge_px: 512
+  upload_max_edge_px: 1024
   camera_image_detail: "high"
 
 opennav:
@@ -31,11 +31,11 @@ opennav:
   candidate_max_travel_distance_m: 1.35
   candidate_min_free_ratio: 0.28
   candidate_column_half_width_px: 26
-  candidate_debug_image_path: "assets/vln_request.png"
+  candidate_debug_image_path: "debug/llm_request.png"
   target_debug_enabled: true
-  target_debug_image_path: "assets/vln_debug.png"
+  target_debug_image_path: "debug/vln_debug.png"
   debug_video_enabled: true
-  debug_video_path: "assets/vln_debug.mp4"
+  debug_video_path: "debug/videos/vln_debug.mp4"
   debug_video_fps: 4.0
   debug_image_update_period_sec: 1.0
   progress_history_length: 6
@@ -54,7 +54,7 @@ target_grounding:
   backend: "auto"
   call_period_sec: 1.5
   reuse_last_observation_sec: 2.5
-  upload_max_edge_px: 512
+  upload_max_edge_px: 768
   min_bbox_area_ratio: 0.002
   max_bbox_area_ratio: 0.60
   min_bbox_width_px: 4
@@ -86,6 +86,19 @@ target_grounding:
   max_result_age_sec: 2.0
   max_result_pose_delta_m: 1.5
   max_result_yaw_delta_deg: 45.0
+  semantic_verification_enabled: true
+  semantic_verification_min_confidence: 0.70
+  semantic_verification_max_edge_px: 768
+  semantic_verification_auto_accept_confidence: 1.01
+  pause_during_active_primitive: true
+  tracker_enabled: true
+  tracker_type: "CSRT"
+  tracker_max_lost_frames: 8
+  tracker_lost_confirmed_sec: 2.0
+  tracker_min_depth_valid_ratio: 0.08
+  tracker_center_patch_ratio: 0.35
+  tracker_confidence_decay_per_lost_frame: 0.06
+  tracker_min_tracking_confidence: 0.35
 
 landmark_tracker:
   arrival_visible_depth_m: 1.40
@@ -93,6 +106,7 @@ landmark_tracker:
   min_visible_count: 2
   arrival_confirmations: 2
   arrival_window_size: 5
+  arrival_recent_visible_sec: 3.0
   max_lost_count: 6
   anchor_update_min_consistent_observations: 2
   anchor_update_max_jump_m: 1.5
@@ -100,7 +114,7 @@ landmark_tracker:
   landmark_map_anchor_ttl_sec: 120.0
   landmark_map_min_confidence: 0.20
   landmark_map_log_period_sec: 2.0
-  confirm_confidence_threshold: 0.50
+  confirm_confidence_threshold: 0.65
   potential_confidence_threshold: 0.50
   confirm_min_observations: 3
   confirm_max_anchor_jump_m: 0.50
@@ -138,7 +152,7 @@ camera:
   candidate_preferred_distance_m: 1.0
   depth_eval_period_sec: 0.12
   depth_debug_enabled: false
-  depth_debug_image_path: "assets/depth_debug.png"
+  depth_debug_image_path: "debug/depth_debug.png"
   obstacle_avoidance_enabled: true
   obstacle_stop_distance_m: 0.65
   obstacle_roi_vertical_range: [0.50, 0.95]
@@ -228,8 +242,8 @@ occupancy_grid:
   turn_clearance_radius_m: 0.36
   unknown_is_traversable: true
   unknown_cell_cost: 0.10
-  debug_enabled: true
-  debug_image_path: "assets/local_map.png"
+  debug_enabled: false
+  debug_image_path: "debug/local_map.png"
   debug_update_period_sec: 0.5
   debug_width: 900
   debug_height: 900

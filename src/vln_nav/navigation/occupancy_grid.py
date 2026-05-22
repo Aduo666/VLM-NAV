@@ -48,7 +48,7 @@ class OccupancyGridConfig:
     max_astar_iterations: int = 7000
     max_path_detour_ratio: float = 2.2
     debug_enabled: bool = True
-    debug_image_path: str = "assets/local_map.png"
+    debug_image_path: str = "debug/local_map.png"
     debug_update_period_sec: float = 0.5
     debug_width: int = 900
     debug_height: int = 900

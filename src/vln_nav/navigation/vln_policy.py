@@ -8,7 +8,7 @@ from typing import Any
 import numpy as np
 
 from .candidate_waypoint_predictor import CandidateSet, CandidateWaypointPredictor, WaypointCandidate
-from .instruction_manager import InstructionContext
+from .instruction_manager import InstructionContext, RouteStep
 from .landmark_map import LandmarkMapEntry
 from .landmark_tracker import LandmarkState
 from .map_candidate_generator import MapCandidateGenerator
@@ -136,7 +136,8 @@ class OpenNavVLNPolicy:
         self._last_decision_summary = "startup"
         self._last_candidate_set: CandidateSet | None = None
         self._next_replan_time = 0.0
-        self._ordered_landmarks = _ordered_landmarks(instruction_context)
+        self._route_steps = _route_steps(instruction_context)
+        self._ordered_landmarks = _ordered_landmarks_from_steps(self._route_steps, instruction_context)
         self._current_landmark_index = 0
         self._completed_landmarks: list[str] = []
         self._route_complete = False
@@ -172,6 +173,9 @@ class OpenNavVLNPolicy:
         self._turn_at_landmark_index: int | None = None
         self._turn_at_steps_taken = 0
         self._turn_at_exhausted_landmark_index: int | None = None
+        self._pass_landmark_index: int | None = None
+        self._pass_actions: list[str] = []
+        self._pass_action_index = 0
 
     def step(
         self,
@@ -223,6 +227,14 @@ class OpenNavVLNPolicy:
         )
         if turn_at_result is not None:
             return turn_at_result
+
+        pass_result = self._pass_step(
+            observation=observation,
+            progress_signal=progress_state.progress_signal,
+            now=now,
+        )
+        if pass_result is not None:
+            return pass_result
 
         if self._recovery_action_name is not None:
             return self._recovery_step(observation=observation, progress_signal=progress_state.progress_signal, now=now)
@@ -392,7 +404,7 @@ class OpenNavVLNPolicy:
                 semantic_entries=list(self._all_landmark_map_entries),
                 semantic_plan=semantic_plan,
             )
-            occupancy_debug_path = saved_occupancy_path or getattr(self._occupancy_grid, "output_path", None)
+            occupancy_debug_path = saved_occupancy_path
         debug_image_path = self._candidate_predictor.save_debug(
             observation=observation,
             candidate_set=candidate_set,
@@ -1114,6 +1126,119 @@ class OpenNavVLNPolicy:
             return "TURN_RIGHT"
         return self._preferred_search_turn_action()
 
+    def _pass_step(
+        self,
+        *,
+        observation: VLNObservation,
+        progress_signal: str,
+        now: float,
+    ) -> PolicyStepResult | None:
+        if self.current_behavior_type != "pass":
+            return None
+
+        if self._pass_landmark_index != self._current_landmark_index:
+            self._pass_landmark_index = int(self._current_landmark_index)
+            self._pass_actions = _pass_action_sequence(self._current_direction_clause())
+            self._pass_action_index = 0
+            self._logger.info(
+                "[Pass] start target=%s directive=%s actions=%s",
+                self._current_target_text(),
+                self._current_direction_clause() or "none",
+                self._pass_actions,
+            )
+
+        if (
+            self._active_candidate_label == "pass"
+            and self._active_world_goal_xy is not None
+            and self._execution_steps_remaining > 0
+        ):
+            local_goal = _world_waypoint_to_local_xy(
+                robot_pose=observation.pose,
+                world_goal_xy=self._active_world_goal_xy,
+            )
+            return self._motion_primitive_step(
+                observation=observation,
+                local_goal=local_goal,
+                progress_signal=progress_signal,
+                now=now,
+            )
+
+        if self._pass_action_index >= len(self._pass_actions):
+            anchor_world_xy, _ = self._current_route_anchor()
+            self._logger.info(
+                "[Pass] complete target=%s actions=%s next_route_step=%s",
+                self._current_target_text(),
+                self._pass_actions,
+                int(self._current_landmark_index) + 1,
+            )
+            self._advance_current_landmark(
+                observation=observation,
+                anchor_world_xy=anchor_world_xy,
+                distance_m=None,
+                source="PassPrimitive",
+                reason="pass_sequence_complete",
+                visible_now=False,
+                lost_count=0,
+            )
+            self._clear_active_goal()
+            return PolicyStepResult(
+                action_name="STOP",
+                speed_scale=0.0,
+                decision_source="PASS_COMPLETE",
+                selected_candidate_id=None,
+                local_goal_xy=[0.0, 0.0],
+                world_goal_xy=anchor_world_xy,
+                execution_steps_remaining=0,
+                reasoning_summary="pass behavior completed; advancing to next route step",
+                progress_signal=progress_signal,
+                replanned=False,
+                debug_image_path=(
+                    None if self._candidate_predictor.last_saved_debug_path is None
+                    else str(self._candidate_predictor.last_saved_debug_path)
+                ),
+                **self._route_result_kwargs(),
+            )
+
+        action_name = str(self._pass_actions[self._pass_action_index]).strip().upper()
+        self._pass_action_index += 1
+        self._active_world_goal_xy = [float(observation.pose.x), float(observation.pose.y)]
+        self._active_candidate_id = None
+        self._active_candidate_label = "pass"
+        self._execution_steps_remaining = max(1, int(self._config.execution_steps))
+        self._active_action_name = action_name
+        self._active_goal_started_sec = float(now)
+        self._active_start_yaw_rad = float(observation.pose.yaw_rad)
+        self._active_start_pose = observation.pose
+        self._last_decision_summary = (
+            f"pass primitive {self._pass_action_index}/{len(self._pass_actions)}; "
+            f"directive={self._current_direction_clause() or 'none'}"
+        )
+        self._logger.info(
+            "[Pass] action=%s target=%s step=%s/%s directive=%s",
+            action_name,
+            self._current_target_text(),
+            int(self._pass_action_index),
+            int(len(self._pass_actions)),
+            self._current_direction_clause() or "none",
+        )
+        return PolicyStepResult(
+            action_name=action_name,
+            speed_scale=float(_primitive_speed_scale(action_name, self._config)),
+            decision_source="PASS_PRIMITIVE",
+            selected_candidate_id=None,
+            local_goal_xy=[0.0, 0.0],
+            world_goal_xy=list(self._active_world_goal_xy),
+            execution_steps_remaining=int(self._execution_steps_remaining),
+            reasoning_summary=self._last_decision_summary,
+            progress_signal=progress_signal,
+            replanned=True,
+            debug_image_path=(
+                None if self._candidate_predictor.last_saved_debug_path is None
+                else str(self._candidate_predictor.last_saved_debug_path)
+            ),
+            **self._route_result_kwargs(),
+        )
+
     def _semantic_landmark_entry(self) -> LandmarkMapEntry | None:
         if self.current_behavior_type != "go_to":
             return None
@@ -1193,7 +1318,11 @@ class OpenNavVLNPolicy:
             f"bearing_deg={_format_optional_float(None if bearing_rad is None else np.degrees(float(bearing_rad)))} "
             f"world_xy={_format_xy(world_xy) if world_xy is not None else 'none'} "
             f"mask_area={float(getattr(observation, 'mask_area_ratio', 0.0)):.4f} "
-            f"segmentation={getattr(observation, 'segmentation_source', 'none')}"
+            f"segmentation={getattr(observation, 'segmentation_source', 'none')} "
+            f"evidence={getattr(observation, 'evidence_level', 'none')} "
+            f"can_confirm={int(bool(getattr(observation, 'can_confirm', False)))} "
+            f"vlm_verified={int(bool(getattr(observation, 'vlm_verified', False)))} "
+            f"vlm_conf={float(getattr(observation, 'vlm_verification_confidence', 0.0)):.2f}"
         )
 
     def _build_reacquire_guard_context(self, *, now: float) -> ReacquireGuardContext:
@@ -1691,15 +1820,24 @@ class OpenNavVLNPolicy:
         )
 
     def _current_target_text(self) -> str:
+        route_step = self._current_route_step()
+        if route_step is not None:
+            landmark = str(getattr(route_step, "landmark", "")).strip().lower()
+            if _is_valid_landmark(landmark):
+                return landmark
         if self._ordered_landmarks and self._current_landmark_index < len(self._ordered_landmarks):
             return str(self._ordered_landmarks[self._current_landmark_index])
         return self._instruction_context.goal_phrase or self._instruction_context.normalized_text
 
-    def _current_route_step(self):
-        route_steps = list(getattr(self._instruction_context, "route_steps", []) or [])
-        if self._current_landmark_index < len(route_steps):
-            return route_steps[self._current_landmark_index]
+    def _current_route_step(self) -> RouteStep | None:
+        if self._current_landmark_index < len(self._route_steps):
+            return self._route_steps[self._current_landmark_index]
         return None
+
+    def _route_step_count(self) -> int:
+        if self._route_steps:
+            return len(self._route_steps)
+        return len(self._ordered_landmarks)
 
     def _sync_instruction_target(self) -> None:
         self._instruction_context.goal_phrase = self._current_target_text()
@@ -1712,7 +1850,7 @@ class OpenNavVLNPolicy:
         }
 
     def _maybe_advance_landmark(self, *, observation: VLNObservation) -> bool:
-        if not self._ordered_landmarks or self._route_complete:
+        if self._route_step_count() <= 0 or self._route_complete:
             self._arrival_confirmation_window.clear()
             return False
 
@@ -1806,9 +1944,12 @@ class OpenNavVLNPolicy:
         self._turn_at_landmark_index = None
         self._turn_at_steps_taken = 0
         self._turn_at_exhausted_landmark_index = None
+        self._pass_landmark_index = None
+        self._pass_actions = []
+        self._pass_action_index = 0
 
         distance_text = "none" if distance_m is None else f"{float(distance_m):.2f}"
-        if self._current_landmark_index >= len(self._ordered_landmarks):
+        if self._current_landmark_index >= self._route_step_count():
             self._route_complete = True
             self._logger.info(
                 "[Landmark] reached=%s source=%s reason=%s distance=%sm visible_now=%s lost_count=%s route=complete completed=%s",
@@ -1842,9 +1983,10 @@ class OpenNavVLNPolicy:
     def _route_context_text(self, *, robot_pose) -> str:
         current_target = self._current_target_text()
         current_index = self._current_landmark_index
+        current_route_step = self._current_route_step()
         expected_words = self._expected_direction_words()
         route_steps = []
-        for step in getattr(self._instruction_context, "route_steps", []):
+        for step in self._route_steps:
             raw_behavior = str(getattr(step, "behavior_type", "go_to")).strip().lower() or "go_to"
             route_steps.append(
                 f"{raw_behavior}:{getattr(step, 'landmark', '')}:{getattr(step, 'directive', '')}"
@@ -1852,11 +1994,14 @@ class OpenNavVLNPolicy:
         lines = [
             f"ordered_landmarks={self._ordered_landmarks}",
             f"route_steps={route_steps or ['none']}",
-            f"current_landmark_index={current_index}",
+            f"current_route_step_index={current_index}",
+            f"current_behavior_type={self.current_behavior_type}",
+            f"current_route_step={current_route_step}",
             f"current_landmark={current_target}",
             f"completed_landmarks={self._completed_landmarks}",
             f"directional_clause_for_current={self._current_direction_clause() or 'none'}",
             f"expected_direction_words={sorted(expected_words) if expected_words else 'none'}",
+            f"global_route_direction_hint={self._global_route_direction_hint()}",
         ]
         if self._topology_summary:
             lines.append(self._topology_summary)
@@ -1893,6 +2038,31 @@ class OpenNavVLNPolicy:
                     f"{side}, forward={relative[0]:.2f}m, left={relative[1]:.2f}m, consistency={consistency}"
                 )
         return "; ".join(lines)
+
+    def _global_route_direction_hint(self) -> str:
+        if not self._route_steps:
+            return "none"
+        start = max(0, int(self._current_landmark_index) - 2)
+        end = min(len(self._route_steps), int(self._current_landmark_index) + 1)
+        window = self._route_steps[start:end]
+        parts: list[str] = []
+        direction_tokens: list[str] = []
+        for absolute_index, step in enumerate(window, start=start):
+            directive = str(getattr(step, "directive", "")).strip()
+            behavior = str(getattr(step, "behavior_type", "go_to")).strip().lower() or "go_to"
+            landmark = str(getattr(step, "landmark", "")).strip().lower()
+            tokens = _direction_tokens_from_text(directive)
+            direction_tokens.extend(tokens)
+            marker = "CURRENT" if absolute_index == self._current_landmark_index else "PREV"
+            parts.append(
+                f"{marker}[{absolute_index}]={behavior}:{landmark}:directive={directive or 'none'}:directions={tokens or ['none']}"
+            )
+        latest = direction_tokens[-1] if direction_tokens else "unknown"
+        return (
+            f"recent_route_window={' | '.join(parts)}; "
+            f"latest_direction_bias={latest}; "
+            "when current target is not visible, prefer safe frontier/candidate directions that satisfy this recent route direction chain relative to completed landmarks"
+        )
 
     def _current_direction_clause(self) -> str:
         route_step = self._current_route_step()
@@ -2007,9 +2177,50 @@ def _is_valid_landmark(label: str) -> bool:
     return bool(text) and text not in _INVALID_LANDMARKS and len(text) >= 2
 
 
-def _ordered_landmarks(instruction_context: InstructionContext) -> list[str]:
-    ordered: list[str] = []
+def _route_steps(instruction_context: InstructionContext) -> list[RouteStep]:
+    steps: list[RouteStep] = []
     for route_step in getattr(instruction_context, "route_steps", []) or []:
+        landmark = str(getattr(route_step, "landmark", "")).strip().lower()
+        if not _is_valid_landmark(landmark):
+            continue
+        directive = str(getattr(route_step, "directive", "")).strip()
+        behavior_type = str(getattr(route_step, "behavior_type", "go_to")).strip().lower() or "go_to"
+        steps.append(
+            RouteStep(
+                landmark=landmark,
+                directive=directive,
+                behavior_type=behavior_type,
+            )
+        )
+    if steps:
+        return steps
+
+    fallback_steps: list[RouteStep] = []
+    for raw_landmark in instruction_context.landmarks:
+        landmark = str(raw_landmark).strip().lower()
+        if _is_valid_landmark(landmark):
+            fallback_steps.append(
+                RouteStep(
+                    landmark=landmark,
+                    directive=f"go to {landmark}",
+                    behavior_type="go_to",
+                )
+            )
+    if fallback_steps:
+        return fallback_steps
+
+    fallback = str(instruction_context.goal_phrase or instruction_context.normalized_text).strip().lower()
+    if _is_valid_landmark(fallback):
+        return [RouteStep(landmark=fallback, directive=f"go to {fallback}", behavior_type="go_to")]
+    return []
+
+
+def _ordered_landmarks_from_steps(
+    route_steps: list[RouteStep],
+    instruction_context: InstructionContext,
+) -> list[str]:
+    ordered: list[str] = []
+    for route_step in route_steps:
         landmark = str(getattr(route_step, "landmark", "")).strip().lower()
         if _is_valid_landmark(landmark) and landmark not in ordered:
             ordered.append(landmark)
@@ -2022,6 +2233,32 @@ def _ordered_landmarks(instruction_context: InstructionContext) -> list[str]:
         if fallback and _is_valid_landmark(fallback):
             ordered.append(fallback)
     return ordered
+
+
+def _pass_action_sequence(directive: str) -> list[str]:
+    text = str(directive).strip().lower()
+    if "right" in text:
+        return ["TURN_RIGHT", "FORWARD", "TURN_LEFT", "FORWARD"]
+    if "left" in text:
+        return ["TURN_LEFT", "FORWARD", "TURN_RIGHT", "FORWARD"]
+    return ["FORWARD"]
+
+
+def _direction_tokens_from_text(text: str) -> list[str]:
+    lowered = str(text).strip().lower()
+    tokens: list[str] = []
+    checks = [
+        ("left", ("left", "左")),
+        ("right", ("right", "右")),
+        ("forward", ("forward", "straight", "ahead", "front", "前", "直")),
+        ("backward", ("back", "backward", "后", "退")),
+        ("through", ("through", "go through", "穿过", "通过")),
+        ("pass", ("pass", "around", "绕过", "经过")),
+    ]
+    for token, aliases in checks:
+        if any(alias in lowered for alias in aliases):
+            tokens.append(token)
+    return tokens
 
 
 def _is_fresh_grounded_observation(observation) -> bool:

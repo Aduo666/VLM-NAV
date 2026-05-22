@@ -11,6 +11,7 @@ from .candidate_waypoint_predictor import CandidateSet, CandidateWaypointPredict
 from .instruction_manager import InstructionContext
 from .landmark_map import LandmarkMapEntry
 from .landmark_tracker import LandmarkState
+from .map_candidate_generator import MapCandidateGenerator
 from .observation_adapter import VLNObservation
 from .progress_manager import ProgressManager
 from .target_memory import TargetMemory
@@ -108,6 +109,7 @@ class OpenNavVLNPolicy:
         instruction_context: InstructionContext,
         candidate_predictor: CandidateWaypointPredictor,
         occupancy_grid: Any | None = None,
+        map_candidate_generator: MapCandidateGenerator | None = None,
         progress_manager: ProgressManager,
         reasoner: OpenNavReasoner,
         config: OpenNavPolicyConfig,
@@ -116,6 +118,7 @@ class OpenNavVLNPolicy:
         self._instruction_context = instruction_context
         self._candidate_predictor = candidate_predictor
         self._occupancy_grid = occupancy_grid
+        self._map_candidate_generator = map_candidate_generator
         self._progress_manager = progress_manager
         self._reasoner = reasoner
         self._config = config
@@ -156,11 +159,14 @@ class OpenNavVLNPolicy:
         self._sync_instruction_target()
         self._safety_context_text = ""
         self._last_applied_action = "STOP"
+        self._safety_override_streak = 0
+        self._last_safety_override_signature: tuple[str, str, str] | None = None
         self._recovery_action_name: str | None = None
         self._recovery_steps_remaining = 0
         self._recovery_started_sec: float | None = None
         self._recovery_count = 0
         self._last_semantic_plan_signature: tuple | None = None
+        self._last_semantic_skip_signature: tuple | None = None
         self._topology_summary = ""
         self._topology_revisit_world_xy: list[float] | None = None
         self._turn_at_landmark_index: int | None = None
@@ -220,6 +226,14 @@ class OpenNavVLNPolicy:
 
         if self._recovery_action_name is not None:
             return self._recovery_step(observation=observation, progress_signal=progress_state.progress_signal, now=now)
+
+        if self._should_start_safety_recovery():
+            return self._start_recovery(
+                observation=observation,
+                progress_signal=f"SAFETY_BLOCKED:{progress_state.progress_signal}",
+                now=now,
+                reason="repeated_safety_override",
+            )
 
         if self._should_start_recovery(progress_state=progress_state):
             return self._start_recovery(
@@ -341,13 +355,24 @@ class OpenNavVLNPolicy:
 
         reacquire_guard = self._build_reacquire_guard_context(now=now)
         candidate_set = self._candidate_predictor.predict(observation)
+        semantic_landmark_entry = self._semantic_landmark_entry()
+        if self._map_candidate_generator is not None and self._occupancy_grid is not None:
+            candidate_set = self._map_candidate_generator.augment(
+                observation=observation,
+                base_candidate_set=candidate_set,
+                occupancy_snapshot=self._occupancy_grid.snapshot(),
+                current_target=self._current_target_text(),
+                landmark_state=self._landmark_tracker_state,
+                landmark_entry=semantic_landmark_entry,
+                progress_signal=progress_state.progress_signal,
+                safety_context_text=self._safety_context_text,
+            )
         if self._occupancy_grid is not None:
             candidate_set = self._occupancy_grid.filter_candidates(
                 observation=observation,
                 candidate_set=candidate_set,
             )
         self._last_candidate_set = candidate_set
-        semantic_landmark_entry = self._semantic_landmark_entry()
         semantic_plan = None
         if self._occupancy_grid is not None and semantic_landmark_entry is not None and not bool(semantic_landmark_entry.reached):
             try:
@@ -442,7 +467,6 @@ class OpenNavVLNPolicy:
             if (
                 int(candidate_set.valid_count) == 0
                 and bool(self._config.recovery_enabled)
-                and progress_state.progress_signal in {"STALLED", "SPINNING"}
             ):
                 self._logger.warning(
                     "[Recovery] no_valid_candidates signal=%s; starting local escape instead of repeating STOP",
@@ -675,6 +699,37 @@ class OpenNavVLNPolicy:
         action_name = _local_goal_to_primitive_action(local_goal_xy=local_goal)
         if action_name == "STOP":
             return None
+        local_goal_distance_m = float(np.hypot(float(local_goal[0]), float(local_goal[1])))
+        min_executable_forward_m = max(0.10, 0.75 * float(self._config.active_forward_distance_m))
+        path_length_m = float(getattr(semantic_plan, "path_length_m", 0.0))
+        if action_name == "FORWARD" and (
+            local_goal_distance_m < min_executable_forward_m
+            or path_length_m < min_executable_forward_m
+        ):
+            self._log_semantic_skip(
+                target_label=str(getattr(semantic_plan, "target_label", self._current_target_text())),
+                reason="subgoal_too_short_for_forward_primitive",
+                action_name=action_name,
+                distance_to_target_m=float(getattr(semantic_plan, "distance_to_target_m", 0.0)),
+                path_length_m=path_length_m,
+                local_goal=local_goal,
+                min_executable_m=min_executable_forward_m,
+            )
+            return None
+        if (
+            self._safety_context_text
+            and f"previous_desired={action_name}" in self._safety_context_text
+        ):
+            self._log_semantic_skip(
+                target_label=str(getattr(semantic_plan, "target_label", self._current_target_text())),
+                reason="previous_action_safety_blocked",
+                action_name=action_name,
+                distance_to_target_m=float(getattr(semantic_plan, "distance_to_target_m", 0.0)),
+                path_length_m=path_length_m,
+                local_goal=local_goal,
+                min_executable_m=min_executable_forward_m,
+            )
+            return None
         speed_scale = float(_primitive_speed_scale(action_name, self._config))
         selected_candidate = _nearest_candidate_for_local_goal(candidate_set=candidate_set, local_goal_xy=local_goal)
         selected_candidate_id = None if selected_candidate is None else int(selected_candidate.slot_id)
@@ -737,6 +792,41 @@ class OpenNavVLNPolicy:
             **self._route_result_kwargs(),
         )
 
+    def _log_semantic_skip(
+        self,
+        *,
+        target_label: str,
+        reason: str,
+        action_name: str,
+        distance_to_target_m: float,
+        path_length_m: float,
+        local_goal: tuple[float, float],
+        min_executable_m: float,
+    ) -> None:
+        signature = (
+            str(target_label),
+            str(reason),
+            str(action_name),
+            round(float(distance_to_target_m), 1),
+            round(float(path_length_m), 1),
+            round(float(local_goal[0]), 1),
+            round(float(local_goal[1]), 1),
+        )
+        if signature == self._last_semantic_skip_signature:
+            return
+        self._logger.warning(
+            "[SemanticPlanner] skip target=%s reason=%s action=%s distance_m=%.2f path_length_m=%.2f subgoal_local_xy=[%.2f,%.2f] min_executable_m=%.2f",
+            target_label,
+            reason,
+            action_name,
+            float(distance_to_target_m),
+            float(path_length_m),
+            float(local_goal[0]),
+            float(local_goal[1]),
+            float(min_executable_m),
+        )
+        self._last_semantic_skip_signature = signature
+
     def _clear_active_goal(self) -> None:
         self._active_world_goal_xy = None
         self._active_candidate_id = None
@@ -753,6 +843,36 @@ class OpenNavVLNPolicy:
 
     def set_safety_context(self, text: str) -> None:
         self._safety_context_text = str(text).strip()
+
+    def record_safety_result(
+        self,
+        *,
+        overridden: bool,
+        desired_action: str,
+        applied_action: str,
+        reason: str,
+    ) -> None:
+        desired = str(desired_action).strip().upper()
+        applied = str(applied_action).strip().upper()
+        reason_text = str(reason).strip() or "unknown"
+        if not bool(overridden):
+            self._safety_override_streak = 0
+            self._last_safety_override_signature = None
+            return
+        signature = (desired, applied, reason_text)
+        if signature == self._last_safety_override_signature:
+            self._safety_override_streak += 1
+        else:
+            self._safety_override_streak = 1
+            self._last_safety_override_signature = signature
+        if self._safety_override_streak >= 2:
+            self._logger.warning(
+                "[SafetyRecovery] repeated_override streak=%s desired=%s applied=%s reason=%s",
+                int(self._safety_override_streak),
+                desired,
+                applied,
+                reason_text,
+            )
 
     @property
     def current_landmark(self) -> str:
@@ -1345,21 +1465,28 @@ class OpenNavVLNPolicy:
             return False
         return True
 
+    def _should_start_safety_recovery(self) -> bool:
+        return bool(self._config.recovery_enabled) and int(self._safety_override_streak) >= 2
+
     def _start_recovery(
         self,
         *,
         observation: VLNObservation,
         progress_signal: str,
         now: float,
+        reason: str = "progress_stalled",
     ) -> PolicyStepResult:
         self._clear_active_goal()
         self._recovery_action_name = self._choose_recovery_action()
         self._recovery_steps_remaining = max(1, int(self._config.recovery_execution_steps))
         self._recovery_started_sec = float(now)
         self._recovery_count += 1
+        self._safety_override_streak = 0
+        self._last_safety_override_signature = None
         self._logger.warning(
-            "[Recovery] start action=%s signal=%s count=%s current_landmark=%s",
+            "[Recovery] start action=%s reason=%s signal=%s count=%s current_landmark=%s",
             self._recovery_action_name,
+            reason,
             progress_signal,
             self._recovery_count,
             self._current_target_text(),

@@ -27,6 +27,7 @@ from ..navigation.lidar_sensor import (
     PhysXLidarConfig,
     PhysXLidarReader,
 )
+from ..navigation.map_candidate_generator import MapCandidateGenerator, MapCandidateGeneratorConfig
 from ..navigation.navigation_map_visualizer import NavigationMapConfig, NavigationMapVisualizer
 from ..navigation.occupancy_grid import OccupancyGridConfig, OccupancyGridMapper
 from ..navigation.observation_adapter import ObservationAdapter
@@ -416,6 +417,21 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
             robot_root_path=str(config.robot_prim_path),
             logger=logger,
         )
+    map_candidate_generator = MapCandidateGenerator(
+        config=MapCandidateGeneratorConfig(
+            enabled=bool(config.map_candidates_enabled),
+            max_candidates=int(config.map_candidates_max_candidates),
+            min_distance_m=float(config.map_candidates_min_distance_m),
+            max_distance_m=float(config.map_candidates_max_distance_m),
+            semantic_enabled=bool(config.map_candidates_semantic_enabled),
+            frontier_enabled=bool(config.map_candidates_frontier_enabled),
+            escape_enabled=bool(config.map_candidates_escape_enabled),
+            min_clearance_m=float(config.map_candidates_min_clearance_m),
+            unknown_gain_weight=float(config.map_candidates_unknown_gain_weight),
+            semantic_weight=float(config.map_candidates_semantic_weight),
+        ),
+        logger=logger,
+    )
     navigation_map_visualizer = NavigationMapVisualizer(
         config=NavigationMapConfig(
             enabled=bool(config.navigation_map_enabled),
@@ -433,6 +449,7 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
         instruction_context=instruction_context,
         candidate_predictor=candidate_predictor,
         occupancy_grid=occupancy_grid if bool(config.occupancy_grid_enabled) else None,
+        map_candidate_generator=map_candidate_generator,
         progress_manager=progress_manager,
         reasoner=reasoner,
         config=OpenNavPolicyConfig(
@@ -683,7 +700,7 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
     if config.target_debug_enabled:
         logger.info("Runtime debug image output: %s", target_debug_output_path)
     if config.debug_video_enabled and config.target_debug_enabled:
-        logger.info("Runtime debug video output: %s", target_debug_video_path)
+        logger.info("Runtime debug video output: %s", debug_video_recorder.output_path)
     if config.depth_debug_enabled:
         logger.info("Depth debug output: %s", depth_debug_output_path)
     if config.occupancy_grid_enabled:
@@ -1060,6 +1077,12 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
             speed_scale=step_result.speed_scale,
             local_goal_xy=step_result.local_goal_xy,
         )
+        policy.record_safety_result(
+            overridden=bool(safety_decision.overridden),
+            desired_action=step_result.action_name,
+            applied_action=safety_decision.action_name,
+            reason=safety_decision.reason,
+        )
         if safety_decision.overridden:
             policy.cancel_active_goal()
             safety_context = (
@@ -1214,7 +1237,7 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
             last_action_name = "STOP"
             target_grounder.close()
             debug_video_recorder.close()
-            logger.info("Route complete — navigation stopped; Isaac Sim scene remains open. Debug video saved: %s", target_debug_video_path)
+            logger.info("Route complete — navigation stopped; Isaac Sim scene remains open. Debug video saved: %s", debug_video_recorder.output_path)
             continue
 
         if (

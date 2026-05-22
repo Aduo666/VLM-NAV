@@ -121,6 +121,14 @@ opennav:
   recovery_trigger_stalled_steps: 3
   debug_image_update_period_sec: 1.0
 
+map_candidates:
+  enabled: true
+  max_candidates: 6
+  semantic_enabled: true
+  frontier_enabled: true
+  escape_enabled: true
+  min_clearance_m: 0.34
+
 target_grounding:
   enabled: true
   backend: "auto"   # auto | grounding_dino | qwen_vl
@@ -216,19 +224,19 @@ bash scripts/run_nav.sh --headless
 
 ```text
 logs/nav_latest.log
-assets/opennav_debug.png
-assets/opennav_debug.mp4
-assets/opennav_request.png
-assets/occupancy_grid.png
+assets/vln_debug.png
+assets/vln_debug_YYYYMMDD_HHMMSS.mp4
+assets/vln_request.png
+assets/local_map.png
 assets/depth_debug.png
 logs/last_candidate_choice_request.json
 ```
 
-`assets/opennav_debug.png` 是给人看的组合调试图：左侧是第一人称 target/动作覆盖图，会直接画出 grounding bbox、SAM mask、depth 或 lost 原因；右侧是 navigation map，包含轨迹、landmark、当前目标和 occupancy。`assets/occupancy_grid.png` 是单独的局部占用图；开启 `lidar.enabled` 时，红色为 LiDAR 障碍，橙色为安全膨胀边界。
+`assets/vln_debug.png` 是给人看的组合调试图：左侧是第一人称 target/动作覆盖图，会直接画出 grounding bbox、SAM mask、depth 或 lost 原因；右侧是 navigation map，包含轨迹、landmark、当前目标和 occupancy。`assets/local_map.png` 是单独的局部占用图；开启 `lidar.enabled` 时，红色为 LiDAR 障碍，橙色为安全膨胀边界。
 
-`assets/opennav_debug.mp4` 会把运行过程中的组合调试图低频记录成视频，便于事后看完整决策过程。
+`assets/vln_debug_YYYYMMDD_HHMMSS.mp4` 会把运行过程中的组合调试图低频记录成视频，每次运行自动加日期后缀，格式为 VSCode 可直接打开的 mp4。
 
-`assets/opennav_request.png` 是真正发送给 VLM 的候选点请求图，只在重规划时更新。
+`assets/vln_request.png` 是真正发送给 VLM 的候选点请求图，只在重规划时更新。
 
 `scripts/test_llm_call.py` 可以复用最近一次导航真正发给模型的 prompt：
 
@@ -239,7 +247,7 @@ python scripts/test_llm_call.py
 也可以手动测试：
 
 ```bash
-python scripts/test_llm_call.py --mode manual --image assets/opennav_request.png
+python scripts/test_llm_call.py --mode manual --image assets/vln_request.png
 ```
 
 ## 当前主链路
@@ -248,12 +256,13 @@ python scripts/test_llm_call.py --mode manual --image assets/opennav_request.png
 2. `observation_adapter.py` 整理 RGB、Depth、机器人位姿和上一帧执行反馈。
 3. `lidar_sensor.py` 从 `dummy_base_link/base_link/Lidar_link` 读取或创建 PhysX LiDAR，并用 LiDAR scan 更新 occupancy grid；只有关闭 LiDAR 时才退回前视深度建图。
 4. `candidate_waypoint_predictor.py` 从深度图生成固定槽位候选动作。
-5. `target_grounding.py` 低频获取当前 landmark 的 bbox；`backend: auto` 时优先尝试本地 GroundingDINO，缺少 checkpoint 或不可用时自动回退到 Qwen VLM bbox。bbox 会映射回原始 RGB/depth 坐标，然后优先用 SAM 在 bbox 内生成目标 mask，并用 mask 内深度估计目标距离和世界坐标候选 anchor；SAM 不可用时才退回 bbox 内深度一致区域。
-6. `landmark_tracker.py` 只在连续一致观测后确认 landmark anchor，并判断当前 landmark 是否到达。
-7. `landmark_map.py` 保存 confirmed landmark anchor；目标暂时离开视野后，主链仍能基于已确认世界坐标判断距离和给 VLM 提供记忆。
-8. `vln_reasoner.py` 将指令、历史、候选点图、LandmarkMap 和安全上下文发给 VLM。
-9. `vln_policy.py` 将 VLM 选中的候选槽位映射成固定离散动作原语，并在 tracker/map 判定到达后切换到下一个 landmark；如果目标刚可见后因转向丢失，`ReacquireGuard` 会禁止继续同向转。
-10. `controller.py` 执行 `FORWARD/BACKWARD/TURN_LEFT/TURN_RIGHT/STOP`，每个原语按固定时间或固定转角结束，然后停车回正并重规划。
+5. `map_candidate_generator.py` 基于 occupancy grid、当前 landmark anchor、安全上下文和进展状态补充 `semantic_approach/frontier/escape_turn` 候选，并统一成 `WaypointCandidate` 供 VLM 选择。
+6. `target_grounding.py` 低频获取当前 landmark 的 bbox；`backend: auto` 时优先尝试本地 GroundingDINO，缺少 checkpoint 或不可用时自动回退到 Qwen VLM bbox。bbox 会映射回原始 RGB/depth 坐标，然后优先用 SAM 在 bbox 内生成目标 mask，并用 mask 内深度估计目标距离和世界坐标候选 anchor；SAM 不可用时才退回 bbox 内深度一致区域。
+7. `landmark_tracker.py` 只在连续一致观测后确认 landmark anchor，并判断当前 landmark 是否到达。
+8. `landmark_map.py` 保存 confirmed landmark anchor；目标暂时离开视野后，主链仍能基于已确认世界坐标判断距离和给 VLM 提供记忆。
+9. `vln_reasoner.py` 将指令、历史、候选点图、LandmarkMap 和安全上下文发给 VLM。
+10. `vln_policy.py` 将 VLM 选中的候选槽位映射成固定离散动作原语，并在 tracker/map 判定到达后切换到下一个 landmark；如果目标刚可见后因转向丢失，`ReacquireGuard` 会禁止继续同向转。
+11. `controller.py` 执行 `FORWARD/BACKWARD/TURN_LEFT/TURN_RIGHT/STOP`，每个原语按固定时间或固定转角结束，然后停车回正并重规划。
 
 当前版本没有本地启发式强行覆盖 VLM 选择；安全模块只在近距离碰撞风险时 STOP，并把原因传回下一轮 VLM 决策。
 

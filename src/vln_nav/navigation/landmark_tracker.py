@@ -429,13 +429,27 @@ class LandmarkTracker:
             current = np.asarray(state.estimated_world_xy, dtype=np.float32).reshape(2)
             jump_from_confirmed = float(np.linalg.norm(averaged - current))
             if jump_from_confirmed > confirm_max_anchor_jump:
+                reanchor_required = max(required + 2, 5)
+                if int(pending.count) < int(reanchor_required):
+                    self._logger.warning(
+                        "[LandmarkReanchorWait] target=%s reason=confirmed_anchor_jump jump_m=%.2f max=%.2f candidate=%s confirmed=%s confirm_wait=%s/%s",
+                        label,
+                        jump_from_confirmed,
+                        confirm_max_anchor_jump,
+                        _format_xy(averaged.tolist()),
+                        _format_xy(state.estimated_world_xy),
+                        int(pending.count),
+                        int(reanchor_required),
+                    )
+                    return
                 self._logger.warning(
-                    "[LandmarkConfirmReject] target=%s reason=confirmed_anchor_jump jump_m=%.2f max=%.2f candidate=%s confirmed=%s",
-                    label, jump_from_confirmed, confirm_max_anchor_jump,
-                    _format_xy(averaged.tolist()), _format_xy(state.estimated_world_xy),
+                    "[LandmarkReanchor] target=%s reason=stable_new_anchor jump_m=%.2f old=%s new=%s observations=%s",
+                    label,
+                    jump_from_confirmed,
+                    _format_xy(state.estimated_world_xy),
+                    _format_xy(averaged.tolist()),
+                    int(pending.count),
                 )
-                self._pending_confirmed.pop(label, None)
-                return
 
         state.estimated_world_xy = [float(averaged[0]), float(averaged[1])]
         state.confirmed_observation_count = int(pending.count)

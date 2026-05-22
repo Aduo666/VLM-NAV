@@ -284,7 +284,7 @@ class OpenNavReasoner:
             "8. If progress is STALLED/SPINNING, select an escape/recovery candidate instead of continuing the same direction.\n"
             "9. If not visible but grounded_landmark_map has confirmed=1, choose a candidate that moves the robot toward robot_forward_m/robot_left_m instead of forgetting the landmark.\n"
             "10. If grounded_landmark_map has confirmed=0 and evidence=potential, use it as a weak direction hint: move toward it only when the occupancy map says the path is safe; otherwise choose a safer open/unknown frontier.\n"
-            "11. If no target memory or map anchor is available, prefer valid candidates with safe occupancy, high clearance/free_ratio, and non-repeating progress into open or unknown areas.\n"
+            "11. If no target memory or map anchor is available, prefer valid candidates with type=safe_forward/open_frontier/safe_turn_search, safe occupancy, high clearance/free_ratio, and non-repeating progress into open or unknown areas.\n"
             "12. If not visible but only weak target memory has a last seen anchor, try to reacquire around that memory bearing; avoid continuing straight into a dead end.\n"
             "13. If Reacquire guard names a Forbidden action this step and target_visible=false, do not output that action even if memory says the target was last seen that way.\n"
             "14. If this is not the first landmark, use the route context to check whether the candidate is plausible relative to the previous landmark and the instruction direction.\n"
@@ -320,20 +320,41 @@ def _candidate_line(candidate: WaypointCandidate) -> str:
     primitive_action = _candidate_primitive_action(candidate)
     occupancy_reason = str(candidate.depth_support.get("occupancy_reason", "not_checked"))
     occupancy_path_length = float(candidate.depth_support.get("occupancy_path_length_m", 0.0))
+    free_ratio = float(candidate.depth_support.get("free_ratio", 0.0))
+    near_depth_m = float(candidate.depth_support.get("min_depth", 0.0))
+    candidate_type = _candidate_type(candidate=candidate, occupancy_reason=occupancy_reason)
     return (
         f"- id={candidate.slot_id} valid={int(candidate.valid)} "
-        f"label={candidate.label} side={side} "
+        f"type={candidate_type} label={candidate.label} side={side} "
         f"primitive_action={primitive_action} "
         f"heading_deg={candidate.heading_delta_deg:+.1f} "
         f"distance_m={candidate.travel_distance_m:.2f} "
         f"source=current_frame "
         f"clearance={candidate.clearance_score:.2f} "
-        f"free_ratio={candidate.depth_support.get('free_ratio', 0.0):.2f} "
-        f"near_depth_m={candidate.depth_support.get('min_depth', 0.0):.2f} "
+        f"free_ratio={free_ratio:.2f} "
+        f"near_depth_m={near_depth_m:.2f} "
         f"median_depth_m={candidate.depth_support.get('median_depth', 0.0):.2f} "
         f"occupancy={occupancy_reason} "
         f"planned_path_m={occupancy_path_length:.2f}"
     )
+
+
+def _candidate_type(*, candidate: WaypointCandidate, occupancy_reason: str) -> str:
+    explicit_type = str(candidate.depth_support.get("map_candidate_type", "")).strip()
+    if explicit_type:
+        return explicit_type
+    if not bool(candidate.valid):
+        return "invalid"
+    heading = abs(float(candidate.heading_delta_deg))
+    free_ratio = float(candidate.depth_support.get("free_ratio", 0.0))
+    clearance = float(candidate.clearance_score)
+    if str(occupancy_reason) == "reachable" and heading <= 12.0 and clearance >= 0.55:
+        return "safe_forward"
+    if str(occupancy_reason) == "reachable" and heading > 12.0:
+        return "safe_turn_search"
+    if free_ratio >= 0.50 and clearance >= 0.45:
+        return "open_frontier"
+    return "low_confidence_search"
 
 
 def _candidate_side(candidate: WaypointCandidate) -> str:

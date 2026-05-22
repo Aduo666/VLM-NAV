@@ -45,11 +45,11 @@ class AppConfig:
     candidate_max_travel_distance_m: float = 1.35
     candidate_min_free_ratio: float = 0.28
     candidate_column_half_width_px: int = 26
-    candidate_debug_image_path: str = "assets/opennav_request.png"
+    candidate_debug_image_path: str = "assets/vln_request.png"
     target_debug_enabled: bool = True
-    target_debug_image_path: str = "assets/opennav_debug.png"
+    target_debug_image_path: str = "assets/vln_debug.png"
     debug_video_enabled: bool = True
-    debug_video_path: str = "assets/opennav_debug.avi"
+    debug_video_path: str = "assets/vln_debug.mp4"
     debug_video_fps: float = 4.0
     debug_image_update_period_sec: float = 1.0
     progress_history_length: int = 6
@@ -240,6 +240,16 @@ class AppConfig:
     occupancy_grid_semantic_goal_step_m: float = 0.90
     occupancy_grid_semantic_goal_min_step_m: float = 0.45
     occupancy_grid_semantic_goal_lateral_search_m: float = 0.80
+    map_candidates_enabled: bool = True
+    map_candidates_max_candidates: int = 6
+    map_candidates_min_distance_m: float = 0.55
+    map_candidates_max_distance_m: float = 1.35
+    map_candidates_semantic_enabled: bool = True
+    map_candidates_frontier_enabled: bool = True
+    map_candidates_escape_enabled: bool = True
+    map_candidates_min_clearance_m: float = 0.34
+    map_candidates_unknown_gain_weight: float = 0.35
+    map_candidates_semantic_weight: float = 0.45
     lidar_enabled: bool = True
     lidar_prim_path: str = "dummy_base_link/base_link/Lidar_link"
     lidar_child_name: str = "lidar_sensor"
@@ -346,6 +356,7 @@ def load_config(config_path: str | None = None) -> AppConfig:
     odom = _section(file_data, "odom")
     navigation_map = _section(file_data, "navigation_map")
     occupancy_grid = _section(file_data, "occupancy_grid")
+    map_candidates = _section(file_data, "map_candidates")
     lidar = _section(file_data, "lidar")
     topology = _section(file_data, "topology")
     scene = _section(file_data, "scene")
@@ -427,7 +438,7 @@ def load_config(config_path: str | None = None) -> AppConfig:
         ),
         candidate_debug_image_path=_env_or_value(
             "CANDIDATE_DEBUG_IMAGE_PATH",
-            opennav.get("candidate_debug_image_path", "assets/opennav_request.png"),
+            opennav.get("candidate_debug_image_path", "assets/vln_request.png"),
         ),
         target_debug_enabled=_bool_env_or_value(
             "TARGET_DEBUG_ENABLED",
@@ -435,7 +446,7 @@ def load_config(config_path: str | None = None) -> AppConfig:
         ),
         target_debug_image_path=_env_or_value(
             "TARGET_DEBUG_IMAGE_PATH",
-            opennav.get("target_debug_image_path", "assets/opennav_debug.png"),
+            opennav.get("target_debug_image_path", "assets/vln_debug.png"),
         ),
         debug_video_enabled=_bool_env_or_value(
             "DEBUG_VIDEO_ENABLED",
@@ -443,7 +454,7 @@ def load_config(config_path: str | None = None) -> AppConfig:
         ),
         debug_video_path=_env_or_value(
             "DEBUG_VIDEO_PATH",
-            opennav.get("debug_video_path", "assets/opennav_debug.avi"),
+            opennav.get("debug_video_path", "assets/vln_debug.mp4"),
         ),
         debug_video_fps=_float_env_or_value(
             "DEBUG_VIDEO_FPS",
@@ -1148,6 +1159,46 @@ def load_config(config_path: str | None = None) -> AppConfig:
         occupancy_grid_semantic_goal_lateral_search_m=_float_env_or_value(
             "OCCUPANCY_GRID_SEMANTIC_GOAL_LATERAL_SEARCH_M",
             occupancy_grid.get("semantic_goal_lateral_search_m", 0.80),
+        ),
+        map_candidates_enabled=_bool_env_or_value(
+            "MAP_CANDIDATES_ENABLED",
+            map_candidates.get("enabled", True),
+        ),
+        map_candidates_max_candidates=_int_env_or_value(
+            "MAP_CANDIDATES_MAX_CANDIDATES",
+            map_candidates.get("max_candidates", 6),
+        ),
+        map_candidates_min_distance_m=_float_env_or_value(
+            "MAP_CANDIDATES_MIN_DISTANCE_M",
+            map_candidates.get("min_distance_m", 0.55),
+        ),
+        map_candidates_max_distance_m=_float_env_or_value(
+            "MAP_CANDIDATES_MAX_DISTANCE_M",
+            map_candidates.get("max_distance_m", 1.35),
+        ),
+        map_candidates_semantic_enabled=_bool_env_or_value(
+            "MAP_CANDIDATES_SEMANTIC_ENABLED",
+            map_candidates.get("semantic_enabled", True),
+        ),
+        map_candidates_frontier_enabled=_bool_env_or_value(
+            "MAP_CANDIDATES_FRONTIER_ENABLED",
+            map_candidates.get("frontier_enabled", True),
+        ),
+        map_candidates_escape_enabled=_bool_env_or_value(
+            "MAP_CANDIDATES_ESCAPE_ENABLED",
+            map_candidates.get("escape_enabled", True),
+        ),
+        map_candidates_min_clearance_m=_float_env_or_value(
+            "MAP_CANDIDATES_MIN_CLEARANCE_M",
+            map_candidates.get("min_clearance_m", 0.34),
+        ),
+        map_candidates_unknown_gain_weight=_float_env_or_value(
+            "MAP_CANDIDATES_UNKNOWN_GAIN_WEIGHT",
+            map_candidates.get("unknown_gain_weight", 0.35),
+        ),
+        map_candidates_semantic_weight=_float_env_or_value(
+            "MAP_CANDIDATES_SEMANTIC_WEIGHT",
+            map_candidates.get("semantic_weight", 0.45),
         ),
         lidar_enabled=_bool_env_or_value("LIDAR_ENABLED", lidar.get("enabled", True)),
         lidar_prim_path=_env_or_value(

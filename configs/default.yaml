@@ -1,5 +1,5 @@
 sim:
-  headless: true
+  headless: false
   width: 1280
   height: 720
   active_gpu: 0
@@ -31,11 +31,11 @@ opennav:
   candidate_max_travel_distance_m: 1.35
   candidate_min_free_ratio: 0.28
   candidate_column_half_width_px: 26
-  candidate_debug_image_path: "assets/opennav_request.png"
+  candidate_debug_image_path: "assets/vln_request.png"
   target_debug_enabled: true
-  target_debug_image_path: "assets/opennav_debug.png"
+  target_debug_image_path: "assets/vln_debug.png"
   debug_video_enabled: true
-  debug_video_path: "assets/opennav_debug.avi"
+  debug_video_path: "assets/vln_debug.mp4"
   debug_video_fps: 4.0
   debug_image_update_period_sec: 1.0
   progress_history_length: 6
@@ -43,9 +43,9 @@ opennav:
   progress_spin_yaw_deg: 85.0
   policy_execution_steps: 24
   turn_at_max_turns: 6
-  landmark_arrival_distance_m: 1.3
+  landmark_arrival_distance_m: 1.4
   landmark_arrival_confirmations: 2
-  recovery_enabled: false
+  recovery_enabled: true
   recovery_trigger_stalled_steps: 3
   recovery_execution_steps: 18
 
@@ -88,8 +88,8 @@ target_grounding:
   max_result_yaw_delta_deg: 45.0
 
 landmark_tracker:
-  arrival_visible_depth_m: 1.00
-  arrival_anchor_radius_m: 1.00
+  arrival_visible_depth_m: 1.40
+  arrival_anchor_radius_m: 1.40
   min_visible_count: 2
   arrival_confirmations: 2
   arrival_window_size: 5
@@ -166,7 +166,7 @@ control:
   track_smoothing_alpha: 0.92
   track_steering_sign: -1.0
   use_discrete_action_primitives: true
-  stuck_detection_enabled: false
+  stuck_detection_enabled: true
   stuck_window_sec: 2.0
   stuck_displacement_threshold_m: 0.05
   stuck_yaw_threshold_deg: 5.0
@@ -242,6 +242,18 @@ occupancy_grid:
   semantic_goal_step_m: 0.9
   semantic_goal_min_step_m: 0.45
   semantic_goal_lateral_search_m: 0.8
+
+map_candidates:
+  enabled: true
+  max_candidates: 6
+  min_distance_m: 0.55
+  max_distance_m: 1.35
+  semantic_enabled: true
+  frontier_enabled: true
+  escape_enabled: true
+  min_clearance_m: 0.34
+  unknown_gain_weight: 0.35
+  semantic_weight: 0.45
 
 lidar:
   enabled: true

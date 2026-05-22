@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import signal
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +15,7 @@ class DebugVideoRecorder:
 
     def __init__(self, *, enabled: bool, output_path: Path, fps: float, logger: Any) -> None:
         self._enabled = bool(enabled)
-        self._output_path = Path(output_path)
+        self._output_path = _dated_video_path(Path(output_path))
         self._fps = max(0.5, float(fps))
         self._logger = logger
         self._writer = None
@@ -120,3 +121,12 @@ class DebugVideoRecorder:
             return None
         frame = np.asarray(frame[..., :3], dtype=np.uint8)
         return np.ascontiguousarray(frame)
+
+
+def _dated_video_path(path: Path) -> Path:
+    suffix = path.suffix or ".mp4"
+    stem = path.stem or "vln_debug"
+    if suffix.lower() not in {".mp4", ".avi"}:
+        suffix = ".mp4"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return path.with_name(f"{stem}_{timestamp}{suffix}")

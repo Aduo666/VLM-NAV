@@ -1,0 +1,65 @@
+{
+  "schema_version": "1.0",
+  "tasks": [
+    {
+      "id": "hospital_001",
+      "scene_usd_path": "usd/hospital.usd",
+      "robot_start_position": [
+        1.5,
+        4.0,
+        0.0
+      ],
+      "robot_start_orientation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "instruction": "向前走找到轮椅，然后左转再直走找到楼梯"
+    },
+    {
+      "id": "hospital_002",
+      "scene_usd_path": "usd/hospital.usd",
+      "robot_start_position": [
+        13.0,
+        7.0,
+        0.0
+      ],
+      "robot_start_orientation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "instruction": "向前走看到黄色警告牌后右转，再直走停在垃圾桶前"
+    },
+    {
+      "id": "hospital_003",
+      "scene_usd_path": "usd/hospital.usd",
+      "robot_start_position": [
+        1.5,
+        4.0,
+        0.0
+      ],
+      "robot_start_orientation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "instruction": "找到楼梯"
+    },
+    {
+      "id": "hospital_004",
+      "scene_usd_path": "usd/hospital.usd",
+      "robot_start_position": [
+        12.2986,
+        11.0719,
+        0.0
+      ],
+      "robot_start_orientation_deg": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "instruction": "sss"
+    }
+  ]
+}

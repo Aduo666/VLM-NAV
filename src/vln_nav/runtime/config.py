@@ -33,7 +33,7 @@ class AppConfig:
     llm_retry_cooldown_sec: float = 0.0
     llm_upload_max_edge_px: int = 512
     camera_image_detail: str = "low"
-    instruction: str = "find the wheelchair"
+    instruction: str = ""
     instruction_preparse_enabled: bool = True
     instruction_preparse_max_tokens: int = 384
     candidate_slot_bearings_deg: list[float] = field(default_factory=lambda: [75.0, 35.0, 0.0, -35.0, -75.0])
@@ -57,7 +57,8 @@ class AppConfig:
     progress_spin_yaw_deg: float = 85.0
     policy_execution_steps: int = 24
     turn_at_max_turns: int = 6
-    landmark_arrival_distance_m: float = 1.0
+    arrival_distance_m: float = 1.4
+    success_distance_m: float = 2.0
     landmark_arrival_confirmations: int = 2
     recovery_enabled: bool = True
     recovery_trigger_stalled_steps: int = 3
@@ -402,10 +403,7 @@ def load_config(config_path: str | None = None) -> AppConfig:
             "CAMERA_IMAGE_DETAIL",
             _section_value(llm, legacy_deepseek, "camera_image_detail", "low"),
         ),
-        instruction=_env_or_value(
-            "INSTRUCTION",
-            opennav.get("instruction", "find the wheelchair"),
-        ),
+        instruction=_env_or_value("INSTRUCTION", opennav.get("instruction", "")),
         instruction_preparse_enabled=_bool_env_or_value(
             "INSTRUCTION_PREPARSE_ENABLED",
             opennav.get("instruction_preparse_enabled", True),
@@ -498,9 +496,13 @@ def load_config(config_path: str | None = None) -> AppConfig:
             "TURN_AT_MAX_TURNS",
             opennav.get("turn_at_max_turns", 6),
         ),
-        landmark_arrival_distance_m=_float_env_or_value(
-            "LANDMARK_ARRIVAL_DISTANCE_M",
-            opennav.get("landmark_arrival_distance_m", 1.0),
+        arrival_distance_m=_float_env_or_value(
+            "ARRIVAL_DISTANCE_M",
+            opennav.get("arrival_distance_m", opennav.get("landmark_arrival_distance_m", 1.4)),
+        ),
+        success_distance_m=_float_env_or_value(
+            "SUCCESS_DISTANCE_M",
+            opennav.get("success_distance_m", 2.0),
         ),
         landmark_arrival_confirmations=_int_env_or_value(
             "LANDMARK_ARRIVAL_CONFIRMATIONS",
@@ -745,11 +747,17 @@ def load_config(config_path: str | None = None) -> AppConfig:
         ),
         landmark_tracker_arrival_visible_depth_m=_float_env_or_value(
             "LANDMARK_TRACKER_ARRIVAL_VISIBLE_DEPTH_M",
-            landmark_tracker.get("arrival_visible_depth_m", 1.00),
+            landmark_tracker.get(
+                "arrival_visible_depth_m",
+                opennav.get("arrival_distance_m", opennav.get("landmark_arrival_distance_m", 1.4)),
+            ),
         ),
         landmark_tracker_arrival_anchor_radius_m=_float_env_or_value(
             "LANDMARK_TRACKER_ARRIVAL_ANCHOR_RADIUS_M",
-            landmark_tracker.get("arrival_anchor_radius_m", 1.00),
+            landmark_tracker.get(
+                "arrival_anchor_radius_m",
+                opennav.get("arrival_distance_m", opennav.get("landmark_arrival_distance_m", 1.4)),
+            ),
         ),
         landmark_tracker_min_visible_count=_int_env_or_value(
             "LANDMARK_TRACKER_MIN_VISIBLE_COUNT",

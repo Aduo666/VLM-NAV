@@ -19,7 +19,6 @@ llm:
   camera_image_detail: "high"
 
 opennav:
-  instruction: "向前走找到轮椅，然后向右绕过轮椅之后向左前进，再直走找到楼梯"
   instruction_preparse_enabled: true
   instruction_preparse_max_tokens: 384
   candidate_slot_bearings_deg: [75.0, 35.0, 0.0, -35.0, -75.0]
@@ -43,7 +42,8 @@ opennav:
   progress_spin_yaw_deg: 85.0
   policy_execution_steps: 24
   turn_at_max_turns: 6
-  landmark_arrival_distance_m: 1.4
+  arrival_distance_m: 1.4
+  success_distance_m: 2.0
   landmark_arrival_confirmations: 2
   recovery_enabled: true
   recovery_trigger_stalled_steps: 3
@@ -101,8 +101,6 @@ target_grounding:
   tracker_min_tracking_confidence: 0.35
 
 landmark_tracker:
-  arrival_visible_depth_m: 1.40
-  arrival_anchor_radius_m: 1.40
   min_visible_count: 2
   arrival_confirmations: 2
   arrival_window_size: 5
@@ -129,8 +127,6 @@ robot:
   usd_path: "src/ros2_car_model_ws/src/1557/urdf/1557_all/1557_all.usd"
   prim_path: "/World/Robot"
   articulation_path: ""
-  init_position: [1.5, 4.0, 0.22]
-  init_orientation_deg: [0.0, 0.0, 0.0]
   left_wheel_joint_names: []
   right_wheel_joint_names: []
   steering_joint_names: []
@@ -179,7 +175,7 @@ control:
   track_slow_heading_rad: 1.35
   track_smoothing_alpha: 0.92
   track_steering_sign: -1.0
-  use_discrete_action_primitives: true
+  use_discrete_action_primitives: false
   stuck_detection_enabled: true
   stuck_window_sec: 2.0
   stuck_displacement_threshold_m: 0.05
@@ -291,7 +287,6 @@ lidar:
   multi_child_names: ["LidarLeft", "LidarCenter", "LidarRight"]
 
 scene:
-  usd_path: "usd/hospital.usd"
   prim_path: "/World/Environment"
   add_default_ground_plane: false
   stage_load_timeout_sec: 120.0

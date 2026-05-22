@@ -1,0 +1,13 @@
+[package]
+version = "0.1.0"
+title = "VLM-NAV Task Editor"
+description = "Isaac Sim panel for loading VLN scenes/robots and saving navigation instructions to configs/instructions.json."
+category = "VLM-NAV"
+keywords = ["vln", "navigation", "task", "pose", "isaac sim"]
+
+[dependencies]
+"omni.kit.uiapp" = {}
+"omni.kit.viewport.utility" = {}
+
+[[python.module]]
+name = "vln_nav_task_editor"

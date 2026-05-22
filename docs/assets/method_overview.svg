@@ -1,0 +1,79 @@
+<svg width="1440" height="650" viewBox="0 0 1440 650" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="VLM-NAV method overview">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1440" y2="650" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F8FAFC"/>
+      <stop offset="1" stop-color="#EEF2FF"/>
+    </linearGradient>
+    <filter id="shadow" x="-10%" y="-20%" width="120%" height="150%">
+      <feDropShadow dx="0" dy="18" stdDeviation="18" flood-color="#0F172A" flood-opacity="0.14"/>
+    </filter>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M2 2 L10 6 L2 10 Z" fill="#475569"/>
+    </marker>
+  </defs>
+  <rect width="1440" height="650" fill="url(#bg)"/>
+  <text x="90" y="88" fill="#0F172A" font-family="Inter, ui-sans-serif, system-ui" font-size="42" font-weight="800">Closed-loop VLN stack in Isaac Sim</text>
+  <text x="92" y="126" fill="#475569" font-family="Inter, ui-sans-serif, system-ui" font-size="19">Language-conditioned reasoning is separated from metric control, semantic confirmation, occupancy mapping, and robot execution.</text>
+
+  <g filter="url(#shadow)">
+    <rect x="90" y="190" width="230" height="150" rx="24" fill="#FFFFFF" stroke="#CBD5E1"/>
+    <rect x="116" y="218" width="178" height="42" rx="13" fill="#DBEAFE"/>
+    <text x="142" y="245" fill="#1D4ED8" font-family="Inter, ui-sans-serif, system-ui" font-size="17" font-weight="800">Instruction</text>
+    <text x="122" y="292" fill="#334155" font-family="Inter, ui-sans-serif, system-ui" font-size="16">task JSON</text>
+    <text x="122" y="318" fill="#334155" font-family="Inter, ui-sans-serif, system-ui" font-size="16">route landmarks</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="405" y="160" width="260" height="210" rx="24" fill="#FFFFFF" stroke="#CBD5E1"/>
+    <text x="435" y="204" fill="#0F172A" font-family="Inter, ui-sans-serif, system-ui" font-size="21" font-weight="800">Observation</text>
+    <rect x="436" y="230" width="84" height="56" rx="14" fill="#E0F2FE"/>
+    <text x="454" y="264" fill="#0369A1" font-family="Inter, ui-sans-serif, system-ui" font-size="15" font-weight="800">RGB-D</text>
+    <rect x="544" y="230" width="84" height="56" rx="14" fill="#DCFCE7"/>
+    <text x="563" y="264" fill="#15803D" font-family="Inter, ui-sans-serif, system-ui" font-size="15" font-weight="800">LiDAR</text>
+    <rect x="436" y="302" width="192" height="40" rx="12" fill="#F1F5F9"/>
+    <text x="458" y="328" fill="#334155" font-family="Inter, ui-sans-serif, system-ui" font-size="15">Isaac pose / odom</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="750" y="110" width="280" height="160" rx="24" fill="#0F172A"/>
+    <text x="782" y="154" fill="#F8FAFC" font-family="Inter, ui-sans-serif, system-ui" font-size="21" font-weight="800">Metric Memory</text>
+    <text x="782" y="190" fill="#CBD5E1" font-family="Inter, ui-sans-serif, system-ui" font-size="15">north-up occupancy grid</text>
+    <text x="782" y="218" fill="#CBD5E1" font-family="Inter, ui-sans-serif, system-ui" font-size="15">landmark anchors</text>
+    <text x="782" y="246" fill="#CBD5E1" font-family="Inter, ui-sans-serif, system-ui" font-size="15">trajectory + topology</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="750" y="335" width="280" height="175" rx="24" fill="#FFFFFF" stroke="#CBD5E1"/>
+    <text x="782" y="379" fill="#0F172A" font-family="Inter, ui-sans-serif, system-ui" font-size="21" font-weight="800">Semantic Grounding</text>
+    <text x="782" y="416" fill="#334155" font-family="Inter, ui-sans-serif, system-ui" font-size="15">GroundingDINO bbox</text>
+    <text x="782" y="444" fill="#334155" font-family="Inter, ui-sans-serif, system-ui" font-size="15">VLM verification</text>
+    <text x="782" y="472" fill="#334155" font-family="Inter, ui-sans-serif, system-ui" font-size="15">bbox/depth world anchor</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="1110" y="155" width="240" height="250" rx="28" fill="#FFFFFF" stroke="#CBD5E1"/>
+    <text x="1140" y="204" fill="#0F172A" font-family="Inter, ui-sans-serif, system-ui" font-size="22" font-weight="800">VLM Policy</text>
+    <rect x="1140" y="232" width="180" height="44" rx="14" fill="#FEF3C7"/>
+    <text x="1170" y="260" fill="#92400E" font-family="Inter, ui-sans-serif, system-ui" font-size="15" font-weight="800">candidate choice</text>
+    <rect x="1140" y="292" width="180" height="44" rx="14" fill="#E0E7FF"/>
+    <text x="1175" y="320" fill="#3730A3" font-family="Inter, ui-sans-serif, system-ui" font-size="15" font-weight="800">subgoal</text>
+    <rect x="1140" y="352" width="180" height="44" rx="14" fill="#DCFCE7"/>
+    <text x="1170" y="380" fill="#166534" font-family="Inter, ui-sans-serif, system-ui" font-size="15" font-weight="800">TRACK_TARGET</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="465" y="455" width="220" height="120" rx="24" fill="#FFFFFF" stroke="#CBD5E1"/>
+    <text x="496" y="499" fill="#0F172A" font-family="Inter, ui-sans-serif, system-ui" font-size="20" font-weight="800">Ackermann Control</text>
+    <text x="498" y="536" fill="#334155" font-family="Inter, ui-sans-serif, system-ui" font-size="15">wheel velocity</text>
+    <text x="498" y="560" fill="#334155" font-family="Inter, ui-sans-serif, system-ui" font-size="15">steering targets</text>
+  </g>
+
+  <path d="M320 265 L398 265" stroke="#475569" stroke-width="3" marker-end="url(#arrow)"/>
+  <path d="M665 242 C700 210 710 190 750 186" stroke="#475569" stroke-width="3" marker-end="url(#arrow)"/>
+  <path d="M665 292 C710 350 710 402 750 424" stroke="#475569" stroke-width="3" marker-end="url(#arrow)"/>
+  <path d="M1030 190 L1105 236" stroke="#475569" stroke-width="3" marker-end="url(#arrow)"/>
+  <path d="M1030 422 L1105 326" stroke="#475569" stroke-width="3" marker-end="url(#arrow)"/>
+  <path d="M1225 405 C1180 540 850 565 688 528" stroke="#475569" stroke-width="3" marker-end="url(#arrow)"/>
+  <path d="M465 515 C315 500 205 420 205 342" stroke="#94A3B8" stroke-width="2.5" stroke-dasharray="9 9" marker-end="url(#arrow)"/>
+  <text x="864" y="590" fill="#64748B" font-family="Inter, ui-sans-serif, system-ui" font-size="15">loop: observe -> reason -> track subgoal -> update memory -> replan</text>
+</svg>

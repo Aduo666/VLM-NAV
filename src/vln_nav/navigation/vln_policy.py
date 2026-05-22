@@ -45,7 +45,8 @@ class OpenNavPolicyConfig:
     active_track_max_yaw_deg: float
     active_track_min_duration_sec: float
     use_discrete_action_primitives: bool
-    landmark_arrival_distance_m: float
+    arrival_distance_m: float
+    success_distance_m: float
     recovery_enabled: bool
     recovery_trigger_stalled_steps: int
     recovery_execution_steps: int
@@ -176,6 +177,9 @@ class OpenNavVLNPolicy:
         self._pass_landmark_index: int | None = None
         self._pass_actions: list[str] = []
         self._pass_action_index = 0
+        self._request_map_image_path: str | None = None
+        self._recent_primitive_actions: deque[str] = deque(maxlen=4)
+        self._last_turn_oscillation_signature: tuple | None = None
 
     def step(
         self,
@@ -391,7 +395,7 @@ class OpenNavVLNPolicy:
                 semantic_plan = self._occupancy_grid.plan_toward_landmark(
                     observation=observation,
                     landmark_entry=semantic_landmark_entry,
-                    stop_distance_m=float(self._config.landmark_arrival_distance_m),
+                    stop_distance_m=float(self._current_arrival_distance_m()),
                 )
             except Exception as exc:
                 self._logger.warning("[SemanticPlanner] plan_failed landmark=%s error=%s", self._current_target_text(), exc)
@@ -405,6 +409,7 @@ class OpenNavVLNPolicy:
                 semantic_plan=semantic_plan,
             )
             occupancy_debug_path = saved_occupancy_path
+        left_panel_image_path = self._request_map_image_path or occupancy_debug_path
         debug_image_path = self._candidate_predictor.save_debug(
             observation=observation,
             candidate_set=candidate_set,
@@ -413,7 +418,7 @@ class OpenNavVLNPolicy:
                 if self._landmark_tracker_state is None
                 else self._landmark_tracker_state.last_observation
             ),
-            left_panel_image_path=occupancy_debug_path,
+            left_panel_image_path=left_panel_image_path,
         )
         annotated_png_bytes = None
         if debug_image_path is not None and Path(debug_image_path).exists():
@@ -442,6 +447,7 @@ class OpenNavVLNPolicy:
             if topology_revisit_result is not None:
                 return topology_revisit_result
 
+        safety_context_for_decision = self._safety_context_text
         decision = self._reasoner.choose_candidate(
             instruction_context=self._instruction_context,
             candidate_set=candidate_set,
@@ -449,7 +455,7 @@ class OpenNavVLNPolicy:
             annotated_image_png_bytes=annotated_png_bytes,
             annotated_image_path=None if debug_image_path is None else str(debug_image_path),
             target_memory_text=self._combined_target_memory_text(robot_pose=observation.pose),
-            safety_context_text=self._safety_context_text,
+            safety_context_text=safety_context_for_decision,
             route_context_text=self._route_context_text(robot_pose=observation.pose),
             reacquire_context_text=_format_reacquire_prompt_context(reacquire_guard),
         )
@@ -616,6 +622,43 @@ class OpenNavVLNPolicy:
             elif decision.selected_action in {"TURN_LEFT", "FORWARD", "TURN_RIGHT"}:
                 action_name = str(decision.selected_action)
                 speed_scale = float(_primitive_speed_scale(action_name, self._config))
+            replacement = self._select_candidate_after_turn_guard(
+                candidate_set=candidate_set,
+                selected_candidate=selected_candidate,
+                action_name=action_name,
+                decision_reason=decision_summary,
+                safety_context_text=safety_context_for_decision,
+            )
+            if replacement is not None and int(replacement.slot_id) != int(selected_candidate.slot_id):
+                selected_candidate = replacement
+                local_goal = tuple(float(value) for value in selected_candidate.local_goal_xy)
+                world_goal_xy = _local_waypoint_to_world_xy(
+                    robot_pose=observation.pose,
+                    waypoint_local_xy=selected_candidate.local_goal_xy,
+                )
+                world_goal_xy_list = [float(world_goal_xy[0]), float(world_goal_xy[1])]
+                self._active_world_goal_xy = [float(world_goal_xy[0]), float(world_goal_xy[1])]
+                self._active_candidate_id = int(selected_candidate.slot_id)
+                self._active_candidate_label = str(selected_candidate.label)
+                memory_anchor_world_xy = _local_waypoint_to_world_xy(
+                    robot_pose=observation.pose,
+                    waypoint_local_xy=_memory_anchor_local_xy(
+                        candidate=selected_candidate,
+                        bearing_hint=decision.target_bearing_hint,
+                    ),
+                )
+                self._target_memory.update_from_decision(
+                    target_visible=decision.target_visible,
+                    bearing_hint=decision.target_bearing_hint,
+                    status=decision.target_status,
+                    selected_world_goal_xy=[float(memory_anchor_world_xy[0]), float(memory_anchor_world_xy[1])],
+                )
+                action_name, speed_scale = _candidate_to_primitive_action(
+                    selected_candidate,
+                    turn_speed_scale=float(self._config.turn_speed_scale),
+                    forward_speed_scale=float(self._config.forward_speed_scale),
+                )
+                decision_summary = f"{decision_summary} | TurnOscillationGuard switched to candidate {int(selected_candidate.slot_id)}"
         else:
             action_name, speed_scale = _track_target_command(
                 local_goal_xy=local_goal,
@@ -666,8 +709,10 @@ class OpenNavVLNPolicy:
             self._active_goal_started_sec = now
             self._active_start_yaw_rad = float(observation.pose.yaw_rad)
             self._active_start_pose = observation.pose
+            if action_name in {"FORWARD", "BACKWARD", "TURN_LEFT", "TURN_RIGHT"}:
+                self._recent_primitive_actions.append(str(action_name))
         self._logger.info(
-            "[PrimitiveDecision] candidate=%s label=%s heading_deg=%.1f semantic_visible=%s grounded_visible=%s target_bearing=%s action=%s",
+            "[WaypointDecision] candidate=%s label=%s heading_deg=%.1f semantic_visible=%s grounded_visible=%s target_bearing=%s action=%s",
             int(selected_candidate.slot_id),
             str(selected_candidate.label),
             float(selected_candidate.heading_delta_deg),
@@ -708,26 +753,38 @@ class OpenNavVLNPolicy:
             float(semantic_plan.subgoal_local_xy[0]),
             float(semantic_plan.subgoal_local_xy[1]),
         )
-        action_name = _local_goal_to_primitive_action(local_goal_xy=local_goal)
-        if action_name == "STOP":
-            return None
         local_goal_distance_m = float(np.hypot(float(local_goal[0]), float(local_goal[1])))
-        min_executable_forward_m = max(0.10, 0.75 * float(self._config.active_forward_distance_m))
         path_length_m = float(getattr(semantic_plan, "path_length_m", 0.0))
-        if action_name == "FORWARD" and (
-            local_goal_distance_m < min_executable_forward_m
-            or path_length_m < min_executable_forward_m
-        ):
-            self._log_semantic_skip(
-                target_label=str(getattr(semantic_plan, "target_label", self._current_target_text())),
-                reason="subgoal_too_short_for_forward_primitive",
-                action_name=action_name,
-                distance_to_target_m=float(getattr(semantic_plan, "distance_to_target_m", 0.0)),
-                path_length_m=path_length_m,
-                local_goal=local_goal,
-                min_executable_m=min_executable_forward_m,
+
+        if bool(self._config.use_discrete_action_primitives):
+            action_name = _local_goal_to_primitive_action(local_goal_xy=local_goal)
+            if action_name == "STOP":
+                return None
+            min_executable_forward_m = max(0.10, 0.75 * float(self._config.active_forward_distance_m))
+            if (
+                local_goal_distance_m < min_executable_forward_m
+                or path_length_m < min_executable_forward_m
+            ):
+                self._log_semantic_skip(
+                    target_label=str(getattr(semantic_plan, "target_label", self._current_target_text())),
+                    reason="subgoal_too_short_for_primitive",
+                    action_name=action_name,
+                    distance_to_target_m=float(getattr(semantic_plan, "distance_to_target_m", 0.0)),
+                    path_length_m=path_length_m,
+                    local_goal=local_goal,
+                    min_executable_m=min_executable_forward_m,
+                )
+                return None
+            speed_scale = float(_primitive_speed_scale(action_name, self._config))
+        else:
+            action_name, speed_scale = _track_target_command(
+                local_goal_xy=local_goal,
+                stop_distance_m=float(self._config.stop_distance_m),
             )
-            return None
+            if action_name == "STOP":
+                return None
+            min_executable_forward_m = 0.0
+
         if (
             self._safety_context_text
             and f"previous_desired={action_name}" in self._safety_context_text
@@ -742,7 +799,6 @@ class OpenNavVLNPolicy:
                 min_executable_m=min_executable_forward_m,
             )
             return None
-        speed_scale = float(_primitive_speed_scale(action_name, self._config))
         selected_candidate = _nearest_candidate_for_local_goal(candidate_set=candidate_set, local_goal_xy=local_goal)
         selected_candidate_id = None if selected_candidate is None else int(selected_candidate.slot_id)
         world_goal_xy_list = (
@@ -839,6 +895,74 @@ class OpenNavVLNPolicy:
         )
         self._last_semantic_skip_signature = signature
 
+    def _select_candidate_after_turn_guard(
+        self,
+        *,
+        candidate_set: CandidateSet,
+        selected_candidate: WaypointCandidate,
+        action_name: str,
+        decision_reason: str,
+        safety_context_text: str,
+    ) -> WaypointCandidate | None:
+        action = str(action_name).strip().upper()
+        if action not in {"TURN_LEFT", "TURN_RIGHT"}:
+            return None
+        opposite = "TURN_RIGHT" if action == "TURN_LEFT" else "TURN_LEFT"
+        recent = [str(item).strip().upper() for item in self._recent_primitive_actions]
+        turn_recent = [item for item in recent if item in {"TURN_LEFT", "TURN_RIGHT"}]
+        alternating_turns = len(turn_recent) >= 2 and turn_recent[-1] == opposite and turn_recent[-2] == action
+        immediate_reverse = len(turn_recent) >= 1 and turn_recent[-1] == opposite
+        safety_blocked = bool(safety_context_text and f"previous_desired={action}" in safety_context_text)
+        if not safety_blocked and not (alternating_turns and immediate_reverse):
+            return None
+
+        alternatives: list[tuple[float, WaypointCandidate, str]] = []
+        for candidate in candidate_set.candidates:
+            if not bool(candidate.valid):
+                continue
+            candidate_action, _ = _candidate_to_primitive_action(
+                candidate,
+                turn_speed_scale=float(self._config.turn_speed_scale),
+                forward_speed_scale=float(self._config.forward_speed_scale),
+            )
+            candidate_action = str(candidate_action).strip().upper()
+            if candidate_action == action:
+                continue
+            if candidate_action == opposite and alternating_turns:
+                continue
+            action_cost = 0.0 if candidate_action == "FORWARD" else 1.0
+            score = (
+                action_cost,
+                -float(candidate.clearance_score),
+                abs(float(candidate.heading_delta_deg)),
+                abs(float(candidate.travel_distance_m) - float(self._config.active_forward_distance_m)),
+            )
+            alternatives.append((float(score[0] * 1000.0 + score[1] + score[2] * 0.01 + score[3] * 0.1), candidate, candidate_action))
+        if not alternatives:
+            return None
+        _, replacement, replacement_action = min(alternatives, key=lambda item: item[0])
+        signature = (
+            action,
+            opposite,
+            int(selected_candidate.slot_id),
+            int(replacement.slot_id),
+            safety_blocked,
+            tuple(turn_recent[-3:]),
+        )
+        if signature != self._last_turn_oscillation_signature:
+            self._logger.warning(
+                "[TurnOscillationGuard] action=%s replacement=%s selected_candidate=%s replacement_candidate=%s safety_blocked=%s recent_turns=%s reason=%s",
+                action,
+                replacement_action,
+                int(selected_candidate.slot_id),
+                int(replacement.slot_id),
+                int(bool(safety_blocked)),
+                turn_recent[-4:],
+                str(decision_reason)[:120],
+            )
+            self._last_turn_oscillation_signature = signature
+        return replacement
+
     def _clear_active_goal(self) -> None:
         self._active_world_goal_xy = None
         self._active_candidate_id = None
@@ -900,6 +1024,10 @@ class OpenNavVLNPolicy:
         behavior = str(getattr(route_step, "behavior_type", "go_to")).strip().lower()
         return behavior or "go_to"
 
+    @property
+    def current_arrival_distance_m(self) -> float:
+        return self._current_arrival_distance_m()
+
     def set_landmark_state(self, state: LandmarkState | None) -> None:
         self._landmark_tracker_state = state
         if state is None or state.last_observation is None:
@@ -913,6 +1041,9 @@ class OpenNavVLNPolicy:
 
     def set_all_landmark_map_entries(self, entries: list[LandmarkMapEntry]) -> None:
         self._all_landmark_map_entries = list(entries)
+
+    def set_request_map_image_path(self, path: str | Path | None) -> None:
+        self._request_map_image_path = None if path is None else str(path)
 
     def set_landmark_map_summary(self, text: str) -> None:
         self._landmark_map_summary = str(text).strip()
@@ -1246,6 +1377,13 @@ class OpenNavVLNPolicy:
         if not current_target or current_target in {"none", "null", "unknown", "n/a", "na", "target", "object", "thing", "place", "location"}:
             return None
         if self._landmark_map_entry is not None and bool(self._landmark_map_entry.world_xy):
+            if not bool(getattr(self._landmark_map_entry, "confirmed", False)):
+                self._logger.info(
+                    "[SemanticPlanner] skip target=%s evidence=%s reason=map_entry_not_confirmed",
+                    getattr(self._landmark_map_entry, "label", self._current_target_text()),
+                    getattr(self._landmark_map_entry, "evidence_level", "unknown"),
+                )
+                return None
             return self._landmark_map_entry
         state = self._landmark_tracker_state
         if state is None:
@@ -1849,6 +1987,11 @@ class OpenNavVLNPolicy:
             "route_complete": bool(self._route_complete),
         }
 
+    def _current_arrival_distance_m(self) -> float:
+        if self._route_step_count() > 0 and self._current_landmark_index >= self._route_step_count() - 1:
+            return max(0.05, float(self._config.success_distance_m))
+        return max(0.05, float(self._config.arrival_distance_m))
+
     def _maybe_advance_landmark(self, *, observation: VLNObservation) -> bool:
         if self._route_step_count() <= 0 or self._route_complete:
             self._arrival_confirmation_window.clear()
@@ -1889,7 +2032,7 @@ class OpenNavVLNPolicy:
             and map_entry.anchor_distance_m is not None
             and self.current_behavior_type == "go_to"
         ):
-            threshold_m = max(0.05, float(self._config.landmark_arrival_distance_m))
+            threshold_m = max(0.05, float(self._current_arrival_distance_m()))
             if float(map_entry.anchor_distance_m) <= threshold_m:
                 required_confirmations = max(1, int(self._config.landmark_arrival_confirmations))
                 self._arrival_confirmation_window.append(True)

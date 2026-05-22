@@ -116,6 +116,7 @@ class LandmarkTracker:
         observation: TargetObservation,
         robot_pose: Pose2D,
         timestamp_sec: float,
+        arrival_distance_m: float | None = None,
     ) -> LandmarkState:
         label = _normalize_label(target_label)
         behavior = str(behavior_type).strip().lower() or "go_to"
@@ -291,6 +292,7 @@ class LandmarkTracker:
             label=label,
             state=state,
             observation=observation,
+            arrival_distance_m=arrival_distance_m,
         )
         if state.reached:
             state.status = "reached"
@@ -536,6 +538,7 @@ class LandmarkTracker:
         label: str,
         state: LandmarkState,
         observation: TargetObservation,
+        arrival_distance_m: float | None,
     ) -> tuple[bool, str, int, int, int, list[int]]:
         if state.behavior_type != "go_to":
             return False, f"behavior_not_implemented:{state.behavior_type}", 0, 0, 0, []
@@ -545,8 +548,12 @@ class LandmarkTracker:
             return False, "not_confirmed_for_completion", 0, 0, window_size, []
 
         min_visible = max(1, int(self._config.min_visible_count))
-        depth_threshold_m = max(0.05, float(self._config.arrival_visible_depth_m))
-        anchor_threshold_m = max(0.05, float(self._config.arrival_anchor_radius_m))
+        if arrival_distance_m is None:
+            depth_threshold_m = max(0.05, float(self._config.arrival_visible_depth_m))
+            anchor_threshold_m = max(0.05, float(self._config.arrival_anchor_radius_m))
+        else:
+            depth_threshold_m = max(0.05, float(arrival_distance_m))
+            anchor_threshold_m = max(0.05, float(arrival_distance_m))
         required = max(1, int(self._config.arrival_confirmations))
         window_size = max(required, int(self._config.arrival_window_size))
         reach_window = self._reach_windows.get(label)

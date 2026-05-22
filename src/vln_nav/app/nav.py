@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import tempfile
@@ -49,6 +50,9 @@ from ..runtime.debug_video import DebugVideoRecorder
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Isaac Sim Open-Nav style VLN runtime")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="YAML config path")
+    parser.add_argument("--task", default=os.getenv("TASK_ID", ""), help="Task id from configs/instructions.json")
+    parser.add_argument("--tasks-file", default=str(PROJECT_ROOT / "configs" / "instructions.json"), help="JSON task list path")
+    parser.add_argument("--list-tasks", action="store_true", help="List available task ids and exit")
     parser.add_argument("--headless", action="store_true", help="Force headless simulation")
     return parser.parse_args()
 
@@ -60,7 +64,18 @@ def main() -> int:
         config.headless = True
 
     logger = setup_logging(config.log_level)
+    if args.list_tasks:
+        _print_available_tasks(tasks_file=Path(args.tasks_file), logger=logger)
+        return 0
+    applied_task_id = _apply_task_overrides(
+        config=config,
+        task_id=str(args.task).strip(),
+        tasks_file=Path(args.tasks_file),
+        logger=logger,
+    )
     logger.info("Loaded config from %s", Path(args.config).resolve())
+    if applied_task_id:
+        logger.info("Loaded task from %s: %s", Path(args.tasks_file).resolve(), applied_task_id)
     logger.info("Robot USD path: %s", config.robot_usd_path)
     logger.info("LLM model=%s api_base=%s key_present=%s", config.model_name, config.api_base_url, bool(config.llm_api_key))
     if not config.llm_api_key:
@@ -87,6 +102,148 @@ def main() -> int:
         simulation_app.close()
 
     return 0
+
+
+def _apply_task_overrides(*, config: AppConfig, task_id: str, tasks_file: Path, logger) -> str:
+    tasks_path = tasks_file if tasks_file.is_absolute() else PROJECT_ROOT / tasks_file
+    if not tasks_path.exists():
+        if task_id:
+            raise FileNotFoundError(f"Task file does not exist: {tasks_path}")
+        if not str(config.instruction).strip():
+            raise RuntimeError(
+                "No task selected and config has no opennav.instruction. "
+                "Use --task <id> or set INSTRUCTION."
+            )
+        logger.info("[Task] no task file found; using instruction from config/env")
+        return ""
+
+    tasks = _load_tasks(tasks_path)
+    selected = None
+    requested = str(task_id).strip()
+    if requested:
+        # Exact match first, then prefix match
+        for task in tasks:
+            if str(task.get("id", "")).strip() == requested:
+                selected = task
+                break
+        if selected is None:
+            candidates = [t for t in tasks if str(t.get("id", "")).strip().startswith(requested)]
+            if len(candidates) == 1:
+                selected = candidates[0]
+            elif len(candidates) > 1:
+                ids = [str(t.get("id", "")) for t in candidates]
+                raise ValueError(f"Ambiguous task prefix '{requested}': {', '.join(ids)}")
+        if selected is None:
+            available = ", ".join(str(task.get("id", "")) for task in tasks)
+            raise ValueError(f"Task id not found: {requested}. Available tasks: {available}")
+    elif not str(config.instruction).strip() and tasks:
+        selected = _interactive_task_selection(tasks=tasks)
+        if selected is None:
+            raise SystemExit("No task selected. Exiting.")
+
+    if selected is None:
+        logger.info("[Task] no task selected; using instruction from config/env")
+        return ""
+
+    selected_id = str(selected.get("id", "")).strip() or "unnamed_task"
+    instruction = str(selected.get("instruction", "")).strip()
+    if not instruction:
+        raise ValueError(f"Task {selected_id} has empty instruction")
+    config.instruction = instruction
+
+    scene_usd_path = str(selected.get("scene_usd_path", "")).strip()
+    if scene_usd_path:
+        config.scene_usd_path = scene_usd_path
+
+    start_position = selected.get("robot_start_position", None)
+    if isinstance(start_position, list) and len(start_position) >= 3:
+        config.robot_init_position = [float(start_position[0]), float(start_position[1]), float(start_position[2])]
+
+    start_orientation = selected.get("robot_start_orientation_deg", None)
+    if isinstance(start_orientation, list) and len(start_orientation) >= 3:
+        config.robot_init_orientation_deg = [
+            float(start_orientation[0]),
+            float(start_orientation[1]),
+            float(start_orientation[2]),
+        ]
+
+    logger.info(
+        "[Task] selected=%s scene=%s start=%s rpy_deg=%s instruction=%s",
+        selected_id,
+        config.scene_usd_path,
+        config.robot_init_position,
+        config.robot_init_orientation_deg,
+        config.instruction,
+    )
+    return selected_id
+
+
+def _interactive_task_selection(*, tasks: list[dict]) -> dict | None:
+    print("\n" + "=" * 60)
+    print("  Available Tasks")
+    print("=" * 60)
+    for i, task in enumerate(tasks):
+        tid = str(task.get("id", ""))
+        instruction = str(task.get("instruction", ""))
+        scene = str(task.get("scene_usd_path", ""))
+        enabled = task.get("enabled", True)
+        marker = " " if enabled else " [disabled]"
+        print(f"  [{i + 1}] {tid}{marker}")
+        print(f"      instruction: {instruction}")
+        if scene:
+            print(f"      scene: {scene}")
+    print("=" * 60)
+    print("  Enter number or task id (q to quit): ", end="", flush=True)
+    try:
+        choice = input().strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+    if not choice or choice.lower() == "q":
+        return None
+    # Try as number
+    if choice.isdigit():
+        idx = int(choice) - 1
+        if 0 <= idx < len(tasks):
+            return tasks[idx]
+        print(f"  Invalid number: {choice}")
+        return None
+    # Try as task id (exact, then prefix)
+    for task in tasks:
+        if str(task.get("id", "")).strip() == choice:
+            return task
+    candidates = [t for t in tasks if str(t.get("id", "")).strip().startswith(choice)]
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        ids = [str(t.get("id", "")) for t in candidates]
+        print(f"  Ambiguous: {', '.join(ids)}")
+    else:
+        print(f"  Not found: {choice}")
+    return None
+
+
+def _print_available_tasks(*, tasks_file: Path, logger) -> None:
+    tasks_path = tasks_file if tasks_file.is_absolute() else PROJECT_ROOT / tasks_file
+    tasks = _load_tasks(tasks_path)
+    logger.info("Available tasks in %s:", tasks_path)
+    for task in tasks:
+        logger.info(
+            "  %s | scene=%s | start=%s | instruction=%s",
+            str(task.get("id", "")),
+            str(task.get("scene_usd_path", "")),
+            task.get("robot_start_position", []),
+            str(task.get("instruction", "")),
+        )
+
+
+def _load_tasks(tasks_path: Path) -> list[dict]:
+    with tasks_path.open("r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    tasks = data.get("tasks", []) if isinstance(data, dict) else []
+    if not isinstance(tasks, list):
+        raise ValueError(f"Invalid task file, expected tasks list: {tasks_path}")
+    return [task for task in tasks if isinstance(task, dict)]
 
 
 def _build_simulation_app_settings(*, config: AppConfig, logger) -> dict:
@@ -228,10 +385,11 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
     logger.info("[Goal] actions=%s", instruction_context.actions)
     logger.info("[Goal] landmarks=%s", instruction_context.landmarks)
     logger.info(
-        "[Route] current_landmark=%s ordered_landmarks=%s arrival_distance_m=%.2f tracker_min_visible=%s recovery_enabled=%s recovery_stalled_steps=%s",
+        "[Route] current_landmark=%s ordered_landmarks=%s arrival_distance_m=%.2f success_distance_m=%.2f tracker_min_visible=%s recovery_enabled=%s recovery_stalled_steps=%s",
         instruction_context.goal_phrase or "none",
         instruction_context.landmarks,
-        float(config.landmark_arrival_distance_m),
+        float(config.arrival_distance_m),
+        float(config.success_distance_m),
         int(config.landmark_tracker_min_visible_count),
         int(config.recovery_enabled),
         int(config.recovery_trigger_stalled_steps),
@@ -265,9 +423,9 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
         float(config.target_tracker_min_depth_valid_ratio),
     )
     logger.info(
-        "[LandmarkTrackerConfig] visible_depth=%.2f anchor_radius=%.2f min_visible=%s confirmations=%s landmark_map=%s map_ttl=%.1f reacquire_guard=%s recent_visible_sec=%.1f override=%s",
-        float(config.landmark_tracker_arrival_visible_depth_m),
-        float(config.landmark_tracker_arrival_anchor_radius_m),
+        "[LandmarkTrackerConfig] arrival_distance=%.2f success_distance=%.2f min_visible=%s confirmations=%s landmark_map=%s map_ttl=%.1f reacquire_guard=%s recent_visible_sec=%.1f override=%s",
+        float(config.arrival_distance_m),
+        float(config.success_distance_m),
         int(config.landmark_tracker_min_visible_count),
         int(config.landmark_tracker_arrival_confirmations),
         int(bool(config.landmark_map_enabled)),
@@ -409,8 +567,8 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
     )
     landmark_tracker = LandmarkTracker(
         config=LandmarkTrackerConfig(
-            arrival_visible_depth_m=float(config.landmark_tracker_arrival_visible_depth_m),
-            arrival_anchor_radius_m=float(config.landmark_tracker_arrival_anchor_radius_m),
+            arrival_visible_depth_m=float(config.arrival_distance_m),
+            arrival_anchor_radius_m=float(config.arrival_distance_m),
             min_visible_count=int(config.landmark_tracker_min_visible_count),
             arrival_confirmations=int(config.landmark_tracker_arrival_confirmations),
             arrival_window_size=int(config.landmark_tracker_arrival_window_size),
@@ -601,7 +759,8 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
             reacquire_guard_enabled=bool(config.reacquire_guard_enabled),
             reacquire_guard_recent_visible_sec=float(config.reacquire_guard_recent_visible_sec),
             reacquire_guard_override_action=str(config.reacquire_guard_override_action),
-            landmark_arrival_distance_m=float(config.landmark_arrival_distance_m),
+            arrival_distance_m=float(config.arrival_distance_m),
+            success_distance_m=float(config.success_distance_m),
             recovery_enabled=bool(config.recovery_enabled),
             recovery_trigger_stalled_steps=int(config.recovery_trigger_stalled_steps),
             recovery_execution_steps=int(config.recovery_execution_steps),
@@ -808,6 +967,7 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
     depth_debug_output_path = _resolve_output_path(config.depth_debug_image_path)
     target_debug_output_path = _resolve_output_path(config.target_debug_image_path)
     target_debug_video_path = _resolve_output_path(config.debug_video_path)
+    llm_global_map_output_path = _resolve_output_path("debug/llm_global_map.png")
     debug_video_recorder = DebugVideoRecorder(
         enabled=bool(config.debug_video_enabled) and bool(config.target_debug_enabled),
         output_path=target_debug_video_path,
@@ -817,6 +977,8 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
     logger.info("VLM request image output: %s", _resolve_output_path(config.candidate_debug_image_path))
     if config.target_debug_enabled:
         logger.info("Runtime debug image output: %s", target_debug_output_path)
+    if config.occupancy_grid_enabled:
+        logger.info("VLM global map panel output: %s", llm_global_map_output_path)
     if config.debug_video_enabled and config.target_debug_enabled:
         logger.info("Runtime debug video output: %s", debug_video_recorder.output_path)
     if config.depth_debug_enabled:
@@ -1084,9 +1246,11 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
         landmark_map_entry = None
         if current_landmark:
             target_tracker.set_target_label(current_landmark)
+            tracker_can_cover_motion = target_tracker.lifecycle in {"TRACKING", "LOST_TEMP"}
             perception_motion_active = (
                 bool(config.target_grounding_pause_during_active_primitive)
                 and _is_executing_motion_step(active_step_result)
+                and bool(tracker_can_cover_motion)
             )
             allow_new_grounding = (
                 not perception_motion_active
@@ -1135,6 +1299,7 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
                 observation=target_observation,
                 robot_pose=observation.pose,
                 timestamp_sec=sim_time_sec,
+                arrival_distance_m=float(policy.current_arrival_distance_m),
             )
             landmark_map_entry = landmark_map.update_from_tracker(
                 state=landmark_state,
@@ -1183,6 +1348,20 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
                 robot_pose=observation.pose,
             )
         )
+
+        if bool(config.occupancy_grid_enabled):
+            if not _is_executing_motion_step(active_step_result):
+                _save_global_occupancy_debug(
+                    occupancy_snapshot=occupancy_grid.snapshot(),
+                    robot_pose=observation.pose,
+                    trajectory_xy=global_pose_trace,
+                    landmark_entries=all_entries,
+                    step_result=active_step_result,
+                    output_path=llm_global_map_output_path,
+                )
+                policy.set_request_map_image_path(llm_global_map_output_path)
+        else:
+            policy.set_request_map_image_path(None)
 
         should_refresh_policy = True
         recovery_command = stuck_detector.recovery_command(now_sec=sim_time_sec)
@@ -1731,7 +1910,7 @@ def _save_current_target_debug_image(
         color = (255, 220, 0) if abs(heading_rad) <= half_fov_rad else (255, 120, 0)
         fp_draw.line((origin[0], origin[1], target_u, target_v), fill=color, width=4)
         fp_draw.ellipse((target_u - 16, target_v - 16, target_u + 16, target_v + 16), outline=color, width=4)
-        fp_draw.text((target_u + 18, max(0, target_v - 14)), "current target", fill=color, font=_debug_font(15))
+        fp_draw.text((target_u + 18, max(0, target_v - 14)), "active subgoal", fill=color, font=_debug_font(15))
     else:
         color = (255, 80, 80)
         fp_draw.line((origin[0] - 35, origin[1], origin[0] + 35, origin[1]), fill=color, width=4)
@@ -1744,6 +1923,7 @@ def _save_current_target_debug_image(
         f"policy={step_result.action_name} executed={executed_action}",
         f"local_goal forward={local_forward:.2f}m left={local_left:.2f}m",
         f"distance={distance_m:.2f}m heading={heading_deg:+.1f}deg",
+        "yellow marker=active subgoal; colored box=visual grounding/tracker",
     ]
     margin = 10
     overlay_font = _debug_font(15)
@@ -2242,7 +2422,7 @@ def _save_global_occupancy_debug(
     robot_pose,
     trajectory_xy: list[tuple[float, float]],
     landmark_entries,
-    step_result: PolicyStepResult,
+    step_result: PolicyStepResult | None,
     output_path: Path | None,
 ) -> Image.Image | None:
     if occupancy_snapshot is None:
@@ -2260,7 +2440,7 @@ def _save_global_occupancy_debug(
 
     world_points: list[tuple[float, float]] = [(float(robot_pose.x), float(robot_pose.y))]
     world_points.extend((float(x), float(y)) for x, y in trajectory_xy[-2000:])
-    if step_result.world_goal_xy is not None:
+    if step_result is not None and step_result.world_goal_xy is not None:
         world_points.append((float(step_result.world_goal_xy[0]), float(step_result.world_goal_xy[1])))
     for entry in landmark_entries or []:
         world_xy = getattr(entry, "world_xy", None)
@@ -2325,7 +2505,7 @@ def _save_global_occupancy_debug(
     draw.text((12, 10), "NORTH-UP GLOBAL OCCUPANCY MAP", fill=(245, 245, 245), font=font_title)
     draw.text(
         (12, 42),
-        "black=occupied  white=free  gray=unknown  cyan=trajectory  blue=robot  magenta=landmark  yellow=active_goal",
+        "black=occupied  white=free  gray=unknown  cyan=trajectory  blue=robot  green=DONE  magenta=confirmed  amber=potential  yellow=active_subgoal",
         fill=(210, 220, 230),
         font=font_label,
     )
@@ -2344,10 +2524,10 @@ def _save_global_occupancy_debug(
         points_px = [world_to_px(float(x), float(y)) for x, y in trajectory_xy[-2000:]]
         draw.line(points_px, fill=(0, 190, 220), width=3)
 
-    if step_result.world_goal_xy is not None:
+    if step_result is not None and step_result.world_goal_xy is not None:
         gx, gy = world_to_px(float(step_result.world_goal_xy[0]), float(step_result.world_goal_xy[1]))
         draw.ellipse((gx - 8, gy - 8, gx + 8, gy + 8), fill=(255, 220, 0), outline=(0, 0, 0), width=2)
-        draw.text((gx + 10, gy - 9), "active_goal", fill=(255, 220, 0), font=font_label)
+        draw.text((gx + 10, gy - 9), "active_subgoal", fill=(255, 220, 0), font=font_label)
 
     for entry in landmark_entries or []:
         world_xy = getattr(entry, "world_xy", None)
@@ -2355,9 +2535,23 @@ def _save_global_occupancy_debug(
             continue
         lx, ly = world_to_px(float(world_xy[0]), float(world_xy[1]))
         reached = bool(getattr(entry, "reached", False))
-        color = (255, 150, 30) if reached else (220, 60, 220)
-        draw.ellipse((lx - 9, ly - 9, lx + 9, ly + 9), fill=color, outline=(255, 255, 255), width=2)
-        draw.text((lx + 11, ly - 10), str(getattr(entry, "label", "landmark")), fill=color, font=font_label)
+        evidence = str(getattr(entry, "evidence_level", "")).strip().lower()
+        confirmed = bool(getattr(entry, "confirmed", False)) or evidence == "confirmed"
+        label = str(getattr(entry, "label", "landmark"))
+        if reached:
+            color = (40, 235, 95)
+            draw.ellipse((lx - 11, ly - 11, lx + 11, ly + 11), fill=color, outline=(255, 255, 255), width=3)
+            draw.line((lx - 6, ly, lx - 1, ly + 6), fill=(0, 0, 0), width=3)
+            draw.line((lx - 1, ly + 6, lx + 8, ly - 7), fill=(0, 0, 0), width=3)
+            draw.text((lx + 13, ly - 10), f"{label} DONE", fill=color, font=font_label)
+        elif confirmed:
+            color = (220, 60, 220)
+            draw.ellipse((lx - 9, ly - 9, lx + 9, ly + 9), fill=color, outline=(255, 255, 255), width=2)
+            draw.text((lx + 11, ly - 10), f"{label} confirmed", fill=color, font=font_label)
+        else:
+            color = (255, 175, 40)
+            draw.ellipse((lx - 7, ly - 7, lx + 7, ly + 7), outline=color, width=3)
+            draw.text((lx + 10, ly - 10), f"{label} potential", fill=color, font=font_label)
 
     yaw = float(robot_pose.yaw_rad)
     robot_x = float(robot_pose.x)

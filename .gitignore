@@ -1,9 +1,9 @@
 __pycache__/
 *.pyc
 logs/
-assets/*.png
-assets/*.gif
-assets/*.mp4
+debug/*.png
+debug/*.gif
+debug/videos/*.mp4
 third_party/
 weights/grounded_sam/*.pth
 weights/grounded_sam/*.pt

@@ -1,72 +1,179 @@
-# Isaac Sim Open-Nav VLN
+<div align="center">
+  <img src="docs/assets/vlm_nav_hero.svg" alt="VLM-NAV hero" width="100%">
 
-这是一个基于 Isaac Sim 5.1 的 Open-Nav 风格 VLN 工程。当前版本只保留一条主链路：
+  <h1>VLM-NAV</h1>
+
+  <p>
+    <b>Vision-language navigation in Isaac Sim for a custom Ackermann-style mobile robot.</b><br>
+    Language instructions, RGB-D perception, LiDAR occupancy mapping, semantic grounding, VLM decision making, and low-level wheel/steering control in one runnable stack.
+  </p>
+
+  <p>
+    <img alt="Isaac Sim" src="https://img.shields.io/badge/Isaac%20Sim-5.1-76B900?style=for-the-badge">
+    <img alt="Python" src="https://img.shields.io/badge/Python-3.10-3776AB?style=for-the-badge&logo=python&logoColor=white">
+    <img alt="Robot" src="https://img.shields.io/badge/Robot-Ackermann%20USD-0F172A?style=for-the-badge">
+    <img alt="VLM" src="https://img.shields.io/badge/VLM-Qwen%2FOpenAI--compatible-FFB000?style=for-the-badge">
+  </p>
+</div>
+
+## Overview
+
+VLM-NAV is a research-oriented VLN/ObjectNav prototype built on **Isaac Sim 5.1**. It keeps the simulator, robot USD, RGB-D camera, LiDAR, odometry, and Ackermann joint-control pipeline in Isaac Sim, while the high-level navigation stack uses a VLM to choose local navigation subgoals from visual and map context.
+
+The current main branch is intentionally focused on a clean closed loop:
 
 ```text
-Isaac Sim observation -> Open-Nav candidate/action representation -> VLM reasoner -> Ackermann joint controller
+instruction -> observation -> candidates/map/grounding -> VLM decision -> TRACK_TARGET -> Ackermann controller
 ```
 
-旧的手动控制测试、startup scan、contact sheet、BEV/语义地图实验链路已经从主工程删除。
+It is not a Habitat reproduction and does not require training a waypoint predictor. The goal is to make a custom robot move in a realistic Isaac Sim scene, expose the important intermediate signals, and provide a base for iterative VLN experiments.
 
-## 目录结构
+## Highlights
+
+- **Isaac Sim native runtime**: standalone Python entry point, USD scene loading, custom robot USD loading, front camera, observer camera, LiDAR, and odometry.
+- **Language-conditioned navigation**: tasks are stored as JSON instructions with scene path and robot start pose.
+- **Semantic landmark grounding**: GroundingDINO bbox, optional SAM hooks, VLM semantic verification, depth-based world anchor estimation, and landmark tracking.
+- **Global occupancy memory**: LiDAR-based north-up occupancy map with robot trajectory, active subgoal, and confirmed/completed landmarks.
+- **Continuous subgoal tracking**: current default mode uses `TRACK_TARGET` for normal navigation subgoals instead of repeatedly executing short discrete primitives.
+- **Ackermann-aware low-level control**: wheel velocity and steering position targets are sent through the existing robot articulation chain.
+- **Debug-first design**: a single human-facing debug image plus timestamped MP4 videos are generated for post-run analysis.
+
+## Method
+
+<p align="center">
+  <img src="docs/assets/method_overview.svg" alt="VLM-NAV method overview" width="100%">
+</p>
+
+The stack separates four concerns:
+
+1. **Metric memory**: LiDAR and odometry update a global occupancy map. The map is rendered north-up so the VLM sees route context rather than only an egocentric crop.
+2. **Semantic memory**: target detections are grounded in the RGB image, verified semantically, projected into the world frame with depth, and stored as landmark anchors after consistency checks.
+3. **VLM policy**: the VLM receives the instruction, first-person view, global map, candidate actions, landmark state, and safety context, then selects a local target.
+4. **Robot execution**: selected subgoals are tracked continuously with Ackermann-friendly wheel/steering commands. Safety and stuck monitors can interrupt execution and request replanning.
+
+## Repository Layout
 
 ```text
 .
-├── assets/
-│   └── README.md
 ├── configs/
-│   └── default.yaml
+│   ├── default.yaml              # runtime, perception, control, map, and debug config
+│   └── instructions.json         # navigation task list
+├── docs/assets/
+│   ├── vlm_nav_hero.svg          # README hero graphic
+│   └── method_overview.svg       # README method diagram
+├── exts/vln.nav.task_editor/     # Isaac Sim UI extension for creating new tasks
 ├── scripts/
+│   ├── run_nav.sh                # main navigation launcher
+│   ├── run_task_editor.sh        # Isaac Sim task authoring panel
 │   ├── setup_grounded_sam_local.sh
-│   ├── run_nav.sh
-│   └── test_llm_call.py
+│   └── test_llm_call.py          # isolated LLM/prompt test
 ├── src/
-│   ├── ros2_car_model_ws/
+│   ├── ros2_car_model_ws/        # custom robot USD assets
 │   └── vln_nav/
-│       ├── app/
-│       │   └── nav.py
-│       ├── control/
-│       │   └── controller.py
-│       ├── navigation/
-│       │   ├── candidate_waypoint_predictor.py
-│       │   ├── depth_safety.py
-│       │   ├── instruction_manager.py
-│       │   ├── grounding_dino_detector.py
-│       │   ├── landmark_map.py
-│       │   ├── landmark_tracker.py
-│       │   ├── lidar_sensor.py
-│       │   ├── observation_adapter.py
-│       │   ├── open_nav_client.py
-│       │   ├── progress_manager.py
-│       │   ├── spatial_transform.py
-│       │   ├── target_grounding.py
-│       │   ├── target_memory.py
-│       │   ├── vln_policy.py
-│       │   └── vln_reasoner.py
-│       └── runtime/
-│           ├── config.py
-│           └── isaac_runtime_utils.py
-└── usd/
-    └── hospital.usd
-├── third_party/
-│   └── GroundingDINO/
-└── weights/
-    └── grounded_sam/
+│       ├── app/nav.py            # main Isaac Sim loop
+│       ├── control/controller.py # Ackermann wheel/steering control
+│       ├── navigation/           # perception, memory, policy, planner, grounding
+│       └── runtime/              # config, Isaac helpers, video writer
+├── third_party/GroundingDINO/    # optional local detector checkout
+├── usd/                          # scene USD files
+└── weights/grounded_sam/         # GroundingDINO/SAM weights
 ```
 
-## 运行环境
+## Requirements
 
-使用已有 conda 环境：
+- Ubuntu/Linux workstation with NVIDIA GPU.
+- Conda environment named `env_isaaclab`.
+- Python 3.10.
+- Isaac Sim 5.1 installed in the conda environment.
+- A SiliconFlow/OpenAI-compatible VLM API key.
+- Optional but recommended: GroundingDINO checkpoint for local semantic grounding.
+
+The project assumes the existing conda environment:
 
 ```bash
 conda activate env_isaaclab
 ```
 
-如果需要安装 Isaac Sim 5.1，请在该环境内按 NVIDIA 官方方式安装。当前运行脚本默认使用 `env_isaaclab`。
+If Isaac Sim is not installed yet, install it in that environment using NVIDIA's official Isaac Sim 5.1 Python package workflow.
 
-## 本地 GroundingDINO 部署
+## Quick Start
 
-当前工程默认从工程内部读取 GroundingDINO：
+Set the API key through an environment variable instead of hard-coding it in config:
+
+```bash
+export SILICONFLOW_API_KEY="your_api_key"
+```
+
+Run the default task:
+
+```bash
+bash scripts/run_nav.sh
+```
+
+List available tasks:
+
+```bash
+bash scripts/run_nav.sh --list-tasks
+```
+
+Run a specific task:
+
+```bash
+bash scripts/run_nav.sh --task hospital_002
+```
+
+Run headless:
+
+```bash
+bash scripts/run_nav.sh --headless
+```
+
+If non-headless Isaac Sim starts but no GUI appears, the renderer is usually bound to a GPU without display output. The config uses `sim.active_gpu: auto`; you can override it:
+
+```bash
+ACTIVE_GPU=1 bash scripts/run_nav.sh
+```
+
+## Task Format
+
+Navigation tasks live in `configs/instructions.json`. Each task defines a scene, robot start pose, and natural-language instruction:
+
+```json
+{
+  "id": "hospital_001",
+  "scene_usd_path": "usd/environment/hospital_flat.usd",
+  "robot_start_position": [1.5, 4.0, 0.0],
+  "robot_start_orientation_deg": [0.0, 0.0, 0.0],
+  "instruction": "向前走找到轮椅，然后左转再直走找到楼梯"
+}
+```
+
+`robot_start_position[2]` is the `/World/Robot` root prim z value. In the current setup it should normally stay `0.0`; do not treat it as wheel-ground contact height.
+
+## Creating New Tasks
+
+Use the built-in task editor when you want to author a new start pose visually:
+
+```bash
+bash scripts/run_task_editor.sh
+```
+
+The script opens Isaac Sim, loads the configured scene and robot, and shows a `VLM-NAV Task Editor` panel. Move `/World/Robot` in the viewport, enter a task id and instruction, then save. The panel writes only to `configs/instructions.json`; it does not save changes back into the scene USD unless you explicitly use Isaac Sim's own file-save commands.
+
+The scene and robot used by the editor are defined at the top of `scripts/run_task_editor.sh`.
+
+## GroundingDINO / SAM Setup
+
+The default grounding backend is:
+
+```yaml
+target_grounding:
+  backend: "auto"
+```
+
+In `auto` mode the system tries local GroundingDINO first and falls back to VLM bbox grounding if the detector is unavailable.
+
+Expected local paths:
 
 ```text
 third_party/GroundingDINO/
@@ -74,161 +181,84 @@ weights/grounded_sam/GroundingDINO_SwinT_OGC.py
 weights/grounded_sam/groundingdino_swint_ogc.pth
 ```
 
-部署代码和依赖：
+Set up the local files:
 
 ```bash
 bash scripts/setup_grounded_sam_local.sh
 ```
 
-如果你已经有 CA-Nav 的权重，可以直接软链接，不需要复制 3GB 文件：
+If you already have CA-Nav compatible weights, symlink them:
 
 ```bash
 ln -sf /home/Lab/qiangsibin/CA-Nav-code/data/grounded_sam/GroundingDINO_SwinT_OGC.py weights/grounded_sam/GroundingDINO_SwinT_OGC.py
 ln -sf /home/Lab/qiangsibin/CA-Nav-code/data/grounded_sam/groundingdino_swint_ogc.pth weights/grounded_sam/groundingdino_swint_ogc.pth
 ```
 
-如果后续要启用 SAM mask，再放：
+SAM is currently optional and disabled by default:
+
+```yaml
+target_grounding:
+  sam_enabled: false
+```
+
+To enable SAM later, provide a checkpoint such as:
 
 ```text
 weights/grounded_sam/sam_vit_h_4b8939.pth
-weights/grounded_sam/repvit_sam.pt
 ```
 
-代码里已经预留 `sam_vit_h_4b8939.pth` 接口，但当前默认配置 `target_grounding.sam_enabled: false`，实际运行不会使用 SAM。如果你已有 CA-Nav 权重且想打开 SAM，再软链接：
+## Key Configuration
 
-```bash
-ln -sf /home/Lab/qiangsibin/CA-Nav-code/data/grounded_sam/sam_vit_h_4b8939.pth weights/grounded_sam/sam_vit_h_4b8939.pth
-```
-
-## 配置
-
-主配置文件是 `configs/default.yaml`。
-
-常改字段：
+Most knobs are in `configs/default.yaml`.
 
 ```yaml
 llm:
-  api_key: ""
   api_base_url: "https://api.siliconflow.cn/v1"
   model_name: "Qwen/Qwen3-VL-30B-A3B-Instruct"
-
-opennav:
-  instruction: "<your navigation instruction>"
-  landmark_arrival_distance_m: 1.0
-  landmark_arrival_confirmations: 2
-  progress_stall_distance_m: 0.08
-  recovery_enabled: true
-  recovery_trigger_stalled_steps: 3
-  debug_image_update_period_sec: 1.0
-
-map_candidates:
-  enabled: true
-  max_candidates: 6
-  semantic_enabled: true
-  frontier_enabled: true
-  escape_enabled: true
-  min_clearance_m: 0.34
-
-target_grounding:
-  enabled: true
-  backend: "auto"   # auto | grounding_dino | qwen_vl
-  call_period_sec: 1.5
-  reuse_last_observation_sec: 2.5
-  coordinate_mode: "auto"
-  allow_normalized_bbox: true
-  depth_region: "bbox_depth_mask"
-  depth_statistic: "median"
-  min_depth_valid_ratio: 0.12
-  grounding_dino_repo_path: "third_party/GroundingDINO"
-  grounding_dino_config_path: "weights/grounded_sam/GroundingDINO_SwinT_OGC.py"
-  grounding_dino_checkpoint_path: "weights/grounded_sam/groundingdino_swint_ogc.pth"
-  grounding_dino_device: "cuda:1"
-  sam_checkpoint_path: "weights/grounded_sam/sam_vit_h_4b8939.pth"
-  sam_model_type: "vit_h"
-  sam_device: "cuda:1"
-
-landmark_tracker:
-  arrival_visible_depth_m: 1.00
-  arrival_anchor_radius_m: 1.00
-  min_visible_count: 2
-  arrival_confirmations: 2
-  landmark_map_enabled: true
-  landmark_map_anchor_ttl_sec: 120.0
-  reacquire_guard_enabled: true
-  reacquire_guard_recent_visible_sec: 20.0
-
-camera:
-  front_camera_prim_path: "link6/Camera"
-  observer_camera_prim_path: "dummy_base_link/observecamera"
-  obstacle_stop_distance_m: 0.65
-  near_field_memory_enabled: true
-  near_field_memory_sec: 2.0
+  timeout_sec: 30
 
 control:
+  use_discrete_action_primitives: false  # false = continuous TRACK_TARGET
   wheel_drive_velocity: 14.0
-  turn_drive_velocity: 6.0
-  use_discrete_action_primitives: true
-  stuck_detection_enabled: true
-  stuck_window_sec: 2.0
-  stuck_recovery_backward_sec: 0.75
-  stuck_recovery_turn_sec: 0.35
-  action_forward_duration_sec: 0.65
-  action_turn_duration_sec: 0.30
-  action_turn_angle_deg: 15.0
+  steering_angle: 0.65
+  track_min_speed_scale: 0.45
+  track_max_speed_scale: 1.0
+
+occupancy_grid:
+  enabled: true
+  resolution_m: 0.08
+  size_m: 80.0
+  lidar_bootstrap_min_fov_deg: 165.0
+  semantic_planner_enabled: true
 
 lidar:
   enabled: true
-  prim_path: "dummy_base_link/base_link/Lidar_link"
-  child_name: "lidar_sensor"
-  horizontal_fov_deg: 360.0
-  min_range_m: 0.20
-  max_range_m: 6.0
-  yaw_offset_deg: 0.0
+  mode: "single"
+  horizontal_fov_deg: 180.0
+  max_range_m: 10.0
 
-scene:
-  usd_path: "usd/hospital.usd"
+target_grounding:
+  enabled: true
+  backend: "auto"
+  call_period_sec: 1.5
+  semantic_verification_enabled: true
 
-robot:
-  usd_path: "src/ros2_car_model_ws/src/1557/urdf/1557_all/1557_all.usd"
+opennav:
+  arrival_distance_m: 1.4
+  success_distance_m: 2.0
+  debug_video_enabled: true
 ```
 
-建议用环境变量传 API key，不要写进配置文件：
+To switch back to fully discrete primitive execution:
 
-```bash
-export SILICONFLOW_API_KEY="your_key"
+```yaml
+control:
+  use_discrete_action_primitives: true
 ```
 
-如果没有设置 API key，程序会在启动 Isaac Sim 前直接退出。当前版本没有本地导航 fallback，不能在无 VLM 的情况下移动。
+## Debug Outputs
 
-## 运行导航
-
-```bash
-bash scripts/run_nav.sh
-```
-
-指定配置：
-
-```bash
-CONFIG_PATH=/abs/path/to/default.yaml bash scripts/run_nav.sh
-```
-
-无界面运行：
-
-```bash
-bash scripts/run_nav.sh --headless
-```
-
-非 headless 模式需要当前终端有可用显示环境，并且 Isaac Sim 的 renderer GPU 必须是连接显示器的 GPU。配置里 `sim.active_gpu` 默认是 `auto`，程序会用 `nvidia-smi display_active` 自动选择显示 GPU；也可以手动覆盖：
-
-```bash
-ACTIVE_GPU=1 bash scripts/run_nav.sh
-```
-
-如果日志出现 `Failed to find a graphics and/or presenting queue`、`createSwapchain failed` 或 `backbuffers are not initialized`，通常说明 `ACTIVE_GPU` 指到了没有显示输出的 GPU，或者当前终端没有 `DISPLAY/WAYLAND_DISPLAY`。这种情况下从桌面/NoMachine/VNC 终端启动，或改用 `--headless`。
-
-## 调试输出
-
-运行时会生成：
+Runtime outputs are intentionally concentrated:
 
 ```text
 logs/nav_latest.log
@@ -238,61 +268,52 @@ debug/llm_request.png
 logs/last_candidate_choice_request.json
 ```
 
-`debug/vln_debug.png` 是给人看的组合调试图：左侧是第一人称 target/动作覆盖图，会直接画出 grounding/tracker bbox、可选 SAM mask、depth 或 lost 原因；右侧是 north-up occupancy/navigation map，包含轨迹、landmark、当前目标和 occupancy。
+- `debug/vln_debug.png`: human-facing view. Left side is the north-up occupancy map; right side is first-person target/subgoal visualization.
+- `debug/videos/vln_debug_YYYYMMDD_HHMMSS.mp4`: timestamped MP4 recording of the debug panel, suitable for VSCode playback.
+- `debug/llm_request.png`: the actual image sent to the VLM during replanning. It combines the global map and first-person candidate view.
+- `logs/nav_latest.log`: control, grounding, landmark, safety, and policy decisions.
+- `logs/last_candidate_choice_request.json`: latest VLM candidate-choice request for offline prompt debugging.
 
-`debug/videos/vln_debug_YYYYMMDD_HHMMSS.mp4` 会把运行过程中的组合调试图低频记录成视频，每次运行自动加日期后缀，格式为 VSCode 可直接打开的 mp4。
-
-`debug/llm_request.png` 是真正发送给 VLM 的候选点请求图，只在重规划时覆盖更新。单独的 `local_map/global_map/lidar_raw_scan/depth_debug` 默认不再周期性落盘，避免 IO 和观察干扰。
-
-## 目标识别与到达判定
-
-当前目标感知不是每帧重新跑 GroundingDINO。默认流程是：GroundingDINO 给出候选 bbox，bbox/depth 一致区域用于估计距离，随后 VLM 会对标记区域做语义复核；通过后初始化 OpenCV tracker。原子动作执行期间默认暂停新的 GroundingDINO/Qwen grounding，只用 tracker 更新 bbox，并继续通过 bbox + depth 估计 bearing/depth/world anchor。只有 `can_confirm=1` 且连续观测稳定的目标才会进入 confirmed anchor；低置信或 VLM 复核失败的结果只作为 weak hint，不允许触发 landmark 到达。SAM 是可选增强，当前默认关闭。
-
-默认关键阈值在 `configs/default.yaml`：
-
-```yaml
-target_grounding:
-  sam_enabled: false
-  semantic_verification_enabled: true
-  semantic_verification_min_confidence: 0.70
-  semantic_verification_auto_accept_confidence: 1.01
-  pause_during_active_primitive: true
-  tracker_enabled: true
-  tracker_type: "CSRT"
-landmark_tracker:
-  confirm_confidence_threshold: 0.65
-  arrival_recent_visible_sec: 3.0
-```
-
-候选请求图 `debug/llm_request.png` 的第一人称画面只保留小号编号点，避免遮挡目标和环境；候选动作、距离、clearance、free ratio 仍在 prompt 文本里。
-
-`scripts/test_llm_call.py` 可以复用最近一次导航真正发给模型的 prompt：
+Test the latest navigation prompt without launching Isaac Sim:
 
 ```bash
 python scripts/test_llm_call.py
 ```
 
-也可以手动测试：
+Or manually test an image:
 
 ```bash
 python scripts/test_llm_call.py --mode manual --image debug/llm_request.png
 ```
 
-## 当前主链路
+## Main Runtime Chain
 
-1. `nav.py` 启动 Isaac Sim，加载 `usd/hospital.usd` 和机器人 USD。
-2. `observation_adapter.py` 整理 RGB、Depth、机器人位姿和上一帧执行反馈。
-3. `lidar_sensor.py` 从 `dummy_base_link/base_link/Lidar_link` 读取或创建 PhysX LiDAR，并用 LiDAR scan 更新 occupancy grid；只有关闭 LiDAR 时才退回前视深度建图。
-4. `candidate_waypoint_predictor.py` 从深度图生成固定槽位候选动作。
-5. `map_candidate_generator.py` 基于 occupancy grid、当前 landmark anchor、安全上下文和进展状态补充 `semantic_approach/frontier/escape_turn` 候选，并统一成 `WaypointCandidate` 供 VLM 选择。
-6. `target_grounding.py` 只在搜索/重规划/跟踪丢失时低频获取当前 landmark 的 bbox；`backend: auto` 时优先尝试本地 GroundingDINO，缺少 checkpoint 或不可用时自动回退到 Qwen VLM bbox。
-7. `target_tracker.py` 在 confirmed grounding 后接管 bbox 连续跟踪。原子动作执行期间不再新发 GroundingDINO/Qwen grounding，而是 tracker bbox + depth 继续更新目标 bearing/depth/world anchor。
-8. `landmark_tracker.py` 只在连续一致观测后确认 landmark anchor，并判断当前 landmark 是否到达。
-9. `landmark_map.py` 保存 confirmed landmark anchor；目标暂时离开视野后，主链仍能基于已确认世界坐标判断距离和给 VLM 提供记忆。
-10. `vln_reasoner.py` 将指令、历史、候选点图、LandmarkMap 和安全上下文发给 VLM。
-11. `vln_policy.py` 将 VLM 选中的候选槽位映射成固定离散动作原语，并在 tracker/map 判定到达后切换到下一个 landmark；如果目标刚可见后因转向丢失，`ReacquireGuard` 会禁止继续同向转。
-12. `controller.py` 执行 `FORWARD/BACKWARD/TURN_LEFT/TURN_RIGHT/STOP`，每个原语按固定时间或固定转角结束，然后停车回正并重规划。
+1. `src/vln_nav/app/nav.py` launches Isaac Sim and loads the scene, robot, cameras, LiDAR, and controller.
+2. `observation_adapter.py` packages RGB, depth, robot pose, and execution feedback.
+3. `lidar_sensor.py` and `occupancy_grid.py` maintain the global occupancy map.
+4. `target_grounding.py`, `target_tracker.py`, `landmark_tracker.py`, and `landmark_map.py` maintain semantic landmark state.
+5. `candidate_waypoint_predictor.py` and `map_candidate_generator.py` build local action/subgoal candidates.
+6. `vln_reasoner.py` sends the instruction, map, image, candidates, memory, and safety context to the VLM.
+7. `vln_policy.py` converts the decision into either a continuous `TRACK_TARGET` subgoal or, if explicitly configured, a discrete action primitive.
+8. `control/controller.py` applies wheel velocity and steering targets to the robot articulation.
 
-当前版本没有本地启发式强行覆盖 VLM 选择；安全模块只在近距离碰撞风险时 STOP，并把原因传回下一轮 VLM 决策。
+## Current Scope
 
-当前本地语义感知主链是 GroundingDINO bbox + bbox/depth 估计 + VLM 语义复核。GroundingDINO 缺失时会回退到 Qwen bbox；SAM 只有在 `target_grounding.sam_enabled: true` 时才参与。
+This repository is a working research prototype, not a polished benchmark implementation. Current priorities are:
+
+- robust custom-robot execution in Isaac Sim;
+- readable debug artifacts;
+- global metric memory for avoiding dead ends;
+- semantic landmark memory for multi-step instructions;
+- controlled iteration on VLM prompts and candidate generation.
+
+Known limitations:
+
+- landmark grounding can still produce false positives in visually ambiguous hospital scenes;
+- world anchors depend on camera/depth geometry quality;
+- VLM decisions are latency-bound by the configured API endpoint;
+- continuous tracking is smoother than short primitives, but still relies on local map quality and safety interruption.
+
+## Citation / Acknowledgement
+
+This project is inspired by recent VLN and open-vocabulary navigation systems that combine language-conditioned reasoning, visual grounding, topological or metric memory, and local control. It adapts those ideas to an Isaac Sim custom-robot workflow rather than a Habitat benchmark pipeline.

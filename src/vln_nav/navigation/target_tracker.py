@@ -112,8 +112,8 @@ class TargetTracker:
         if tracker is None:
             return False
         x0, y0, x1, y1 = bbox
-        cv_bbox = (float(x0), float(y0), float(x1 - x0), float(y1 - y0))
-        frame = np.ascontiguousarray(np.asarray(rgb, dtype=np.uint8)[..., :3])
+        cv_bbox = (int(x0), int(y0), max(1, int(x1 - x0)), max(1, int(y1 - y0)))
+        frame = self._tracker_frame(rgb)
         try:
             ok = bool(tracker.init(frame, cv_bbox))
         except Exception as exc:
@@ -155,7 +155,7 @@ class TargetTracker:
             return _empty_track_observation(label=label, timestamp_sec=timestamp_sec, reason="tracker_rgb_unavailable")
 
         try:
-            frame = np.ascontiguousarray(np.asarray(rgb, dtype=np.uint8)[..., :3])
+            frame = self._tracker_frame(rgb)
             ok, raw_bbox = self._tracker.update(frame)
         except Exception as exc:
             self._logger.warning("[TargetTracker] update_failed target=%s error=%s", label, exc)
@@ -340,6 +340,15 @@ class TargetTracker:
                 continue
         self._logger.warning("[TargetTracker] no_supported_opencv_tracker tracker_type=%s", tracker_type)
         return None
+
+    def _tracker_frame(self, rgb: np.ndarray) -> np.ndarray:
+        frame_rgb = np.ascontiguousarray(np.asarray(rgb, dtype=np.uint8)[..., :3])
+        if self._cv2 is None:
+            return frame_rgb
+        try:
+            return self._cv2.cvtColor(frame_rgb, self._cv2.COLOR_RGB2BGR)
+        except Exception:
+            return frame_rgb
 
     def _log_state(self, *, timestamp_sec: float, reason: str, bbox: tuple[int, int, int, int] | None) -> None:
         signature = (

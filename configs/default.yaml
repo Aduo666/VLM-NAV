@@ -175,7 +175,7 @@ control:
   track_slow_heading_rad: 1.35
   track_smoothing_alpha: 0.92
   track_steering_sign: -1.0
-  use_discrete_action_primitives: false
+  use_discrete_action_primitives: true
   stuck_detection_enabled: true
   stuck_window_sec: 2.0
   stuck_displacement_threshold_m: 0.05

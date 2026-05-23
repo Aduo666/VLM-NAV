@@ -59,11 +59,11 @@ The design borrows several principles from recent VLN work:
 
 ## Demo
 
-The video below shows an early successful closed-loop run in Isaac Sim. The robot follows a language-conditioned route using the current RGB-D, LiDAR map, semantic landmark memory, VLM candidate selection, and Ackermann primitive controller.
+The demo below shows an early successful closed-loop run in Isaac Sim. The robot follows a language-conditioned route using the current RGB-D, LiDAR map, semantic landmark memory, VLM candidate selection, and Ackermann primitive controller.
 
-<video src="docs/assets/firstsuccess.mp4" controls width="100%"></video>
+[![VLM-NAV demo](docs/assets/firstsuccess_thumb.png)](docs/assets/firstsuccess.mp4)
 
-[Open the demo video](docs/assets/firstsuccess.mp4) if your Markdown viewer does not render embedded local MP4 files.
+[Watch the MP4 demo](docs/assets/firstsuccess.mp4). GitHub README pages do not reliably render repository-local MP4 files as inline video players, so the thumbnail links directly to the video.
 
 This demo is meant to show the system running end-to-end rather than final navigation robustness. The current policy can still oscillate when adjacent left/right candidates receive similar scores, which may cause local spinning or slow progress in narrow areas.
 

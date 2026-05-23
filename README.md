@@ -57,6 +57,16 @@ The design borrows several principles from recent VLN work:
 - **Structure the execution loop**: instruction parsing, progress tracking, candidate selection, safety checks, and low-level control are separate modules.
 - **Keep robot control deterministic**: the VLM selects from constrained candidates; the controller executes fixed primitives rather than continuous free-form commands.
 
+## Demo
+
+The video below shows an early successful closed-loop run in Isaac Sim. The robot follows a language-conditioned route using the current RGB-D, LiDAR map, semantic landmark memory, VLM candidate selection, and Ackermann primitive controller.
+
+<video src="docs/assets/firstsuccess.mp4" controls width="100%"></video>
+
+[Open the demo video](docs/assets/firstsuccess.mp4) if your Markdown viewer does not render embedded local MP4 files.
+
+This demo is meant to show the system running end-to-end rather than final navigation robustness. The current policy can still oscillate when adjacent left/right candidates receive similar scores, which may cause local spinning or slow progress in narrow areas.
+
 ## Features
 
 - **Isaac Sim 5.1 standalone runtime** with scene USD loading, custom robot USD loading, cameras, LiDAR, and viewport setup.
@@ -341,6 +351,7 @@ Known limitations:
 - landmark world anchors depend on camera/depth calibration and valid depth pixels;
 - API-based VLM calls introduce latency;
 - primitive execution is inspectable, but may require tuning distance and turning thresholds for each robot model;
+- candidate selection can flicker between neighboring left/right options, causing oscillation or in-place turning in cluttered layouts;
 - this repository does not yet provide standardized R2R/RxR/VLN-CE benchmark evaluation.
 
 ## Research Context

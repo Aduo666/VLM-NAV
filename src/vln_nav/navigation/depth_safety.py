@@ -155,11 +155,21 @@ class DepthSafetyMonitor:
         if safety_action == "TURN_LEFT":
             turn_block_distance_m = stop_distance_m + 0.08
             if front_depth_m <= turn_block_distance_m or left_depth_m <= turn_block_distance_m:
+                if right_depth_m > turn_block_distance_m:
+                    return DepthSafetyDecision(
+                        action_name="TURN_RIGHT",
+                        speed_scale=min(base_speed_scale, 0.45),
+                        overridden=True,
+                        reason="turn_left_blocked_redirect_right",
+                        front_depth_m=front_depth_m,
+                        left_depth_m=left_depth_m,
+                        right_depth_m=right_depth_m,
+                    )
                 return DepthSafetyDecision(
-                    action_name="BACKWARD",
-                    speed_scale=min(base_speed_scale, 0.45),
+                    action_name="TURN_RIGHT",
+                    speed_scale=min(base_speed_scale, 0.30),
                     overridden=True,
-                    reason="turn_left_blocked_backoff",
+                    reason="turn_left_blocked_both_sides",
                     front_depth_m=front_depth_m,
                     left_depth_m=left_depth_m,
                     right_depth_m=right_depth_m,
@@ -168,11 +178,21 @@ class DepthSafetyMonitor:
         if safety_action == "TURN_RIGHT":
             turn_block_distance_m = stop_distance_m + 0.08
             if front_depth_m <= turn_block_distance_m or right_depth_m <= turn_block_distance_m:
+                if left_depth_m > turn_block_distance_m:
+                    return DepthSafetyDecision(
+                        action_name="TURN_LEFT",
+                        speed_scale=min(base_speed_scale, 0.45),
+                        overridden=True,
+                        reason="turn_right_blocked_redirect_left",
+                        front_depth_m=front_depth_m,
+                        left_depth_m=left_depth_m,
+                        right_depth_m=right_depth_m,
+                    )
                 return DepthSafetyDecision(
-                    action_name="BACKWARD",
-                    speed_scale=min(base_speed_scale, 0.45),
+                    action_name="TURN_LEFT",
+                    speed_scale=min(base_speed_scale, 0.30),
                     overridden=True,
-                    reason="turn_right_blocked_backoff",
+                    reason="turn_right_blocked_both_sides",
                     front_depth_m=front_depth_m,
                     left_depth_m=left_depth_m,
                     right_depth_m=right_depth_m,

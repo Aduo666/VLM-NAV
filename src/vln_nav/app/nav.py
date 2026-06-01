@@ -488,7 +488,7 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
             window_sec=float(config.stuck_window_sec),
             displacement_threshold_m=float(config.stuck_displacement_threshold_m),
             yaw_threshold_deg=float(config.stuck_yaw_threshold_deg),
-            recovery_backward_sec=float(config.stuck_recovery_backward_sec),
+            recovery_pause_sec=float(config.stuck_recovery_pause_sec),
             recovery_turn_sec=float(config.stuck_recovery_turn_sec),
             recovery_turn_action=str(config.stuck_recovery_turn_action),
         ),
@@ -738,11 +738,9 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
             forward_speed_scale=float(config.waypoint_forward_speed_scale),
             replanning_cooldown_sec=float(config.replanning_cooldown_sec),
             active_forward_duration_sec=float(config.action_forward_duration_sec),
-            active_backward_duration_sec=float(config.action_backward_duration_sec),
             active_turn_duration_sec=float(config.action_turn_duration_sec),
             active_turn_angle_deg=float(config.action_turn_angle_deg),
             active_forward_distance_m=float(config.action_forward_distance_m),
-            active_backward_distance_m=float(config.action_backward_distance_m),
             active_distance_tolerance_m=float(config.action_distance_tolerance_m),
             active_turn_tolerance_deg=float(config.action_turn_tolerance_deg),
             active_odom_completion_enabled=bool(config.action_odom_completion_enabled),
@@ -955,12 +953,11 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
         int(bool(config.use_discrete_action_primitives)),
     )
     logger.info(
-        "[OdomConfig] enabled=%s source=%s primitive_completion=%s forward_distance=%.2fm backward_distance=%.2fm turn_angle=%.1fdeg tolerance=%.1fdeg",
+        "[OdomConfig] enabled=%s source=%s primitive_completion=%s forward_distance=%.2fm turn_angle=%.1fdeg tolerance=%.1fdeg",
         int(bool(config.odom_enabled)),
         str(config.odom_source),
         int(bool(config.action_odom_completion_enabled)),
         float(config.action_forward_distance_m),
-        float(config.action_backward_distance_m),
         float(config.action_turn_angle_deg),
         float(config.action_turn_tolerance_deg),
     )
@@ -1825,7 +1822,7 @@ def _is_executing_motion_step(step_result) -> bool:
     if step_result is None:
         return False
     action = str(getattr(step_result, "action_name", "STOP")).strip().upper()
-    if action not in {"FORWARD", "BACKWARD", "TURN_LEFT", "TURN_RIGHT", "TRACK_TARGET"}:
+    if action not in {"FORWARD", "TURN_LEFT", "TURN_RIGHT", "TRACK_TARGET"}:
         return False
     remaining = int(getattr(step_result, "execution_steps_remaining", 0) or 0)
     return remaining > 0

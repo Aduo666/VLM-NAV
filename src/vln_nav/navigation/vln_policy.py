@@ -16,6 +16,33 @@ from .observation_adapter import VLNObservation
 from .progress_manager import ProgressManager
 from .target_memory import TargetMemory
 from .vln_reasoner import OpenNavReasoner
+from .policy_helpers import (
+    _INVALID_LANDMARKS,
+    _candidate_to_primitive_action,
+    _direction_consistency,
+    _direction_tokens_from_text,
+    _find_candidate,
+    _format_optional_float,
+    _format_reacquire_prompt_context,
+    _format_xy,
+    _has_non_forbidden_valid_candidate,
+    _is_fresh_grounded_observation,
+    _is_valid_landmark,
+    _local_goal_to_primitive_action,
+    _local_waypoint_to_world_xy,
+    _memory_anchor_local_xy,
+    _nearest_candidate_for_local_goal,
+    _ordered_landmarks_from_steps,
+    _pass_action_sequence,
+    _pose_distance_m,
+    _primitive_speed_scale,
+    _relative_side,
+    _relative_xy_from_anchor,
+    _route_steps,
+    _track_target_command,
+    _world_waypoint_to_local_xy,
+    _wrap_angle_rad,
+)
 
 
 @dataclass
@@ -34,11 +61,9 @@ class OpenNavPolicyConfig:
     forward_speed_scale: float
     replanning_cooldown_sec: float
     active_forward_duration_sec: float
-    active_backward_duration_sec: float
     active_turn_duration_sec: float
     active_turn_angle_deg: float
     active_forward_distance_m: float
-    active_backward_distance_m: float
     active_distance_tolerance_m: float
     active_turn_tolerance_deg: float
     active_odom_completion_enabled: bool
@@ -199,7 +224,7 @@ class OpenNavVLNPolicy:
                 reasoning_summary=self._last_decision_summary,
             )
             self._last_applied_action = str(execution_feedback.applied_action).strip().upper()
-            if self._last_applied_action in {"FORWARD", "BACKWARD", "TURN_LEFT", "TURN_RIGHT"}:
+            if self._last_applied_action in {"FORWARD", "TURN_LEFT", "TURN_RIGHT"}:
                 self._last_motion_action = self._last_applied_action
 
         progress_state = self._progress_manager.state
@@ -265,7 +290,6 @@ class OpenNavVLNPolicy:
             )
             if bool(self._config.use_discrete_action_primitives) and self._active_action_name in {
                 "FORWARD",
-                "BACKWARD",
                 "TURN_LEFT",
                 "TURN_RIGHT",
             }:
@@ -709,7 +733,7 @@ class OpenNavVLNPolicy:
             self._active_goal_started_sec = now
             self._active_start_yaw_rad = float(observation.pose.yaw_rad)
             self._active_start_pose = observation.pose
-            if action_name in {"FORWARD", "BACKWARD", "TURN_LEFT", "TURN_RIGHT"}:
+            if action_name in {"FORWARD", "TURN_LEFT", "TURN_RIGHT"}:
                 self._recent_primitive_actions.append(str(action_name))
         self._logger.info(
             "[WaypointDecision] candidate=%s label=%s heading_deg=%.1f semantic_visible=%s grounded_visible=%s target_bearing=%s action=%s",
@@ -1669,7 +1693,7 @@ class OpenNavVLNPolicy:
         if not bool(has_non_forbidden_valid_candidate):
             return selected, False, "no_non_forbidden_valid_candidate"
         override = str(self._config.reacquire_guard_override_action).strip().upper() or "STOP"
-        if override not in {"STOP", "TURN_LEFT", "TURN_RIGHT", "FORWARD", "BACKWARD"}:
+        if override not in {"STOP", "TURN_LEFT", "TURN_RIGHT", "FORWARD"}:
             override = "STOP"
         return override, True, "prevent_repeat_turn_after_target_loss"
 
@@ -1796,7 +1820,7 @@ class OpenNavVLNPolicy:
             )
 
         self._recovery_steps_remaining -= 1
-        speed_scale = 0.55 if action_name == "BACKWARD" else float(self._config.turn_speed_scale)
+        speed_scale = float(self._config.turn_speed_scale)
         return PolicyStepResult(
             action_name=action_name,
             speed_scale=float(speed_scale),
@@ -1820,12 +1844,12 @@ class OpenNavVLNPolicy:
 
     def _choose_recovery_action(self) -> str:
         cycle = self._recovery_count % 4
-        if cycle in {0, 2}:
-            return "BACKWARD"
-        if cycle == 1:
+        if cycle in {0, 1}:
             return self._preferred_search_turn_action()
-        preferred = self._preferred_search_turn_action()
-        return "TURN_LEFT" if preferred == "TURN_RIGHT" else "TURN_RIGHT"
+        if cycle == 2:
+            preferred = self._preferred_search_turn_action()
+            return "TURN_LEFT" if preferred == "TURN_RIGHT" else "TURN_RIGHT"
+        return "FORWARD"
 
     def _preferred_search_turn_action(self) -> str:
         bearing = str(self._target_memory.state.last_seen_bearing_hint).lower()
@@ -1849,7 +1873,7 @@ class OpenNavVLNPolicy:
         now: float,
     ) -> PolicyStepResult:
         action_name = str(self._active_action_name).strip().upper()
-        if action_name not in {"FORWARD", "BACKWARD", "TURN_LEFT", "TURN_RIGHT"}:
+        if action_name not in {"FORWARD", "TURN_LEFT", "TURN_RIGHT"}:
             self._clear_active_goal()
             return PolicyStepResult(
                 action_name="STOP",
@@ -1889,20 +1913,16 @@ class OpenNavVLNPolicy:
         target_yaw_rad = float(np.deg2rad(max(1.0, float(self._config.active_turn_angle_deg))))
         yaw_tolerance_rad = float(np.deg2rad(max(0.1, float(self._config.active_turn_tolerance_deg))))
         forward_target_m = max(0.05, float(self._config.active_forward_distance_m))
-        backward_target_m = max(0.05, float(self._config.active_backward_distance_m))
         distance_tolerance_m = max(0.0, float(self._config.active_distance_tolerance_m))
         is_turn = action_name in {"TURN_LEFT", "TURN_RIGHT"}
-        is_translation = action_name in {"FORWARD", "BACKWARD"}
         odom_completion_enabled = bool(self._config.active_odom_completion_enabled)
         completion_reason = ""
         if odom_completion_enabled and is_turn and yaw_delta_rad >= max(0.0, target_yaw_rad - yaw_tolerance_rad):
             completion_reason = "odom_target_yaw_reached"
         elif odom_completion_enabled and action_name == "FORWARD" and traveled_m >= max(0.0, forward_target_m - distance_tolerance_m):
             completion_reason = "odom_forward_distance_reached"
-        elif odom_completion_enabled and action_name == "BACKWARD" and traveled_m >= max(0.0, backward_target_m - distance_tolerance_m):
-            completion_reason = "odom_backward_distance_reached"
         elif elapsed_sec >= max_duration_sec:
-            completion_reason = "timeout_reached" if odom_completion_enabled and (is_turn or is_translation) else "duration_reached"
+            completion_reason = "timeout_reached" if odom_completion_enabled and (is_turn or action_name == "FORWARD") else "duration_reached"
 
         if completion_reason:
             completed_candidate_id = self._active_candidate_id
@@ -1916,7 +1936,7 @@ class OpenNavVLNPolicy:
                 float(elapsed_sec),
                 float(max_duration_sec),
                 float(traveled_m),
-                float(forward_target_m if action_name == "FORWARD" else backward_target_m if action_name == "BACKWARD" else 0.0),
+                float(forward_target_m if action_name == "FORWARD" else 0.0),
                 float(np.degrees(yaw_delta_rad)),
                 float(np.degrees(target_yaw_rad)) if is_turn else 0.0,
             )
@@ -2291,354 +2311,8 @@ class OpenNavVLNPolicy:
         action = str(action_name).strip().upper()
         if action == "FORWARD":
             return max(0.05, float(self._config.active_forward_duration_sec))
-        if action == "BACKWARD":
-            return max(0.05, float(self._config.active_backward_duration_sec))
         if action in {"TURN_LEFT", "TURN_RIGHT"}:
             return max(0.05, float(self._config.active_turn_duration_sec))
         if action == "TRACK_TARGET":
             return max(0.05, float(self._config.active_forward_duration_sec))
         return 0.05
-
-
-def _find_candidate(candidate_set: CandidateSet, slot_id: int | None) -> WaypointCandidate | None:
-    if slot_id is None:
-        return None
-    for candidate in candidate_set.candidates:
-        if int(candidate.slot_id) == int(slot_id):
-            return candidate
-    return None
-
-
-_INVALID_LANDMARKS: set[str] = {
-    "none", "null", "unknown", "n/a", "na", "target", "object", "thing",
-    "place", "location", "area", "destination", "goal", "",
-}
-
-
-def _is_valid_landmark(label: str) -> bool:
-    text = str(label).strip().lower()
-    return bool(text) and text not in _INVALID_LANDMARKS and len(text) >= 2
-
-
-def _route_steps(instruction_context: InstructionContext) -> list[RouteStep]:
-    steps: list[RouteStep] = []
-    for route_step in getattr(instruction_context, "route_steps", []) or []:
-        landmark = str(getattr(route_step, "landmark", "")).strip().lower()
-        if not _is_valid_landmark(landmark):
-            continue
-        directive = str(getattr(route_step, "directive", "")).strip()
-        behavior_type = str(getattr(route_step, "behavior_type", "go_to")).strip().lower() or "go_to"
-        steps.append(
-            RouteStep(
-                landmark=landmark,
-                directive=directive,
-                behavior_type=behavior_type,
-            )
-        )
-    if steps:
-        return steps
-
-    fallback_steps: list[RouteStep] = []
-    for raw_landmark in instruction_context.landmarks:
-        landmark = str(raw_landmark).strip().lower()
-        if _is_valid_landmark(landmark):
-            fallback_steps.append(
-                RouteStep(
-                    landmark=landmark,
-                    directive=f"go to {landmark}",
-                    behavior_type="go_to",
-                )
-            )
-    if fallback_steps:
-        return fallback_steps
-
-    fallback = str(instruction_context.goal_phrase or instruction_context.normalized_text).strip().lower()
-    if _is_valid_landmark(fallback):
-        return [RouteStep(landmark=fallback, directive=f"go to {fallback}", behavior_type="go_to")]
-    return []
-
-
-def _ordered_landmarks_from_steps(
-    route_steps: list[RouteStep],
-    instruction_context: InstructionContext,
-) -> list[str]:
-    ordered: list[str] = []
-    for route_step in route_steps:
-        landmark = str(getattr(route_step, "landmark", "")).strip().lower()
-        if _is_valid_landmark(landmark) and landmark not in ordered:
-            ordered.append(landmark)
-    for raw_landmark in instruction_context.landmarks:
-        landmark = str(raw_landmark).strip().lower()
-        if _is_valid_landmark(landmark) and landmark not in ordered:
-            ordered.append(landmark)
-    if not ordered:
-        fallback = str(instruction_context.goal_phrase or instruction_context.normalized_text).strip()
-        if fallback and _is_valid_landmark(fallback):
-            ordered.append(fallback)
-    return ordered
-
-
-def _pass_action_sequence(directive: str) -> list[str]:
-    text = str(directive).strip().lower()
-    if "right" in text:
-        return ["TURN_RIGHT", "FORWARD", "TURN_LEFT", "FORWARD"]
-    if "left" in text:
-        return ["TURN_LEFT", "FORWARD", "TURN_RIGHT", "FORWARD"]
-    return ["FORWARD"]
-
-
-def _direction_tokens_from_text(text: str) -> list[str]:
-    lowered = str(text).strip().lower()
-    tokens: list[str] = []
-    checks = [
-        ("left", ("left", "左")),
-        ("right", ("right", "右")),
-        ("forward", ("forward", "straight", "ahead", "front", "前", "直")),
-        ("backward", ("back", "backward", "后", "退")),
-        ("through", ("through", "go through", "穿过", "通过")),
-        ("pass", ("pass", "around", "绕过", "经过")),
-    ]
-    for token, aliases in checks:
-        if any(alias in lowered for alias in aliases):
-            tokens.append(token)
-    return tokens
-
-
-def _is_fresh_grounded_observation(observation) -> bool:
-    return (
-        bool(getattr(observation, "visible", False))
-        and str(getattr(observation, "reason", "")).strip().lower() == "ok"
-        and "reused" not in str(getattr(observation, "source", "")).strip().lower()
-        and bool(getattr(observation, "is_current_frame", True))
-        and getattr(observation, "depth_m", None) is not None
-        and getattr(observation, "estimated_world_xy", None) is not None
-    )
-
-
-def _format_reacquire_prompt_context(guard: ReacquireGuardContext) -> str:
-    if not bool(guard.target_recently_visible) and not bool(guard.lost_after_visible):
-        return "none"
-    if bool(guard.lost_after_visible):
-        return (
-            "LOST_AFTER_VISIBLE active. "
-            f"previous_semantic_visible={int(guard.previous_semantic_visible)}; "
-            f"previous_grounded_visible={int(guard.previous_grounded_visible)}; "
-            f"current_grounded_visible={int(guard.current_grounded_visible)}; "
-            f"last_action={guard.last_action}; "
-            f"last_seen_bearing={guard.last_seen_bearing}; "
-            f"Forbidden action this step: {guard.forbidden_action}. "
-            "Do not choose the forbidden action. If the target is still not visible in the current image, "
-            "prefer a candidate that stops repeating the previous turn direction; if the target is visible again "
-            "in the current image, choose based on that current visual evidence. The runtime will force STOP if "
-            "the forbidden action is selected while the target is still not visible."
-        )
-    return (
-        "target_recently_visible=1 but LOST_AFTER_VISIBLE inactive. "
-        f"previous_semantic_visible={int(guard.previous_semantic_visible)}; "
-        f"previous_grounded_visible={int(guard.previous_grounded_visible)}; "
-        f"current_grounded_visible={int(guard.current_grounded_visible)}; "
-        f"last_action={guard.last_action}; last_seen_bearing={guard.last_seen_bearing}."
-    )
-
-
-def _relative_xy_from_anchor(
-    *,
-    anchor_world_xy: list[float],
-    anchor_yaw_rad: float,
-    target_world_xy: list[float],
-) -> tuple[float, float]:
-    delta_world = np.asarray(target_world_xy, dtype=np.float32) - np.asarray(anchor_world_xy, dtype=np.float32)
-    cos_yaw = float(np.cos(anchor_yaw_rad))
-    sin_yaw = float(np.sin(anchor_yaw_rad))
-    forward_m = cos_yaw * float(delta_world[0]) + sin_yaw * float(delta_world[1])
-    left_m = -sin_yaw * float(delta_world[0]) + cos_yaw * float(delta_world[1])
-    return float(forward_m), float(left_m)
-
-
-def _relative_side(*, local_forward_m: float, local_left_m: float) -> str:
-    if local_forward_m < -0.30:
-        if local_left_m > 0.35:
-            return "behind_left"
-        if local_left_m < -0.35:
-            return "behind_right"
-        return "behind"
-    if abs(local_left_m) <= 0.35:
-        return "ahead"
-    return "left" if local_left_m > 0.0 else "right"
-
-
-def _direction_consistency(*, expected_words: set[str], observed_side: str) -> str:
-    observed = str(observed_side)
-    if "left" in expected_words and "right" in observed:
-        return "contradiction"
-    if "right" in expected_words and "left" in observed:
-        return "contradiction"
-    if ("forward" in expected_words or "straight" in expected_words or "ahead" in expected_words) and observed.startswith("behind"):
-        return "contradiction"
-    if expected_words:
-        return "consistent_or_unknown"
-    return "no_direction_constraint"
-
-
-def _local_waypoint_to_world_xy(*, robot_pose, waypoint_local_xy: list[float]) -> np.ndarray:
-    forward_m, left_m = [float(value) for value in waypoint_local_xy]
-    cos_yaw = float(np.cos(robot_pose.yaw_rad))
-    sin_yaw = float(np.sin(robot_pose.yaw_rad))
-    delta_world = np.asarray(
-        [
-            cos_yaw * forward_m - sin_yaw * left_m,
-            sin_yaw * forward_m + cos_yaw * left_m,
-        ],
-        dtype=np.float32,
-    )
-    return np.asarray([float(robot_pose.x), float(robot_pose.y)], dtype=np.float32) + delta_world
-
-
-def _memory_anchor_local_xy(*, candidate: WaypointCandidate, bearing_hint: str) -> list[float]:
-    distance_m = max(0.8, float(candidate.travel_distance_m))
-    hint = str(bearing_hint).strip().lower()
-    if hint == "left":
-        return [float(distance_m * 0.75), float(distance_m * 0.65)]
-    if hint == "right":
-        return [float(distance_m * 0.75), float(-distance_m * 0.65)]
-    return [float(distance_m), 0.0]
-
-
-def _world_waypoint_to_local_xy(*, robot_pose, world_goal_xy: list[float]) -> tuple[float, float]:
-    delta_world = np.asarray(world_goal_xy, dtype=np.float32) - np.asarray(
-        [float(robot_pose.x), float(robot_pose.y)],
-        dtype=np.float32,
-    )
-    cos_yaw = float(np.cos(robot_pose.yaw_rad))
-    sin_yaw = float(np.sin(robot_pose.yaw_rad))
-    forward_m = cos_yaw * float(delta_world[0]) + sin_yaw * float(delta_world[1])
-    left_m = -sin_yaw * float(delta_world[0]) + cos_yaw * float(delta_world[1])
-    return float(forward_m), float(left_m)
-
-
-def _pose_distance_m(start_pose, current_pose) -> float:
-    if start_pose is None or current_pose is None:
-        return 0.0
-    return float(
-        np.hypot(
-            float(current_pose.x) - float(start_pose.x),
-            float(current_pose.y) - float(start_pose.y),
-        )
-    )
-
-
-def _track_target_command(
-    *,
-    local_goal_xy: tuple[float, float] | list[float],
-    stop_distance_m: float,
-) -> tuple[str, float]:
-    forward_m = float(local_goal_xy[0])
-    left_m = float(local_goal_xy[1])
-    distance_m = float(np.hypot(forward_m, left_m))
-    if distance_m <= float(stop_distance_m) or forward_m < -0.10:
-        return "STOP", 0.0
-    return "TRACK_TARGET", 1.0
-
-
-def _candidate_to_primitive_action(
-    candidate: WaypointCandidate,
-    *,
-    turn_speed_scale: float,
-    forward_speed_scale: float,
-) -> tuple[str, float]:
-    heading_deg = float(candidate.heading_delta_deg)
-    if heading_deg > 12.0:
-        return "TURN_LEFT", float(turn_speed_scale)
-    if heading_deg < -12.0:
-        return "TURN_RIGHT", float(turn_speed_scale)
-    return "FORWARD", float(forward_speed_scale)
-
-
-def _local_goal_to_primitive_action(*, local_goal_xy: tuple[float, float] | list[float]) -> str:
-    forward_m = float(local_goal_xy[0])
-    left_m = float(local_goal_xy[1])
-    heading_deg = float(np.degrees(np.arctan2(left_m, max(1.0e-6, forward_m))))
-    if forward_m < -0.10:
-        return "TURN_LEFT" if left_m >= 0.0 else "TURN_RIGHT"
-    if heading_deg > 12.0:
-        return "TURN_LEFT"
-    if heading_deg < -12.0:
-        return "TURN_RIGHT"
-    return "FORWARD"
-
-
-def _nearest_candidate_for_local_goal(
-    *,
-    candidate_set: CandidateSet,
-    local_goal_xy: tuple[float, float] | list[float],
-) -> WaypointCandidate | None:
-    candidates = [candidate for candidate in candidate_set.candidates if bool(candidate.valid)]
-    if not candidates:
-        candidates = list(candidate_set.candidates)
-    if not candidates:
-        return None
-    goal_forward = float(local_goal_xy[0])
-    goal_left = float(local_goal_xy[1])
-    goal_heading = float(np.degrees(np.arctan2(goal_left, max(1.0e-6, goal_forward))))
-    return min(
-        candidates,
-        key=lambda candidate: (
-            abs(float(candidate.heading_delta_deg) - goal_heading),
-            abs(float(candidate.travel_distance_m) - float(np.hypot(goal_forward, goal_left))),
-            0 if candidate.valid else 1,
-        ),
-    )
-
-
-def _has_non_forbidden_valid_candidate(
-    *,
-    candidate_set: CandidateSet,
-    forbidden_action: str,
-    config: OpenNavPolicyConfig,
-) -> bool:
-    forbidden = str(forbidden_action).strip().upper()
-    if forbidden not in {"TURN_LEFT", "TURN_RIGHT", "FORWARD", "BACKWARD", "STOP"}:
-        return True
-    for candidate in candidate_set.candidates:
-        if not bool(candidate.valid):
-            continue
-        action_name, _ = _candidate_to_primitive_action(
-            candidate,
-            turn_speed_scale=float(config.turn_speed_scale),
-            forward_speed_scale=float(config.forward_speed_scale),
-        )
-        if str(action_name).strip().upper() != forbidden:
-            return True
-    return False
-
-
-def _primitive_speed_scale(action_name: str, config: OpenNavPolicyConfig) -> float:
-    action = str(action_name).strip().upper()
-    if action in {"TURN_LEFT", "TURN_RIGHT"}:
-        return float(config.turn_speed_scale)
-    if action == "BACKWARD":
-        return float(min(config.forward_speed_scale, 0.70))
-    if action == "FORWARD":
-        return float(config.forward_speed_scale)
-    return 0.0
-
-
-def _format_optional_float(value: float | None) -> str:
-    if value is None or not np.isfinite(float(value)):
-        return "none"
-    return f"{float(value):.2f}"
-
-
-def _format_xy(value) -> str:
-    if value is None:
-        return "none"
-    try:
-        if len(value) < 2:
-            return "none"
-        return f"[{float(value[0]):.2f},{float(value[1]):.2f}]"
-    except Exception:
-        return "none"
-
-
-def _wrap_angle_rad(angle_rad: float) -> float:
-    return float((float(angle_rad) + np.pi) % (2.0 * np.pi) - np.pi)

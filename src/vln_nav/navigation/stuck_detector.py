@@ -14,7 +14,7 @@ class StuckDetectorConfig:
     window_sec: float
     displacement_threshold_m: float
     yaw_threshold_deg: float
-    recovery_backward_sec: float
+    recovery_pause_sec: float
     recovery_turn_sec: float
     recovery_turn_action: str
 
@@ -99,11 +99,11 @@ class StuckDetector:
 
         self._samples.clear()
         self._recovery_started_sec = now_sec
-        self._cooldown_until_sec = now_sec + window_sec + float(self._config.recovery_backward_sec) + float(
+        self._cooldown_until_sec = now_sec + window_sec + float(self._config.recovery_pause_sec) + float(
             self._config.recovery_turn_sec
         )
         self._logger.warning(
-            "[Stuck] reason=%s displacement=%.3fm yaw_delta=%.1fdeg recovery=BACKWARD+%s",
+            "[Stuck] reason=%s displacement=%.3fm yaw_delta=%.1fdeg recovery=PAUSE+%s",
             reason,
             displacement_m,
             yaw_delta_deg,
@@ -125,16 +125,16 @@ class StuckDetector:
             return RecoveryCommand(active=False)
 
         elapsed_sec = max(0.0, float(now_sec) - float(self._recovery_started_sec))
-        backward_sec = max(0.0, float(self._config.recovery_backward_sec))
+        pause_sec = max(0.0, float(self._config.recovery_pause_sec))
         turn_sec = max(0.0, float(self._config.recovery_turn_sec))
-        if elapsed_sec < backward_sec:
+        if elapsed_sec < pause_sec:
             return RecoveryCommand(
                 active=True,
-                action_name="BACKWARD",
-                speed_scale=0.65,
-                reason="stuck_recovery_backward",
+                action_name="TURN_RIGHT",
+                speed_scale=0.0,
+                reason="stuck_recovery_pause",
             )
-        if elapsed_sec < backward_sec + turn_sec:
+        if elapsed_sec < pause_sec + turn_sec:
             return RecoveryCommand(
                 active=True,
                 action_name=self._recovery_turn_action,

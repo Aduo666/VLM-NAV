@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python setup.py build_ext --inplace)",
+      "Bash(git -C /home/Lab/qiangsibin/VLM-NAV show d6d4405:third_party/GroundingDINO/groundingdino/models/GroundingDINO/ms_deform_attn.py)",
+      "Bash(git -C /home/Lab/qiangsibin/VLM-NAV log --all --oneline -- third_party/GroundingDINO/)",
+      "Bash(git -C /home/Lab/qiangsibin/VLM-NAV show 93a66e6:src/vln_nav/navigation/target_grounding.py)",
+      "Bash(git -C /home/Lab/qiangsibin/VLM-NAV show 93a66e6:src/vln_nav/navigation/grounding_dino_detector.py)",
+      "Bash(python3 -c ' *)"
+    ]
+  }
+}

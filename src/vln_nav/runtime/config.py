@@ -199,11 +199,9 @@ class AppConfig:
     track_smoothing_alpha: float = 0.92
     track_steering_sign: float = -1.0
     action_forward_duration_sec: float = 0.8
-    action_backward_duration_sec: float = 1.4
     action_turn_duration_sec: float = 0.30
     action_turn_angle_deg: float = 15.0
     action_forward_distance_m: float = 0.55
-    action_backward_distance_m: float = 0.35
     action_distance_tolerance_m: float = 0.04
     action_turn_tolerance_deg: float = 1.5
     action_odom_completion_enabled: bool = True
@@ -288,7 +286,7 @@ class AppConfig:
     stuck_window_sec: float = 2.0
     stuck_displacement_threshold_m: float = 0.05
     stuck_yaw_threshold_deg: float = 5.0
-    stuck_recovery_backward_sec: float = 0.75
+    stuck_recovery_pause_sec: float = 0.5
     stuck_recovery_turn_sec: float = 0.35
     stuck_recovery_turn_action: str = "TURN_RIGHT"
     wheel_drive_damping: float = 10000.0
@@ -1020,10 +1018,6 @@ def load_config(config_path: str | None = None) -> AppConfig:
             "ACTION_FORWARD_DURATION_SEC",
             control.get("action_forward_duration_sec", 0.8),
         ),
-        action_backward_duration_sec=_float_env_or_value(
-            "ACTION_BACKWARD_DURATION_SEC",
-            control.get("action_backward_duration_sec", 1.4),
-        ),
         action_turn_duration_sec=_float_env_or_value(
             "ACTION_TURN_DURATION_SEC",
             control.get("action_turn_duration_sec", 0.30),
@@ -1035,10 +1029,6 @@ def load_config(config_path: str | None = None) -> AppConfig:
         action_forward_distance_m=_float_env_or_value(
             "ACTION_FORWARD_DISTANCE_M",
             control.get("action_forward_distance_m", 0.55),
-        ),
-        action_backward_distance_m=_float_env_or_value(
-            "ACTION_BACKWARD_DISTANCE_M",
-            control.get("action_backward_distance_m", 0.35),
         ),
         action_distance_tolerance_m=_float_env_or_value(
             "ACTION_DISTANCE_TOLERANCE_M",
@@ -1356,9 +1346,9 @@ def load_config(config_path: str | None = None) -> AppConfig:
             "STUCK_YAW_THRESHOLD_DEG",
             control.get("stuck_yaw_threshold_deg", 5.0),
         ),
-        stuck_recovery_backward_sec=_float_env_or_value(
-            "STUCK_RECOVERY_BACKWARD_SEC",
-            control.get("stuck_recovery_backward_sec", 0.75),
+        stuck_recovery_pause_sec=_float_env_or_value(
+            "STUCK_RECOVERY_PAUSE_SEC",
+            control.get("stuck_recovery_pause_sec", 0.5),
         ),
         stuck_recovery_turn_sec=_float_env_or_value(
             "STUCK_RECOVERY_TURN_SEC",

@@ -180,15 +180,13 @@ control:
   stuck_window_sec: 2.0
   stuck_displacement_threshold_m: 0.05
   stuck_yaw_threshold_deg: 5.0
-  stuck_recovery_backward_sec: 0.75
+  stuck_recovery_pause_sec: 0.5
   stuck_recovery_turn_sec: 0.35
   stuck_recovery_turn_action: "TURN_RIGHT"
   action_forward_duration_sec: 1.40
-  action_backward_duration_sec: 1.00
   action_turn_duration_sec: 1.00
   action_turn_angle_deg: 15.0
   action_forward_distance_m: 0.55
-  action_backward_distance_m: 0.35
   action_distance_tolerance_m: 0.04
   action_turn_tolerance_deg: 1.5
   action_odom_completion_enabled: true

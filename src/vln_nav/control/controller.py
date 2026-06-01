@@ -9,7 +9,6 @@ import numpy as np
 
 ACTIONS = (
     "FORWARD",
-    "BACKWARD",
     "TURN_LEFT",
     "TURN_RIGHT",
     "STOP",
@@ -17,7 +16,6 @@ ACTIONS = (
 
 INTENTS = (
     "STRAIGHT",
-    "BACKWARD",
     "LEFT",
     "RIGHT",
     "STOP",
@@ -35,8 +33,6 @@ def sanitize_intent(intent: str) -> str:
         "FORWARD": "STRAIGHT",
         "GO_FORWARD": "STRAIGHT",
         "GO_STRAIGHT": "STRAIGHT",
-        "BACKWARD": "BACKWARD",
-        "REVERSE": "BACKWARD",
         "TURN_LEFT": "LEFT",
         "TURN_RIGHT": "RIGHT",
     }
@@ -48,8 +44,6 @@ def intent_to_default_action(intent: str) -> str:
     sanitized = sanitize_intent(intent)
     if sanitized == "STRAIGHT":
         return "FORWARD"
-    if sanitized == "BACKWARD":
-        return "BACKWARD"
     if sanitized == "LEFT":
         return "TURN_LEFT"
     if sanitized == "RIGHT":
@@ -68,9 +62,6 @@ def waypoint_to_action(
     distance = float(np.hypot(local_forward_m, local_left_m))
     if distance <= float(reached_threshold_m):
         return "STOP"
-
-    if local_forward_m < -max(float(reached_threshold_m), 0.20) and abs(float(local_left_m)) <= 0.20:
-        return "BACKWARD"
 
     if local_forward_m <= 0.20:
         return "TURN_LEFT" if local_left_m >= 0.0 else "TURN_RIGHT"
@@ -221,7 +212,7 @@ class SteeringDriveController:
 
     def apply(self, action_name: str, *, speed_scale: float = 1.0) -> tuple[float, float]:
         sanitized = sanitize_action(action_name)
-        if sanitized in {"FORWARD", "BACKWARD"} and self._steering_reset_pending:
+        if sanitized == "FORWARD" and self._steering_reset_pending:
             if not self._steering_is_centered():
                 wheel_targets, steering_targets = self._zero_targets()
                 return self._apply_targets(
@@ -496,10 +487,6 @@ class SteeringDriveController:
         if action_name == "FORWARD":
             for joint_name in wheel_targets:
                 wheel_targets[joint_name] = self.wheel_drive_velocity * wheel_speed_scale
-            return wheel_targets, steering_targets
-        if action_name == "BACKWARD":
-            for joint_name in wheel_targets:
-                wheel_targets[joint_name] = -self.wheel_drive_velocity * wheel_speed_scale
             return wheel_targets, steering_targets
         if action_name == "TURN_LEFT":
             return self._turn_targets(direction="left", speed_scale=wheel_speed_scale)

@@ -1,10 +1,5 @@
 __pycache__/
 *.pyc
 logs/
-debug/*.png
-debug/*.gif
-debug/videos/*.mp4
-third_party/
-weights/grounded_sam/*.pth
-weights/grounded_sam/*.pt
-weights/grounded_sam/*.ckpt
+debug/
+weights/

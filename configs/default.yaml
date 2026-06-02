@@ -42,8 +42,8 @@ opennav:
   progress_spin_yaw_deg: 85.0
   policy_execution_steps: 24
   turn_at_max_turns: 6
-  arrival_distance_m: 1.4
-  success_distance_m: 2.0
+  arrival_distance_m: 2.0
+  success_distance_m: 3.0
   landmark_arrival_confirmations: 2
   recovery_enabled: true
   recovery_trigger_stalled_steps: 3

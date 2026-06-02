@@ -137,9 +137,12 @@ def _apply_task_overrides(*, config: AppConfig, task_id: str, tasks_file: Path, 
             available = ", ".join(str(task.get("id", "")) for task in tasks)
             raise ValueError(f"Task id not found: {requested}. Available tasks: {available}")
     elif not str(config.instruction).strip() and tasks:
-        selected = _interactive_task_selection(tasks=tasks)
-        if selected is None:
-            raise SystemExit("No task selected. Exiting.")
+        if len(tasks) == 1:
+            selected = tasks[0]
+        else:
+            selected = _interactive_task_selection(tasks=tasks)
+            if selected is None:
+                raise SystemExit("No task selected. Exiting.")
 
     if selected is None:
         logger.info("[Task] no task selected; using instruction from config/env")
@@ -240,7 +243,7 @@ def _print_available_tasks(*, tasks_file: Path, logger) -> None:
 def _load_tasks(tasks_path: Path) -> list[dict]:
     with tasks_path.open("r", encoding="utf-8") as handle:
         data = json.load(handle)
-    tasks = data.get("tasks", []) if isinstance(data, dict) else []
+    tasks = data.get("tasks", data.get("episodes", [])) if isinstance(data, dict) else []
     if not isinstance(tasks, list):
         raise ValueError(f"Invalid task file, expected tasks list: {tasks_path}")
     return [task for task in tasks if isinstance(task, dict)]
@@ -1238,6 +1241,57 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
             )
             occupancy_bootstrap_done_logged = True
 
+        # --- Fast path during active primitive execution ---
+        is_motion_active = _is_executing_motion_step(active_step_result)
+        if is_motion_active:
+            proposed_step_result = policy.step(observation, execution_feedback=last_policy_feedback)
+            active_step_result = proposed_step_result
+            step_result = active_step_result
+            for completed_label in step_result.completed_landmarks:
+                completed_key = str(completed_label).strip().lower()
+                if completed_key and completed_key not in landmark_map_reached_synced:
+                    landmark_map.mark_reached(completed_key, timestamp_sec=sim_time_sec)
+                    landmark_map_reached_synced.add(completed_key)
+            safety_decision = depth_safety_monitor.apply(
+                observation=observation,
+                action_name=step_result.action_name,
+                speed_scale=step_result.speed_scale,
+                local_goal_xy=step_result.local_goal_xy,
+            )
+            if safety_decision.action_name == "TRACK_TARGET":
+                last_applied_wheel_velocity, last_applied_steering_angle = drive_controller.track_local_target(
+                    local_forward_m=float(step_result.local_goal_xy[0]),
+                    local_left_m=float(step_result.local_goal_xy[1]),
+                    stop_distance_m=float(config.waypoint_stop_distance_m),
+                    min_speed_scale=float(config.track_min_speed_scale),
+                    max_speed_scale=float(config.track_max_speed_scale) * float(safety_decision.speed_scale),
+                    heading_gain=float(config.track_heading_gain),
+                    slow_heading_rad=float(config.track_slow_heading_rad),
+                    smoothing_alpha=float(config.track_smoothing_alpha),
+                )
+            else:
+                last_applied_wheel_velocity, last_applied_steering_angle = drive_controller.apply(
+                    safety_decision.action_name,
+                    speed_scale=safety_decision.speed_scale,
+                )
+            last_policy_feedback = ExecutionFeedback(
+                applied_action=safety_decision.action_name,
+                wheel_velocity=last_applied_wheel_velocity,
+                steering_angle=last_applied_steering_angle,
+            )
+            stuck_detector.update(
+                observation=observation,
+                executed_action=safety_decision.action_name,
+                speed_scale=safety_decision.speed_scale,
+            )
+            if step_result.route_complete and not route_complete_handled:
+                route_complete_handled = True
+                navigation_finished = True
+                drive_controller.apply("STOP", speed_scale=0.0)
+                target_grounder.close()
+                debug_video_recorder.close()
+            continue
+
         current_landmark = policy.current_landmark
         target_observation: TargetObservation | None = None
         landmark_map_entry = None
@@ -1360,6 +1414,22 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
         else:
             policy.set_request_map_image_path(None)
 
+        obstacle_summary = _extract_obstacle_summary(
+            depth=last_depth_image,
+            occupancy_grid=occupancy_grid if bool(config.occupancy_grid_enabled) else None,
+            robot_pose=observation.pose,
+            stop_distance_m=float(config.obstacle_stop_distance_m),
+        )
+        semantic_map_summary = _build_semantic_map_summary(
+            current_target=current_landmark or "",
+            landmark_entries=list(landmark_map.entries()),
+            robot_pose=observation.pose,
+            obstacle_summary=obstacle_summary,
+            completed_anchors=policy.landmark_anchors,
+            direction_clause=policy.current_direction_clause,
+        )
+        policy.set_obstacle_summary(obstacle_summary)
+        policy.set_semantic_map_summary(semantic_map_summary)
         should_refresh_policy = True
         recovery_command = stuck_detector.recovery_command(now_sec=sim_time_sec)
         if recovery_command.active:
@@ -2648,6 +2718,135 @@ def _save_lidar_raw_scan(
 def _format_joint_map(values: dict[str, float]) -> str:
     ordered_items = sorted(values.items(), key=lambda item: item[0])
     return ",".join(f"{name}={float(value):+.3f}" for name, value in ordered_items)
+
+
+def _extract_obstacle_summary(
+    *,
+    depth: np.ndarray | None,
+    occupancy_grid,
+    robot_pose,
+    stop_distance_m: float,
+) -> str:
+    """Extract obstacle distances in 5 directions for VLM text prompt."""
+    rays = {"front": 0.0, "front_left": -25.0, "left": -70.0, "front_right": 25.0, "right": 70.0}
+    parts: list[str] = []
+    max_check_m = 8.0
+    for name, angle_deg in rays.items():
+        if depth is not None:
+            h, w = depth.shape[:2]
+            cx = w // 2
+            angle_per_pixel = 90.0 / w  # approximate
+            offset_px = int(angle_deg / angle_per_pixel)
+            sx = max(0, min(w - 1, cx + offset_px))
+            col = depth[max(0, h // 2):, sx]
+            valid = col[np.isfinite(col) & (col > 0.1)]
+            dist_m = float(np.percentile(valid, 10.0)) if valid.size > 0 else float("inf")
+        else:
+            dist_m = float("inf")
+        display = f"{dist_m:.1f}m" if dist_m < max_check_m else "clear"
+        if dist_m <= stop_distance_m:
+            display += " BLOCKED"
+        parts.append(f"{name}={display}")
+    return ", ".join(parts)
+
+
+def _extract_direction_words(text: str) -> set[str]:
+    t = str(text).lower()
+    words: set[str] = set()
+    if "left" in t:
+        words.add("left")
+    if "right" in t:
+        words.add("right")
+    if "forward" in t or "straight" in t or "ahead" in t or "直" in t or "前" in t:
+        words.add("forward")
+    return words
+
+
+def _build_semantic_map_summary(
+    *,
+    current_target: str,
+    landmark_entries,
+    robot_pose,
+    obstacle_summary: str,
+    completed_anchors: dict[str, list[float]] | None = None,
+    direction_clause: str = "",
+) -> str:
+    """Build a clean semantic map description for VLM."""
+    lines = [f"Current Goal: {current_target}"]
+    object_lines = []
+    for entry in landmark_entries:
+        label = str(entry.label).strip().lower()
+        if not label or label in {"none", "null", "unknown", "n/a"}:
+            continue
+        is_goal = label == current_target.strip().lower()
+        status = str(entry.evidence_level).strip()
+        fwd_m = entry.robot_forward_m
+        left_m = entry.robot_left_m
+        if fwd_m is not None and left_m is not None:
+            if abs(left_m) < 0.3:
+                direction = "ahead"
+            elif left_m > 0:
+                direction = "left-front" if fwd_m > 1.0 else "left"
+            else:
+                direction = "right-front" if fwd_m > 1.0 else "right"
+            dist_str = f"{entry.anchor_distance_m or float(np.hypot(fwd_m, left_m)):.1f}m"
+        else:
+            direction = "mapped"
+            dist_str = "?"
+        marker = ">> " if is_goal else ""
+        confidence = f"conf={float(entry.confidence):.2f}" if entry.confidence else ""
+        object_lines.append(
+            f"  {marker}{label}: {direction} {dist_str} [{status}] {confidence}"
+        )
+    if object_lines:
+        lines.append("Objects:")
+        lines.extend(object_lines)
+    else:
+        lines.append("Objects: none mapped yet")
+    lines.append(f"Obstacles: {obstacle_summary}")
+    # Direction check
+    if completed_anchors and direction_clause:
+        direction_words = _extract_direction_words(direction_clause)
+        prev_keys = list(completed_anchors.keys())
+        if prev_keys and direction_words:
+            prev_label = prev_keys[-1]
+            prev_anchor = completed_anchors.get(prev_label)
+            if prev_anchor is not None:
+                robot_x, robot_y = float(robot_pose.x), float(robot_pose.y)
+                dx = robot_x - prev_anchor[0]
+                dy = robot_y - prev_anchor[1]
+                dist = float(np.hypot(dx, dy))
+                lateral = dy
+                if abs(lateral) < 0.5:
+                    actual_side = "ahead"
+                elif lateral > 0:
+                    actual_side = "left"
+                else:
+                    actual_side = "right"
+                expected_str = ", ".join(sorted(direction_words))
+                match = "OK" if actual_side in direction_words else "CHECK"
+                lines.append(
+                    f"Direction: should go {expected_str} of {prev_label} | "
+                    f"you are {actual_side} of {prev_label} (dist={dist:.1f}m) | {match}"
+                )
+                for entry in landmark_entries:
+                    if (entry.label == current_target
+                            and entry.evidence_level in ("potential", "confirmed_candidate")
+                            and entry.world_xy and prev_anchor):
+                        ex = entry.world_xy[0] - prev_anchor[0]
+                        ey = entry.world_xy[1] - prev_anchor[1]
+                        if abs(ey) < 0.5:
+                            entry_side = "ahead"
+                        elif ey > 0:
+                            entry_side = "left"
+                        else:
+                            entry_side = "right"
+                        if entry_side in direction_words:
+                            lines.append(f"  [CONSISTENT] potential {entry.label} at {entry_side} matches instruction -> prefer this direction")
+                        else:
+                            lines.append(f"  [IGNORE] potential {entry.label} at {entry_side} contradicts instruction (expected {expected_str}) -> likely false positive")
+                        break
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":

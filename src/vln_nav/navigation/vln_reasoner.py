@@ -69,6 +69,8 @@ class OpenNavReasoner:
         safety_context_text: str = "",
         route_context_text: str = "",
         reacquire_context_text: str = "",
+        obstacle_summary_text: str = "",
+        semantic_map_summary: str = "",
     ) -> ReasonerDecision:
         valid_candidates = [candidate for candidate in candidate_set.candidates if candidate.valid]
         if not valid_candidates:
@@ -104,6 +106,8 @@ class OpenNavReasoner:
             safety_context_text=safety_context_text,
             route_context_text=route_context_text,
             reacquire_context_text=reacquire_context_text,
+            obstacle_summary_text=obstacle_summary_text,
+            semantic_map_summary=semantic_map_summary,
         )
         _dump_candidate_choice_request(
             request_payload=request_payload,
@@ -212,6 +216,8 @@ class OpenNavReasoner:
         safety_context_text: str = "",
         route_context_text: str = "",
         reacquire_context_text: str = "",
+        obstacle_summary_text: str = "",
+        semantic_map_summary: str = "",
     ) -> CandidateChoiceRequest:
         prompt_progress_estimation = progress_estimation
         if prompt_progress_estimation is None:
@@ -224,41 +230,27 @@ class OpenNavReasoner:
             instruction_context.landmarks[0] if instruction_context.landmarks else instruction_context.normalized_text
         )
         system_prompt = (
-            "You are a VLN local planner. Choose ONE valid candidate from the list based on the annotated image.\n"
-            "Image: LEFT=occupancy map (occupied=unsafe, unknown=explorable), RIGHT=front camera.\n"
-            "Candidates: ID numbers on the image. heading_deg>0=left turn, <0=right turn, near 0=FORWARD.\n"
+            "You are a navigation planner. You receive a front camera image with numbered candidate markers.\n"
+            "The semantic map below tells you where objects are. Use the MAP, not just the image, to decide.\n"
             "\n"
-            "CORE RULES (follow in order):\n"
-            "1. target_visible=true ONLY if you see the target in the right panel NOW. Never report memory as current.\n"
-            "2. If visible: select a same-side candidate (left target→TURN_LEFT, center→FORWARD, right→TURN_RIGHT).\n"
-            "3. If NOT visible: target_visible=false, bearing=unknown. Use confirmed anchors > weak hints > safe frontier exploration.\n"
-            "4. Don't repeat a safety-blocked action. Prefer different direction or safest alternative.\n"
-            "5. If STALLED/SPINNING: change heading, don't repeat the same direction.\n"
-            "6. Output valid JSON only, no markdown."
+            "RULES:\n"
+            "1. If the current goal has a known position, choose a candidate toward it.\n"
+            "2. If the goal is NOT in the map yet, explore open/safe directions.\n"
+            "3. Avoid directions blocked by nearby obstacles.\n"
+            "4. Output valid JSON only, no markdown."
         )
         valid_ids_text = ", ".join(str(candidate.slot_id) for candidate in candidate_set.candidates if candidate.valid)
         user_prompt = (
-            f"Task: {instruction_context.normalized_text}\n"
-            f"Current target: {current_target}\n"
-            f"Route: {[{'step': s.landmark, 'behavior': s.behavior_type} for s in instruction_context.route_steps]}"
-            f" | completed: {route_context_text.split('completed_landmarks=')[-1].split(';')[0] if 'completed_landmarks=' in route_context_text else 'none'}\n"
-            "\n"
-            f"--- Agent State ---\n"
-            f"Route: {route_context_text or 'none'}\n"
-            f"Memory: {target_memory_text or 'none'}\n"
-            f"Safety: {safety_context_text or 'none'}\n"
-            f"Reacquire: {reacquire_context_text or 'none'}\n"
-            f"Progress: {progress_state.progress_signal} | history: {progress_state.history_text}\n"
-            "\n"
-            f"--- Candidates ---\n"
-            f"Valid IDs: [{valid_ids_text}]\n"
+            f"Instruction: {instruction_context.normalized_text}\n"
+            f"\n"
+            f"{semantic_map_summary or 'Objects: none mapped yet'}\n"
+            f"\n"
+            "Candidates:\n"
             f"{candidate_lines}\n"
+            f"Valid IDs: [{valid_ids_text}]\n"
             "\n"
-            "Output JSON: {reason, target_visible, target_bearing_hint, target_memory_state, selected_action, selected_candidate_id}\n"
-            "target_visible: true/false (THIS IMAGE only, not memory)\n"
-            "target_bearing_hint: left/center/right/unknown\n"
-            "target_memory_state: visible_now/lost_recently/not_seen_yet/approaching/uncertain\n"
-            "selected_action: TURN_LEFT/FORWARD/TURN_RIGHT (must match candidate primitive_action)\n"
+            "Output JSON: {reason, selected_action, selected_candidate_id}\n"
+            "selected_action: TURN_LEFT/FORWARD/TURN_RIGHT (match candidate primitive_action)\n"
             "selected_candidate_id: integer from Valid IDs"
         )
         return CandidateChoiceRequest(

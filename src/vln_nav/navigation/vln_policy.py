@@ -174,6 +174,8 @@ class OpenNavVLNPolicy:
         self._landmark_map_entry: LandmarkMapEntry | None = None
         self._all_landmark_map_entries: list[LandmarkMapEntry] = []
         self._landmark_map_summary = ""
+        self._obstacle_summary_text = ""
+        self._semantic_map_summary = ""
         self._previous_semantic_visible = False
         self._previous_grounded_visible = False
         self._last_semantic_visible_time_sec = -float("inf")
@@ -482,6 +484,8 @@ class OpenNavVLNPolicy:
             safety_context_text=safety_context_for_decision,
             route_context_text=self._route_context_text(robot_pose=observation.pose),
             reacquire_context_text=_format_reacquire_prompt_context(reacquire_guard),
+            obstacle_summary_text=self._obstacle_summary_text,
+            semantic_map_summary=self._semantic_map_summary,
         )
         self._safety_context_text = ""
         selected_candidate = _find_candidate(candidate_set, decision.selected_candidate_id)
@@ -1052,6 +1056,14 @@ class OpenNavVLNPolicy:
     def current_arrival_distance_m(self) -> float:
         return self._current_arrival_distance_m()
 
+    @property
+    def landmark_anchors(self) -> dict[str, list[float]]:
+        return dict(self._landmark_anchors)
+
+    @property
+    def current_direction_clause(self) -> str:
+        return self._current_direction_clause()
+
     def set_landmark_state(self, state: LandmarkState | None) -> None:
         self._landmark_tracker_state = state
         if state is None or state.last_observation is None:
@@ -1074,6 +1086,12 @@ class OpenNavVLNPolicy:
 
     def set_topology_summary(self, text: str) -> None:
         self._topology_summary = str(text).strip()
+
+    def set_obstacle_summary(self, text: str) -> None:
+        self._obstacle_summary_text = str(text).strip()
+
+    def set_semantic_map_summary(self, text: str) -> None:
+        self._semantic_map_summary = str(text).strip()
 
     def set_topology_revisit_world_xy(self, value: list[float] | None) -> None:
         if value is None:

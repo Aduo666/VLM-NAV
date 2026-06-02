@@ -20,7 +20,7 @@ class MapCandidateGeneratorConfig:
     semantic_enabled: bool = True
     frontier_enabled: bool = True
     escape_enabled: bool = True
-    frontier_bearings_deg: tuple[float, ...] = (70.0, 35.0, 0.0, -35.0, -70.0)
+    frontier_bearings_deg: tuple[float, ...] = (35.0, 18.0, 0.0, -18.0, -35.0)
     frontier_distances_m: tuple[float, ...] = (0.75, 1.10, 1.35)
     min_clearance_m: float = 0.34
     unknown_gain_weight: float = 0.35
@@ -275,7 +275,7 @@ class MapCandidateGenerator:
         start_slot_id: int,
     ) -> list[WaypointCandidate]:
         candidates: list[WaypointCandidate] = []
-        for offset, bearing_deg in enumerate((70.0, -70.0)):
+        for offset, bearing_deg in enumerate((40.0, -40.0)):
             local_goal = [0.45, float(np.sin(np.deg2rad(bearing_deg)) * 0.75)]
             evaluation = _evaluate_local_goal(
                 snapshot=snapshot,

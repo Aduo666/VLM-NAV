@@ -21,7 +21,7 @@ llm:
 opennav:
   instruction_preparse_enabled: true
   instruction_preparse_max_tokens: 384
-  candidate_slot_bearings_deg: [75.0, 35.0, 0.0, -35.0, -75.0]
+  candidate_slot_bearings_deg: [35.0, 18.0, 0.0, -18.0, -35.0]
   candidate_adaptive_enabled: true
   candidate_adaptive_count: 5
   candidate_adaptive_min_spacing_deg: 18.0
@@ -53,7 +53,7 @@ target_grounding:
   enabled: true
   backend: "auto"
   call_period_sec: 1.5
-  reuse_last_observation_sec: 2.5
+  reuse_last_observation_sec: 1.0
   upload_max_edge_px: 768
   min_bbox_area_ratio: 0.002
   max_bbox_area_ratio: 0.60
@@ -87,7 +87,7 @@ target_grounding:
   max_result_pose_delta_m: 1.5
   max_result_yaw_delta_deg: 45.0
   semantic_verification_enabled: true
-  semantic_verification_min_confidence: 0.70
+  semantic_verification_min_confidence: 0.50
   semantic_verification_max_edge_px: 768
   semantic_verification_auto_accept_confidence: 1.01
   pause_during_active_primitive: true
@@ -102,7 +102,7 @@ target_grounding:
 
 landmark_tracker:
   min_visible_count: 2
-  arrival_confirmations: 2
+  arrival_confirmations: 1
   arrival_window_size: 5
   arrival_recent_visible_sec: 3.0
   max_lost_count: 6
@@ -114,9 +114,9 @@ landmark_tracker:
   landmark_map_log_period_sec: 2.0
   confirm_confidence_threshold: 0.65
   potential_confidence_threshold: 0.50
-  confirm_min_observations: 3
-  confirm_max_anchor_jump_m: 0.50
-  confirm_max_depth_jump_m: 0.80
+  confirm_min_observations: 1
+  confirm_max_anchor_jump_m: 2.0
+  confirm_max_depth_jump_m: 3.0
   turn_at_complete_requires_confirmed_anchor: true
   turn_at_complete_max_distance_m: 3.0
   reacquire_guard_enabled: true
@@ -149,7 +149,7 @@ camera:
   depth_eval_period_sec: 0.12
   depth_debug_enabled: false
   depth_debug_image_path: "debug/depth_debug.png"
-  obstacle_avoidance_enabled: true
+  obstacle_avoidance_enabled: false
   obstacle_stop_distance_m: 0.65
   obstacle_roi_vertical_range: [0.50, 0.95]
   obstacle_center_width_ratio: 0.34

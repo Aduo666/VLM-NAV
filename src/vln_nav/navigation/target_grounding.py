@@ -276,7 +276,7 @@ class TargetGrounder:
         return TargetObservation(
             label=self._last_observation.label,
             visible=self._last_observation.visible,
-            bbox=self._last_observation.bbox,
+            bbox=None,  # don't show stale bbox from old frame
             center_uv=self._last_observation.center_uv,
             confidence=self._last_observation.confidence,
             depth_m=self._last_observation.depth_m,

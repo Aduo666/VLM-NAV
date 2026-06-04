@@ -1,0 +1,91 @@
+{
+  "schema_version": "vlnpe-r2r-v1",
+  "source_dataset": "vlnpe",
+  "source_root": "/Data/qiang/InternData-N1/vln_pe",
+  "split": "val_seen",
+  "episodes": [
+    {
+      "episode_id": 1,
+      "trajectory_id": 37,
+      "scene_id": "mp3d/s8pcmisQ38h/s8pcmisQ38h.glb",
+      "start_position": [
+        5.582849979400635,
+        -1.6265579462051392,
+        2.817889928817749
+      ],
+      "start_rotation": [
+        -0.0,
+        0.9659258262890683,
+        -0.0,
+        -0.25881904510252063
+      ],
+      "info": {
+        "geodesic_distance": 10.39185905456543
+      },
+      "goals": [
+        {
+          "position": [
+            11.632800102233887,
+            -3.1616740226745605,
+            1.9992599487304688
+          ],
+          "radius": 3.0
+        }
+      ],
+      "instruction": "Walk down the stairs, turn right, and walk towards place with a rug. Wait near the bench and piano along the right side of the wall.",
+      "reference_path": [
+        [
+          5.582849979400635,
+          -1.6265579462051392,
+          2.817889928817749
+        ],
+        [
+          4.822649955749512,
+          -2.2173328399658203,
+          2.7935900688171387
+        ],
+        [
+          3.584249973297119,
+          -2.761673927307129,
+          2.7057600021362305
+        ],
+        [
+          4.091310024261475,
+          -3.1616740226745605,
+          1.2295000553131104
+        ],
+        [
+          7.354829788208008,
+          -3.1616740226745605,
+          1.3889299631118774
+        ],
+        [
+          11.632800102233887,
+          -3.1616740226745605,
+          1.9992599487304688
+        ]
+      ],
+      "id": "val_seen_s8pcmisQ38h_1",
+      "robot_start_position": [
+        5.582849979400635,
+        -1.6265579462051392,
+        2.817889928817749
+      ],
+      "robot_start_rotation_wxyz": [
+        -0.25881904510252063,
+        -0.0,
+        0.9659258262890683,
+        -0.0
+      ],
+      "robot_start_orientation_deg": [
+        180.0,
+        -29.999999999999986,
+        180.0
+      ],
+      "goal_radius_m": 3.0,
+      "success_distance_m": 3.0,
+      "arrival_distance_m": 1.4,
+      "scene_usd_path": "/Data/qiang/InternData-N1/../mp3d_pe/scans/s8pcmisQ38h/matterport_mesh/b2f1bf0a0de54856b1d9c8816633c0bb/fixed.usd"
+    }
+  ]
+}

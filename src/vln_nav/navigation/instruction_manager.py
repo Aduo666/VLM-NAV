@@ -274,9 +274,7 @@ def _heuristic_route_steps(*, actions: list[str], landmarks: list[str], normaliz
 
 def _infer_behavior_type(clause: str) -> str:
     lowered = str(clause).lower()
-    if re.search(r"\b(go through|through)\b", lowered):
-        return "go_through"
-    if re.search(r"\b(pass|go past|past)\b", lowered):
+    if re.search(r"\b(pass|go past|past|go through|through)\b", lowered):
         return "pass"
     if re.search(r"\b(turn at|at the)\b", lowered) and re.search(r"\bturn\b", lowered):
         return "turn_at"

@@ -1,5 +1,5 @@
 sim:
-  headless: false
+  headless: true
   width: 1280
   height: 720
   active_gpu: auto
@@ -30,11 +30,11 @@ opennav:
   candidate_max_travel_distance_m: 1.35
   candidate_min_free_ratio: 0.28
   candidate_column_half_width_px: 26
-  candidate_debug_image_path: "debug/llm_request.png"
+  candidate_debug_image_path: "debug/local/llm_request.png"
   target_debug_enabled: true
-  target_debug_image_path: "debug/vln_debug.png"
+  target_debug_image_path: "debug/local/vln_debug.png"
   debug_video_enabled: true
-  debug_video_path: "debug/videos/vln_debug.mp4"
+  debug_video_path: "debug/local/videos/vln_debug.mp4"
   debug_video_fps: 4.0
   debug_image_update_period_sec: 1.0
   progress_history_length: 6
@@ -148,7 +148,7 @@ camera:
   candidate_preferred_distance_m: 1.0
   depth_eval_period_sec: 0.12
   depth_debug_enabled: false
-  depth_debug_image_path: "debug/depth_debug.png"
+  depth_debug_image_path: "debug/local/depth_debug.png"
   obstacle_avoidance_enabled: false
   obstacle_stop_distance_m: 0.65
   obstacle_roi_vertical_range: [0.50, 0.95]
@@ -237,7 +237,7 @@ occupancy_grid:
   unknown_is_traversable: true
   unknown_cell_cost: 0.10
   debug_enabled: false
-  debug_image_path: "debug/local_map.png"
+  debug_image_path: "debug/local/local_map.png"
   debug_update_period_sec: 0.5
   debug_width: 900
   debug_height: 900

@@ -6,3 +6,5 @@ weights/
 .codex
 third_party/
 流程.txt
+.agents
+.claude

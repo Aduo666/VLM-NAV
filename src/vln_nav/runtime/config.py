@@ -302,6 +302,7 @@ class AppConfig:
     scene_usd_path: str = "usd/hospital.usd"
     scene_prim_path: str = "/World/Environment"
     add_default_ground_plane: bool = False
+    add_dome_light: bool = False
     stage_load_timeout_sec: float = 120.0
     viewport_eye: list[float] = field(default_factory=lambda: [7.0, -2.0, 4.0])
     viewport_target: list[float] = field(default_factory=lambda: [1.5, 4.0, 1.0])
@@ -1387,6 +1388,10 @@ def load_config(config_path: str | None = None) -> AppConfig:
         add_default_ground_plane=_bool_env_or_value(
             "ADD_DEFAULT_GROUND_PLANE",
             scene.get("add_default_ground_plane", False),
+        ),
+        add_dome_light=_bool_env_or_value(
+            "ADD_DOME_LIGHT",
+            scene.get("add_dome_light", False),
         ),
         stage_load_timeout_sec=_float_env_or_value(
             "STAGE_LOAD_TIMEOUT_SEC",

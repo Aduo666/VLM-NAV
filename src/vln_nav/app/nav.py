@@ -804,6 +804,27 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
         world.scene.add_default_ground_plane()
         logger.info("Added default ground plane.")
 
+    if getattr(config, "add_dome_light", False):
+        try:
+            from pxr import UsdLux, Gf, UsdGeom
+            # Dome light for ambient outdoor lighting
+            dome = UsdLux.DomeLight.Define(stage, "/World/defaultDomeLight")
+            dome.CreateIntensityAttr().Set(3000.0)
+            dome.CreateExposureAttr().Set(2.0)
+
+            # Headlight attached to robot camera, follows the robot through rooms
+            headlight = UsdLux.SphereLight.Define(stage, f"{config.robot_prim_path}/headlight")
+            headlight.CreateIntensityAttr().Set(3000.0)
+            headlight.CreateExposureAttr().Set(2.0)
+            headlight.CreateRadiusAttr().Set(0.3)
+            # Position slightly ahead and above the camera
+            xform = UsdGeom.Xformable(headlight.GetPrim())
+            xform.AddTranslateOp().Set(Gf.Vec3f(1.5, 0.0, 1.8))
+
+            logger.info("Added dome+robot-headlight (add_dome_light=true)")
+        except Exception as exc:
+            logger.warning("Failed to add lights: %s", exc)
+
     add_reference_to_stage(str(config.robot_usd_path), config.robot_prim_path)
     _wait_for_stage_assets(
         simulation_app=simulation_app,

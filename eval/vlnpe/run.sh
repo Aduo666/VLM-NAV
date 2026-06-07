@@ -17,4 +17,5 @@ python eval/vlnpe/select_episode.py
 TARGET_DEBUG_IMAGE_PATH="debug/eval/vln_debug.png" \
 DEBUG_VIDEO_PATH="debug/eval/videos/vln_debug.mp4" \
 DEPTH_DEBUG_IMAGE_PATH="debug/eval/depth_debug.png" \
+ADD_DOME_LIGHT="true" \
 bash scripts/run_nav.sh --tasks-file eval/current_episode.json

@@ -1,5 +1,5 @@
 sim:
-  headless: true
+  headless: false
   width: 1280
   height: 720
   active_gpu: auto
@@ -287,6 +287,7 @@ lidar:
 scene:
   prim_path: "/World/Environment"
   add_default_ground_plane: false
+  add_dome_light: false
   stage_load_timeout_sec: 120.0
   viewport_eye: [7.0, -2.0, 4.0]
   viewport_target: [1.5, 4.0, 1.0]

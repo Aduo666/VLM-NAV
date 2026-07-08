@@ -241,6 +241,19 @@ class LandmarkTracker:
                     state=state,
                     observation=observation,
                 )
+            elif current_fresh and not has_world and high_conf and can_confirm and bool(getattr(observation, "vlm_verified", False)):
+                # VLM-confirmed without depth: mark as confirmed with bearing only, no arrival
+                state.evidence_level = "confirmed"
+                state.visible_count += 1
+                state.lost_count = 0
+                state.confirmed_observation_count += 1
+                self._logger.info(
+                    "[LandmarkNoDepthConfirm] target=%s source=%s bearing=%.1f conf=%.2f evidence=confirmed_no_world",
+                    label,
+                    getattr(observation, "semantic_source", "unknown"),
+                    float(np.degrees(float(observation.bearing_rad))) if observation.bearing_rad is not None else 0,
+                    float(observation.confidence),
+                )
             elif current_fresh and has_world:
                 reasons = []
                 if not high_conf:

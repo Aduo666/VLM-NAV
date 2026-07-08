@@ -426,7 +426,7 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
         float(config.target_tracker_min_depth_valid_ratio),
     )
     logger.info(
-        "[LandmarkTrackerConfig] arrival_distance=%.2f success_distance=%.2f min_visible=%s confirmations=%s landmark_map=%s map_ttl=%.1f reacquire_guard=%s recent_visible_sec=%.1f override=%s",
+        "[LandmarkTrackerConfig] arrival_distance=%.2f success_distance=%.2f min_visible=%s confirmations=%s landmark_map=%s map_ttl=%.1f reacquire_guard=%s recent_visible_sec=%.1f",
         float(config.arrival_distance_m),
         float(config.success_distance_m),
         int(config.landmark_tracker_min_visible_count),
@@ -435,7 +435,6 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
         float(config.landmark_map_anchor_ttl_sec),
         int(bool(config.reacquire_guard_enabled)),
         float(config.reacquire_guard_recent_visible_sec),
-        str(config.reacquire_guard_override_action),
     )
 
     observation_adapter = ObservationAdapter(
@@ -759,7 +758,6 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
             landmark_arrival_window_size=int(config.landmark_tracker_arrival_window_size),
             reacquire_guard_enabled=bool(config.reacquire_guard_enabled),
             reacquire_guard_recent_visible_sec=float(config.reacquire_guard_recent_visible_sec),
-            reacquire_guard_override_action=str(config.reacquire_guard_override_action),
             arrival_distance_m=float(config.arrival_distance_m),
             success_distance_m=float(config.success_distance_m),
             recovery_enabled=bool(config.recovery_enabled),
@@ -988,7 +986,6 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
     depth_debug_output_path = _resolve_output_path(config.depth_debug_image_path)
     target_debug_output_path = _resolve_output_path(config.target_debug_image_path)
     target_debug_video_path = _resolve_output_path(config.debug_video_path)
-    llm_global_map_output_path = _resolve_output_path("debug/llm_global_map.png")
     debug_video_recorder = DebugVideoRecorder(
         enabled=bool(config.debug_video_enabled) and bool(config.target_debug_enabled),
         output_path=target_debug_video_path,
@@ -999,7 +996,7 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
     if config.target_debug_enabled:
         logger.info("Runtime debug image output: %s", target_debug_output_path)
     if config.occupancy_grid_enabled:
-        logger.info("VLM global map panel output: %s", llm_global_map_output_path)
+        logger.info("Occupancy map is rendered in runtime debug only; VLM receives structured map text.")
     if config.debug_video_enabled and config.target_debug_enabled:
         logger.info("Runtime debug video output: %s", debug_video_recorder.output_path)
     if config.depth_debug_enabled:
@@ -1300,6 +1297,7 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
                 wheel_velocity=last_applied_wheel_velocity,
                 steering_angle=last_applied_steering_angle,
             )
+            policy.record_action(safety_decision.action_name, _action_result_text(step_result), sim_time_sec)
             stuck_detector.update(
                 observation=observation,
                 executed_action=safety_decision.action_name,
@@ -1421,26 +1419,18 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
             )
         )
 
-        if bool(config.occupancy_grid_enabled):
-            if not _is_executing_motion_step(active_step_result):
-                _save_global_occupancy_debug(
-                    occupancy_snapshot=occupancy_grid.snapshot(),
-                    robot_pose=observation.pose,
-                    trajectory_xy=global_pose_trace,
-                    landmark_entries=all_entries,
-                    step_result=active_step_result,
-                    output_path=llm_global_map_output_path,
-                )
-                policy.set_request_map_image_path(llm_global_map_output_path)
-        else:
-            policy.set_request_map_image_path(None)
-
         obstacle_summary = _extract_obstacle_summary(
             depth=last_depth_image,
             occupancy_grid=occupancy_grid if bool(config.occupancy_grid_enabled) else None,
             robot_pose=observation.pose,
             stop_distance_m=float(config.obstacle_stop_distance_m),
         )
+        # Layout classification
+        if bool(config.occupancy_grid_enabled):
+            policy.set_layout_description(
+                _classify_occupancy_layout(occupancy_grid=occupancy_grid, robot_pose=observation.pose)
+            )
+
         semantic_map_summary = _build_semantic_map_summary(
             current_target=current_landmark or "",
             landmark_entries=list(landmark_map.entries()),
@@ -1448,6 +1438,8 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
             obstacle_summary=obstacle_summary,
             completed_anchors=policy.landmark_anchors,
             direction_clause=policy.current_direction_clause,
+            action_history=policy.action_history_text,
+            layout_description=policy.current_layout_description,
         )
         policy.set_obstacle_summary(obstacle_summary)
         policy.set_semantic_map_summary(semantic_map_summary)
@@ -1546,6 +1538,7 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
             wheel_velocity=last_applied_wheel_velocity,
             steering_angle=last_applied_steering_angle,
         )
+        policy.record_action(safety_decision.action_name, _action_result_text(step_result), sim_time_sec)
         stuck_event = stuck_detector.update(
             observation=observation,
             executed_action=safety_decision.action_name,
@@ -2783,6 +2776,89 @@ def _extract_direction_words(text: str) -> set[str]:
     return words
 
 
+def _action_result_text(step_result) -> str:
+    action = str(getattr(step_result, "action_name", "STOP"))
+    source = str(getattr(step_result, "decision_source", ""))
+    if "COMPLETE" in source or "COMPLETE" in action:
+        return "completed"
+    if action in ("TURN_LEFT", "TURN_RIGHT"):
+        return f"turn {action.split('_')[1].lower()}"
+    if action == "FORWARD":
+        return "forward"
+    return action.lower()
+
+
+def _classify_occupancy_layout(*, occupancy_grid, robot_pose) -> str:
+    """Analyze occupancy grid free space around robot and classify layout."""
+    try:
+        snapshot = occupancy_grid.snapshot()
+        if snapshot is None:
+            return ""
+        resolution = float(getattr(snapshot, "resolution_m", 0.08))
+        robot_x, robot_y = float(robot_pose.x), float(robot_pose.y)
+        robot_yaw = float(robot_pose.yaw_rad)
+        check_dist_m = 3.0
+        check_steps = int(check_dist_m / resolution)
+
+        # Check free space ratio in 5 directions
+        cos_yaw, sin_yaw = float(np.cos(robot_yaw)), float(np.sin(robot_yaw))
+        rays_deg = [0, -45, 45, -90, 90]
+        free_counts: list[tuple[str, float]] = []
+        for angle_deg in rays_deg:
+            angle = robot_yaw + float(np.deg2rad(angle_deg))
+            dx, dy = float(np.cos(angle)), float(np.sin(angle))
+            free = 0
+            for step in range(1, check_steps):
+                x = robot_x + dx * step * resolution
+                y = robot_y + dy * step * resolution
+                # Check if occupied at (x, y) and nearby cells
+                clear = True
+                for ox, oy in ((0, 0), (resolution, 0), (-resolution, 0), (0, resolution), (0, -resolution)):
+                    col = int(np.floor((x + ox - float(getattr(snapshot, "origin_x", 0.0))) / resolution))
+                    row = int(np.floor((y + oy - float(getattr(snapshot, "origin_y", 0.0))) / resolution))
+                    if hasattr(snapshot, "inflated_occupied"):
+                        grid = getattr(snapshot, "inflated_occupied", None)
+                    else:
+                        grid = getattr(snapshot, "log_odds", None)
+                    if grid is not None:
+                        if 0 <= row < grid.shape[0] and 0 <= col < grid.shape[1]:
+                            if grid[row, col] > 0.5:
+                                clear = False
+                                break
+                if clear:
+                    free += 1
+                else:
+                    break
+            ratio = free / check_steps
+            if angle_deg <= -45:
+                name = "left"
+            elif angle_deg >= 45:
+                name = "right"
+            else:
+                name = "front"
+            free_counts.append((name, ratio))
+
+        front = max(r for n, r in free_counts if n == "front")
+        left = max(r for n, r in free_counts if n == "left")
+        right = max(r for n, r in free_counts if n == "right")
+
+        if front > 0.6 and left < 0.3 and right < 0.3:
+            return "layout: corridor ahead"
+        if front < 0.2 and left > 0.4 and right > 0.4:
+            return "layout: T-junction or crossroad"
+        if front < 0.1 and left > 0.3 and right < 0.1:
+            return "layout: doorway on left"
+        if front < 0.1 and right > 0.3 and left < 0.1:
+            return "layout: doorway on right"
+        if front < 0.15:
+            return "layout: near wall/dead end"
+        if front > 0.6 and left > 0.4 and right > 0.4:
+            return "layout: open room"
+        return "layout: open"
+    except Exception:
+        return ""
+
+
 def _build_semantic_map_summary(
     *,
     current_target: str,
@@ -2791,6 +2867,8 @@ def _build_semantic_map_summary(
     obstacle_summary: str,
     completed_anchors: dict[str, list[float]] | None = None,
     direction_clause: str = "",
+    action_history: str = "",
+    layout_description: str = "",
 ) -> str:
     """Build a clean semantic map description for VLM."""
     lines = [f"Current Goal: {current_target}"]
@@ -2867,6 +2945,10 @@ def _build_semantic_map_summary(
                         else:
                             lines.append(f"  [IGNORE] potential {entry.label} at {entry_side} contradicts instruction (expected {expected_str}) -> likely false positive")
                         break
+    if layout_description:
+        lines.append(layout_description)
+    if action_history:
+        lines.append(action_history)
     return "\n".join(lines)
 
 

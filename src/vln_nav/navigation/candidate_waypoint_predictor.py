@@ -156,23 +156,20 @@ class CandidateWaypointPredictor:
                 fill=(255, 255, 255),
             )
 
-        rgb_width, rgb_height = rgb_panel.size
-        costmap_width = max(360, int(rgb_height * 0.78))
-        costmap_panel = _load_left_panel_image(
-            image_path=left_panel_image_path,
-            width=costmap_width,
-            height=rgb_height,
-        )
-        if costmap_panel is None:
-            costmap_panel = self._render_candidate_costmap_panel(
+        canvas = rgb_panel
+        if left_panel_image_path is not None:
+            rgb_width, rgb_height = rgb_panel.size
+            costmap_width = max(360, int(rgb_height * 0.78))
+            costmap_panel = _load_left_panel_image(
+                image_path=left_panel_image_path,
                 width=costmap_width,
                 height=rgb_height,
-                depth=None if observation.depth is None else np.asarray(observation.depth, dtype=np.float32),
-                candidate_set=candidate_set,
             )
-        canvas = Image.new("RGB", (costmap_width + rgb_width, rgb_height), (0, 0, 0))
-        canvas.paste(costmap_panel, (0, 0))
-        canvas.paste(rgb_panel, (costmap_width, 0))
+            if costmap_panel is not None:
+                canvas = Image.new("RGB", (costmap_width + rgb_width, rgb_height), (0, 0, 0))
+                canvas.paste(costmap_panel, (0, 0))
+                canvas.paste(rgb_panel, (costmap_width, 0))
+
         target = self.debug_image_path
         target.parent.mkdir(parents=True, exist_ok=True)
         _save_image_atomic(canvas, target)

@@ -1,371 +1,241 @@
-<div align="center">
-  <img src="docs/assets/hero.png" alt="VLM-NAV hero" width="100%">
+VLM-NAV
+=======
 
-  <h1>VLM-NAV</h1>
+**An Isaac Sim 5.1 vision-language navigation testbed for a custom 4-wheel-steering robot.**
 
-  <p>
-    <b>An Isaac Sim testbed for vision-language navigation with a custom Ackermann-style mobile robot.</b>
-  </p>
+VLM-NAV connects natural-language instructions, RGB-D perception, LiDAR mapping, open-vocabulary grounding, VLM reasoning, and low-level wheel/steering control into a runnable closed-loop navigation stack.
 
-  <p>
-    VLM-NAV connects language instructions, RGB-D perception, LiDAR mapping, semantic grounding,
-    VLM reasoning, and low-level wheel/steering control into a runnable closed-loop navigation stack.
-  </p>
+| | |
+|---|---|
+| Simulator | Isaac Sim 5.1 from pip |
+| Python | Conda environment `vlmnav` |
+| Robot | Custom 4WS USD |
+| Policy | VLM-guided ObjectNav / VLN prototype |
+| Actions | Discrete atomic primitives |
 
-  <p>
-    <img alt="Isaac Sim" src="https://img.shields.io/badge/Isaac%20Sim-5.1-76B900?style=for-the-badge">
-    <img alt="Python" src="https://img.shields.io/badge/Python-3.10-3776AB?style=for-the-badge&logo=python&logoColor=white">
-    <img alt="Robot" src="https://img.shields.io/badge/Robot-Custom%20USD-0F172A?style=for-the-badge">
-    <img alt="Navigation" src="https://img.shields.io/badge/VLN%20%2F%20ObjectNav-Zero--shot-FFB000?style=for-the-badge">
-  </p>
-</div>
-
-## Why This Project Exists
-
-Vision-and-Language Navigation (VLN) asks an embodied agent to follow natural-language instructions through previously unseen 3D environments. Classic VLN benchmarks such as R2R formalized the problem around language-conditioned action sequences in real building-scale scenes, while VLN-CE pushed the setting toward continuous navigation with realistic motion and collision constraints.
-
-This repository focuses on the engineering gap between those benchmark formulations and an Isaac Sim robot stack:
-
-- running a custom robot USD instead of a benchmark agent;
-- using Isaac Sim RGB-D, LiDAR, odometry, and articulation control;
-- keeping the high-level policy replaceable through VLM/LLM APIs;
-- exposing maps, semantic anchors, candidates, and robot actions for debugging.
-
-VLM-NAV is not a claim of state-of-the-art benchmark performance. It is a practical platform for testing VLN-style ideas on a wheel-driven robot in Isaac Sim.
-
-## Core Idea
-
-<p align="center">
-  <img src="docs/assets/overview.png" alt="VLM-NAV method overview" width="100%">
-</p>
-
-The stack follows a simple separation of responsibilities:
-
-```text
-language instruction
-    -> visual / metric observation
-    -> semantic grounding + landmark memory
-    -> occupancy-aware candidate generation
-    -> VLM local decision
-    -> discrete Ackermann action primitive
-```
-
-The design borrows several principles from recent VLN work:
-
-- **Think global, act local**: maintain a global map and landmark memory, but execute short local decisions.
-- **Ground before acting**: visual detections are checked with depth and VLM semantic verification before becoming stable landmarks.
-- **Structure the execution loop**: instruction parsing, progress tracking, candidate selection, safety checks, and low-level control are separate modules.
-- **Keep robot control deterministic**: the VLM selects from constrained candidates; the controller executes fixed primitives rather than continuous free-form commands.
-
-## Demo
-
-The demo below shows an early successful closed-loop run in Isaac Sim. The robot follows a language-conditioned route using the current RGB-D, LiDAR map, semantic landmark memory, VLM candidate selection, and Ackermann primitive controller.
-
-[![VLM-NAV demo](docs/assets/firstsuccess_thumb.png)](docs/assets/firstsuccess.mp4)
-
-[Watch the MP4 demo](docs/assets/firstsuccess.mp4). GitHub README pages do not reliably render repository-local MP4 files as inline video players, so the thumbnail links directly to the video.
-
-This demo is meant to show the system running end-to-end rather than final navigation robustness. The current policy can still oscillate when adjacent left/right candidates receive similar scores, which may cause local spinning or slow progress in narrow areas.
+![VLM-NAV overview](docs/assets/hero.png)
 
 ## Features
 
-- **Isaac Sim 5.1 standalone runtime** with scene USD loading, custom robot USD loading, cameras, LiDAR, and viewport setup.
-- **Custom Ackermann-style robot control** through wheel velocity targets and steering joint position targets.
-- **Task JSON workflow** for scene path, start pose, and natural-language instruction selection.
-- **Global occupancy map** from LiDAR, rendered as a north-up map for both debugging and VLM context.
-- **Semantic landmark tracking** with GroundingDINO, optional SAM hooks, VLM verification, bbox/depth projection, and confirmed landmark anchors.
-- **VLM candidate policy** using a first-person candidate view plus map context.
-- **Discrete action primitives** by default: `FORWARD`, `BACKWARD`, `TURN_LEFT`, `TURN_RIGHT`, `STOP`.
-- **Debug artifacts** including `vln_debug.png`, VLM request images, structured logs, and timestamped MP4 debug videos.
+- **Isaac Sim 5.1 pip runtime**: scene USD loading, custom robot USD, cameras, LiDAR, viewport setup.
+- **Custom 4-wheel-steering control**: FORWARD / TURN_LEFT / TURN_RIGHT atomic primitives with odometry-based completion.
+- **Semantic grounding + memory**: GroundingDINO and VLM verification maintain landmark observations and map anchors.
+- **Map-aware VLM decision**: the VLM receives a clean first-person candidate image, structured map text, route context, and an explicit candidate action table.
+- **Fast primitive execution**: during an atomic action, expensive decision-time perception is skipped; odometry, depth safety, drive control, and LiDAR/map updates remain active.
+- **Local and evaluation flows**: normal debugging uses `debug/local` and `logs/nav_latest.log`; dataset evaluation uses `debug/eval` plus eval outputs.
 
-## System Architecture
+![Core method](docs/assets/overview.png)
 
-```text
-src/vln_nav/
-├── app/
-│   └── nav.py                    # Isaac Sim main loop
-├── control/
-│   └── controller.py             # wheel / steering articulation control
-├── navigation/
-│   ├── instruction_manager.py    # route and landmark parsing
-│   ├── observation_adapter.py    # RGB-D, pose, feedback packaging
-│   ├── lidar_sensor.py           # Isaac / PhysX LiDAR access
-│   ├── occupancy_grid.py         # global occupancy memory
-│   ├── map_candidate_generator.py
-│   ├── candidate_waypoint_predictor.py
-│   ├── target_grounding.py       # detector/VLM grounding interface
-│   ├── target_tracker.py         # bbox tracking between grounding calls
-│   ├── landmark_tracker.py       # stable landmark state and arrival checks
-│   ├── landmark_map.py           # confirmed landmark memory
-│   ├── progress_manager.py       # progress/stall signals
-│   ├── depth_safety.py           # near-field safety override
-│   ├── vln_reasoner.py           # VLM prompt and response parsing
-│   └── vln_policy.py             # high-level navigation policy
-└── runtime/
-    ├── config.py
-    ├── debug_video.py
-    └── isaac_runtime_utils.py
-```
+## Environment Setup
 
-## Repository Layout
+The project now uses only the conda / pip Isaac Sim workflow. The project environment name is `vlmnav`.
 
-```text
-.
-├── configs/
-│   ├── default.yaml              # runtime, perception, control, map, and debug config
-│   └── instructions.json         # navigation task list
-├── docs/assets/
-│   ├── hero.png                  # README cover image
-│   └── overview.png              # method overview image
-├── exts/vln.nav.task_editor/     # Isaac Sim task authoring panel
-├── scripts/
-│   ├── run_nav.sh                # main navigation launcher
-│   ├── run_task_editor.sh        # task authoring launcher
-│   ├── setup_grounded_sam_local.sh
-│   └── test_llm_call.py          # offline VLM request test
-├── src/
-│   ├── ros2_car_model_ws/        # robot model workspace / USD assets
-│   └── vln_nav/                  # navigation package
-├── third_party/GroundingDINO/    # optional detector checkout
-├── usd/                          # scene USD files
-└── weights/grounded_sam/         # detector / segmenter weights
-```
+### 1. Create The Conda Environment
 
-## Installation
-
-The project assumes an existing conda environment:
+Isaac Sim 5.1 uses Python 3.11.
 
 ```bash
-conda activate env_isaaclab
+conda create -n vlmnav python=3.11 -y
+conda activate vlmnav
+python -m pip install --upgrade pip setuptools wheel
 ```
 
-Runtime assumptions:
+### 2. Install Isaac Sim And Core Dependencies
 
-- Ubuntu/Linux workstation with NVIDIA GPU.
-- Python 3.10.
-- Isaac Sim 5.1 installed in `env_isaaclab`.
-- A SiliconFlow/OpenAI-compatible VLM API key.
-- Optional local GroundingDINO weights for faster grounding.
+```bash
+pip install -r requirements.txt
+```
 
-Set the API key through an environment variable:
+`requirements.txt` contains:
+
+- `isaacsim[all,extscache]==5.1.0`
+- `numpy==1.26.0`
+- `PyYAML==6.0.2`
+- `Pillow==11.3.0`
+- `opencv-contrib-python-headless==4.11.0.86`
+
+The NVIDIA PyPI index is already included in `requirements.txt`.
+
+### 3. Configure SiliconFlow / VLM API
 
 ```bash
 export SILICONFLOW_API_KEY="your_api_key"
 ```
 
-If you use non-headless mode, start from a terminal with a valid desktop display. For multi-GPU machines, `sim.active_gpu: auto` tries to choose the display GPU; override it when necessary:
+The default model and API endpoint are configured in `configs/default.yaml`.
+
+### 4. Install Local GroundingDINO
+
+Grounding is part of the current main navigation method. GroundingDINO provides the local open-vocabulary detections used by landmark memory, semantic map updates, and arrival checks. VLM bbox fallback can help when the detector misses, but it is not the intended primary grounding path.
 
 ```bash
-ACTIVE_GPU=1 bash scripts/run_nav.sh
-```
+conda activate vlmnav
 
-## Running Navigation
+# If torch / torchvision are missing in your conda environment, install a CUDA build first.
+pip install torch==2.7.0 torchvision==0.22.0 --index-url https://download.pytorch.org/whl/cu128
 
-Run the default enabled task:
-
-```bash
-bash scripts/run_nav.sh
-```
-
-List available tasks:
-
-```bash
-bash scripts/run_nav.sh --list-tasks
-```
-
-Run a specific task:
-
-```bash
-bash scripts/run_nav.sh --task hospital_002
-```
-
-Run headless:
-
-```bash
-bash scripts/run_nav.sh --headless
-```
-
-## Task Format
-
-Navigation episodes are defined in `configs/instructions.json`:
-
-```json
-{
-  "id": "hospital_001",
-  "scene_usd_path": "usd/environment/hospital_flat.usd",
-  "robot_start_position": [1.5, 4.0, 0.0],
-  "robot_start_orientation_deg": [0.0, 0.0, 0.0],
-  "instruction": "向前走找到轮椅，然后左转再直走找到楼梯"
-}
-```
-
-Notes:
-
-- `scene_usd_path` is resolved relative to the repository root unless absolute.
-- `robot_start_position` is applied to `/World/Robot`.
-- `robot_start_position[2]` should normally remain `0.0` in the current setup.
-- The instruction can be Chinese or English; landmarks are normalized internally for grounding and tracking.
-
-## Creating New Tasks
-
-Launch the lightweight Isaac Sim task editor:
-
-```bash
-bash scripts/run_task_editor.sh
-```
-
-The editor loads the configured scene and robot, then opens a `VLM-NAV Task Editor` panel. Move `/World/Robot` in the viewport, enter a task id and instruction, and save. The panel writes to `configs/instructions.json`; it does not modify the original scene USD unless you explicitly save the USD from Isaac Sim.
-
-The task editor scene and robot paths are configured at the top of `scripts/run_task_editor.sh`.
-
-## GroundingDINO / SAM
-
-The default grounding backend is:
-
-```yaml
-target_grounding:
-  backend: "auto"
-```
-
-In `auto` mode, the system tries local GroundingDINO first and falls back to VLM bbox grounding if the detector is unavailable.
-
-Expected local paths:
-
-```text
-third_party/GroundingDINO/
-weights/grounded_sam/GroundingDINO_SwinT_OGC.py
-weights/grounded_sam/groundingdino_swint_ogc.pth
-```
-
-Set up local files:
-
-```bash
+# Clone / patch GroundingDINO and install its Python dependencies.
 bash scripts/setup_grounded_sam_local.sh
 ```
 
-If you already have compatible weights, symlink them:
+Required model files:
+
+- `third_party/GroundingDINO/`
+- `weights/grounded_sam/GroundingDINO_SwinT_OGC.py`
+- `weights/grounded_sam/groundingdino_swint_ogc.pth`
+
+`scripts/setup_grounded_sam_local.sh` prints symlink commands if you already have the CA-Nav weights locally.
+
+## Run
+
+### Local Navigation
 
 ```bash
-ln -sf /path/to/GroundingDINO_SwinT_OGC.py weights/grounded_sam/GroundingDINO_SwinT_OGC.py
-ln -sf /path/to/groundingdino_swint_ogc.pth weights/grounded_sam/groundingdino_swint_ogc.pth
+conda activate vlmnav
+export SILICONFLOW_API_KEY="your_api_key"
+export CONDA_ENV_NAME=vlmnav
+
+# Run the default task from configs/default.yaml / configs/instructions.json.
+bash scripts/run_nav.sh
+
+# Run a named task.
+bash scripts/run_nav.sh --task hospital_001
+
+# List available tasks.
+bash scripts/run_nav.sh --list-tasks
+
+# Headless mode.
+bash scripts/run_nav.sh --headless
 ```
 
-SAM is optional and disabled by default:
+The launch scripts read `CONDA_ENV_NAME`. Keep it set to `vlmnav` because the old `env_isaaclab` environment is no longer used:
 
-```yaml
-target_grounding:
-  sam_enabled: false
+```bash
+CONDA_ENV_NAME=vlmnav bash scripts/run_nav.sh
 ```
+
+### Task Authoring Panel
+
+```bash
+conda activate vlmnav
+export CONDA_ENV_NAME=vlmnav
+bash scripts/run_task_editor.sh
+```
+
+This loads the configured scene and robot, then opens the in-simulator task editor panel for adding instructions to `configs/instructions.json`.
+
+## Benchmark Evaluation
+
+### InteriorNav
+
+```bash
+bash eval/interiornav/run.sh
+SPLIT=val_unseen EPISODE_INDEX=0 bash eval/interiornav/run.sh
+```
+
+Data root: `/Data/qiang/interiornav_data`
+
+### VLN-PE / R2R
+
+```bash
+bash eval/vlnpe/run.sh
+SPLIT=val_unseen EPISODE_INDEX=5 bash eval/vlnpe/run.sh
+```
+
+Data root: `/Data/qiang/InternData-N1/vln_pe`
+
+Scene root: `/Data/qiang/mp3d_pe`
+
+Each dataset has an adapter under `eval/<dataset>/adapter.py` that normalizes dataset episodes into the task format consumed by `nav.py`.
+
+## Current Pipeline
+
+```text
+language instruction
+  -> instruction parsing
+  -> RGB-D + LiDAR + odometry observation
+  -> target grounding and landmark memory
+  -> structured map / route / obstacle summary
+  -> occupancy-aware candidate generation
+  -> VLM local decision
+  -> discrete action primitive
+  -> low-level 4WS controller
+```
+
+During primitive execution, the loop does not request new VLM decisions or run heavy grounding. It continues only the work needed for safe physical execution and map maintenance.
+
+The VLM input is intentionally split by role:
+
+- A clean first-person candidate image for visual choice.
+- Structured text for semantic map, landmark memory, obstacle distances, route context, and candidate action metadata.
+- No raw occupancy image is sent to the VLM by default; occupancy visualization is mainly for human debugging.
 
 ## Key Configuration
 
-Most runtime knobs live in `configs/default.yaml`.
+All main configuration lives in `configs/default.yaml`.
 
 ```yaml
 llm:
-  api_base_url: "https://api.siliconflow.cn/v1"
   model_name: "Qwen/Qwen3-VL-30B-A3B-Instruct"
-  timeout_sec: 30
+  api_base_url: "https://api.siliconflow.cn/v1"
 
 control:
   use_discrete_action_primitives: true
-  wheel_drive_velocity: 14.0
-  turn_drive_velocity: 6.0
   action_forward_distance_m: 0.55
   action_turn_angle_deg: 15.0
-
-occupancy_grid:
-  enabled: true
-  resolution_m: 0.08
-  size_m: 80.0
-  semantic_planner_enabled: true
-
-lidar:
-  enabled: true
-  mode: "single"
-  horizontal_fov_deg: 180.0
-  max_range_m: 10.0
+  action_odom_completion_enabled: true
 
 target_grounding:
   enabled: true
   backend: "auto"
-  call_period_sec: 1.5
   semantic_verification_enabled: true
+  semantic_verification_min_confidence: 0.50
 
 opennav:
-  arrival_distance_m: 1.4
-  success_distance_m: 2.0
-  debug_video_enabled: true
+  candidate_slot_bearings_deg: [35, 18, 0, -18, -35]
+  arrival_distance_m: 2.0
+  success_distance_m: 3.0
 ```
 
-To try continuous subgoal tracking instead of primitive execution:
-
-```yaml
-control:
-  use_discrete_action_primitives: false
-```
+Tasks are stored in `configs/instructions.json`. Each task can specify scene path, robot start pose, instruction text, and task metadata.
 
 ## Debug Outputs
 
-Runtime outputs are intentionally concentrated:
-
 ```text
-logs/nav_latest.log
-debug/vln_debug.png
-debug/videos/vln_debug_YYYYMMDD_HHMMSS.mp4
-debug/llm_request.png
-logs/last_candidate_choice_request.json
+debug/
+  local/
+    vln_debug.png
+    llm_request.png
+    depth_debug.png
+    videos/vln_debug_YYYYMMDD_HHMMSS.mp4
+  eval/
+    vln_debug.png
+    depth_debug.png
+    videos/vln_debug_YYYYMMDD_HHMMSS.mp4
+
+logs/
+  nav_latest.log
+  last_candidate_choice_request.json
 ```
 
-- `debug/vln_debug.png`: human-facing combined view. It shows the north-up map, robot pose, landmarks, first-person target overlays, and current subgoal/action.
-- `debug/videos/vln_debug_YYYYMMDD_HHMMSS.mp4`: timestamped debug video for post-run review.
-- `debug/llm_request.png`: the exact image used for VLM candidate selection.
-- `logs/nav_latest.log`: policy, grounding, landmark, safety, control, and simulator logs.
-- `logs/last_candidate_choice_request.json`: latest candidate-choice request payload for prompt debugging.
+## Demo
 
-Test the latest VLM prompt without launching Isaac Sim:
+The current prototype can complete simple landmark-driven navigation, but candidate choice can still oscillate in cluttered scenes.
 
-```bash
-python scripts/test_llm_call.py
-```
+<video src="docs/assets/firstsuccess.mp4" controls width="720"></video>
 
-Manual image test:
+If GitHub does not render the MP4 inline, open `docs/assets/firstsuccess.mp4` directly from the repository file browser.
 
-```bash
-python scripts/test_llm_call.py --mode manual --image debug/llm_request.png
-```
+## Known Limitations
 
-## Current Scope
-
-VLM-NAV is a development platform, not a polished benchmark submission. The current implementation prioritizes:
-
-- interpretable closed-loop behavior in Isaac Sim;
-- custom robot control rather than benchmark-only action spaces;
-- explicit semantic and metric memory;
-- debuggable candidate selection and action execution;
-- fast iteration on prompts, detectors, maps, and controller settings.
-
-Known limitations:
-
-- semantic grounding may produce false positives in visually ambiguous scenes;
-- landmark world anchors depend on camera/depth calibration and valid depth pixels;
-- API-based VLM calls introduce latency;
-- primitive execution is inspectable, but may require tuning distance and turning thresholds for each robot model;
-- candidate selection can flicker between neighboring left/right options, causing oscillation or in-place turning in cluttered layouts;
-- this repository does not yet provide standardized R2R/RxR/VLN-CE benchmark evaluation.
+- VLM API latency is still the dominant delay between atomic primitives.
+- GroundingDINO can produce false positives for visually ambiguous objects such as stairs, shadows, and furniture edges.
+- Detections without usable depth cannot create reliable world anchors.
+- Candidate selection may still oscillate between adjacent left/right actions in tight layouts.
+- The system is a research prototype, not a benchmark-final VLN agent.
 
 ## Research Context
 
-This project is inspired by the following lines of work:
+VLM-NAV adapts ideas from VLN, ObjectNav, open-vocabulary grounding, semantic memory, and map-aware robot navigation into an Isaac Sim workflow for a custom wheel-driven robot.
 
-- [R2R / Vision-and-Language Navigation](https://openaccess.thecvf.com/content_cvpr_2018/papers/Anderson_Vision-and-Language_Navigation_Interpreting_CVPR_2018_paper.pdf): language-conditioned navigation in real building-scale environments.
-- [VLN-CE](https://github.com/jacobkrantz/VLN-CE): continuous-environment VLN with realistic observations and unconstrained navigation.
-- [DUET](https://github.com/cshizhe/VLN-DUET): global map reasoning plus fine-grained local cross-modal grounding.
-- [NavGPT](https://github.com/GengzeZhou/NavGPT): explicit LLM reasoning for VLN.
-- [Open-Nav](https://github.com/YanyuanQiao/Open-Nav): zero-shot continuous VLN with open-source LLMs and structured reasoning.
-- [Safe-VLN](https://arxiv.org/abs/2311.02817): collision-aware VLN-CE with occupancy-informed waypoint selection.
-- [CA-Nav](https://arxiv.org/abs/2412.10137): constraint-aware zero-shot VLN-CE with sub-instruction progress tracking.
-
-## Acknowledgement
-
-VLM-NAV adapts ideas from VLN, ObjectNav, open-vocabulary grounding, and robotics navigation into an Isaac Sim workflow for a custom wheel-driven robot. The repository is intended as an experimental base for building, testing, and debugging embodied navigation systems rather than as a finished product.
+Inspired by R2R, VLN-CE, DUET, NavGPT, Open-Nav, Safe-VLN, and CA-Nav.

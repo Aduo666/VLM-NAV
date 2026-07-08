@@ -1,0 +1,13 @@
+# GroundingDINO / semantic grounding dependencies.
+# Install these inside the same conda environment used to run Isaac Sim.
+transformers==4.49.0
+tokenizers==0.21.2
+safetensors
+huggingface-hub
+httpx
+timm
+pycocotools
+supervision==0.6.0
+addict
+yapf
+nltk

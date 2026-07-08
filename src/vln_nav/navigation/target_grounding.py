@@ -642,6 +642,11 @@ class TargetGrounder:
                 mask_min_pixels=int(self._config.depth_mask_min_pixels),
             )
             segmentation_source = str(self._config.depth_region)
+        # Bearing from bbox center (works with or without depth)
+        cx_px = (float(image_width) - 1.0) * 0.5
+        half_fov_rad = float(np.deg2rad(float(self._config.horizontal_fov_deg)) * 0.5)
+        bearing_rad = float(np.arctan(((float(center_uv[0]) - cx_px) / max(cx_px, 1.0)) * np.tan(half_fov_rad)))
+
         semantic_source = source_prefix.split(":", 1)[0]
         is_dino = semantic_source.startswith("grounding_dino")
         can_confirm = True
@@ -651,8 +656,9 @@ class TargetGrounder:
         vlm_verification_confidence = 0.0
         vlm_verification_reason = "not_run"
 
-        # Depth validation - if failed, still return visible observation as potential
-        if valid_ratio < float(self._config.min_depth_valid_ratio) or depth_m is None or not np.isfinite(depth_m):
+        # Depth validation - if failed, flag it but don't reject. Let VLM verify instead.
+        depth_failed = valid_ratio < float(self._config.min_depth_valid_ratio) or depth_m is None or not np.isfinite(depth_m)
+        if depth_failed:
             self._logger.info(
                 "[GroundingNoDepth] target=%s valid_ratio=%.2f depth=%s reason=depth_invalid_but_visible source=%s",
                 request.target_label,
@@ -660,43 +666,19 @@ class TargetGrounder:
                 "none" if depth_m is None else f"{float(depth_m):.2f}",
                 semantic_source,
             )
-            return TargetObservation(
-                label=request.target_label,
-                visible=True,
-                bbox=bbox,
-                center_uv=center_uv,
-                confidence=float(confidence),
-                depth_m=None,
-                bearing_rad=None,
-                estimated_world_xy=None,
-                depth_valid_ratio=float(valid_ratio),
-                area_ratio=float(area_ratio),
-                source=f"{source_prefix}:{coordinate_mode}",
-                reason="depth_invalid",
-                timestamp_sec=float(request.timestamp_sec),
-                mask_area_ratio=float(mask_area_ratio),
-                coordinate_mode=str(coordinate_mode),
-                segmentation_source=str(segmentation_source),
-                mask=mask,
-                evidence_level="potential",
-                semantic_source=semantic_source,
-                can_confirm=False,
-                vlm_verified=False,
-                vlm_verification_confidence=0.0,
-                vlm_verification_reason="depth_invalid",
-            )
-        if depth_m < float(self._config.min_depth_m) or depth_m > float(self._config.max_depth_m):
+        if not depth_failed and (depth_m < float(self._config.min_depth_m) or depth_m > float(self._config.max_depth_m)):
             return _empty_observation(request.target_label, request.timestamp_sec, "depth_out_of_range")
 
-        geometry = estimate_target_world_xy(
-            center_uv=center_uv,
-            depth_m=float(depth_m),
-            image_width=int(image_width),
-            image_height=int(image_height),
-            horizontal_fov_deg=float(self._config.horizontal_fov_deg),
-            robot_pose=request.robot_pose,
-        )
-
+        geometry = None
+        if not depth_failed:
+            geometry = estimate_target_world_xy(
+                center_uv=center_uv,
+                depth_m=float(depth_m),
+                image_width=int(image_width),
+                image_height=int(image_height),
+                horizontal_fov_deg=float(self._config.horizontal_fov_deg),
+                robot_pose=request.robot_pose,
+            )
         if can_confirm and bool(self._config.semantic_verification_enabled):
             if float(confidence) >= float(self._config.semantic_verification_auto_accept_confidence):
                 vlm_verified = True
@@ -721,6 +703,12 @@ class TargetGrounder:
                 )
 
         evidence_level = "confirmed_candidate" if can_confirm else "potential"
+        if geometry is not None:
+            estimated_xy = list(geometry.world_xy)
+        else:
+            estimated_xy = None
+        depth_out = float(depth_m) if depth_m is not None else None
+        bear_out = float(bearing_rad) if bearing_rad is not None else None
 
         return TargetObservation(
             label=request.target_label,
@@ -728,9 +716,9 @@ class TargetGrounder:
             bbox=bbox,
             center_uv=center_uv,
             confidence=float(confidence),
-            depth_m=float(depth_m),
-            bearing_rad=float(geometry.bearing_rad),
-            estimated_world_xy=list(geometry.world_xy),
+            depth_m=depth_out,
+            bearing_rad=bear_out,
+            estimated_world_xy=estimated_xy,
             depth_valid_ratio=float(valid_ratio),
             area_ratio=float(area_ratio),
             source=f"{source_prefix}:{coordinate_mode}",

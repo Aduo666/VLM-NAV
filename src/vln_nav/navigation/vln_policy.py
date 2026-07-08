@@ -79,7 +79,6 @@ class OpenNavPolicyConfig:
     landmark_arrival_window_size: int
     reacquire_guard_enabled: bool
     reacquire_guard_recent_visible_sec: float
-    reacquire_guard_override_action: str
     turn_at_max_turns: int = 4
     turn_at_complete_max_distance_m: float = 3.0
     turn_at_complete_requires_confirmed_anchor: bool = True
@@ -176,6 +175,8 @@ class OpenNavVLNPolicy:
         self._landmark_map_summary = ""
         self._obstacle_summary_text = ""
         self._semantic_map_summary = ""
+        self._layout_description = ""
+        self._action_history: deque[tuple[float, str, str]] = deque(maxlen=8)
         self._previous_semantic_visible = False
         self._previous_grounded_visible = False
         self._last_semantic_visible_time_sec = -float("inf")
@@ -204,7 +205,6 @@ class OpenNavVLNPolicy:
         self._pass_landmark_index: int | None = None
         self._pass_actions: list[str] = []
         self._pass_action_index = 0
-        self._request_map_image_path: str | None = None
         self._recent_primitive_actions: deque[str] = deque(maxlen=4)
         self._last_turn_oscillation_signature: tuple | None = None
 
@@ -426,16 +426,13 @@ class OpenNavVLNPolicy:
             except Exception as exc:
                 self._logger.warning("[SemanticPlanner] plan_failed landmark=%s error=%s", self._current_target_text(), exc)
                 semantic_plan = None
-        occupancy_debug_path = None
         if self._occupancy_grid is not None:
-            saved_occupancy_path = self._occupancy_grid.save_debug(
+            self._occupancy_grid.save_debug(
                 observation=observation,
                 candidate_set=candidate_set,
                 semantic_entries=list(self._all_landmark_map_entries),
                 semantic_plan=semantic_plan,
             )
-            occupancy_debug_path = saved_occupancy_path
-        left_panel_image_path = self._request_map_image_path or occupancy_debug_path
         debug_image_path = self._candidate_predictor.save_debug(
             observation=observation,
             candidate_set=candidate_set,
@@ -444,7 +441,9 @@ class OpenNavVLNPolicy:
                 if self._landmark_tracker_state is None
                 else self._landmark_tracker_state.last_observation
             ),
-            left_panel_image_path=left_panel_image_path,
+            # The VLM request image stays first-person only. Map state is passed
+            # as structured text; occupancy rendering is for human debug.
+            left_panel_image_path=None,
         )
         annotated_png_bytes = None
         if debug_image_path is not None and Path(debug_image_path).exists():
@@ -687,6 +686,46 @@ class OpenNavVLNPolicy:
                     forward_speed_scale=float(self._config.forward_speed_scale),
                 )
                 decision_summary = f"{decision_summary} | TurnOscillationGuard switched to candidate {int(selected_candidate.slot_id)}"
+            reacquire_replacement = self._select_reacquire_replacement_candidate(
+                candidate_set=candidate_set,
+                guard=reacquire_guard,
+                selected_candidate=selected_candidate,
+                action_name=action_name,
+            )
+            if reacquire_replacement is not None and int(reacquire_replacement.slot_id) != int(selected_candidate.slot_id):
+                previous_action = str(action_name)
+                selected_candidate = reacquire_replacement
+                local_goal = tuple(float(value) for value in selected_candidate.local_goal_xy)
+                world_goal_xy = _local_waypoint_to_world_xy(
+                    robot_pose=observation.pose,
+                    waypoint_local_xy=selected_candidate.local_goal_xy,
+                )
+                world_goal_xy_list = [float(world_goal_xy[0]), float(world_goal_xy[1])]
+                self._active_world_goal_xy = [float(world_goal_xy[0]), float(world_goal_xy[1])]
+                self._active_candidate_id = int(selected_candidate.slot_id)
+                self._active_candidate_label = str(selected_candidate.label)
+                memory_anchor_world_xy = _local_waypoint_to_world_xy(
+                    robot_pose=observation.pose,
+                    waypoint_local_xy=_memory_anchor_local_xy(
+                        candidate=selected_candidate,
+                        bearing_hint=decision.target_bearing_hint,
+                    ),
+                )
+                self._target_memory.update_from_decision(
+                    target_visible=decision.target_visible,
+                    bearing_hint=decision.target_bearing_hint,
+                    status=decision.target_status,
+                    selected_world_goal_xy=[float(memory_anchor_world_xy[0]), float(memory_anchor_world_xy[1])],
+                )
+                action_name, speed_scale = _candidate_to_primitive_action(
+                    selected_candidate,
+                    turn_speed_scale=float(self._config.turn_speed_scale),
+                    forward_speed_scale=float(self._config.forward_speed_scale),
+                )
+                decision_summary = (
+                    f"{decision_summary} | ReacquireGuard switched repeated {previous_action} "
+                    f"to candidate {int(selected_candidate.slot_id)} action={action_name}"
+                )
         else:
             action_name, speed_scale = _track_target_command(
                 local_goal_xy=local_goal,
@@ -1078,9 +1117,6 @@ class OpenNavVLNPolicy:
     def set_all_landmark_map_entries(self, entries: list[LandmarkMapEntry]) -> None:
         self._all_landmark_map_entries = list(entries)
 
-    def set_request_map_image_path(self, path: str | Path | None) -> None:
-        self._request_map_image_path = None if path is None else str(path)
-
     def set_landmark_map_summary(self, text: str) -> None:
         self._landmark_map_summary = str(text).strip()
 
@@ -1092,6 +1128,29 @@ class OpenNavVLNPolicy:
 
     def set_semantic_map_summary(self, text: str) -> None:
         self._semantic_map_summary = str(text).strip()
+
+    def set_layout_description(self, text: str) -> None:
+        self._layout_description = str(text).strip()
+
+    def record_action(self, action: str, result: str, now: float) -> None:
+        self._action_history.append((now, str(action).strip(), str(result).strip()))
+
+    @property
+    def current_layout_description(self) -> str:
+        return self._layout_description
+
+    @property
+    def action_history_text(self) -> str:
+        if not self._action_history:
+            return ""
+        now = self._action_history[-1][0] if self._action_history else 0.0
+        lines: list[str] = []
+        for t, action, result in self._action_history:
+            age = now - t
+            if age > 60:
+                continue
+            lines.append(f"  {age:.0f}s ago: {action} → {result}")
+        return "Recent:\n" + "\n".join(lines) if lines else ""
 
     def set_topology_revisit_world_xy(self, value: list[float] | None) -> None:
         if value is None:
@@ -1546,6 +1605,15 @@ class OpenNavVLNPolicy:
         observation = state.last_observation
         if _is_fresh_grounded_observation(observation):
             return True, "grounded_visible"
+        reason = str(getattr(observation, "reason", "")).strip().lower()
+        source = str(getattr(observation, "source", "")).strip().lower()
+        if (
+            bool(getattr(observation, "visible", False))
+            and "reused" not in source
+            and bool(getattr(observation, "is_current_frame", True))
+            and reason in {"ok", "depth_invalid", "no_depth", "no_world_xy"}
+        ):
+            return True, f"image_visible_no_world:{reason or 'visible'}"
         if str(getattr(state, "status", "")).strip().lower() in {"visible", "confirmed", "reached"} and int(
             getattr(state, "lost_count", 0)
         ) == 0:
@@ -1710,10 +1778,63 @@ class OpenNavVLNPolicy:
             return selected, False, "none"
         if not bool(has_non_forbidden_valid_candidate):
             return selected, False, "no_non_forbidden_valid_candidate"
-        override = str(self._config.reacquire_guard_override_action).strip().upper() or "STOP"
-        if override not in {"STOP", "TURN_LEFT", "TURN_RIGHT", "FORWARD"}:
-            override = "STOP"
-        return override, True, "prevent_repeat_turn_after_target_loss"
+        return selected, False, "repeat_turn_not_overridden_no_replacement"
+
+    def _select_reacquire_replacement_candidate(
+        self,
+        *,
+        candidate_set: CandidateSet,
+        guard: ReacquireGuardContext,
+        selected_candidate: WaypointCandidate,
+        action_name: str,
+    ) -> WaypointCandidate | None:
+        if not bool(guard.lost_after_visible):
+            return None
+        forbidden = str(guard.forbidden_action).strip().upper()
+        selected_action = str(action_name).strip().upper()
+        if selected_action != forbidden or forbidden not in {"TURN_LEFT", "TURN_RIGHT"}:
+            return None
+        candidates: list[WaypointCandidate] = []
+        for candidate in candidate_set.candidates:
+            if not bool(candidate.valid):
+                continue
+            candidate_action, _ = _candidate_to_primitive_action(
+                candidate,
+                turn_speed_scale=float(self._config.turn_speed_scale),
+                forward_speed_scale=float(self._config.forward_speed_scale),
+            )
+            if str(candidate_action).strip().upper() == forbidden:
+                continue
+            candidates.append(candidate)
+        if not candidates:
+            return None
+
+        def score(candidate: WaypointCandidate) -> tuple[float, float, float, float]:
+            candidate_action, _ = _candidate_to_primitive_action(
+                candidate,
+                turn_speed_scale=float(self._config.turn_speed_scale),
+                forward_speed_scale=float(self._config.forward_speed_scale),
+            )
+            action = str(candidate_action).strip().upper()
+            action_priority = 2.0 if action == "FORWARD" else 1.0
+            clearance = float(candidate.clearance_score)
+            distance = float(candidate.travel_distance_m)
+            heading_penalty = -abs(float(candidate.heading_delta_deg)) / 90.0
+            return action_priority, clearance, distance, heading_penalty
+
+        replacement = max(candidates, key=score)
+        self._logger.warning(
+            "[ReacquireGuard] replacing repeated_turn=%s selected_candidate=%s replacement_candidate=%s replacement_action=%s reason=target_lost_after_visible",
+            forbidden,
+            int(selected_candidate.slot_id),
+            int(replacement.slot_id),
+            _candidate_to_primitive_action(
+                replacement,
+                turn_speed_scale=float(self._config.turn_speed_scale),
+                forward_speed_scale=float(self._config.forward_speed_scale),
+            )[0],
+        )
+        return replacement
 
     def _update_semantic_visibility_state(self, *, decision, now: float) -> None:
         semantic_visible = bool(decision.target_visible)

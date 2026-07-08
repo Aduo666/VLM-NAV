@@ -121,7 +121,6 @@ landmark_tracker:
   turn_at_complete_max_distance_m: 3.0
   reacquire_guard_enabled: true
   reacquire_guard_recent_visible_sec: 20.0
-  reacquire_guard_override_action: "STOP"
 
 robot:
   usd_path: "src/ros2_car_model_ws/src/1557/urdf/1557_all/1557_all.usd"

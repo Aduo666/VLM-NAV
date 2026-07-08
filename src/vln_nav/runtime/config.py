@@ -139,7 +139,6 @@ class AppConfig:
     landmark_map_log_period_sec: float = 2.0
     reacquire_guard_enabled: bool = True
     reacquire_guard_recent_visible_sec: float = 20.0
-    reacquire_guard_override_action: str = "STOP"
     depth_debug_enabled: bool = True
     depth_debug_image_path: str = "debug/depth_debug.png"
 
@@ -837,10 +836,6 @@ def load_config(config_path: str | None = None) -> AppConfig:
         reacquire_guard_recent_visible_sec=_float_env_or_value(
             "REACQUIRE_GUARD_RECENT_VISIBLE_SEC",
             landmark_tracker.get("reacquire_guard_recent_visible_sec", 20.0),
-        ),
-        reacquire_guard_override_action=_env_or_value(
-            "REACQUIRE_GUARD_OVERRIDE_ACTION",
-            landmark_tracker.get("reacquire_guard_override_action", "STOP"),
         ),
         depth_debug_enabled=_bool_env_or_value(
             "DEPTH_DEBUG_ENABLED",

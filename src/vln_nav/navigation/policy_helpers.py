@@ -142,8 +142,8 @@ def _format_reacquire_prompt_context(guard) -> str:
             f"Forbidden action this step: {guard.forbidden_action}. "
             "Do not choose the forbidden action. If the target is still not visible in the current image, "
             "prefer a candidate that stops repeating the previous turn direction; if the target is visible again "
-            "in the current image, choose based on that current visual evidence. The runtime will force STOP if "
-            "the forbidden action is selected while the target is still not visible."
+            "in the current image, choose based on that current visual evidence. If you still choose the forbidden "
+            "action while the target is not visible, the runtime may replace it with a non-repeating valid candidate."
         )
     return (
         "target_recently_visible=1 but LOST_AFTER_VISIBLE inactive. "

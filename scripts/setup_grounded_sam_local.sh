@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PYTHON_BIN="${PYTHON_BIN:-/home/Lab/qiangsibin/miniconda3/envs/env_isaaclab/bin/python}"
+PYTHON_BIN="${PYTHON_BIN:-python}"
 GROUNDING_DINO_DIR="${ROOT_DIR}/third_party/GroundingDINO"
 WEIGHT_DIR="${ROOT_DIR}/weights/grounded_sam"
 
@@ -37,7 +37,7 @@ PY
 
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.9}"
 
-"${PYTHON_BIN}" -m pip install --no-deps addict yapf timm pycocotools nltk supervision==0.6.0
+"${PYTHON_BIN}" -m pip install -r "${ROOT_DIR}/requirements-grounding.txt"
 "${PYTHON_BIN}" -m pip install --no-build-isolation --no-deps -e .
 "${PYTHON_BIN}" -m pip install 'git+https://github.com/facebookresearch/segment-anything.git'
 

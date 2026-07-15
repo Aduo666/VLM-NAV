@@ -93,7 +93,6 @@ Required model files:
 ```bash
 conda activate vlmnav
 export SILICONFLOW_API_KEY="your_api_key"
-export CONDA_ENV_NAME=vlmnav
 
 # Run the default task from configs/default.yaml / configs/instructions.json.
 bash scripts/run_nav.sh
@@ -108,7 +107,7 @@ bash scripts/run_nav.sh --list-tasks
 bash scripts/run_nav.sh --headless
 ```
 
-The launch scripts read `CONDA_ENV_NAME`. Keep it set to `vlmnav` because the old `env_isaaclab` environment is no longer used:
+The launch scripts use the currently active conda environment. If you need to launch from another shell without activating first, override the environment explicitly:
 
 ```bash
 CONDA_ENV_NAME=vlmnav bash scripts/run_nav.sh
@@ -118,7 +117,6 @@ CONDA_ENV_NAME=vlmnav bash scripts/run_nav.sh
 
 ```bash
 conda activate vlmnav
-export CONDA_ENV_NAME=vlmnav
 bash scripts/run_task_editor.sh
 ```
 

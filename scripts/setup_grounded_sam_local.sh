@@ -40,6 +40,15 @@ export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.9}"
 "${PYTHON_BIN}" -m pip install -r "${ROOT_DIR}/requirements-grounding.txt"
 "${PYTHON_BIN}" -m pip install --no-build-isolation --no-deps -e .
 "${PYTHON_BIN}" -m pip install 'git+https://github.com/facebookresearch/segment-anything.git'
+"${PYTHON_BIN}" - <<'PY'
+import numpy as np
+
+if np.__version__ != "1.26.0":
+    raise SystemExit(
+        "Isaac Sim 5.1 requires numpy==1.26.0, "
+        f"but the active environment has numpy=={np.__version__}."
+    )
+PY
 
 cat <<EOF
 

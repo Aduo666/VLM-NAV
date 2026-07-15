@@ -51,7 +51,7 @@ Robot Prim选择机器人prim（ranger_with_xarm6）。
 ### Python脚本
 在已经安装 Isaac Sim pip 包的 conda 环境中运行`ros2_car_model_ws_ws/src/scripts/load_keyboard_control.py`即可直接启动 Isaac Sim，并实现加载机器人与场景以及键盘控制，命令如下：  
 ``` bash
-conda activate env_isaaclab
+conda activate vlmnav
 python nav_ws/src/scripts/load_keyboard_control.py
 ```  
 

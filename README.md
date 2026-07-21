@@ -250,9 +250,9 @@ The console intentionally shows only navigation milestones: `[PLAN]`, `[NAV_STAT
 
 The current prototype can complete simple landmark-driven navigation, but candidate choice can still oscillate in cluttered scenes.
 
-<video src="docs/assets/firstsuccess.mp4" controls width="720"></video>
+[![Watch the VLM-NAV demo](docs/assets/display_thumb.png)](docs/assets/display.mp4)
 
-If GitHub does not render the MP4 inline, open `docs/assets/firstsuccess.mp4` directly from the repository file browser.
+Click the preview to watch the H.264 demo directly with GitHub's video player.
 
 ## Known Limitations
 

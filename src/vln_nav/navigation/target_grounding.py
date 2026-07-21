@@ -80,14 +80,15 @@ class TargetGroundingConfig:
     grounding_dino_device: str = "cuda"
     grounding_dino_box_threshold: float = 0.45
     grounding_dino_text_threshold: float = 0.25
+    grounding_dino_text_encoder_path: str = "weights/grounded_sam/bert-base-uncased"
     sam_checkpoint_path: str = "weights/grounded_sam/sam_vit_h_4b8939.pth"
     sam_model_type: str = "vit_h"
     sam_device: str = "cuda"
     sam_min_mask_area_ratio: float = 0.0005
     sam_enabled: bool = True
-    max_result_age_sec: float = 2.0
-    max_result_pose_delta_m: float = 1.5
-    max_result_yaw_delta_deg: float = 45.0
+    max_result_age_sec: float = 30.0
+    max_result_pose_delta_m: float = 0.05
+    max_result_yaw_delta_deg: float = 3.0
     qwen_fallback_confirm_allowed: bool = False
     semantic_verification_enabled: bool = True
     semantic_verification_min_confidence: float = 0.70
@@ -144,6 +145,7 @@ class TargetGrounder:
                 device=str(config.grounding_dino_device),
                 box_threshold=float(config.grounding_dino_box_threshold),
                 text_threshold=float(config.grounding_dino_text_threshold),
+                text_encoder_path=str(config.grounding_dino_text_encoder_path),
             ),
             logger=logger,
         )
@@ -161,6 +163,13 @@ class TargetGrounder:
 
     def close(self) -> None:
         self._executor.shutdown(wait=False, cancel_futures=True)
+
+    @property
+    def request_in_flight(self) -> bool:
+        return self._future is not None and not self._future.done()
+
+    def set_horizontal_fov_deg(self, value: float) -> None:
+        self._config.horizontal_fov_deg = float(value)
 
     def observe(
         self,
@@ -322,7 +331,22 @@ class TargetGrounder:
             return None
         if reason != "ok":
             self._logger.warning("[GroundingReject] target=%s reason=%s", request.target_label, reason)
-            return None
+            observation = _copy_observation_with_timestamp(
+                _empty_observation(
+                    target_label=request.target_label,
+                    timestamp_sec=request.timestamp_sec,
+                    reason=reason,
+                ),
+                timestamp_sec=timestamp_sec,
+                request_frame_index=request.frame_index,
+                request_sim_time_sec=request.timestamp_sec,
+                request_robot_pose=request.robot_pose,
+                result_age_sec=float(timestamp_sec) - float(request.timestamp_sec),
+                is_current_frame=True,
+            )
+            self._last_observation = observation
+            self._last_observation_wall_sec = float(wall_time_sec)
+            return observation
         result_age_sec = float(timestamp_sec) - float(request.timestamp_sec)
         is_current = _is_current_frame(
             result_age_sec=result_age_sec,
@@ -391,25 +415,18 @@ class TargetGrounder:
         return False
 
     def _call_grounding(self, request: _GroundingRequest) -> tuple[str, str]:
-        backend = str(self._config.backend).strip().lower() or "auto"
-        if backend in {"auto", "grounding_dino", "dino"}:
-            detection, reason = self._grounding_dino.detect(rgb=request.rgb, target_label=request.target_label)
-            if detection is not None:
-                payload = {
-                    "visible": True,
-                    "label": request.target_label,
-                    "bbox": list(detection.bbox),
-                    "confidence": float(detection.confidence),
-                    "coordinate_mode": "original_pixels",
-                    "source": "grounding_dino",
-                }
-                return json.dumps(payload), "ok"
-            if backend in {"grounding_dino", "dino"}:
-                return "", reason
-            if not self._dino_fallback_logged:
-                self._logger.info("[GroundingDINO] unavailable reason=%s; fallback=qwen_vl", reason)
-                self._dino_fallback_logged = True
-        return self._call_llm(request)
+        detection, reason = self._grounding_dino.detect(rgb=request.rgb, target_label=request.target_label)
+        if detection is None:
+            return "", reason
+        payload = {
+            "visible": True,
+            "label": request.target_label,
+            "bbox": list(detection.bbox),
+            "confidence": float(detection.confidence),
+            "coordinate_mode": "original_pixels",
+            "source": "grounding_dino",
+        }
+        return json.dumps(payload), "ok"
 
     def _call_llm(self, request: _GroundingRequest) -> tuple[str, str]:
         system_prompt = (

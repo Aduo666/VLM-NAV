@@ -44,6 +44,7 @@ class LidarScan:
     timestamp_sec: float
     sensor_path: str
     source: str
+    sensor_origin_local_xy: np.ndarray
 
 
 @dataclass
@@ -290,6 +291,7 @@ class PhysXLidarReader:
             timestamp_sec=float(timestamp_sec),
             sensor_path=self._sensor_path,
             source="physx_lidar_sector_merged_binned",
+            sensor_origin_local_xy=self._sensor_origin_robot_xy.copy(),
         )
 
     def _update_sector_history(
@@ -696,6 +698,7 @@ class MultiLidarReader:
             timestamp_sec=float(timestamp_sec),
             sensor_path=str(self._sector_states[0].get("sensor_path", "")),
             source="multi_lidar",
+            sensor_origin_local_xy=self._sensor_origin_robot_xy.copy(),
         )
 
     def _configure_sensor_to_robot_transform(self, *, stage) -> None:

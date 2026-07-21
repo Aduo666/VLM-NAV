@@ -49,30 +49,27 @@ class DepthSafetyMonitor:
         sanitized_action = str(action_name).strip().upper()
         safety_action = "FORWARD" if sanitized_action == "TRACK_TARGET" else sanitized_action
         base_speed_scale = max(0.0, float(speed_scale))
-        if not self._config.enabled or observation.depth is None:
+        if not self._config.enabled:
             return DepthSafetyDecision(
                 action_name=sanitized_action,
                 speed_scale=base_speed_scale,
                 overridden=False,
-                reason="disabled_or_no_depth",
+                reason="disabled",
                 front_depth_m=float("nan"),
                 left_depth_m=float("nan"),
                 right_depth_m=float("nan"),
             )
 
-        depth = np.asarray(observation.depth, dtype=np.float32)
-        if depth.ndim != 2 or depth.size == 0:
-            return DepthSafetyDecision(
-                action_name=sanitized_action,
-                speed_scale=base_speed_scale,
-                overridden=False,
-                reason="invalid_depth",
-                front_depth_m=float("nan"),
-                left_depth_m=float("nan"),
-                right_depth_m=float("nan"),
-            )
-
-        front_depth_m, left_depth_m, right_depth_m = self._region_depths(depth)
+        depth = None if observation.depth is None else np.asarray(observation.depth, dtype=np.float32)
+        if depth is None or depth.ndim != 2 or depth.size == 0:
+            front_depth_m = left_depth_m = right_depth_m = float("inf")
+        else:
+            front_depth_m, left_depth_m, right_depth_m = self._region_depths(depth)
+        lidar_meta = observation.meta.get("lidar", {})
+        if isinstance(lidar_meta, dict) and bool(lidar_meta.get("enabled", False)):
+            front_depth_m = _minimum_finite(front_depth_m, lidar_meta.get("front_depth_m"))
+            left_depth_m = _minimum_finite(left_depth_m, lidar_meta.get("left_depth_m"))
+            right_depth_m = _minimum_finite(right_depth_m, lidar_meta.get("right_depth_m"))
         stop_distance_m = float(self._config.stop_distance_m)
         now_sec = float(observation.meta.get("timestamp_sec", 0.0))
         front_depth_m, left_depth_m, right_depth_m = self._apply_near_field_memory(
@@ -155,21 +152,11 @@ class DepthSafetyMonitor:
         if safety_action == "TURN_LEFT":
             turn_block_distance_m = stop_distance_m + 0.08
             if front_depth_m <= turn_block_distance_m or left_depth_m <= turn_block_distance_m:
-                if right_depth_m > turn_block_distance_m:
-                    return DepthSafetyDecision(
-                        action_name="TURN_RIGHT",
-                        speed_scale=min(base_speed_scale, 0.45),
-                        overridden=True,
-                        reason="turn_left_blocked_redirect_right",
-                        front_depth_m=front_depth_m,
-                        left_depth_m=left_depth_m,
-                        right_depth_m=right_depth_m,
-                    )
                 return DepthSafetyDecision(
-                    action_name="TURN_RIGHT",
-                    speed_scale=min(base_speed_scale, 0.30),
+                    action_name="STOP",
+                    speed_scale=0.0,
                     overridden=True,
-                    reason="turn_left_blocked_both_sides",
+                    reason="turn_left_blocked_safety_hold",
                     front_depth_m=front_depth_m,
                     left_depth_m=left_depth_m,
                     right_depth_m=right_depth_m,
@@ -178,21 +165,11 @@ class DepthSafetyMonitor:
         if safety_action == "TURN_RIGHT":
             turn_block_distance_m = stop_distance_m + 0.08
             if front_depth_m <= turn_block_distance_m or right_depth_m <= turn_block_distance_m:
-                if left_depth_m > turn_block_distance_m:
-                    return DepthSafetyDecision(
-                        action_name="TURN_LEFT",
-                        speed_scale=min(base_speed_scale, 0.45),
-                        overridden=True,
-                        reason="turn_right_blocked_redirect_left",
-                        front_depth_m=front_depth_m,
-                        left_depth_m=left_depth_m,
-                        right_depth_m=right_depth_m,
-                    )
                 return DepthSafetyDecision(
-                    action_name="TURN_LEFT",
-                    speed_scale=min(base_speed_scale, 0.30),
+                    action_name="STOP",
+                    speed_scale=0.0,
                     overridden=True,
-                    reason="turn_right_blocked_both_sides",
+                    reason="turn_right_blocked_safety_hold",
                     front_depth_m=front_depth_m,
                     left_depth_m=left_depth_m,
                     right_depth_m=right_depth_m,
@@ -277,3 +254,15 @@ def _local_goal_heading_rad(local_goal_xy: list[float] | tuple[float, float] | N
     forward_m = float(local_goal_xy[0])
     left_m = float(local_goal_xy[1])
     return float(np.arctan2(left_m, max(forward_m, 1e-6)))
+
+
+def _minimum_finite(first, second) -> float:
+    values = []
+    for value in (first, second):
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(numeric):
+            values.append(numeric)
+    return min(values) if values else float("inf")

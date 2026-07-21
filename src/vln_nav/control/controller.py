@@ -9,6 +9,7 @@ import numpy as np
 
 ACTIONS = (
     "FORWARD",
+    "BACKWARD",
     "TURN_LEFT",
     "TURN_RIGHT",
     "STOP",
@@ -212,7 +213,7 @@ class SteeringDriveController:
 
     def apply(self, action_name: str, *, speed_scale: float = 1.0) -> tuple[float, float]:
         sanitized = sanitize_action(action_name)
-        if sanitized == "FORWARD" and self._steering_reset_pending:
+        if sanitized in {"FORWARD", "BACKWARD"} and self._steering_reset_pending:
             if not self._steering_is_centered():
                 wheel_targets, steering_targets = self._zero_targets()
                 return self._apply_targets(
@@ -487,6 +488,10 @@ class SteeringDriveController:
         if action_name == "FORWARD":
             for joint_name in wheel_targets:
                 wheel_targets[joint_name] = self.wheel_drive_velocity * wheel_speed_scale
+            return wheel_targets, steering_targets
+        if action_name == "BACKWARD":
+            for joint_name in wheel_targets:
+                wheel_targets[joint_name] = -self.wheel_drive_velocity * wheel_speed_scale
             return wheel_targets, steering_targets
         if action_name == "TURN_LEFT":
             return self._turn_targets(direction="left", speed_scale=wheel_speed_scale)

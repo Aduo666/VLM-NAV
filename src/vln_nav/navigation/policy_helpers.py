@@ -46,6 +46,8 @@ def _route_steps(instruction_context: InstructionContext) -> list[RouteStep]:
                 landmark=landmark,
                 directive=directive,
                 behavior_type=behavior_type,
+                reference_landmark=str(getattr(route_step, "reference_landmark", "")).strip().lower(),
+                relation_direction=str(getattr(route_step, "relation_direction", "none")).strip().lower() or "none",
             )
         )
     if steps:
@@ -259,6 +261,13 @@ def _candidate_to_primitive_action(
     turn_speed_scale: float,
     forward_speed_scale: float,
 ) -> tuple[str, float]:
+    explicit = str(candidate.depth_support.get("primitive_action", "")).strip().upper()
+    if explicit == "TURN_LEFT":
+        return explicit, float(turn_speed_scale)
+    if explicit == "TURN_RIGHT":
+        return explicit, float(turn_speed_scale)
+    if explicit == "FORWARD":
+        return explicit, float(forward_speed_scale)
     heading_deg = float(candidate.heading_delta_deg)
     if heading_deg > 12.0:
         return "TURN_LEFT", float(turn_speed_scale)

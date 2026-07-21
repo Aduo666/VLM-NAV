@@ -36,6 +36,7 @@ class AppConfig:
     instruction: str = ""
     instruction_preparse_enabled: bool = True
     instruction_preparse_max_tokens: int = 384
+    visual_target_center_deadband_deg: float = 15.0
     candidate_slot_bearings_deg: list[float] = field(default_factory=lambda: [75.0, 35.0, 0.0, -35.0, -75.0])
     candidate_adaptive_enabled: bool = True
     candidate_adaptive_count: int = 5
@@ -64,7 +65,7 @@ class AppConfig:
     recovery_trigger_stalled_steps: int = 3
     recovery_execution_steps: int = 18
     target_grounding_enabled: bool = True
-    target_grounding_backend: str = "auto"
+    target_grounding_backend: str = "grounding_dino"
     target_grounding_call_period_sec: float = 1.5
     target_grounding_reuse_last_observation_sec: float = 2.5
     target_grounding_upload_max_edge_px: int = 512
@@ -77,7 +78,7 @@ class AppConfig:
     target_grounding_depth_statistic: str = "median"
     target_grounding_center_patch_ratio: float = 0.25
     target_grounding_min_depth_m: float = 0.20
-    target_grounding_max_depth_m: float = 6.0
+    target_grounding_max_depth_m: float = 10.0
     target_grounding_min_confidence: float = 0.50
     target_grounding_coordinate_mode: str = "auto"
     target_grounding_allow_normalized_bbox: bool = True
@@ -95,14 +96,17 @@ class AppConfig:
     target_grounding_dino_device: str = "cuda"
     target_grounding_dino_box_threshold: float = 0.45
     target_grounding_dino_text_threshold: float = 0.25
+    target_grounding_dino_text_encoder_path: str = str(
+        PROJECT_ROOT / "weights" / "grounded_sam" / "bert-base-uncased"
+    )
     target_grounding_sam_checkpoint_path: str = str(PROJECT_ROOT / "weights" / "grounded_sam" / "sam_vit_h_4b8939.pth")
     target_grounding_sam_model_type: str = "vit_h"
     target_grounding_sam_device: str = "cuda"
     target_grounding_sam_min_mask_area_ratio: float = 0.0005
     target_grounding_sam_enabled: bool = True
-    target_grounding_max_result_age_sec: float = 2.0
-    target_grounding_max_result_pose_delta_m: float = 1.5
-    target_grounding_max_result_yaw_delta_deg: float = 45.0
+    target_grounding_max_result_age_sec: float = 30.0
+    target_grounding_max_result_pose_delta_m: float = 0.05
+    target_grounding_max_result_yaw_delta_deg: float = 3.0
     target_grounding_qwen_fallback_confirm_allowed: bool = False
     target_grounding_semantic_verification_enabled: bool = True
     target_grounding_semantic_verification_min_confidence: float = 0.70
@@ -236,8 +240,8 @@ class AppConfig:
     occupancy_grid_robot_radius_m: float = 0.32
     occupancy_grid_path_corridor_radius_m: float = 0.30
     occupancy_grid_turn_clearance_radius_m: float = 0.36
-    occupancy_grid_unknown_is_traversable: bool = True
-    occupancy_grid_unknown_cell_cost: float = 0.10
+    occupancy_grid_unknown_is_traversable: bool = False
+    occupancy_grid_unknown_cell_cost: float = 0.80
     occupancy_grid_debug_enabled: bool = True
     occupancy_grid_debug_image_path: str = "debug/local_map.png"
     occupancy_grid_debug_update_period_sec: float = 0.5
@@ -253,7 +257,7 @@ class AppConfig:
     occupancy_grid_semantic_goal_min_step_m: float = 0.45
     occupancy_grid_semantic_goal_lateral_search_m: float = 0.80
     map_candidates_enabled: bool = True
-    map_candidates_max_candidates: int = 6
+    map_candidates_max_candidates: int = 3
     map_candidates_min_distance_m: float = 0.55
     map_candidates_max_distance_m: float = 1.35
     map_candidates_semantic_enabled: bool = True
@@ -286,6 +290,7 @@ class AppConfig:
     stuck_displacement_threshold_m: float = 0.05
     stuck_yaw_threshold_deg: float = 5.0
     stuck_recovery_pause_sec: float = 0.5
+    stuck_recovery_reverse_sec: float = 0.65
     stuck_recovery_turn_sec: float = 0.35
     stuck_recovery_turn_action: str = "TURN_RIGHT"
     wheel_drive_damping: float = 10000.0
@@ -410,6 +415,10 @@ def load_config(config_path: str | None = None) -> AppConfig:
             "INSTRUCTION_PREPARSE_MAX_TOKENS",
             opennav.get("instruction_preparse_max_tokens", 384),
         ),
+        visual_target_center_deadband_deg=_float_env_or_value(
+            "VISUAL_TARGET_CENTER_DEADBAND_DEG",
+            opennav.get("visual_target_center_deadband_deg", 15.0),
+        ),
         candidate_slot_bearings_deg=_list_env_or_value(
             "CANDIDATE_SLOT_BEARINGS_DEG",
             opennav.get("candidate_slot_bearings_deg", [75.0, 35.0, 0.0, -35.0, -75.0]),
@@ -524,7 +533,7 @@ def load_config(config_path: str | None = None) -> AppConfig:
         ),
         target_grounding_backend=_env_or_value(
             "TARGET_GROUNDING_BACKEND",
-            target_grounding.get("backend", "auto"),
+            target_grounding.get("backend", "grounding_dino"),
         ),
         target_grounding_call_period_sec=_float_env_or_value(
             "TARGET_GROUNDING_CALL_PERIOD_SEC",
@@ -648,6 +657,17 @@ def load_config(config_path: str | None = None) -> AppConfig:
             "GROUNDING_DINO_TEXT_THRESHOLD",
             target_grounding.get("grounding_dino_text_threshold", 0.25),
         ),
+        target_grounding_dino_text_encoder_path=str(
+            _resolve_path(
+                _env_or_value(
+                    "GROUNDING_DINO_TEXT_ENCODER_PATH",
+                    target_grounding.get(
+                        "grounding_dino_text_encoder_path",
+                        "weights/grounded_sam/bert-base-uncased",
+                    ),
+                )
+            )
+        ),
         target_grounding_sam_checkpoint_path=str(
             _resolve_path(
                 _env_or_value(
@@ -677,15 +697,15 @@ def load_config(config_path: str | None = None) -> AppConfig:
         ),
         target_grounding_max_result_age_sec=_float_env_or_value(
             "TARGET_GROUNDING_MAX_RESULT_AGE_SEC",
-            target_grounding.get("max_result_age_sec", 2.0),
+            target_grounding.get("max_result_age_sec", 30.0),
         ),
         target_grounding_max_result_pose_delta_m=_float_env_or_value(
             "TARGET_GROUNDING_MAX_RESULT_POSE_DELTA_M",
-            target_grounding.get("max_result_pose_delta_m", 1.5),
+            target_grounding.get("max_result_pose_delta_m", 0.05),
         ),
         target_grounding_max_result_yaw_delta_deg=_float_env_or_value(
             "TARGET_GROUNDING_MAX_RESULT_YAW_DELTA_DEG",
-            target_grounding.get("max_result_yaw_delta_deg", 45.0),
+            target_grounding.get("max_result_yaw_delta_deg", 3.0),
         ),
         target_grounding_qwen_fallback_confirm_allowed=_bool_env_or_value(
             "TARGET_GROUNDING_QWEN_FALLBACK_CONFIRM_ALLOWED",
@@ -1162,11 +1182,11 @@ def load_config(config_path: str | None = None) -> AppConfig:
         ),
         occupancy_grid_unknown_is_traversable=_bool_env_or_value(
             "OCCUPANCY_GRID_UNKNOWN_IS_TRAVERSABLE",
-            occupancy_grid.get("unknown_is_traversable", True),
+            occupancy_grid.get("unknown_is_traversable", False),
         ),
         occupancy_grid_unknown_cell_cost=_float_env_or_value(
             "OCCUPANCY_GRID_UNKNOWN_CELL_COST",
-            occupancy_grid.get("unknown_cell_cost", 0.10),
+            occupancy_grid.get("unknown_cell_cost", 0.80),
         ),
         occupancy_grid_debug_enabled=_bool_env_or_value(
             "OCCUPANCY_GRID_DEBUG_ENABLED",
@@ -1230,7 +1250,7 @@ def load_config(config_path: str | None = None) -> AppConfig:
         ),
         map_candidates_max_candidates=_int_env_or_value(
             "MAP_CANDIDATES_MAX_CANDIDATES",
-            map_candidates.get("max_candidates", 6),
+            map_candidates.get("max_candidates", 3),
         ),
         map_candidates_min_distance_m=_float_env_or_value(
             "MAP_CANDIDATES_MIN_DISTANCE_M",
@@ -1345,6 +1365,10 @@ def load_config(config_path: str | None = None) -> AppConfig:
         stuck_recovery_pause_sec=_float_env_or_value(
             "STUCK_RECOVERY_PAUSE_SEC",
             control.get("stuck_recovery_pause_sec", 0.5),
+        ),
+        stuck_recovery_reverse_sec=_float_env_or_value(
+            "STUCK_RECOVERY_REVERSE_SEC",
+            control.get("stuck_recovery_reverse_sec", 0.65),
         ),
         stuck_recovery_turn_sec=_float_env_or_value(
             "STUCK_RECOVERY_TURN_SEC",

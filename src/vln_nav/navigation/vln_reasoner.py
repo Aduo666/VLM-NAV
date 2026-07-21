@@ -134,17 +134,7 @@ class OpenNavReasoner:
         try:
             payload = _parse_json(result.content)
             selected_candidate_id = int(payload.get("selected_candidate_id"))
-            selected_action = _sanitize_selected_action(payload.get("selected_action"))
             thought = str(payload.get("reason", payload.get("thought", ""))).strip() or "No reason provided."
-            target_visible = _parse_optional_bool(payload.get("target_visible"))
-            target_bearing_hint = str(payload.get("target_bearing_hint", "unknown")).strip() or "unknown"
-            target_status = str(payload.get("target_memory_state", payload.get("target_status", ""))).strip()
-            if target_visible is None:
-                target_visible = _infer_target_visible_from_text(thought)
-            if target_bearing_hint.lower() == "unknown":
-                target_bearing_hint = _infer_bearing_from_text(thought)
-            if not target_status:
-                target_status = thought[:180]
         except Exception:
             return ReasonerDecision(
                 selected_candidate_id=None,
@@ -167,31 +157,7 @@ class OpenNavReasoner:
             )
 
         selected_candidate = next(candidate for candidate in valid_candidates if candidate.slot_id == selected_candidate_id)
-        expected_action = _candidate_primitive_action(selected_candidate)
-        if selected_action is None:
-            selected_action = expected_action
-        if selected_action != expected_action:
-            repaired_candidate = _find_candidate_for_action(valid_candidates, selected_action)
-            if repaired_candidate is None:
-                return ReasonerDecision(
-                    selected_candidate_id=None,
-                    selected_action=None,
-                    thought=(
-                        "LLM returned inconsistent candidate/action pair and no matching candidate is valid: "
-                        f"candidate_id={selected_candidate_id} expects {expected_action}, got {selected_action}."
-                    ),
-                    progress_estimation=progress_estimation,
-                    used_fallback=False,
-                    reason="action_candidate_mismatch",
-                )
-            self._logger.warning(
-                "[LLMRepair] action_candidate_mismatch original_candidate=%s expected=%s selected_action=%s repaired_candidate=%s",
-                selected_candidate_id,
-                expected_action,
-                selected_action,
-                repaired_candidate.slot_id,
-            )
-            selected_candidate_id = int(repaired_candidate.slot_id)
+        selected_action = _candidate_primitive_action(selected_candidate)
 
         return ReasonerDecision(
             selected_candidate_id=selected_candidate_id,
@@ -200,9 +166,9 @@ class OpenNavReasoner:
             progress_estimation=progress_estimation,
             used_fallback=False,
             reason="ok",
-            target_visible=target_visible,
-            target_bearing_hint=target_bearing_hint,
-            target_status=target_status,
+            target_visible=None,
+            target_bearing_hint="unknown",
+            target_status="",
         )
 
     def build_candidate_choice_request(
@@ -237,9 +203,8 @@ class OpenNavReasoner:
             "\n"
             "ACTION CONTRACT:\n"
             "- You must choose exactly one valid candidate id from Valid IDs.\n"
-            "- selected_action must match that candidate's primitive_action.\n"
-            "- Allowed navigation actions are only TURN_LEFT, FORWARD, TURN_RIGHT.\n"
-            "- Do not output STOP. STOP is reserved internally for ARRIVED or SAFETY_HOLD.\n"
+            "- The runtime deterministically maps that candidate id to its primitive action.\n"
+            "- Do not infer target visibility or output a motor action.\n"
             "\n"
             "DECISION RULES:\n"
             "1. If the current target/landmark is visible in the first-person image, choose the candidate that centers or approaches it.\n"
@@ -247,7 +212,9 @@ class OpenNavReasoner:
             "3. If the target is not visible or confirmed, explore open/safe unknown space that is consistent with the instruction.\n"
             "4. Avoid candidates marked invalid, blocked, low-clearance, or inconsistent with safety context.\n"
             "5. Avoid repeating a turn direction after recently losing a visible target unless the current image clearly shows the target there.\n"
-            "6. Output valid JSON only, no markdown."
+            "6. Route turns are one-time relations. If route context says a relation turn was consumed, do not repeat it merely because words such as left/right remain in the instruction.\n"
+            "7. Treat repetition_penalty=1.0 as a strong reason not to repeat that turn unless current visual evidence requires it.\n"
+            "8. Output valid JSON only, no markdown."
         )
         valid_ids_text = ", ".join(str(candidate.slot_id) for candidate in candidate_set.candidates if candidate.valid)
         user_prompt = (
@@ -279,8 +246,7 @@ class OpenNavReasoner:
             f"{candidate_lines}\n"
             f"Valid IDs: [{valid_ids_text}]\n"
             "\n"
-            "Output JSON: {reason, selected_action, selected_candidate_id}\n"
-            "selected_action: TURN_LEFT/FORWARD/TURN_RIGHT only, matching candidate primitive_action\n"
+            "Output JSON: {reason, selected_candidate_id}\n"
             "selected_candidate_id: integer from Valid IDs\n"
             "reason: one short sentence explaining why this candidate is best"
         )
@@ -300,6 +266,11 @@ def _candidate_line(candidate: WaypointCandidate) -> str:
     occupancy_path_length = float(candidate.depth_support.get("occupancy_path_length_m", 0.0))
     free_ratio = float(candidate.depth_support.get("free_ratio", 0.0))
     near_depth_m = float(candidate.depth_support.get("min_depth", 0.0))
+    min_clearance_m = float(candidate.depth_support.get("min_clearance_m", near_depth_m))
+    unknown_gain = float(candidate.depth_support.get("unknown_gain", 0.0))
+    route_alignment = float(candidate.depth_support.get("route_alignment", 0.0))
+    repetition_penalty = float(candidate.depth_support.get("repetition_penalty", 0.0))
+    anchor_delta_m = candidate.depth_support.get("anchor_distance_delta_m", "none")
     candidate_type = _candidate_type(candidate=candidate, occupancy_reason=occupancy_reason)
     return (
         f"- id={candidate.slot_id} valid={int(candidate.valid)} "
@@ -310,7 +281,11 @@ def _candidate_line(candidate: WaypointCandidate) -> str:
         f"source=current_frame "
         f"clearance={candidate.clearance_score:.2f} "
         f"free_ratio={free_ratio:.2f} "
-        f"near_depth_m={near_depth_m:.2f} "
+        f"min_clearance_m={min_clearance_m:.2f} "
+        f"unknown_gain={unknown_gain:.2f} "
+        f"route_alignment={route_alignment:.2f} "
+        f"repetition_penalty={repetition_penalty:.2f} "
+        f"anchor_distance_delta_m={anchor_delta_m} "
         f"median_depth_m={candidate.depth_support.get('median_depth', 0.0):.2f} "
         f"occupancy={occupancy_reason} "
         f"planned_path_m={occupancy_path_length:.2f}"
@@ -345,37 +320,15 @@ def _candidate_side(candidate: WaypointCandidate) -> str:
 
 
 def _candidate_primitive_action(candidate: WaypointCandidate) -> str:
+    explicit = str(candidate.depth_support.get("primitive_action", "")).strip().upper()
+    if explicit in {"TURN_LEFT", "FORWARD", "TURN_RIGHT"}:
+        return explicit
     side = _candidate_side(candidate)
     if side == "left":
         return "TURN_LEFT"
     if side == "right":
         return "TURN_RIGHT"
     return "FORWARD"
-
-
-def _find_candidate_for_action(candidates: list[WaypointCandidate], action: str) -> WaypointCandidate | None:
-    desired = str(action).strip().upper()
-    matching = [candidate for candidate in candidates if _candidate_primitive_action(candidate) == desired]
-    if not matching:
-        return None
-    return max(matching, key=lambda item: (float(item.clearance_score), float(item.travel_distance_m)))
-
-
-def _sanitize_selected_action(value) -> str | None:
-    if value is None:
-        return None
-    action = str(value).strip().upper()
-    aliases = {
-        "LEFT": "TURN_LEFT",
-        "RIGHT": "TURN_RIGHT",
-        "STRAIGHT": "FORWARD",
-        "CENTER": "FORWARD",
-        "GO_FORWARD": "FORWARD",
-    }
-    action = aliases.get(action, action)
-    if action in {"TURN_LEFT", "FORWARD", "TURN_RIGHT"}:
-        return action
-    return None
 
 
 def _parse_json(content: str) -> dict:
@@ -385,39 +338,6 @@ def _parse_json(content: str) -> dict:
     if start >= 0 and end >= start:
         text = text[start : end + 1]
     return json.loads(text)
-
-
-def _parse_optional_bool(value) -> bool | None:
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return None
-    text = str(value).strip().lower()
-    if text in {"true", "yes", "1", "visible"}:
-        return True
-    if text in {"false", "no", "0", "not_visible", "not visible"}:
-        return False
-    return None
-
-
-def _infer_target_visible_from_text(text: str) -> bool | None:
-    lowered = str(text).lower()
-    if any(phrase in lowered for phrase in ("not visible", "no longer visible", "lost", "cannot see")):
-        return False
-    if any(phrase in lowered for phrase in ("visible", "i see", "can see", "in view", "appears", "seen")):
-        return True
-    return None
-
-
-def _infer_bearing_from_text(text: str) -> str:
-    lowered = str(text).lower()
-    if "left" in lowered:
-        return "left"
-    if "right" in lowered:
-        return "right"
-    if any(token in lowered for token in ("center", "centre", "ahead", "front", "directly")):
-        return "center"
-    return "unknown"
 
 
 def _dump_candidate_choice_request(*, request_payload: CandidateChoiceRequest, image_path: str | None) -> None:

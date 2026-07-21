@@ -109,6 +109,7 @@ class LandmarkMap:
                 world_xy=world_xy,
             )
             observation = state.last_observation
+            reached = bool(state.reached or (existing is not None and existing.reached))
             entry = LandmarkMapEntry(
                 label=label,
                 behavior_type=str(state.behavior_type),
@@ -119,57 +120,16 @@ class LandmarkMap:
                 ),
                 last_seen_time_sec=float(state.last_seen_time_sec or timestamp_sec),
                 update_count=1 if existing is None else int(existing.update_count) + 1,
-                status=str(state.status),
+                status="reached" if reached else str(state.status),
                 source="LandmarkTracker.confirmed_anchor",
                 depth_m=None if observation is None else observation.depth_m,
                 bbox=None if observation is None else observation.bbox,
                 anchor_distance_m=float(distance_m),
                 robot_forward_m=float(forward_m),
                 robot_left_m=float(left_m),
-                reached=bool(state.reached),
+                reached=reached,
                 confirmed_observation_count=int(state.confirmed_observation_count),
                 evidence_level=str(state.evidence_level),
-            )
-            self._entries[label] = entry
-            self._log_entry_if_needed(entry=entry, timestamp_sec=float(timestamp_sec))
-            return entry
-
-        has_potential_anchor = (
-            state.potential_world_xy is not None
-            and bool(map_anchor_allowed)
-            and float(state.potential_confidence) >= float(self._config.min_confidence)
-        )
-        existing_is_confirmed = (
-            existing is not None
-            and str(getattr(existing, "evidence_level", "")).strip().lower() == "confirmed"
-        )
-        if has_potential_anchor and not existing_is_confirmed:
-            world_xy = [float(state.potential_world_xy[0]), float(state.potential_world_xy[1])]
-            forward_m, left_m, distance_m = _relative_to_robot(
-                robot_pose=robot_pose,
-                world_xy=world_xy,
-            )
-            observation = state.last_observation
-            entry = LandmarkMapEntry(
-                label=label,
-                behavior_type=str(state.behavior_type),
-                world_xy=world_xy,
-                confidence=float(state.potential_confidence),
-                first_seen_time_sec=(
-                    float(existing.first_seen_time_sec) if existing is not None else float(timestamp_sec)
-                ),
-                last_seen_time_sec=float(state.potential_last_seen_time_sec or state.last_seen_time_sec or timestamp_sec),
-                update_count=1 if existing is None else int(existing.update_count) + 1,
-                status="potential",
-                source="LandmarkTracker.potential_anchor",
-                depth_m=None if observation is None else observation.depth_m,
-                bbox=state.potential_bbox,
-                anchor_distance_m=float(distance_m),
-                robot_forward_m=float(forward_m),
-                robot_left_m=float(left_m),
-                reached=False,
-                confirmed_observation_count=int(state.confirmed_observation_count),
-                evidence_level="potential",
             )
             self._entries[label] = entry
             self._log_entry_if_needed(entry=entry, timestamp_sec=float(timestamp_sec))
@@ -182,11 +142,14 @@ class LandmarkMap:
             robot_pose=robot_pose,
             world_xy=existing.world_xy,
         )
-        existing.status = str(state.status)
+        if not bool(existing.reached):
+            existing.status = str(state.status)
         existing.anchor_distance_m = float(distance_m)
         existing.robot_forward_m = float(forward_m)
         existing.robot_left_m = float(left_m)
-        existing.reached = bool(state.reached)
+        existing.reached = bool(existing.reached or state.reached)
+        if existing.reached:
+            existing.status = "reached"
         self._log_entry_if_needed(entry=existing, timestamp_sec=float(timestamp_sec))
         return existing
 
@@ -242,7 +205,6 @@ class LandmarkMap:
         confidence: float,
     ) -> str:
         guard_radius_m = 1.0
-        high_confidence_threshold = 0.50
         for existing_label, entry in self._entries.items():
             if existing_label == label:
                 continue
@@ -253,7 +215,7 @@ class LandmarkMap:
             dx = float(world_xy[0]) - float(entry.world_xy[0])
             dy = float(world_xy[1]) - float(entry.world_xy[1])
             dist = float(np.hypot(dx, dy))
-            if dist < guard_radius_m and float(confidence) < high_confidence_threshold:
+            if dist < guard_radius_m:
                 return f"near_completed_{existing_label}_dist={dist:.2f}m_conf={confidence:.2f}"
         return ""
 
@@ -264,7 +226,8 @@ class LandmarkMap:
         expired = [
             label
             for label, entry in self._entries.items()
-            if float(timestamp_sec) - float(entry.last_seen_time_sec) > ttl
+            if not bool(entry.reached)
+            and float(timestamp_sec) - float(entry.last_seen_time_sec) > ttl
         ]
         for label in expired:
             self._logger.info("[LandmarkMap] expired target=%s ttl_sec=%.1f", label, ttl)

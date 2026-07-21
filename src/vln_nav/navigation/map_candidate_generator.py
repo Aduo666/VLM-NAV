@@ -53,71 +53,168 @@ class MapCandidateGenerator:
         progress_signal: str,
         safety_context_text: str,
     ) -> CandidateSet:
-        if not bool(self._config.enabled) or occupancy_snapshot is None:
+        if not bool(self._config.enabled):
             return base_candidate_set
 
-        next_id = 0
-        merged: list[WaypointCandidate] = []
-        for candidate in base_candidate_set.candidates:
-            merged.append(candidate)
-            next_id = max(next_id, int(candidate.slot_id) + 1)
-
-        generated: list[WaypointCandidate] = []
-        if bool(self._config.semantic_enabled):
-            semantic = self._semantic_candidate(
-                observation=observation,
-                snapshot=occupancy_snapshot,
-                slot_id=next_id,
-                current_target=current_target,
-                landmark_state=landmark_state,
-                landmark_entry=landmark_entry,
-            )
-            if semantic is not None:
-                generated.append(semantic)
-                next_id += 1
-
-        if bool(self._config.frontier_enabled):
-            for candidate in self._frontier_candidates(
-                observation=observation,
-                snapshot=occupancy_snapshot,
-                start_slot_id=next_id,
-                current_target=current_target,
-                landmark_entry=landmark_entry,
-            ):
-                generated.append(candidate)
-                next_id += 1
-
-        if bool(self._config.escape_enabled) and _needs_escape(
-            progress_signal=progress_signal,
-            safety_context_text=safety_context_text,
-        ):
-            for candidate in self._escape_candidates(
-                observation=observation,
-                snapshot=occupancy_snapshot,
-                start_slot_id=next_id,
-            ):
-                generated.append(candidate)
-                next_id += 1
-
-        ranked = self._rank_candidates(
-            base_candidates=merged,
-            generated_candidates=generated,
-            progress_signal=progress_signal,
+        ranked = self._primitive_candidates(
+            observation=observation,
+            base_candidate_set=base_candidate_set,
+            occupancy_snapshot=occupancy_snapshot,
+            current_target=current_target,
+            landmark_state=landmark_state,
+            landmark_entry=landmark_entry,
         )
         valid_count = sum(1 for candidate in ranked if candidate.valid)
         debug = dict(base_candidate_set.predictor_debug)
-        debug["map_candidate_count"] = int(len(generated))
-        debug["map_candidate_valid_count"] = int(sum(1 for item in generated if item.valid))
-        debug["map_candidate_types"] = [
-            str(item.depth_support.get("map_candidate_type", "depth")) for item in ranked
-        ]
+        debug["candidate_representation"] = "atomic_primitive_outcome"
+        debug["map_candidate_count"] = int(len(ranked))
+        debug["map_candidate_valid_count"] = int(valid_count)
         self._log_if_changed(
             current_target=current_target,
             ranked=ranked,
-            generated=generated,
+            generated=ranked,
             valid_count=valid_count,
         )
         return CandidateSet(candidates=ranked, valid_count=int(valid_count), predictor_debug=debug)
+
+    def _primitive_candidates(
+        self,
+        *,
+        observation: VLNObservation,
+        base_candidate_set: CandidateSet,
+        occupancy_snapshot: OccupancyGridSnapshot | None,
+        current_target: str,
+        landmark_state: LandmarkState | None,
+        landmark_entry: LandmarkMapEntry | None,
+    ) -> list[WaypointCandidate]:
+        """Represent the three executable outcomes, not arbitrary depth points."""
+
+        primitive_specs = (
+            (0, "TURN_LEFT", 15.0),
+            (1, "FORWARD", 0.0),
+            (2, "TURN_RIGHT", -15.0),
+        )
+        distance_m = max(0.10, float(self._config.min_distance_m))
+        anchor_world_xy = _confirmed_anchor_world_xy(
+            landmark_state=landmark_state,
+            landmark_entry=landmark_entry,
+        )
+        candidates: list[WaypointCandidate] = []
+        for slot_id, action, heading_deg in primitive_specs:
+            heading_rad = float(np.deg2rad(heading_deg))
+            local_goal = [
+                float(distance_m * np.cos(heading_rad)),
+                float(distance_m * np.sin(heading_rad)),
+            ]
+            depth_candidate = _nearest_depth_candidate(
+                base_candidate_set=base_candidate_set,
+                heading_deg=heading_deg,
+            )
+            depth_support = {} if depth_candidate is None else dict(depth_candidate.depth_support)
+            depth_valid = bool(depth_candidate is not None and depth_candidate.valid)
+            free_ratio = float(depth_support.get("free_ratio", 0.0))
+            min_depth_m = float(depth_support.get("min_depth", 0.0))
+            unknown_gain = 0.0
+            min_clearance_m = min_depth_m
+            occupancy_reason = "not_available"
+            occupancy_valid = True
+
+            if occupancy_snapshot is not None:
+                if action == "FORWARD":
+                    evaluation = _evaluate_local_goal(
+                        snapshot=occupancy_snapshot,
+                        robot_pose=observation.pose,
+                        local_goal_xy=local_goal,
+                        min_clearance_m=float(self._config.min_clearance_m),
+                    )
+                    free_ratio = float(evaluation["free_ratio"])
+                    unknown_gain = float(evaluation["unknown_gain"])
+                    min_clearance_m = float(evaluation["clearance_m"])
+                    occupancy_valid = bool(evaluation["valid"]) and free_ratio >= 0.50
+                    occupancy_reason = str(evaluation["reason"])
+                    if bool(evaluation["valid"]) and free_ratio < 0.50:
+                        occupancy_reason = "corridor_not_known_free"
+                else:
+                    robot_cell = _world_to_cell(
+                        snapshot=occupancy_snapshot,
+                        world_xy=(float(observation.pose.x), float(observation.pose.y)),
+                    )
+                    min_clearance_m = (
+                        0.0
+                        if robot_cell is None
+                        else _clearance_m(
+                            snapshot=occupancy_snapshot,
+                            cell=robot_cell,
+                            max_radius_m=1.0,
+                        )
+                    )
+                    occupancy_valid = min_clearance_m >= float(self._config.min_clearance_m)
+                    occupancy_reason = "turn_footprint_clear" if occupancy_valid else "turn_footprint_occupied"
+
+            valid = bool(occupancy_valid and (depth_valid or action != "FORWARD"))
+            predicted_world_xy = _local_to_world_xy(robot_pose=observation.pose, local_xy=local_goal)
+            anchor_delta_m = None
+            anchor_bearing_after_deg = None
+            if anchor_world_xy is not None:
+                current_distance = float(
+                    np.hypot(
+                        float(anchor_world_xy[0]) - float(observation.pose.x),
+                        float(anchor_world_xy[1]) - float(observation.pose.y),
+                    )
+                )
+                predicted_distance = float(
+                    np.hypot(
+                        float(anchor_world_xy[0]) - float(predicted_world_xy[0]),
+                        float(anchor_world_xy[1]) - float(predicted_world_xy[1]),
+                    )
+                )
+                anchor_delta_m = predicted_distance - current_distance
+                anchor_local = _world_to_local_xy(robot_pose=observation.pose, world_xy=anchor_world_xy)
+                anchor_bearing_after_deg = float(
+                    np.degrees(np.arctan2(float(anchor_local[1]), max(1.0e-6, float(anchor_local[0]))))
+                    - heading_deg
+                )
+
+            support = {
+                **depth_support,
+                "map_candidate_type": "primitive_outcome",
+                "primitive_action": action,
+                "predicted_endpoint_world_xy": [float(predicted_world_xy[0]), float(predicted_world_xy[1])],
+                "free_ratio": float(free_ratio),
+                "min_depth": float(min_depth_m),
+                "min_clearance_m": float(min_clearance_m),
+                "unknown_gain": float(unknown_gain),
+                "occupancy_reason": occupancy_reason,
+                "occupancy_valid": float(bool(occupancy_valid)),
+                "anchor_distance_delta_m": "none" if anchor_delta_m is None else round(float(anchor_delta_m), 3),
+                "anchor_bearing_after_deg": "none" if anchor_bearing_after_deg is None else round(float(anchor_bearing_after_deg), 1),
+                "route_alignment": 0.0,
+                "repetition_penalty": 0.0,
+                "target_label": str(current_target),
+            }
+            clearance_score = float(
+                np.clip(
+                    0.55 * free_ratio
+                    + 0.30 * min(1.0, min_clearance_m / max(0.1, float(self._config.min_clearance_m) * 2.0))
+                    + 0.15 * (1.0 - min(1.0, unknown_gain)),
+                    0.0,
+                    1.0,
+                )
+            )
+            candidates.append(
+                WaypointCandidate(
+                    slot_id=int(slot_id),
+                    label=action.lower(),
+                    valid=valid,
+                    local_goal_xy=local_goal,
+                    heading_delta_deg=float(heading_deg),
+                    travel_distance_m=float(distance_m if action == "FORWARD" else 0.0),
+                    clearance_score=clearance_score,
+                    depth_support=support,
+                    image_uv=_local_goal_to_image_uv(local_goal_xy=local_goal, observation=observation),
+                )
+            )
+        return candidates
 
     def _semantic_candidate(
         self,
@@ -576,3 +673,32 @@ def _needs_escape(*, progress_signal: str, safety_context_text: str) -> bool:
         return True
     text = str(safety_context_text).upper()
     return "SAFETY_STOP" in text or "STUCK_DETECTED" in text
+
+
+def _nearest_depth_candidate(
+    *,
+    base_candidate_set: CandidateSet,
+    heading_deg: float,
+) -> WaypointCandidate | None:
+    if not base_candidate_set.candidates:
+        return None
+    return min(
+        base_candidate_set.candidates,
+        key=lambda item: abs(float(item.heading_delta_deg) - float(heading_deg)),
+    )
+
+
+def _confirmed_anchor_world_xy(
+    *,
+    landmark_state: LandmarkState | None,
+    landmark_entry: LandmarkMapEntry | None,
+) -> list[float] | None:
+    if landmark_entry is not None and bool(landmark_entry.confirmed) and bool(landmark_entry.world_xy):
+        return [float(landmark_entry.world_xy[0]), float(landmark_entry.world_xy[1])]
+    if (
+        landmark_state is not None
+        and str(landmark_state.evidence_level).strip().lower() == "confirmed"
+        and landmark_state.estimated_world_xy is not None
+    ):
+        return [float(landmark_state.estimated_world_xy[0]), float(landmark_state.estimated_world_xy[1])]
+    return None

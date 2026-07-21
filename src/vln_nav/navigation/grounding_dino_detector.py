@@ -6,6 +6,7 @@ import logging
 import sys
 import types
 import os
+import tempfile
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,6 +30,7 @@ class GroundingDinoConfig:
     device: str
     box_threshold: float
     text_threshold: float
+    text_encoder_path: str = ""
 
 
 class GroundingDinoDetector:
@@ -43,6 +45,7 @@ class GroundingDinoDetector:
         self._logger = logger.getChild("grounding_dino")
         self._model = None
         self._load_failed_reason: str | None = None
+        self._runtime_config_path: str | None = None
 
     @property
     def available(self) -> bool:
@@ -70,6 +73,9 @@ class GroundingDinoDetector:
                 if not _path_exists(value)
             ]
             return None, f"grounding_dino_missing_{'_'.join(missing) or 'files'}"
+        text_encoder_path = Path(self._config.text_encoder_path).expanduser()
+        if not text_encoder_path.is_dir() or not (text_encoder_path / "config.json").is_file():
+            return None, "grounding_dino_missing_text_encoder"
         model, reason = self._load_model()
         if model is None:
             return None, reason
@@ -131,7 +137,7 @@ class GroundingDinoDetector:
                 from groundingdino.util.inference import Model
 
                 self._model = Model(
-                    model_config_path=str(Path(self._config.config_path).expanduser().resolve()),
+                    model_config_path=self._prepare_runtime_config(),
                     model_checkpoint_path=str(Path(self._config.checkpoint_path).expanduser().resolve()),
                     device=str(self._config.device),
                 )
@@ -146,6 +152,29 @@ class GroundingDinoDetector:
             self._load_failed_reason = f"grounding_dino_load_failed:{exc}"
             self._logger.warning("[GroundingDINO] load_failed error=%s", exc)
             return None, "grounding_dino_load_failed"
+
+    def _prepare_runtime_config(self) -> str:
+        if self._runtime_config_path is not None:
+            return self._runtime_config_path
+        source_path = Path(self._config.config_path).expanduser().resolve()
+        text_encoder_path = Path(self._config.text_encoder_path).expanduser().resolve()
+        source = source_path.read_text(encoding="utf-8")
+        replacements = (
+            ('text_encoder_type = "bert-base-uncased"', f'text_encoder_type = r"{text_encoder_path}"'),
+            ("text_encoder_type = 'bert-base-uncased'", f'text_encoder_type = r"{text_encoder_path}"'),
+        )
+        patched = source
+        for old, new in replacements:
+            patched = patched.replace(old, new)
+        if patched == source:
+            raise RuntimeError(
+                "GroundingDINO config does not contain the expected bert-base-uncased text_encoder_type"
+            )
+        fd, path = tempfile.mkstemp(prefix="vlmnav_groundingdino_", suffix=".py", dir="/tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(patched)
+        self._runtime_config_path = path
+        return path
 
 
 def _path_exists(value: str) -> bool:

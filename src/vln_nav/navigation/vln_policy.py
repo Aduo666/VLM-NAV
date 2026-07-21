@@ -84,6 +84,7 @@ class OpenNavPolicyConfig:
     turn_at_complete_requires_confirmed_anchor: bool = True
     confirm_min_observations: int = 3
     confirm_confidence_threshold: float = 0.50
+    visual_target_center_deadband_deg: float = 15.0
 
 
 @dataclass
@@ -207,6 +208,9 @@ class OpenNavVLNPolicy:
         self._pass_action_index = 0
         self._recent_primitive_actions: deque[str] = deque(maxlen=4)
         self._last_turn_oscillation_signature: tuple | None = None
+        self._last_route_relation_reject_key: tuple[str, str] | None = None
+        self._relation_prior_actions: deque[str] = deque()
+        self._reset_relation_prior()
 
     def step(
         self,
@@ -394,6 +398,12 @@ class OpenNavVLNPolicy:
                 debug_image_path=None,
                 **self._route_result_kwargs(),
             )
+
+        return self._clean_decision_step(
+            observation=observation,
+            progress_state=progress_state,
+            now=now,
+        )
 
         reacquire_guard = self._build_reacquire_guard_context(now=now)
         candidate_set = self._candidate_predictor.predict(observation)
@@ -803,6 +813,470 @@ class OpenNavVLNPolicy:
             **self._route_result_kwargs(),
         )
 
+    def _clean_decision_step(
+        self,
+        *,
+        observation: VLNObservation,
+        progress_state,
+        now: float,
+    ) -> PolicyStepResult:
+        """Single decision authority for search and confirmed-anchor approach."""
+
+        candidate_set = self._candidate_predictor.predict(observation)
+        semantic_landmark_entry = self._semantic_landmark_entry()
+        if self._map_candidate_generator is not None:
+            candidate_set = self._map_candidate_generator.augment(
+                observation=observation,
+                base_candidate_set=candidate_set,
+                occupancy_snapshot=(
+                    None if self._occupancy_grid is None else self._occupancy_grid.snapshot()
+                ),
+                current_target=self._current_target_text(),
+                landmark_state=self._landmark_tracker_state,
+                landmark_entry=semantic_landmark_entry,
+                progress_signal=progress_state.progress_signal,
+                safety_context_text=self._safety_context_text,
+            )
+        self._annotate_candidate_context(candidate_set=candidate_set)
+        if self._occupancy_grid is not None:
+            candidate_set = self._occupancy_grid.filter_candidates(
+                observation=observation,
+                candidate_set=candidate_set,
+            )
+        self._last_candidate_set = candidate_set
+
+        semantic_plan = None
+        if (
+            self._occupancy_grid is not None
+            and semantic_landmark_entry is not None
+            and not bool(semantic_landmark_entry.reached)
+        ):
+            try:
+                semantic_plan = self._occupancy_grid.plan_toward_landmark(
+                    observation=observation,
+                    landmark_entry=semantic_landmark_entry,
+                    stop_distance_m=float(self._current_arrival_distance_m()),
+                )
+            except Exception as exc:
+                self._logger.warning(
+                    "[SemanticPlanner] plan_failed landmark=%s error=%s",
+                    self._current_target_text(),
+                    exc,
+                )
+
+        if self._occupancy_grid is not None:
+            self._occupancy_grid.save_debug(
+                observation=observation,
+                candidate_set=candidate_set,
+                semantic_entries=list(self._all_landmark_map_entries),
+                semantic_plan=semantic_plan,
+            )
+        debug_image_path = self._candidate_predictor.save_debug(
+            observation=observation,
+            candidate_set=candidate_set,
+            target_observation=(
+                None
+                if self._landmark_tracker_state is None
+                else self._landmark_tracker_state.last_observation
+            ),
+            left_panel_image_path=None,
+        )
+
+        # Fresh verified image evidence outranks a projected world anchor.
+        visual_candidate, visual_desired_action, visual_bearing_deg = (
+            self._verified_visual_target_candidate(candidate_set=candidate_set)
+        )
+        if visual_desired_action is not None and visual_candidate is not None:
+            action_name, speed_scale = _candidate_to_primitive_action(
+                visual_candidate,
+                turn_speed_scale=float(self._config.turn_speed_scale),
+                forward_speed_scale=float(self._config.forward_speed_scale),
+            )
+            self._safety_context_text = ""
+            return self._start_candidate_primitive(
+                observation=observation,
+                candidate=visual_candidate,
+                action_name=action_name,
+                speed_scale=speed_scale,
+                now=now,
+                progress_signal=progress_state.progress_signal,
+                decision_source="VERIFIED_VISUAL_TARGET",
+                reasoning_summary=(
+                    f"fresh verified target bearing={visual_bearing_deg:+.1f}deg; "
+                    f"execute {action_name} before map-anchor navigation"
+                ),
+                debug_image_path=debug_image_path,
+            )
+        if visual_desired_action is not None:
+            self._safety_context_text = ""
+            self._next_replan_time = now + float(self._config.replanning_cooldown_sec)
+            return PolicyStepResult(
+                action_name="STOP",
+                speed_scale=0.0,
+                decision_source="VISUAL_TARGET_SAFETY_HOLD",
+                selected_candidate_id=None,
+                local_goal_xy=[0.0, 0.0],
+                world_goal_xy=None,
+                execution_steps_remaining=0,
+                reasoning_summary=(
+                    f"verified target bearing={visual_bearing_deg:+.1f}deg requires "
+                    f"{visual_desired_action}, but that primitive is not safe"
+                ),
+                progress_signal=progress_state.progress_signal,
+                replanned=True,
+                debug_image_path=None if debug_image_path is None else str(debug_image_path),
+                **self._route_result_kwargs(),
+            )
+
+        # APPROACH: a confirmed semantic anchor has exclusive control through A*.
+        semantic_result = self._semantic_planner_step(
+            observation=observation,
+            candidate_set=candidate_set,
+            progress_signal=progress_state.progress_signal,
+            debug_image_path=debug_image_path,
+            semantic_plan=semantic_plan,
+            now=now,
+        )
+        if semantic_result is not None:
+            self._safety_context_text = ""
+            return semantic_result
+
+        if semantic_landmark_entry is not None:
+            fallback_candidate = self._confirmed_anchor_fallback_candidate(
+                observation=observation,
+                candidate_set=candidate_set,
+                landmark_entry=semantic_landmark_entry,
+            )
+            self._safety_context_text = ""
+            if fallback_candidate is not None:
+                action_name, speed_scale = _candidate_to_primitive_action(
+                    fallback_candidate,
+                    turn_speed_scale=float(self._config.turn_speed_scale),
+                    forward_speed_scale=float(self._config.forward_speed_scale),
+                )
+                return self._start_candidate_primitive(
+                    observation=observation,
+                    candidate=fallback_candidate,
+                    action_name=action_name,
+                    speed_scale=speed_scale,
+                    now=now,
+                    progress_signal=progress_state.progress_signal,
+                    decision_source="SEMANTIC_DETERMINISTIC_FALLBACK",
+                    reasoning_summary=(
+                        "confirmed anchor exists but A* has no executable subgoal; "
+                        "using the safest primitive aligned with the anchor bearing"
+                    ),
+                    debug_image_path=debug_image_path,
+                )
+            self._next_replan_time = now + float(self._config.replanning_cooldown_sec)
+            return PolicyStepResult(
+                action_name="STOP",
+                speed_scale=0.0,
+                decision_source="APPROACH_SAFETY_HOLD",
+                selected_candidate_id=None,
+                local_goal_xy=[0.0, 0.0],
+                world_goal_xy=None,
+                execution_steps_remaining=0,
+                reasoning_summary="confirmed anchor has no safe reachable primitive",
+                progress_signal=progress_state.progress_signal,
+                replanned=True,
+                debug_image_path=None if debug_image_path is None else str(debug_image_path),
+                **self._route_result_kwargs(),
+            )
+
+        # SEARCH: apply an instruction relation once after changing landmarks.
+        relation_candidate = self._consume_relation_prior_candidate(candidate_set=candidate_set)
+        if relation_candidate is not None:
+            action_name, speed_scale = _candidate_to_primitive_action(
+                relation_candidate,
+                turn_speed_scale=float(self._config.turn_speed_scale),
+                forward_speed_scale=float(self._config.forward_speed_scale),
+            )
+            self._logger.info(
+                "[RoutePrior] target=%s action=%s candidate=%s relation=%s",
+                self._current_target_text(),
+                action_name,
+                int(relation_candidate.slot_id),
+                getattr(self._current_route_step(), "relation_direction", "none"),
+            )
+            self._safety_context_text = ""
+            return self._start_candidate_primitive(
+                observation=observation,
+                candidate=relation_candidate,
+                action_name=action_name,
+                speed_scale=speed_scale,
+                now=now,
+                progress_signal=progress_state.progress_signal,
+                decision_source="ROUTE_RELATION_PRIOR",
+                reasoning_summary="one-time instruction relation prior",
+                debug_image_path=debug_image_path,
+            )
+
+        annotated_png_bytes = None
+        if debug_image_path is not None and Path(debug_image_path).exists():
+            annotated_png_bytes = Path(debug_image_path).read_bytes()
+        decision = self._reasoner.choose_candidate(
+            instruction_context=self._instruction_context,
+            candidate_set=candidate_set,
+            progress_state=progress_state,
+            annotated_image_png_bytes=annotated_png_bytes,
+            annotated_image_path=None if debug_image_path is None else str(debug_image_path),
+            target_memory_text=self._grounded_target_context(),
+            safety_context_text=self._safety_context_text,
+            route_context_text=self._route_context_text(robot_pose=observation.pose),
+            reacquire_context_text="none",
+            obstacle_summary_text=self._obstacle_summary_text,
+            semantic_map_summary=self._semantic_map_summary,
+        )
+        self._safety_context_text = ""
+        selected_candidate = _find_candidate(candidate_set, decision.selected_candidate_id)
+        if selected_candidate is None or not bool(selected_candidate.valid):
+            self._next_replan_time = now + float(self._config.replanning_cooldown_sec)
+            self._clear_active_goal()
+            return PolicyStepResult(
+                action_name="STOP",
+                speed_scale=0.0,
+                decision_source=f"SEARCH_HOLD({decision.reason})",
+                selected_candidate_id=None,
+                local_goal_xy=[0.0, 0.0],
+                world_goal_xy=None,
+                execution_steps_remaining=0,
+                reasoning_summary=decision.thought,
+                progress_signal=progress_state.progress_signal,
+                replanned=True,
+                debug_image_path=None if debug_image_path is None else str(debug_image_path),
+                **self._route_result_kwargs(),
+            )
+
+        action_name, speed_scale = _candidate_to_primitive_action(
+            selected_candidate,
+            turn_speed_scale=float(self._config.turn_speed_scale),
+            forward_speed_scale=float(self._config.forward_speed_scale),
+        )
+        return self._start_candidate_primitive(
+            observation=observation,
+            candidate=selected_candidate,
+            action_name=action_name,
+            speed_scale=speed_scale,
+            now=now,
+            progress_signal=progress_state.progress_signal,
+            decision_source="VLM_SEARCH_PRIMITIVE",
+            reasoning_summary=decision.thought,
+            debug_image_path=debug_image_path,
+        )
+
+    def _verified_visual_target_candidate(
+        self,
+        *,
+        candidate_set: CandidateSet,
+    ) -> tuple[WaypointCandidate | None, str | None, float]:
+        state = self._landmark_tracker_state
+        observation = None if state is None else state.last_observation
+        if observation is None:
+            return None, None, 0.0
+        tracker_identity_verified = bool(
+            str(getattr(observation, "semantic_source", "")).strip().lower() == "opencv_tracker"
+            and getattr(observation, "vlm_verified", False)
+        )
+        if not (
+            bool(getattr(observation, "visible", False))
+            and (bool(getattr(observation, "can_confirm", False)) or tracker_identity_verified)
+            and bool(getattr(observation, "is_current_frame", True))
+            and getattr(observation, "bbox", None) is not None
+            and getattr(observation, "bearing_rad", None) is not None
+            and str(getattr(observation, "reason", "")).strip().lower() == "ok"
+        ):
+            return None, None, 0.0
+
+        bearing_deg = float(np.degrees(float(observation.bearing_rad)))
+        deadband_deg = max(1.0, float(self._config.visual_target_center_deadband_deg))
+        if bearing_deg > deadband_deg:
+            desired_action = "TURN_RIGHT"
+        elif bearing_deg < -deadband_deg:
+            desired_action = "TURN_LEFT"
+        else:
+            desired_action = "FORWARD"
+
+        valid = [candidate for candidate in candidate_set.candidates if bool(candidate.valid)]
+        matching = [
+            candidate
+            for candidate in valid
+            if _candidate_to_primitive_action(
+                candidate,
+                turn_speed_scale=float(self._config.turn_speed_scale),
+                forward_speed_scale=float(self._config.forward_speed_scale),
+            )[0]
+            == desired_action
+        ]
+        if matching:
+            return max(matching, key=lambda item: float(item.clearance_score)), desired_action, bearing_deg
+
+        # Never turn away from a visible target. If centered FORWARD is unsafe,
+        # hold position and let runtime recovery handle the blocked corridor.
+        self._logger.info(
+            "[VisualTarget] target=%s bearing_deg=%+.1f desired=%s reason=no_safe_matching_candidate",
+            self._current_target_text(),
+            bearing_deg,
+            desired_action,
+        )
+        return None, desired_action, bearing_deg
+
+    def _start_candidate_primitive(
+        self,
+        *,
+        observation: VLNObservation,
+        candidate: WaypointCandidate,
+        action_name: str,
+        speed_scale: float,
+        now: float,
+        progress_signal: str,
+        decision_source: str,
+        reasoning_summary: str,
+        debug_image_path: str | Path | None,
+    ) -> PolicyStepResult:
+        is_turn = str(action_name) in {"TURN_LEFT", "TURN_RIGHT"}
+        world_goal_xy = (
+            [float(observation.pose.x), float(observation.pose.y)]
+            if is_turn
+            else _local_waypoint_to_world_xy(
+                robot_pose=observation.pose,
+                waypoint_local_xy=candidate.local_goal_xy,
+            )
+        )
+        # The internal pose anchor keeps the primitive active across frames;
+        # it is not exposed as a navigation target for an in-place turn.
+        self._active_world_goal_xy = [float(world_goal_xy[0]), float(world_goal_xy[1])]
+        self._active_candidate_id = int(candidate.slot_id)
+        self._active_candidate_label = str(candidate.label)
+        self._execution_steps_remaining = max(1, int(self._config.execution_steps))
+        self._active_action_name = str(action_name)
+        self._active_goal_started_sec = float(now)
+        self._active_start_yaw_rad = float(observation.pose.yaw_rad)
+        self._active_start_pose = observation.pose
+        self._last_decision_summary = str(reasoning_summary)
+        self._recent_primitive_actions.append(str(action_name))
+        self._logger.info(
+            "[PrimitiveDecision] mode=SEARCH target=%s candidate=%s action=%s valid=%s clearance=%.2f reason=%s",
+            self._current_target_text(),
+            int(candidate.slot_id),
+            action_name,
+            int(bool(candidate.valid)),
+            float(candidate.clearance_score),
+            str(reasoning_summary)[:180],
+        )
+        return PolicyStepResult(
+            action_name=str(action_name),
+            speed_scale=float(speed_scale),
+            decision_source=str(decision_source),
+            selected_candidate_id=int(candidate.slot_id),
+            local_goal_xy=[float(candidate.local_goal_xy[0]), float(candidate.local_goal_xy[1])],
+            world_goal_xy=None if is_turn else list(self._active_world_goal_xy),
+            execution_steps_remaining=int(self._execution_steps_remaining),
+            reasoning_summary=str(reasoning_summary),
+            progress_signal=str(progress_signal),
+            replanned=True,
+            debug_image_path=None if debug_image_path is None else str(debug_image_path),
+            **self._route_result_kwargs(),
+        )
+
+    def _annotate_candidate_context(self, *, candidate_set: CandidateSet) -> None:
+        pending_relation_action = self._relation_prior_actions[0] if self._relation_prior_actions else ""
+        for candidate in candidate_set.candidates:
+            action_name, _ = _candidate_to_primitive_action(
+                candidate,
+                turn_speed_scale=float(self._config.turn_speed_scale),
+                forward_speed_scale=float(self._config.forward_speed_scale),
+            )
+            route_alignment = 1.0 if action_name == pending_relation_action else 0.0
+            repetition_penalty = 0.0
+            if self._recent_primitive_actions and self._recent_primitive_actions[-1] == action_name:
+                repetition_penalty = 1.00 if action_name.startswith("TURN_") else 0.10
+            candidate.depth_support["route_alignment"] = float(route_alignment)
+            candidate.depth_support["repetition_penalty"] = float(repetition_penalty)
+
+    def _consume_relation_prior_candidate(self, *, candidate_set: CandidateSet) -> WaypointCandidate | None:
+        while self._relation_prior_actions:
+            action_name = self._relation_prior_actions.popleft()
+            matching = [
+                candidate
+                for candidate in candidate_set.candidates
+                if bool(candidate.valid)
+                and _candidate_to_primitive_action(
+                    candidate,
+                    turn_speed_scale=float(self._config.turn_speed_scale),
+                    forward_speed_scale=float(self._config.forward_speed_scale),
+                )[0]
+                == action_name
+            ]
+            if matching:
+                return max(matching, key=lambda item: float(item.clearance_score))
+            self._logger.info(
+                "[RoutePrior] skip action=%s reason=no_safe_candidate",
+                action_name,
+            )
+        return None
+
+    def _confirmed_anchor_fallback_candidate(
+        self,
+        *,
+        observation: VLNObservation,
+        candidate_set: CandidateSet,
+        landmark_entry: LandmarkMapEntry,
+    ) -> WaypointCandidate | None:
+        valid = [candidate for candidate in candidate_set.candidates if bool(candidate.valid)]
+        if not valid:
+            return None
+        local_anchor = _world_waypoint_to_local_xy(
+            robot_pose=observation.pose,
+            world_goal_xy=landmark_entry.world_xy,
+        )
+        desired_action = _local_goal_to_primitive_action(local_goal_xy=local_anchor)
+        matching = [
+            candidate
+            for candidate in valid
+            if _candidate_to_primitive_action(
+                candidate,
+                turn_speed_scale=float(self._config.turn_speed_scale),
+                forward_speed_scale=float(self._config.forward_speed_scale),
+            )[0]
+            == desired_action
+        ]
+        if matching:
+            return max(matching, key=lambda item: float(item.clearance_score))
+        anchor_left = float(local_anchor[1])
+        preferred_turn = "TURN_LEFT" if anchor_left >= 0.0 else "TURN_RIGHT"
+        turns = [
+            candidate
+            for candidate in valid
+            if _candidate_to_primitive_action(
+                candidate,
+                turn_speed_scale=float(self._config.turn_speed_scale),
+                forward_speed_scale=float(self._config.forward_speed_scale),
+            )[0]
+            == preferred_turn
+        ]
+        return max(turns, key=lambda item: float(item.clearance_score)) if turns else None
+
+    def _reset_relation_prior(self) -> None:
+        self._relation_prior_actions.clear()
+        route_step = self._current_route_step()
+        reference_landmark = str(getattr(route_step, "reference_landmark", "")).strip().lower()
+        if not self._completed_landmarks and not reference_landmark:
+            return
+        relation = str(getattr(route_step, "relation_direction", "none")).strip().lower()
+        if relation in {"left", "left_then_forward"}:
+            self._relation_prior_actions.append("TURN_LEFT")
+        if relation in {"right", "right_then_forward"}:
+            self._relation_prior_actions.append("TURN_RIGHT")
+        if relation in {"forward", "left_then_forward", "right_then_forward", "through", "past"}:
+            self._relation_prior_actions.append("FORWARD")
+
+    def _grounded_target_context(self) -> str:
+        parts = [f"current_grounding={self._current_grounding_summary()}"]
+        if self._landmark_map_summary:
+            parts.append(f"landmark_map={self._landmark_map_summary}")
+        return "; ".join(parts)
+
     def _semantic_planner_step(
         self,
         *,
@@ -1133,7 +1607,13 @@ class OpenNavVLNPolicy:
         self._layout_description = str(text).strip()
 
     def record_action(self, action: str, result: str, now: float) -> None:
-        self._action_history.append((now, str(action).strip(), str(result).strip()))
+        action_text = str(action).strip()
+        result_text = str(result).strip()
+        if self._action_history:
+            _, last_action, last_result = self._action_history[-1]
+            if last_action == action_text and last_result == result_text:
+                return
+        self._action_history.append((now, action_text, result_text))
 
     @property
     def current_layout_description(self) -> str:
@@ -1547,9 +2027,18 @@ class OpenNavVLNPolicy:
             and reason.strip().lower() == "ok"
             and "reused" not in source.strip().lower()
         )
+        proposal_visible = bool(getattr(observation, "visible", False))
+        tracked_verified = bool(
+            str(getattr(observation, "semantic_source", "")).strip().lower() == "opencv_tracker"
+            and getattr(observation, "vlm_verified", False)
+        )
+        verified_visible = bool(
+            proposal_visible
+            and (getattr(observation, "can_confirm", False) or tracked_verified)
+        )
         return (
             f"label={getattr(observation, 'label', self._current_target_text())} "
-            f"visible={int(bool(getattr(observation, 'visible', False)))} "
+            f"verified_visible={int(verified_visible)} proposal_visible={int(proposal_visible)} "
             f"fresh={int(fresh)} reason={reason} source={source} "
             f"bbox={list(bbox) if bbox is not None else 'none'} "
             f"center_uv={_format_xy(center_uv) if center_uv is not None else 'none'} "
@@ -1887,16 +2376,12 @@ class OpenNavVLNPolicy:
         self._recovery_started_sec = None
 
     def _should_start_recovery(self, *, progress_state) -> bool:
-        if not bool(self._config.recovery_enabled):
-            return False
-        if progress_state.progress_signal not in {"STALLED", "SPINNING"}:
-            return False
-        if int(progress_state.stalled_steps) < max(1, int(self._config.recovery_trigger_stalled_steps)):
-            return False
-        return True
+        # Runtime StuckDetector owns reverse/turn recovery. Keeping a second
+        # policy-level recovery authority caused interleaved actions.
+        return False
 
     def _should_start_safety_recovery(self) -> bool:
-        return bool(self._config.recovery_enabled) and int(self._safety_override_streak) >= 2
+        return False
 
     def _start_recovery(
         self,
@@ -2066,7 +2551,9 @@ class OpenNavVLNPolicy:
         if completion_reason:
             completed_candidate_id = self._active_candidate_id
             completed_world_goal_xy = (
-                list(self._active_world_goal_xy) if self._active_world_goal_xy is not None else None
+                None
+                if is_turn or self._active_world_goal_xy is None
+                else list(self._active_world_goal_xy)
             )
             self._logger.info(
                 "[Primitive] complete action=%s reason=%s elapsed_sec=%.2f max_sec=%.2f odom_distance_m=%.2f target_distance_m=%.2f yaw_delta_deg=%.1f target_yaw_deg=%.1f",
@@ -2104,7 +2591,11 @@ class OpenNavVLNPolicy:
             decision_source="ACTIVE_PRIMITIVE",
             selected_candidate_id=self._active_candidate_id,
             local_goal_xy=[float(local_goal[0]), float(local_goal[1])],
-            world_goal_xy=list(self._active_world_goal_xy) if self._active_world_goal_xy is not None else None,
+            world_goal_xy=(
+                None
+                if is_turn or self._active_world_goal_xy is None
+                else list(self._active_world_goal_xy)
+            ),
             execution_steps_remaining=int(self._execution_steps_remaining),
             reasoning_summary=self._last_decision_summary,
             progress_signal=progress_signal,
@@ -2163,12 +2654,18 @@ class OpenNavVLNPolicy:
             and bool(tracker_state.reached)
             and bool(tracker_state.can_complete)
         ):
+            candidate_anchor = tracker_state.estimated_world_xy or tracker_state.candidate_world_xy
+            visible_depth_reached = str(tracker_state.reach_reason).startswith(
+                "confirmed_visible_depth"
+            )
+            if not visible_depth_reached and not self._route_anchor_is_consistent(candidate_anchor):
+                return False
             distance_m = tracker_state.anchor_distance_m
             if distance_m is None and tracker_state.last_observation is not None:
                 distance_m = tracker_state.last_observation.depth_m
             return self._advance_current_landmark(
                 observation=observation,
-                anchor_world_xy=tracker_state.estimated_world_xy or tracker_state.candidate_world_xy,
+                anchor_world_xy=candidate_anchor,
                 distance_m=distance_m,
                 source="LandmarkTracker",
                 reason=tracker_state.reach_reason,
@@ -2193,6 +2690,8 @@ class OpenNavVLNPolicy:
         ):
             threshold_m = max(0.05, float(self._current_arrival_distance_m()))
             if float(map_entry.anchor_distance_m) <= threshold_m:
+                if not self._route_anchor_is_consistent(map_entry.world_xy):
+                    return False
                 required_confirmations = max(1, int(self._config.landmark_arrival_confirmations))
                 self._arrival_confirmation_window.append(True)
                 hit_count = int(sum(1 for item in self._arrival_confirmation_window if item))
@@ -2224,6 +2723,53 @@ class OpenNavVLNPolicy:
         self._arrival_confirmation_window.append(False)
         return False
 
+    def _route_anchor_is_consistent(self, anchor_world_xy: list[float] | None) -> bool:
+        if anchor_world_xy is None or not self._completed_landmarks:
+            return True
+        previous = self._completed_landmarks[-1]
+        previous_anchor = self._landmark_anchors.get(previous)
+        previous_yaw = self._landmark_anchor_yaws.get(previous)
+        if previous_anchor is None or previous_yaw is None:
+            return True
+        expected_words = self._expected_direction_words()
+        relation = str(getattr(self._current_route_step(), "relation_direction", "none")).lower()
+        if relation.startswith("left"):
+            expected_words.add("left")
+        elif relation.startswith("right"):
+            expected_words.add("right")
+        elif relation in {"forward", "through", "past"}:
+            expected_words.add("forward")
+        if not expected_words:
+            return True
+        relative_forward_m, relative_left_m = _relative_xy_from_anchor(
+            anchor_world_xy=previous_anchor,
+            anchor_yaw_rad=previous_yaw,
+            target_world_xy=anchor_world_xy,
+        )
+        contradiction = False
+        if "left" in expected_words and relative_left_m < -0.50:
+            contradiction = True
+        if "right" in expected_words and relative_left_m > 0.50:
+            contradiction = True
+        if {"forward", "straight", "ahead"} & expected_words and relative_forward_m < -0.50:
+            contradiction = True
+        if contradiction:
+            reject_key = (previous, self._current_target_text())
+            if reject_key != self._last_route_relation_reject_key:
+                self._logger.warning(
+                    "[RouteRelationReject] previous=%s current=%s expected=%s forward=%.2f left=%.2f anchor=%s",
+                    previous,
+                    self._current_target_text(),
+                    sorted(expected_words),
+                    float(relative_forward_m),
+                    float(relative_left_m),
+                    _format_xy(anchor_world_xy),
+                )
+                self._last_route_relation_reject_key = reject_key
+            return False
+        self._last_route_relation_reject_key = None
+        return True
+
     def _advance_current_landmark(
         self,
         *,
@@ -2236,6 +2782,7 @@ class OpenNavVLNPolicy:
         lost_count: int,
     ) -> bool:
         reached_landmark = self._current_target_text()
+        self._last_route_relation_reject_key = None
         self._arrival_confirmation_window.clear()
         if anchor_world_xy is not None:
             self._landmark_anchors[reached_landmark] = list(anchor_world_xy)
@@ -2268,6 +2815,7 @@ class OpenNavVLNPolicy:
         next_landmark = self._current_target_text()
         self._target_memory.reset_for_target(next_landmark)
         self._sync_instruction_target()
+        self._reset_relation_prior()
         self._landmark_tracker_state = None
         self._logger.info(
             "[Landmark] reached=%s source=%s reason=%s distance=%sm visible_now=%s lost_count=%s next=%s completed=%s",
@@ -2291,7 +2839,10 @@ class OpenNavVLNPolicy:
         for step in self._route_steps:
             raw_behavior = str(getattr(step, "behavior_type", "go_to")).strip().lower() or "go_to"
             route_steps.append(
-                f"{raw_behavior}:{getattr(step, 'landmark', '')}:{getattr(step, 'directive', '')}"
+                f"{raw_behavior}:{getattr(step, 'landmark', '')}:"
+                f"relation={getattr(step, 'relation_direction', 'none')}:"
+                f"reference={getattr(step, 'reference_landmark', '') or 'none'}:"
+                f"{getattr(step, 'directive', '')}"
             )
         lines = [
             f"ordered_landmarks={self._ordered_landmarks}",
@@ -2303,6 +2854,7 @@ class OpenNavVLNPolicy:
             f"completed_landmarks={self._completed_landmarks}",
             f"directional_clause_for_current={self._current_direction_clause() or 'none'}",
             f"expected_direction_words={sorted(expected_words) if expected_words else 'none'}",
+            f"one_time_relation_actions_pending={list(self._relation_prior_actions) or 'none'}",
             f"global_route_direction_hint={self._global_route_direction_hint()}",
         ]
         if self._topology_summary:
@@ -2360,9 +2912,16 @@ class OpenNavVLNPolicy:
                 f"{marker}[{absolute_index}]={behavior}:{landmark}:directive={directive or 'none'}:directions={tokens or ['none']}"
             )
         latest = direction_tokens[-1] if direction_tokens else "unknown"
+        pending = list(self._relation_prior_actions)
+        relation_status = (
+            f"pending_one_time_actions={pending}"
+            if pending
+            else "one_time_relation_consumed; do_not_repeat_a_turn_only_because_it_appears_in_the_directive"
+        )
         return (
             f"recent_route_window={' | '.join(parts)}; "
             f"latest_direction_bias={latest}; "
+            f"{relation_status}; "
             "when current target is not visible, prefer safe frontier/candidate directions that satisfy this recent route direction chain relative to completed landmarks"
         )
 

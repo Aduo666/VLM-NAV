@@ -74,6 +74,10 @@ class CandidateWaypointPredictor:
     def last_saved_debug_path(self) -> Path | None:
         return self._last_saved_debug_path
 
+    def set_horizontal_fov_deg(self, value: float) -> None:
+        self._config.horizontal_fov_deg = float(value)
+        self._hfov_rad = np.deg2rad(float(value))
+
     def predict(self, observation: VLNObservation) -> CandidateSet:
         depth = observation.depth
         if depth is None or np.asarray(depth).ndim != 2:

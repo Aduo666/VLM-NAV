@@ -59,6 +59,9 @@ class TargetTracker:
     def last_observation(self) -> TargetObservation | None:
         return self._last_observation
 
+    def set_horizontal_fov_deg(self, value: float) -> None:
+        self._config.horizontal_fov_deg = float(value)
+
     def set_target_label(self, target_label: str) -> None:
         label = _normalize_label(target_label)
         if label != self._label:
@@ -78,19 +81,10 @@ class TargetTracker:
         self._last_log_signature = None
 
     def should_request_grounding(self, *, target_label: str, timestamp_sec: float) -> bool:
-        if not bool(self._config.enabled):
-            return True
-        label = _normalize_label(target_label)
-        if label != self._label:
-            return True
-        if self._tracker is None:
-            return True
-        if self._lifecycle == "LOST_CONFIRMED":
-            return True
-        if self._lifecycle == "SEARCHING":
-            return True
-        _ = timestamp_sec
-        return False
+        # This method is called only at decision keyframes. Re-ground there so
+        # geometric tracker drift can never become semantic truth.
+        _ = target_label, timestamp_sec
+        return True
 
     def initialize_from_grounding(
         self,
@@ -115,7 +109,10 @@ class TargetTracker:
         cv_bbox = (int(x0), int(y0), max(1, int(x1 - x0)), max(1, int(y1 - y0)))
         frame = self._tracker_frame(rgb)
         try:
-            ok = bool(tracker.init(frame, cv_bbox))
+            init_result = tracker.init(frame, cv_bbox)
+            # OpenCV tracker bindings return either True or None on success,
+            # depending on the OpenCV build.
+            ok = True if init_result is None else bool(init_result)
         except Exception as exc:
             self._logger.warning("[TargetTracker] init_failed target=%s error=%s", observation.label, exc)
             return False
@@ -236,6 +233,11 @@ class TargetTracker:
         if image_w > 0 and image_h > 0:
             area_ratio = float(width * height) / max(1.0, float(image_w * image_h))
         if depth_m is None or valid_ratio < float(self._config.min_depth_valid_ratio):
+            cx_px = max(1.0, (float(image_w) - 1.0) * 0.5)
+            half_fov_rad = float(np.deg2rad(float(self._config.horizontal_fov_deg)) * 0.5)
+            bearing_rad = float(
+                np.arctan(((float(center_uv[0]) - cx_px) / cx_px) * np.tan(half_fov_rad))
+            )
             return TargetObservation(
                 label=self._label or "target",
                 visible=True,
@@ -243,7 +245,7 @@ class TargetTracker:
                 center_uv=center_uv,
                 confidence=float(confidence),
                 depth_m=None,
-                bearing_rad=None,
+                bearing_rad=bearing_rad,
                 estimated_world_xy=None,
                 depth_valid_ratio=float(valid_ratio),
                 area_ratio=float(area_ratio),
@@ -290,9 +292,9 @@ class TargetTracker:
             request_robot_pose=robot_pose,
             result_age_sec=0.0,
             is_current_frame=True,
-            evidence_level="confirmed_candidate",
+            evidence_level="tracked_identity",
             semantic_source="opencv_tracker",
-            can_confirm=True,
+            can_confirm=False,
             vlm_verified=bool(self._identity_vlm_verified),
             vlm_verification_confidence=float(self._identity_vlm_confidence),
             vlm_verification_reason=self._identity_reason,

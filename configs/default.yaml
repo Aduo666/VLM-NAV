@@ -21,6 +21,7 @@ llm:
 opennav:
   instruction_preparse_enabled: true
   instruction_preparse_max_tokens: 384
+  visual_target_center_deadband_deg: 15.0
   candidate_slot_bearings_deg: [35.0, 18.0, 0.0, -18.0, -35.0]
   candidate_adaptive_enabled: true
   candidate_adaptive_count: 5
@@ -51,9 +52,9 @@ opennav:
 
 target_grounding:
   enabled: true
-  backend: "auto"
-  call_period_sec: 1.5
-  reuse_last_observation_sec: 1.0
+  backend: "grounding_dino"
+  call_period_sec: 0.10
+  reuse_last_observation_sec: 0.0
   upload_max_edge_px: 768
   min_bbox_area_ratio: 0.002
   max_bbox_area_ratio: 0.60
@@ -64,7 +65,7 @@ target_grounding:
   depth_statistic: "median"
   center_patch_ratio: 0.25
   min_depth_m: 0.20
-  max_depth_m: 6.0
+  max_depth_m: 10.0
   min_confidence: 0.50
   coordinate_mode: "auto"
   allow_normalized_bbox: true
@@ -78,14 +79,15 @@ target_grounding:
   grounding_dino_device: "cuda:0"
   grounding_dino_box_threshold: 0.45
   grounding_dino_text_threshold: 0.25
+  grounding_dino_text_encoder_path: "weights/grounded_sam/bert-base-uncased"
   sam_checkpoint_path: "weights/grounded_sam/sam_vit_h_4b8939.pth"
   sam_model_type: "vit_h"
   sam_device: "cuda:0"
   sam_enabled: false
   sam_min_mask_area_ratio: 0.0005
-  max_result_age_sec: 2.0
-  max_result_pose_delta_m: 1.5
-  max_result_yaw_delta_deg: 45.0
+  max_result_age_sec: 30.0
+  max_result_pose_delta_m: 0.05
+  max_result_yaw_delta_deg: 3.0
   semantic_verification_enabled: true
   semantic_verification_min_confidence: 0.50
   semantic_verification_max_edge_px: 768
@@ -114,8 +116,8 @@ landmark_tracker:
   landmark_map_log_period_sec: 2.0
   confirm_confidence_threshold: 0.65
   potential_confidence_threshold: 0.50
-  confirm_min_observations: 1
-  confirm_max_anchor_jump_m: 2.0
+  confirm_min_observations: 2
+  confirm_max_anchor_jump_m: 0.75
   confirm_max_depth_jump_m: 3.0
   turn_at_complete_requires_confirmed_anchor: true
   turn_at_complete_max_distance_m: 3.0
@@ -143,12 +145,12 @@ camera:
   interactive_confirmation_enabled: false
   roi_vertical_range: [0.45, 0.85]
   clearance_threshold_m: 1.2
-  valid_depth_range_m: [0.2, 8.0]
+  valid_depth_range_m: [0.2, 10.0]
   candidate_preferred_distance_m: 1.0
   depth_eval_period_sec: 0.12
   depth_debug_enabled: false
   depth_debug_image_path: "debug/local/depth_debug.png"
-  obstacle_avoidance_enabled: false
+  obstacle_avoidance_enabled: true
   obstacle_stop_distance_m: 0.65
   obstacle_roi_vertical_range: [0.50, 0.95]
   obstacle_center_width_ratio: 0.34
@@ -180,6 +182,7 @@ control:
   stuck_displacement_threshold_m: 0.05
   stuck_yaw_threshold_deg: 5.0
   stuck_recovery_pause_sec: 0.5
+  stuck_recovery_reverse_sec: 0.65
   stuck_recovery_turn_sec: 0.35
   stuck_recovery_turn_action: "TURN_RIGHT"
   action_forward_duration_sec: 1.40
@@ -233,8 +236,8 @@ occupancy_grid:
   robot_radius_m: 0.32
   path_corridor_radius_m: 0.30
   turn_clearance_radius_m: 0.36
-  unknown_is_traversable: true
-  unknown_cell_cost: 0.10
+  unknown_is_traversable: false
+  unknown_cell_cost: 0.80
   debug_enabled: false
   debug_image_path: "debug/local/local_map.png"
   debug_update_period_sec: 0.5
@@ -252,7 +255,7 @@ occupancy_grid:
 
 map_candidates:
   enabled: true
-  max_candidates: 6
+  max_candidates: 3
   min_distance_m: 0.55
   max_distance_m: 1.35
   semantic_enabled: true

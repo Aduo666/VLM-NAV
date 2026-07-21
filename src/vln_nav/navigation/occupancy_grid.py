@@ -293,6 +293,7 @@ class GlobalOccupancyMap:
         points_local_xy: np.ndarray,
         beam_endpoints_local_xy: np.ndarray | None = None,
         beam_hit_mask: np.ndarray | None = None,
+        sensor_origin_local_xy: np.ndarray | tuple[float, float] | list[float] | None = None,
         timestamp_sec: float,
     ) -> None:
         if not bool(self._config.enabled):
@@ -339,6 +340,14 @@ class GlobalOccupancyMap:
 
         cos_yaw = float(np.cos(robot_pose.yaw_rad))
         sin_yaw = float(np.sin(robot_pose.yaw_rad))
+        sensor_origin = np.asarray(
+            [0.0, 0.0] if sensor_origin_local_xy is None else sensor_origin_local_xy,
+            dtype=np.float64,
+        ).reshape(-1)
+        sensor_forward = float(sensor_origin[0]) if sensor_origin.size >= 1 else 0.0
+        sensor_left = float(sensor_origin[1]) if sensor_origin.size >= 2 else 0.0
+        sensor_world_x = float(robot_x) + cos_yaw * sensor_forward - sin_yaw * sensor_left
+        sensor_world_y = float(robot_y) + sin_yaw * sensor_forward + cos_yaw * sensor_left
         min_depth = max(0.02, float(self._config.min_depth_m))
         max_depth = max(min_depth + 0.10, float(self._config.max_depth_m))
 
@@ -348,14 +357,14 @@ class GlobalOccupancyMap:
         world_xs = float(robot_x) + cos_yaw * fwd - sin_yaw * lft
         world_ys = float(robot_y) + sin_yaw * fwd + cos_yaw * lft
 
-        distances = np.hypot(world_xs - robot_x, world_ys - robot_y)
+        distances = np.hypot(world_xs - sensor_world_x, world_ys - sensor_world_y)
         valid = np.isfinite(distances) & (distances >= min_depth) & (distances <= max_depth)
         if not np.any(valid):
             self._last_update_time_sec = float(timestamp_sec)
             return
         valid_idx = np.where(valid)[0]
 
-        start_xy = np.array([robot_x, robot_y], dtype=np.float64)
+        start_xy = np.array([sensor_world_x, sensor_world_y], dtype=np.float64)
         end_xy_arr = np.stack([world_xs[valid_idx], world_ys[valid_idx]], axis=-1).astype(np.float64)
         endpoint_distances = distances[valid_idx].astype(np.float64)
         endpoint_hit_mask = hits[valid_idx].astype(bool)
@@ -809,6 +818,16 @@ class GlobalOccupancyMap:
                 return _CandidateEvaluation(
                     False, "corridor_occupied", 0.0, int(blocked_cells), goal_world_xy
                 )
+            if str(candidate.depth_support.get("map_candidate_type", "")) == "primitive_outcome":
+                straight = float(
+                    np.hypot(
+                        goal_world_xy[0] - observation.pose.x,
+                        goal_world_xy[1] - observation.pose.y,
+                    )
+                )
+                return _CandidateEvaluation(
+                    True, "primitive_corridor_clear", straight, 0, goal_world_xy
+                )
             path = self._astar_path(
                 start_xy=(float(observation.pose.x), float(observation.pose.y)),
                 goal_xy=goal_world_xy,
@@ -902,8 +921,14 @@ class GlobalOccupancyMap:
         if start is None or goal is None:
             return None
         blocked = self._inflated_occupied_mask()
+        if not bool(self._config.unknown_is_traversable):
+            blocked = blocked | (self._log_odds > float(self._config.free_threshold))
         if self._cell_blocked(blocked, goal):
-            return None
+            # A frontier/semantic goal may lie on the first unknown cell, but
+            # the corridor leading to it must remain observed free space.
+            if bool(self._inflated_occupied_mask()[goal[0], goal[1]]):
+                return None
+            blocked[goal[0], goal[1]] = False
         if self._cell_blocked(blocked, start):
             blocked[start[0], start[1]] = False
 
@@ -1230,7 +1255,7 @@ class GlobalOccupancyMap:
         body = canvas[header_h:, :, :]
         body[sampled_free] = 255
         body[sampled_occupied] = 0
-        return Image.fromarray(canvas, mode="RGB")
+        return Image.fromarray(canvas)
 
     def _draw_debug_grid(
         self, *, draw: ImageDraw.ImageDraw, transform: "_DebugTransform"

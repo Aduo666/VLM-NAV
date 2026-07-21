@@ -491,6 +491,7 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
             displacement_threshold_m=float(config.stuck_displacement_threshold_m),
             yaw_threshold_deg=float(config.stuck_yaw_threshold_deg),
             recovery_pause_sec=float(config.stuck_recovery_pause_sec),
+            recovery_reverse_sec=float(config.stuck_recovery_reverse_sec),
             recovery_turn_sec=float(config.stuck_recovery_turn_sec),
             recovery_turn_action=str(config.stuck_recovery_turn_action),
         ),
@@ -532,6 +533,7 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
             grounding_dino_device=str(config.target_grounding_dino_device),
             grounding_dino_box_threshold=float(config.target_grounding_dino_box_threshold),
             grounding_dino_text_threshold=float(config.target_grounding_dino_text_threshold),
+            grounding_dino_text_encoder_path=str(config.target_grounding_dino_text_encoder_path),
             sam_checkpoint_path=str(config.target_grounding_sam_checkpoint_path),
             sam_model_type=str(config.target_grounding_sam_model_type),
             sam_device=str(config.target_grounding_sam_device),
@@ -754,6 +756,7 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
             turn_at_complete_requires_confirmed_anchor=bool(config.landmark_tracker_turn_at_complete_requires_confirmed_anchor),
             confirm_min_observations=int(config.landmark_tracker_confirm_min_observations),
             confirm_confidence_threshold=float(config.landmark_tracker_confirm_confidence_threshold),
+            visual_target_center_deadband_deg=float(config.visual_target_center_deadband_deg),
             landmark_arrival_confirmations=int(config.landmark_arrival_confirmations),
             landmark_arrival_window_size=int(config.landmark_tracker_arrival_window_size),
             reacquire_guard_enabled=bool(config.reacquire_guard_enabled),
@@ -890,6 +893,39 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
     logger.info("robot.initialize() complete")
     camera.initialize()
     logger.info("front camera initialize() complete")
+    try:
+        actual_camera_hfov_deg = float(np.degrees(float(camera.get_horizontal_fov())))
+    except Exception as exc:
+        actual_camera_hfov_deg = float(config.camera_horizontal_fov_deg)
+        logger.warning(
+            "[CameraCalibration] unable to read USD horizontal FOV; using configured %.2fdeg error=%s",
+            actual_camera_hfov_deg,
+            exc,
+        )
+    if not np.isfinite(actual_camera_hfov_deg) or not 20.0 <= actual_camera_hfov_deg <= 160.0:
+        logger.warning(
+            "[CameraCalibration] invalid USD horizontal FOV %.2fdeg; using configured %.2fdeg",
+            actual_camera_hfov_deg,
+            float(config.camera_horizontal_fov_deg),
+        )
+        actual_camera_hfov_deg = float(config.camera_horizontal_fov_deg)
+    configured_camera_hfov_deg = float(config.camera_horizontal_fov_deg)
+    config.camera_horizontal_fov_deg = actual_camera_hfov_deg
+    observation_adapter.set_horizontal_fov_deg(actual_camera_hfov_deg)
+    candidate_predictor.set_horizontal_fov_deg(actual_camera_hfov_deg)
+    target_grounder.set_horizontal_fov_deg(actual_camera_hfov_deg)
+    target_tracker.set_horizontal_fov_deg(actual_camera_hfov_deg)
+    logger.info(
+        "[CameraCalibration] configured_hfov_deg=%.2f usd_hfov_deg=%.2f source=front_camera_prim",
+        configured_camera_hfov_deg,
+        actual_camera_hfov_deg,
+    )
+    log_spatial_transform_self_check(
+        logger=logger,
+        image_width=int(config.camera_width),
+        image_height=int(config.camera_height),
+        horizontal_fov_deg=actual_camera_hfov_deg,
+    )
     _attach_camera_annotators(camera=camera, logger=logger, enable_depth=True)
     if observer_camera is not None:
         observer_camera.initialize()
@@ -1071,6 +1107,8 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
     depth_warning_emitted = False
     depth_debug_save_pending = False
     last_safety_log_signature: tuple[str, str] | None = None
+    runtime_safety_hold_streak = 0
+    runtime_approach_hold_streak = 0
     last_nav_debug_save_time = 0.0
     last_depth_debug_save_time = 0.0
     sim_time_sec = 0.0
@@ -1176,11 +1214,11 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
             if (
                 current_beam_endpoints_np.ndim == 2
                 and current_beam_endpoints_np.shape[0] == current_beam_hits_np.shape[0]
-                and np.any(current_beam_hits_np)
+                and current_beam_endpoints_np.shape[0] > 0
             ):
-                map_beam_endpoints = current_beam_endpoints_np[current_beam_hits_np]
-                map_beam_hits = np.ones((map_beam_endpoints.shape[0],), dtype=bool)
-                map_points = map_beam_endpoints
+                map_beam_endpoints = current_beam_endpoints_np
+                map_beam_hits = current_beam_hits_np
+                map_points = current_beam_endpoints_np[current_beam_hits_np]
             else:
                 map_beam_endpoints = np.zeros((0, 2), dtype=np.float32)
                 map_beam_hits = np.zeros((0,), dtype=bool)
@@ -1190,7 +1228,13 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
                 points_local_xy=map_points,
                 beam_endpoints_local_xy=map_beam_endpoints,
                 beam_hit_mask=map_beam_hits,
+                sensor_origin_local_xy=getattr(lidar_scan, "sensor_origin_local_xy", None),
                 timestamp_sec=sim_time_sec,
+            )
+            lidar_sector_depths = _lidar_sector_depths(
+                beam_endpoints_local_xy=np.asarray(lidar_scan.beam_endpoints_local_xy, dtype=np.float32),
+                beam_hit_mask=np.asarray(lidar_scan.beam_hit_mask, dtype=bool),
+                sensor_origin_local_xy=getattr(lidar_scan, "sensor_origin_local_xy", None),
             )
             observation.meta["lidar"] = {
                 "enabled": True,
@@ -1202,6 +1246,7 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
                 "raw_beam_count": int(lidar_scan.raw_beam_count),
                 "valid_beam_count": int(lidar_scan.valid_beam_count),
                 "effective_fov_deg": float(lidar_scan.effective_fov_deg),
+                **lidar_sector_depths,
             }
         elif bool(config.lidar_enabled):
             observation.meta["lidar"] = {
@@ -1259,6 +1304,25 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
             )
             occupancy_bootstrap_done_logged = True
 
+        runtime_recovery_command = stuck_detector.recovery_command(now_sec=sim_time_sec)
+        if runtime_recovery_command.active:
+            policy.cancel_active_goal()
+            active_step_result = _runtime_recovery_step_result(
+                recovery_command=runtime_recovery_command,
+                previous_step_result=active_step_result,
+            )
+            last_applied_wheel_velocity, last_applied_steering_angle = drive_controller.apply(
+                runtime_recovery_command.action_name,
+                speed_scale=runtime_recovery_command.speed_scale,
+            )
+            last_action_name = runtime_recovery_command.action_name
+            last_policy_feedback = ExecutionFeedback(
+                applied_action=runtime_recovery_command.action_name,
+                wheel_velocity=last_applied_wheel_velocity,
+                steering_angle=last_applied_steering_angle,
+            )
+            continue
+
         # --- Fast path during active primitive execution ---
         is_motion_active = _is_executing_motion_step(active_step_result)
         if is_motion_active:
@@ -1276,6 +1340,18 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
                 speed_scale=step_result.speed_scale,
                 local_goal_xy=step_result.local_goal_xy,
             )
+            if safety_decision.overridden:
+                runtime_safety_hold_streak += 1
+                policy.cancel_active_goal()
+                active_step_result = None
+                if runtime_safety_hold_streak >= 2:
+                    stuck_detector.trigger_recovery(
+                        now_sec=sim_time_sec,
+                        reason="repeated_safety_hold",
+                    )
+                    runtime_safety_hold_streak = 0
+            else:
+                runtime_safety_hold_streak = 0
             if safety_decision.action_name == "TRACK_TARGET":
                 last_applied_wheel_velocity, last_applied_steering_angle = drive_controller.track_local_target(
                     local_forward_m=float(step_result.local_goal_xy[0]),
@@ -1314,6 +1390,7 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
         current_landmark = policy.current_landmark
         target_observation: TargetObservation | None = None
         landmark_map_entry = None
+        grounding_waiting_for_keyframe = False
         if current_landmark:
             target_tracker.set_target_label(current_landmark)
             tracker_can_cover_motion = target_tracker.lifecycle in {"TRACKING", "LOST_TEMP"}
@@ -1337,6 +1414,11 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
                 timestamp_sec=sim_time_sec,
                 frame_index=frame_index,
                 allow_new_request=allow_new_grounding,
+            )
+            grounding_waiting_for_keyframe = bool(
+                target_grounder.request_in_flight
+                and str(grounding_observation.reason).strip().lower()
+                in {"grounding_request_started", "grounding_request_in_flight"}
             )
             if bool(grounding_observation.visible) and bool(getattr(grounding_observation, "can_confirm", False)):
                 target_tracker.initialize_from_grounding(
@@ -1443,6 +1525,12 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
         )
         policy.set_obstacle_summary(obstacle_summary)
         policy.set_semantic_map_summary(semantic_map_summary)
+        if grounding_waiting_for_keyframe:
+            drive_controller.apply("STOP", speed_scale=0.0)
+            last_action_name = "STOP"
+            last_applied_wheel_velocity = 0.0
+            last_applied_steering_angle = 0.0
+            continue
         should_refresh_policy = True
         recovery_command = stuck_detector.recovery_command(now_sec=sim_time_sec)
         if recovery_command.active:
@@ -1471,6 +1559,19 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
         active_step_result = proposed_step_result
         active_command_token = proposed_command_token
         step_result = active_step_result
+        if str(step_result.decision_source) in {
+            "APPROACH_SAFETY_HOLD",
+            "VISUAL_TARGET_SAFETY_HOLD",
+        }:
+            runtime_approach_hold_streak += 1
+            if runtime_approach_hold_streak >= 3:
+                stuck_detector.trigger_recovery(
+                    now_sec=sim_time_sec,
+                    reason="approach_path_unreachable",
+                )
+                runtime_approach_hold_streak = 0
+        else:
+            runtime_approach_hold_streak = 0
         for completed_label in step_result.completed_landmarks:
             completed_key = str(completed_label).strip().lower()
             if completed_key and completed_key not in landmark_map_reached_synced:
@@ -1490,6 +1591,7 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
             reason=safety_decision.reason,
         )
         if safety_decision.overridden:
+            runtime_safety_hold_streak += 1
             policy.cancel_active_goal()
             safety_context = (
                 f"SAFETY_STOP previous_desired={step_result.action_name}; "
@@ -1515,7 +1617,14 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
                     float(config.obstacle_stop_distance_m),
                 )
                 last_safety_log_signature = safety_signature
+            if runtime_safety_hold_streak >= 2:
+                stuck_detector.trigger_recovery(
+                    now_sec=sim_time_sec,
+                    reason="repeated_safety_hold",
+                )
+                runtime_safety_hold_streak = 0
         else:
+            runtime_safety_hold_streak = 0
             last_safety_log_signature = None
         if safety_decision.action_name == "TRACK_TARGET":
             last_applied_wheel_velocity, last_applied_steering_angle = drive_controller.track_local_target(
@@ -1919,8 +2028,6 @@ def _select_target_observation(
 ) -> TargetObservation:
     if bool(grounding_observation.visible) and bool(getattr(grounding_observation, "can_confirm", False)):
         return grounding_observation
-    if bool(tracker_observation.visible):
-        return tracker_observation
     if _is_transient_grounding_observation(grounding_observation):
         return tracker_observation if bool(tracker_observation.visible) else grounding_observation
     return grounding_observation
@@ -2572,7 +2679,7 @@ def _save_global_occupancy_debug(
     sub[sampled_occupied] = 0
     canvas[map_y0 : map_y0 + map_px, map_x0 : map_x0 + map_px, :] = sub
 
-    image = Image.fromarray(canvas, mode="RGB")
+    image = Image.fromarray(canvas)
     draw = ImageDraw.Draw(image)
     font_title = _debug_font(22)
     font_label = _debug_font(15)
@@ -2950,6 +3057,44 @@ def _build_semantic_map_summary(
     if action_history:
         lines.append(action_history)
     return "\n".join(lines)
+
+
+def _lidar_sector_depths(
+    *,
+    beam_endpoints_local_xy: np.ndarray,
+    beam_hit_mask: np.ndarray,
+    sensor_origin_local_xy,
+) -> dict[str, float]:
+    endpoints = np.asarray(beam_endpoints_local_xy, dtype=np.float32)
+    hits = np.asarray(beam_hit_mask, dtype=bool).reshape(-1)
+    if endpoints.ndim != 2 or endpoints.shape[0] != hits.shape[0] or endpoints.shape[1] < 2:
+        return {
+            "front_depth_m": float("inf"),
+            "left_depth_m": float("inf"),
+            "right_depth_m": float("inf"),
+        }
+    origin = np.asarray(
+        [0.0, 0.0] if sensor_origin_local_xy is None else sensor_origin_local_xy,
+        dtype=np.float32,
+    ).reshape(-1)
+    origin_xy = np.zeros((2,), dtype=np.float32)
+    origin_xy[: min(2, origin.size)] = origin[: min(2, origin.size)]
+    relative = endpoints[:, :2] - origin_xy[None, :]
+    ranges = np.linalg.norm(relative, axis=1)
+    angles_deg = np.degrees(np.arctan2(relative[:, 1], relative[:, 0]))
+    valid = hits & np.isfinite(ranges) & (ranges > 0.05)
+
+    def sector_depth(low_deg: float, high_deg: float) -> float:
+        sector = ranges[valid & (angles_deg >= low_deg) & (angles_deg <= high_deg)]
+        if sector.size == 0:
+            return float("inf")
+        return float(np.percentile(sector, 15.0))
+
+    return {
+        "front_depth_m": sector_depth(-22.5, 22.5),
+        "left_depth_m": sector_depth(22.5, 90.0),
+        "right_depth_m": sector_depth(-90.0, -22.5),
+    }
 
 
 if __name__ == "__main__":

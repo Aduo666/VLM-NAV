@@ -232,7 +232,11 @@ class LandmarkTracker:
 
             # Only high-confidence fresh current-frame from confirmable source enters confirmed pipeline
             high_conf = float(observation.confidence) >= float(self._config.confirm_confidence_threshold)
-            can_confirm = bool(getattr(observation, "can_confirm", False))
+            semantic_source = str(getattr(observation, "semantic_source", "")).strip().lower()
+            can_confirm = bool(
+                getattr(observation, "can_confirm", False)
+                and semantic_source.startswith("grounding_dino")
+            )
             has_world = observation.estimated_world_xy is not None
 
             if current_fresh and has_world and high_conf and can_confirm:
@@ -241,20 +245,7 @@ class LandmarkTracker:
                     state=state,
                     observation=observation,
                 )
-            elif current_fresh and not has_world and high_conf and can_confirm and bool(getattr(observation, "vlm_verified", False)):
-                # VLM-confirmed without depth: mark as confirmed with bearing only, no arrival
-                state.evidence_level = "confirmed"
-                state.visible_count += 1
-                state.lost_count = 0
-                state.confirmed_observation_count += 1
-                self._logger.info(
-                    "[LandmarkNoDepthConfirm] target=%s source=%s bearing=%.1f conf=%.2f evidence=confirmed_no_world",
-                    label,
-                    getattr(observation, "semantic_source", "unknown"),
-                    float(np.degrees(float(observation.bearing_rad))) if observation.bearing_rad is not None else 0,
-                    float(observation.confidence),
-                )
-            elif current_fresh and has_world:
+            elif current_fresh and has_world and semantic_source != "opencv_tracker":
                 reasons = []
                 if not high_conf:
                     reasons.append("low_confidence")
@@ -301,12 +292,20 @@ class LandmarkTracker:
             robot_pose=robot_pose,
             anchor_world_xy=state.estimated_world_xy,
         )
-        state.reached, state.reach_reason, state.reached_count, state.reach_window_hits, state.reach_window_size, state.recent_reach_history = self._update_reach_state(
+        was_reached = bool(state.reached)
+        reach_result = self._update_reach_state(
             label=label,
             state=state,
             observation=observation,
             arrival_distance_m=arrival_distance_m,
+            timestamp_sec=float(timestamp_sec),
         )
+        state.reached = bool(was_reached or reach_result[0])
+        state.reach_reason = state.reach_reason if was_reached else reach_result[1]
+        state.reached_count = max(int(state.reached_count), int(reach_result[2]))
+        state.reach_window_hits = int(reach_result[3])
+        state.reach_window_size = int(reach_result[4])
+        state.recent_reach_history = list(reach_result[5])
         if state.reached:
             state.status = "reached"
 
@@ -390,6 +389,22 @@ class LandmarkTracker:
                 last_depth_m=observation.depth_m,
             )
             self._pending_confirmed[label] = pending
+            if required <= 1:
+                state.estimated_world_xy = [float(candidate[0]), float(candidate[1])]
+                state.confirmed_observation_count = 1
+                state.confirmed_confidence = float(observation.confidence)
+                state.last_confirmed_depth_m = observation.depth_m
+                state.evidence_level = "confirmed"
+                state.confidence = float(observation.confidence)
+                self._pending_confirmed.pop(label, None)
+                self._logger.info(
+                    "[LandmarkConfirmed] target=%s anchor=%s obs=1 confidence=%.2f depth=%.2f",
+                    label,
+                    _format_xy(state.estimated_world_xy),
+                    float(state.confirmed_confidence),
+                    float(observation.depth_m) if observation.depth_m is not None else 0.0,
+                )
+                return
             self._logger.info(
                 "[LandmarkConfirm] target=%s candidate=%s confirm_wait=1/%s",
                 label, _format_xy(candidate.tolist()), int(required),
@@ -552,6 +567,7 @@ class LandmarkTracker:
         state: LandmarkState,
         observation: TargetObservation,
         arrival_distance_m: float | None,
+        timestamp_sec: float,
     ) -> tuple[bool, str, int, int, int, list[int]]:
         if state.behavior_type != "go_to":
             return False, f"behavior_not_implemented:{state.behavior_type}", 0, 0, 0, []
@@ -583,8 +599,12 @@ class LandmarkTracker:
                 return False, f"{base_reason}; waiting_fresh_confirmation", hits, hits, int(window_size), [int(item) for item in reach_window]
             return False, "not_reached", 0, 0, int(window_size), []
 
+        semantic_arrival_observation = str(
+            getattr(observation, "semantic_source", "")
+        ).strip().lower().startswith("grounding_dino")
         visible_depth_reached = (
             bool(observation.visible)
+            and semantic_arrival_observation
             and str(observation.reason).strip().lower() == "ok"
             and "reused" not in str(observation.source).strip().lower()
             and int(state.visible_count) >= min_visible
@@ -598,11 +618,11 @@ class LandmarkTracker:
             and float(state.anchor_distance_m) <= anchor_threshold_m
             and state.can_complete
             and state.last_seen_time_sec is not None
-            and float(observation.timestamp_sec) - float(state.last_seen_time_sec) <= max(0.0, float(self._config.arrival_recent_visible_sec))
+            and float(timestamp_sec) - float(state.last_seen_time_sec) <= max(0.0, float(self._config.arrival_recent_visible_sec))
         )
         recent_visible_age = None
         if state.last_seen_time_sec is not None:
-            recent_visible_age = float(observation.timestamp_sec) - float(state.last_seen_time_sec)
+            recent_visible_age = max(0.0, float(timestamp_sec) - float(state.last_seen_time_sec))
 
         evidence = bool(visible_depth_reached or anchor_reached)
         reach_window.append(bool(evidence))

@@ -19,8 +19,9 @@ VLM-NAV connects natural-language instructions, RGB-D perception, LiDAR mapping,
 
 - **Isaac Sim 5.1 pip runtime**: scene USD loading, custom robot USD, cameras, LiDAR, viewport setup.
 - **Custom 4-wheel-steering control**: FORWARD / TURN_LEFT / TURN_RIGHT atomic primitives with odometry-based completion.
-- **Semantic grounding + memory**: GroundingDINO and VLM verification maintain landmark observations and map anchors.
-- **Map-aware VLM decision**: the VLM receives a clean first-person candidate image, structured map text, route context, and an explicit candidate action table.
+- **Semantic grounding + memory**: mandatory local GroundingDINO proposals plus VLM verification maintain confirmed landmark anchors; reached anchors remain persistent.
+- **Aligned action representation**: the VLM chooses exactly one of three candidate outcomes that map one-to-one to TURN_LEFT / FORWARD / TURN_RIGHT.
+- **Search / approach separation**: VLM exploration is used while a landmark is unknown; fresh verified image evidence directly centers/approaches the target, while a confirmed off-screen anchor is followed through occupancy-grid A*.
 - **Fast primitive execution**: during an atomic action, expensive decision-time perception is skipped; odometry, depth safety, drive control, and LiDAR/map updates remain active.
 - **Local and evaluation flows**: normal debugging uses `debug/local` and `logs/nav_latest.log`; dataset evaluation uses `debug/eval` plus eval outputs.
 
@@ -66,7 +67,7 @@ The default model and API endpoint are configured in `configs/default.yaml`.
 
 ### 4. Install Local GroundingDINO
 
-Grounding is part of the current main navigation method. GroundingDINO provides the local open-vocabulary detections used by landmark memory, semantic map updates, and arrival checks. VLM bbox fallback can help when the detector misses, but it is not the intended primary grounding path.
+GroundingDINO is required by the current main navigation method. It proposes open-vocabulary boxes; the VLM verifies each proposal before it may create a confirmed landmark anchor. The navigation path no longer falls back to VLM-generated boxes.
 
 ```bash
 conda activate vlmnav
@@ -83,6 +84,7 @@ Required model files:
 - `third_party/GroundingDINO/`
 - `weights/grounded_sam/GroundingDINO_SwinT_OGC.py`
 - `weights/grounded_sam/groundingdino_swint_ogc.pth`
+- `weights/grounded_sam/bert-base-uncased/config.json` and the accompanying local BERT snapshot
 
 `scripts/setup_grounded_sam_local.sh` prints symlink commands if you already have the CA-Nav weights locally.
 
@@ -150,17 +152,18 @@ Each dataset has an adapter under `eval/<dataset>/adapter.py` that normalizes da
 
 ```text
 language instruction
-  -> instruction parsing
+  -> ordered route steps + landmark relations
   -> RGB-D + LiDAR + odometry observation
-  -> target grounding and landmark memory
+  -> GroundingDINO proposal + VLM semantic verification
+  -> confirmed/reached landmark memory
   -> structured map / route / obstacle summary
-  -> occupancy-aware candidate generation
-  -> VLM local decision
-  -> discrete action primitive
+  -> SEARCH: three occupancy-checked primitive outcomes -> VLM candidate id
+  -> VISIBLE TARGET: verified bbox bearing -> deterministic centering/forward primitive
+  -> LOST TARGET: confirmed anchor -> occupancy A* -> deterministic primitive
   -> low-level 4WS controller
 ```
 
-During primitive execution, the loop does not request new VLM decisions or run heavy grounding. It continues only the work needed for safe physical execution and map maintenance.
+During primitive execution, the loop does not request new VLM decisions or run heavy grounding. It continues odometry completion, LiDAR hit/miss mapping, hard safety checks, and low-level control. A fresh grounding keyframe is requested only after the primitive stops.
 
 The VLM input is intentionally split by role:
 
@@ -185,14 +188,25 @@ control:
 
 target_grounding:
   enabled: true
-  backend: "auto"
+  backend: "grounding_dino"
+  grounding_dino_text_encoder_path: "weights/grounded_sam/bert-base-uncased"
   semantic_verification_enabled: true
   semantic_verification_min_confidence: 0.50
 
+landmark_tracker:
+  confirm_min_observations: 2
+  confirm_max_anchor_jump_m: 0.75
+
 opennav:
-  candidate_slot_bearings_deg: [35, 18, 0, -18, -35]
+  visual_target_center_deadband_deg: 15.0
   arrival_distance_m: 2.0
   success_distance_m: 3.0
+
+occupancy_grid:
+  unknown_is_traversable: false
+
+map_candidates:
+  max_candidates: 3
 ```
 
 Tasks are stored in `configs/instructions.json`. Each task can specify scene path, robot start pose, instruction text, and task metadata.
@@ -204,11 +218,9 @@ debug/
   local/
     vln_debug.png
     llm_request.png
-    depth_debug.png
     videos/vln_debug_YYYYMMDD_HHMMSS.mp4
   eval/
     vln_debug.png
-    depth_debug.png
     videos/vln_debug_YYYYMMDD_HHMMSS.mp4
 
 logs/
@@ -227,9 +239,9 @@ If GitHub does not render the MP4 inline, open `docs/assets/firstsuccess.mp4` di
 ## Known Limitations
 
 - VLM API latency is still the dominant delay between atomic primitives.
-- GroundingDINO can produce false positives for visually ambiguous objects such as stairs, shadows, and furniture edges.
-- Detections without usable depth cannot create reliable world anchors.
-- Candidate selection may still oscillate between adjacent left/right actions in tight layouts.
+- GroundingDINO proposals can still be ambiguous; VLM verification reduces but cannot eliminate false positives.
+- Detections without usable depth can guide image-space centering, but cannot create a world anchor or complete a landmark.
+- Search decisions still depend on VLM quality, while confirmed-target approach is deterministic.
 - The system is a research prototype, not a benchmark-final VLN agent.
 
 ## Research Context

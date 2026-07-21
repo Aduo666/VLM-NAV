@@ -36,6 +36,9 @@ class ObservationAdapter:
         self._camera_height = int(camera_height)
         self._horizontal_fov_deg = float(horizontal_fov_deg)
 
+    def set_horizontal_fov_deg(self, value: float) -> None:
+        self._horizontal_fov_deg = float(value)
+
     def adapt(
         self,
         *,

@@ -11,6 +11,8 @@ class RouteStep:
     landmark: str
     directive: str
     behavior_type: str = "go_to"
+    reference_landmark: str = ""
+    relation_direction: str = "none"
 
 
 @dataclass
@@ -79,7 +81,8 @@ class InstructionManager:
             '  "actions": ["ordered clause 1", "ordered clause 2"],\n'
             '  "directional_clauses": ["clauses that contain left/right/forward/back/through/past/toward"],\n'
             '  "route_steps": [\n'
-            '    {"landmark": "wheelchair", "directive": "go forward to the wheelchair", "behavior_type": "go_to"}\n'
+            '    {"landmark": "wheelchair", "directive": "go forward to the wheelchair", "behavior_type": "go_to", '
+            '"reference_landmark": "", "relation_direction": "forward"}\n'
             "  ]\n"
             "}\n"
             "Rules:\n"
@@ -89,6 +92,8 @@ class InstructionManager:
             "4. If unsure, prefer behavior_type=go_to.\n"
             "5. Do not invent extra landmarks that are absent from the instruction.\n"
             "6. Keep the original directional meaning inside directive.\n"
+            "7. relation_direction must be one of none, left, right, forward, left_then_forward, right_then_forward, through, past.\n"
+            "8. reference_landmark is the previously reached landmark that the relation is relative to, or an empty string.\n"
         )
         result = self._llm.chat(
             request_name="instruction_preparse",
@@ -241,6 +246,7 @@ def _heuristic_route_steps(*, actions: list[str], landmarks: list[str], normaliz
         return [RouteStep(landmark=normalized, directive=normalized, behavior_type="go_to")]
     steps: list[RouteStep] = []
     remaining_landmarks = [lm for lm in landmarks if _is_valid_landmark(lm)]
+    previous_landmark = ""
     for clause in actions:
         clause_lower = clause.lower()
         clause_landmark = ""
@@ -262,11 +268,23 @@ def _heuristic_route_steps(*, actions: list[str], landmarks: list[str], normaliz
                     landmark=clause_landmark,
                     directive=str(clause).strip(),
                     behavior_type=behavior,
+                    reference_landmark=previous_landmark,
+                    relation_direction=_infer_relation_direction(str(clause)),
                 )
             )
+            previous_landmark = clause_landmark
     for landmark in remaining_landmarks:
         if _is_valid_landmark(landmark):
-            steps.append(RouteStep(landmark=landmark, directive=f"go to the {landmark}", behavior_type="go_to"))
+            steps.append(
+                RouteStep(
+                    landmark=landmark,
+                    directive=f"go to the {landmark}",
+                    behavior_type="go_to",
+                    reference_landmark=previous_landmark,
+                    relation_direction="none",
+                )
+            )
+            previous_landmark = landmark
     if not steps and normalized:
         steps.append(RouteStep(landmark=normalized, directive=normalized, behavior_type="go_to"))
     return steps
@@ -279,6 +297,28 @@ def _infer_behavior_type(clause: str) -> str:
     if re.search(r"\b(turn at|at the)\b", lowered) and re.search(r"\bturn\b", lowered):
         return "turn_at"
     return "go_to"
+
+
+def _infer_relation_direction(clause: str) -> str:
+    lowered = str(clause).strip().lower()
+    has_left = bool(re.search(r"\b(left|turn left)\b|左", lowered))
+    has_right = bool(re.search(r"\b(right|turn right)\b|右", lowered))
+    has_forward = bool(re.search(r"\b(forward|straight|ahead|continue)\b|前|直", lowered))
+    if has_left and has_forward:
+        return "left_then_forward"
+    if has_right and has_forward:
+        return "right_then_forward"
+    if has_left:
+        return "left"
+    if has_right:
+        return "right"
+    if re.search(r"\b(through|go through)\b|穿过|通过", lowered):
+        return "through"
+    if re.search(r"\b(pass|past|go past)\b|经过|绕过", lowered):
+        return "past"
+    if has_forward:
+        return "forward"
+    return "none"
 
 
 def _normalize_text_list(value) -> list[str]:
@@ -302,12 +342,15 @@ def _normalize_route_steps(value) -> tuple[list[RouteStep], list[str]]:
         return [], []
     steps: list[RouteStep] = []
     extracted_directionals: list[str] = []
+    previous_landmark = ""
     for item in value:
         if not isinstance(item, dict):
             continue
         landmark = str(item.get("landmark", "")).strip().lower()
         directive = str(item.get("directive", "")).strip()
         behavior_type = str(item.get("behavior_type", "go_to")).strip().lower() or "go_to"
+        reference_landmark = str(item.get("reference_landmark", "")).strip().lower()
+        relation_direction = str(item.get("relation_direction", "")).strip().lower()
         if behavior_type not in {"go_to", "pass", "turn_at", "go_through"}:
             behavior_type = "go_to"
         if not landmark and not directive:
@@ -324,7 +367,24 @@ def _normalize_route_steps(value) -> tuple[list[RouteStep], list[str]]:
         # skip steps with invalid landmarks
         if not _is_valid_landmark(landmark):
             continue
-        steps.append(RouteStep(landmark=landmark, directive=directive, behavior_type=behavior_type))
+        if not reference_landmark:
+            reference_landmark = previous_landmark
+        allowed_relations = {
+            "none", "left", "right", "forward", "left_then_forward",
+            "right_then_forward", "through", "past",
+        }
+        if relation_direction not in allowed_relations:
+            relation_direction = _infer_relation_direction(directive)
+        steps.append(
+            RouteStep(
+                landmark=landmark,
+                directive=directive,
+                behavior_type=behavior_type,
+                reference_landmark=reference_landmark,
+                relation_direction=relation_direction or "none",
+            )
+        )
+        previous_landmark = landmark
     return steps, extracted_directionals
 
 

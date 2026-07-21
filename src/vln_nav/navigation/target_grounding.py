@@ -42,7 +42,7 @@ class TargetObservation:
     result_age_sec: float = 0.0
     is_current_frame: bool = True
     evidence_level: str = "none"  # none / potential / confirmed_candidate
-    semantic_source: str = "unknown"  # grounding_dino / qwen_vl_bbox
+    semantic_source: str = "unknown"
     can_confirm: bool = False
     vlm_verified: bool = False
     vlm_verification_confidence: float = 0.0
@@ -89,7 +89,6 @@ class TargetGroundingConfig:
     max_result_age_sec: float = 30.0
     max_result_pose_delta_m: float = 0.05
     max_result_yaw_delta_deg: float = 3.0
-    qwen_fallback_confirm_allowed: bool = False
     semantic_verification_enabled: bool = True
     semantic_verification_min_confidence: float = 0.70
     semantic_verification_max_edge_px: int = 768
@@ -127,6 +126,11 @@ class TargetGrounder:
         self._config = config
         self._llm = llm_client
         self._logger = logger.getChild("target_grounding")
+        backend = str(config.backend).strip().lower()
+        if backend not in {"grounding_dino", "dino"}:
+            raise ValueError(
+                f"target grounding backend must be grounding_dino, got {config.backend!r}"
+            )
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="target_grounding")
         self._future: Future | None = None
         self._future_request: _GroundingRequest | None = None
@@ -138,7 +142,7 @@ class TargetGrounder:
         self._last_observation_log_wall_sec = -float("inf")
         self._grounding_dino = GroundingDinoDetector(
             config=GroundingDinoConfig(
-                enabled=str(config.backend).strip().lower() in {"auto", "grounding_dino", "dino"},
+                enabled=True,
                 repo_path=str(config.grounding_dino_repo_path),
                 config_path=str(config.grounding_dino_config_path),
                 checkpoint_path=str(config.grounding_dino_checkpoint_path),
@@ -159,7 +163,6 @@ class TargetGrounder:
             ),
             logger=logger,
         )
-        self._dino_fallback_logged = False
 
     def close(self) -> None:
         self._executor.shutdown(wait=False, cancel_futures=True)
@@ -428,33 +431,6 @@ class TargetGrounder:
         }
         return json.dumps(payload), "ok"
 
-    def _call_llm(self, request: _GroundingRequest) -> tuple[str, str]:
-        system_prompt = (
-            "You are a strict visual grounding module for a mobile robot. "
-            "Return only JSON. Do not include markdown."
-        )
-        user_prompt = (
-            f"Find the current navigation target: {request.target_label}.\n"
-            f"The uploaded image size is width={request.upload_size[0]}, height={request.upload_size[1]}.\n"
-            "Return exactly one JSON object using this schema:\n"
-            '{"visible": true, "label": "target label", "bbox": [xmin, ymin, xmax, ymax], "confidence": 0.0, "coordinate_mode": "upload_pixels"}\n'
-            "Preferred bbox coordinates are pixel coordinates in the uploaded image, format [xmin, ymin, xmax, ymax]. "
-            "If you internally use Qwen-style normalized coordinates, use 0-1000 coordinates and set coordinate_mode=normalized_1000. "
-            "A partially visible but identifiable target counts as visible. Use a tight bbox around the visible part. "
-            "If no identifiable part of the target is visible, return visible=false, bbox=null, confidence=0.0."
-        )
-        result = self._llm.chat(
-            request_name="target_grounding",
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            image_png_bytes=request.image_png_bytes,
-            max_tokens=160,
-            temperature=0.0,
-        )
-        if result.used_fallback or not result.content:
-            return "", result.reason or "llm_failed"
-        return result.content, "ok"
-
     def _build_request(
         self,
         *,
@@ -565,7 +541,7 @@ class TargetGrounder:
                 timestamp_sec=request.timestamp_sec,
                 reason="bbox_out_of_range",
             )
-        source_prefix = str(payload.get("source", "qwen_vl_bbox")).strip() or "qwen_vl_bbox"
+        source_prefix = str(payload.get("source", "grounding_dino")).strip() or "grounding_dino"
         self._logger.debug(
             "[GroundingBbox] target=%s raw_bbox=%s mapped_bbox=%s image_size=%s upload_image_size=%s coord=%s source=%s",
             request.target_label,
@@ -665,10 +641,7 @@ class TargetGrounder:
         bearing_rad = float(np.arctan(((float(center_uv[0]) - cx_px) / max(cx_px, 1.0)) * np.tan(half_fov_rad)))
 
         semantic_source = source_prefix.split(":", 1)[0]
-        is_dino = semantic_source.startswith("grounding_dino")
-        can_confirm = True
-        if not is_dino and not bool(self._config.qwen_fallback_confirm_allowed):
-            can_confirm = False
+        can_confirm = semantic_source.startswith("grounding_dino")
         vlm_verified = False
         vlm_verification_confidence = 0.0
         vlm_verification_reason = "not_run"
@@ -788,7 +761,7 @@ class TargetGrounder:
             max_tokens=96,
             temperature=0.0,
         )
-        if result.used_fallback or not result.content:
+        if result.failed or not result.content:
             return False, 0.0, result.reason or "verification_llm_failed"
         try:
             payload = _parse_json_object(result.content)
@@ -821,7 +794,7 @@ def _empty_observation(target_label: str, timestamp_sec: float, reason: str) -> 
         estimated_world_xy=None,
         depth_valid_ratio=0.0,
         area_ratio=0.0,
-        source="qwen_vl_bbox",
+        source="grounding_dino",
         reason=str(reason),
         timestamp_sec=float(timestamp_sec),
         mask_area_ratio=0.0,

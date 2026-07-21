@@ -20,7 +20,9 @@ VLM-NAV connects natural-language instructions, RGB-D perception, LiDAR mapping,
 - **Isaac Sim 5.1 pip runtime**: scene USD loading, custom robot USD, cameras, LiDAR, viewport setup.
 - **Custom 4-wheel-steering control**: FORWARD / TURN_LEFT / TURN_RIGHT atomic primitives with odometry-based completion.
 - **Semantic grounding + memory**: mandatory local GroundingDINO proposals plus VLM verification maintain confirmed landmark anchors; reached anchors remain persistent.
-- **Aligned action representation**: the VLM chooses exactly one of three candidate outcomes that map one-to-one to TURN_LEFT / FORWARD / TURN_RIGHT.
+- **Typed instruction graph**: one startup parse separates trusted scene context from executable `GO_TO`, `REGION_TRANSITION`, and `TURN` steps; validated plans are cached by instruction and schema version.
+- **Aligned action representation**: at stopped decision keyframes, the VLM chooses exactly one safe candidate outcome that maps one-to-one to TURN_LEFT / FORWARD / TURN_RIGHT.
+- **Region-aware execution**: room transitions require consistent visual region evidence, odometry displacement, and a topology-node change rather than keyword matching alone.
 - **Search / approach separation**: VLM exploration is used while a landmark is unknown; fresh verified image evidence directly centers/approaches the target, while a confirmed off-screen anchor is followed through occupancy-grid A*.
 - **Fast primitive execution**: during an atomic action, expensive decision-time perception is skipped; odometry, depth safety, drive control, and LiDAR/map updates remain active.
 - **Local and evaluation flows**: normal debugging uses `debug/local` and `logs/nav_latest.log`; dataset evaluation uses `debug/eval` plus eval outputs.
@@ -151,25 +153,30 @@ Each dataset has an adapter under `eval/<dataset>/adapter.py` that normalizes da
 ## Current Pipeline
 
 ```text
-language instruction
-  -> ordered route steps + landmark relations
+English language instruction
+  -> one validated typed semantic graph (cached)
+       scene context: localization evidence only
+       route steps: GO_TO / REGION_TRANSITION / TURN
   -> RGB-D + LiDAR + odometry observation
-  -> GroundingDINO proposal + VLM semantic verification
-  -> confirmed/reached landmark memory
-  -> structured map / route / obstacle summary
-  -> SEARCH: three occupancy-checked primitive outcomes -> VLM candidate id
-  -> VISIBLE TARGET: verified bbox bearing -> deterministic centering/forward primitive
-  -> LOST TARGET: confirmed anchor -> occupancy A* -> deterministic primitive
+  -> GO_TO: GroundingDINO proposal + VLM semantic verification
+       visible target -> deterministic centering/approach
+       confirmed off-screen anchor -> occupancy A*
+       unknown target -> one VLM candidate choice at a stopped keyframe
+  -> REGION_TRANSITION: candidate choice + region evidence
+       complete only after semantic + odometry + topology agreement
+  -> TURN: bounded repeated 15-degree primitives until heading alignment
   -> low-level 4WS controller
 ```
 
-During primitive execution, the loop does not request new VLM decisions or run heavy grounding. It continues odometry completion, LiDAR hit/miss mapping, hard safety checks, and low-level control. A fresh grounding keyframe is requested only after the primitive stops.
+During primitive execution, the loop does not request VLM decisions or run heavy grounding. It continues odometry completion, LiDAR hit/miss mapping, hard safety checks, and low-level control. A stopped decision keyframe permits at most one VLM request: semantic verification or candidate/region reasoning, never both.
 
 The VLM input is intentionally split by role:
 
-- A clean first-person candidate image for visual choice.
+- A first-person candidate image for visual choice.
 - Structured text for semantic map, landmark memory, obstacle distances, route context, and candidate action metadata.
 - No raw occupancy image is sent to the VLM by default; occupancy visualization is mainly for human debugging.
+
+Instruction parsing is fail-closed and runs before Isaac Sim starts. It uses a dedicated 90-second timeout, performs one parse request, deterministic schema validation, and at most one repair request. If neither produces a valid graph and no matching cache exists, navigation does not silently substitute a heuristic plan. Normal navigation requests continue using `llm.timeout_sec`.
 
 ## Key Configuration
 
@@ -198,6 +205,15 @@ landmark_tracker:
   confirm_max_anchor_jump_m: 0.75
 
 opennav:
+  instruction_parse_max_tokens: 768
+  instruction_parse_timeout_sec: 90
+  instruction_cache_enabled: true
+  instruction_cache_path: ".cache/instruction_plans.json"
+  region_transition_min_displacement_m: 1.0
+  region_transition_confirmations: 2
+  region_transition_min_confidence: 0.55
+  semantic_turn_min_yaw_deg: 45.0
+  semantic_turn_max_primitives: 6
   visual_target_center_deadband_deg: 15.0
   arrival_distance_m: 2.0
   success_distance_m: 3.0
@@ -224,9 +240,11 @@ debug/
     videos/vln_debug_YYYYMMDD_HHMMSS.mp4
 
 logs/
-  nav_latest.log
+  vln.log
   last_candidate_choice_request.json
 ```
+
+The console intentionally shows only navigation milestones: `[PLAN]`, `[NAV_STATE]`, `[LANDMARK_CONFIRMED]`, `[STEP_COMPLETE]`, `[SAFETY_HOLD]`, `[RECOVERY]`, `[ERROR]`, and `[ROUTE_COMPLETE]`. Full component logs are overwritten in `logs/vln.log` on each run. The human debug frame keeps its status bar outside the imagery: north-up global map on the left and uncropped first-person RGB on the right.
 
 ## Demo
 

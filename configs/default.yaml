@@ -19,8 +19,16 @@ llm:
   camera_image_detail: "high"
 
 opennav:
-  instruction_preparse_enabled: true
-  instruction_preparse_max_tokens: 384
+  instruction_parse_max_tokens: 768
+  instruction_parse_timeout_sec: 90
+  instruction_cache_enabled: true
+  instruction_cache_path: ".cache/instruction_plans.json"
+  region_transition_min_displacement_m: 1.0
+  region_transition_confirmations: 2
+  region_transition_min_confidence: 0.55
+  semantic_turn_min_yaw_deg: 45.0
+  semantic_turn_max_primitives: 6
+  semantic_turn_min_forward_clearance_m: 0.60
   visual_target_center_deadband_deg: 15.0
   candidate_slot_bearings_deg: [35.0, 18.0, 0.0, -18.0, -35.0]
   candidate_adaptive_enabled: true
@@ -42,13 +50,9 @@ opennav:
   progress_stall_distance_m: 0.08
   progress_spin_yaw_deg: 85.0
   policy_execution_steps: 24
-  turn_at_max_turns: 6
   arrival_distance_m: 2.0
   success_distance_m: 3.0
   landmark_arrival_confirmations: 2
-  recovery_enabled: true
-  recovery_trigger_stalled_steps: 3
-  recovery_execution_steps: 18
 
 target_grounding:
   enabled: true
@@ -119,10 +123,6 @@ landmark_tracker:
   confirm_min_observations: 2
   confirm_max_anchor_jump_m: 0.75
   confirm_max_depth_jump_m: 3.0
-  turn_at_complete_requires_confirmed_anchor: true
-  turn_at_complete_max_distance_m: 3.0
-  reacquire_guard_enabled: true
-  reacquire_guard_recent_visible_sec: 20.0
 
 robot:
   usd_path: "src/ros2_car_model_ws/src/1557/urdf/1557_all/1557_all.usd"

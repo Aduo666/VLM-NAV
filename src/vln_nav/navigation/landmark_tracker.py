@@ -250,7 +250,7 @@ class LandmarkTracker:
                 if not high_conf:
                     reasons.append("low_confidence")
                 if not can_confirm:
-                    reasons.append("qwen_fallback_not_confirmable")
+                    reasons.append("semantic_source_not_confirmable")
                 if reasons:
                     self._logger.info(
                         "[LandmarkConfirmReject] target=%s reason=%s confidence=%.2f can_confirm=%s source=%s",

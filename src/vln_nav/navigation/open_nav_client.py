@@ -16,7 +16,7 @@ from PIL import Image
 @dataclass
 class ChatResult:
     content: str
-    used_fallback: bool
+    failed: bool
     reason: str
 
 
@@ -62,7 +62,7 @@ class OpenNavLLMClient:
         temperature: float = 0.2,
     ) -> ChatResult:
         if not self.available:
-            return ChatResult(content="", used_fallback=True, reason="llm_unavailable")
+            return ChatResult(content="", failed=True, reason="llm_unavailable")
 
         now = time.monotonic()
         if now < self._cooldown_until:
@@ -73,7 +73,7 @@ class OpenNavLLMClient:
                 remaining,
                 self._consecutive_failures,
             )
-            return ChatResult(content="", used_fallback=True, reason="llm_cooldown")
+            return ChatResult(content="", failed=True, reason="llm_cooldown")
 
         self._logger.info(
             "[LLM] request name=%s timeout_sec=%s image=%s prompt_chars=%s max_tokens=%s",
@@ -132,11 +132,11 @@ class OpenNavLLMClient:
             body = exc.read().decode("utf-8", errors="replace")
             self._register_failure()
             self._logger.warning("Open-Nav LLM HTTP name=%s code=%s: %s", request_name, exc.code, body)
-            return ChatResult(content="", used_fallback=True, reason="llm_http_error")
+            return ChatResult(content="", failed=True, reason="llm_http_error")
         except Exception as exc:  # pragma: no cover - runtime/network dependent
             self._register_failure()
             self._logger.warning("Open-Nav LLM request failed name=%s: %s", request_name, exc)
-            return ChatResult(content="", used_fallback=True, reason="llm_request_failed")
+            return ChatResult(content="", failed=True, reason="llm_request_failed")
 
         try:
             response_json = json.loads(raw_body)
@@ -144,7 +144,7 @@ class OpenNavLLMClient:
         except Exception as exc:
             self._register_failure()
             self._logger.warning("Open-Nav LLM response parse failed name=%s: %s", request_name, exc)
-            return ChatResult(content="", used_fallback=True, reason="llm_parse_failed")
+            return ChatResult(content="", failed=True, reason="llm_parse_failed")
 
         latency_ms = (time.monotonic() - request_started) * 1000.0
         self._cooldown_until = 0.0
@@ -156,7 +156,7 @@ class OpenNavLLMClient:
             int(image_png_bytes is not None),
             int(max_tokens),
         )
-        return ChatResult(content=content, used_fallback=False, reason="ok")
+        return ChatResult(content=content, failed=False, reason="ok")
 
     def _register_failure(self) -> None:
         self._consecutive_failures += 1

@@ -122,7 +122,7 @@ def main() -> int:
     print(
         json.dumps(
             {
-                "used_fallback": bool(result.used_fallback),
+                "failed": bool(result.failed),
                 "reason": result.reason,
                 "model_name": config.model_name,
                 "api_base_url": config.api_base_url,
@@ -134,7 +134,7 @@ def main() -> int:
         )
     )
 
-    return 0 if not result.used_fallback else 1
+    return 0 if not result.failed else 1
 
 
 def _load_replay_request(*, args: argparse.Namespace, logger) -> dict[str, object]:

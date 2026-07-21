@@ -30,10 +30,9 @@ class MapCandidateGeneratorConfig:
 class MapCandidateGenerator:
     """Generate map-aware candidates while preserving WaypointCandidate output.
 
-    The old depth candidates are still accepted as fallback. This layer adds
-    candidates whose type is explicit: semantic_approach, frontier, or
-    escape_turn. The policy and reasoner can keep using candidate ids without
-    knowing about the internal map representation.
+    Depth-derived candidates provide geometric evidence for three executable
+    primitive outcomes. The policy and reasoner consume the same candidate
+    contract without depending on the internal map representation.
     """
 
     def __init__(self, *, config: MapCandidateGeneratorConfig, logger) -> None:

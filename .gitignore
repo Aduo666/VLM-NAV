@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 logs/
 debug/
+.cache/
 weights/
 .codex
 third_party/

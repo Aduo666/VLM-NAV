@@ -7,7 +7,7 @@ import tempfile
 from dataclasses import dataclass
 
 from .candidate_waypoint_predictor import CandidateSet, WaypointCandidate
-from .instruction_manager import InstructionContext
+from .instruction_manager import InstructionContext, RouteStep
 from .open_nav_client import OpenNavLLMClient
 from .progress_manager import ProgressState
 from ..runtime.config import PROJECT_ROOT
@@ -22,11 +22,13 @@ class ReasonerDecision:
     selected_action: str | None
     thought: str
     progress_estimation: str
-    used_fallback: bool
     reason: str
     target_visible: bool | None = None
     target_bearing_hint: str = "unknown"
     target_status: str = ""
+    current_region_label: str = "unknown"
+    region_confidence: float = 0.0
+    region_changed: bool = False
 
 
 @dataclass
@@ -71,6 +73,7 @@ class OpenNavReasoner:
         reacquire_context_text: str = "",
         obstacle_summary_text: str = "",
         semantic_map_summary: str = "",
+        current_step: RouteStep | None = None,
     ) -> ReasonerDecision:
         valid_candidates = [candidate for candidate in candidate_set.candidates if candidate.valid]
         if not valid_candidates:
@@ -79,7 +82,6 @@ class OpenNavReasoner:
                 selected_action=None,
                 thought="No valid candidates are currently available.",
                 progress_estimation=f"progress_signal={progress_state.progress_signal}",
-                used_fallback=False,
                 reason="no_valid_candidates",
             )
 
@@ -93,7 +95,6 @@ class OpenNavReasoner:
                 selected_action=None,
                 thought="LLM is unavailable or candidate debug image is missing, so no decision was produced.",
                 progress_estimation=progress_estimation,
-                used_fallback=False,
                 reason="llm_unavailable",
             )
 
@@ -108,6 +109,7 @@ class OpenNavReasoner:
             reacquire_context_text=reacquire_context_text,
             obstacle_summary_text=obstacle_summary_text,
             semantic_map_summary=semantic_map_summary,
+            current_step=current_step,
         )
         _dump_candidate_choice_request(
             request_payload=request_payload,
@@ -121,13 +123,12 @@ class OpenNavReasoner:
             max_tokens=request_payload.max_tokens,
             temperature=request_payload.temperature,
         )
-        if result.used_fallback or not result.content:
+        if result.failed or not result.content:
             return ReasonerDecision(
                 selected_candidate_id=None,
                 selected_action=None,
                 thought=f"LLM did not return a usable candidate decision. reason={result.reason}",
                 progress_estimation=progress_estimation,
-                used_fallback=False,
                 reason=result.reason,
             )
 
@@ -135,13 +136,15 @@ class OpenNavReasoner:
             payload = _parse_json(result.content)
             selected_candidate_id = int(payload.get("selected_candidate_id"))
             thought = str(payload.get("reason", payload.get("thought", ""))).strip() or "No reason provided."
+            current_region_label = str(payload.get("current_region_label", "unknown")).strip().lower() or "unknown"
+            region_confidence = float(payload.get("region_confidence", 0.0))
+            region_changed = _parse_bool(payload.get("region_changed", False))
         except Exception:
             return ReasonerDecision(
                 selected_candidate_id=None,
                 selected_action=None,
                 thought="LLM returned non-JSON or malformed JSON for candidate selection.",
                 progress_estimation=progress_estimation,
-                used_fallback=False,
                 reason="invalid_llm_output",
             )
 
@@ -152,7 +155,6 @@ class OpenNavReasoner:
                 selected_action=None,
                 thought=f"LLM selected invalid candidate id={selected_candidate_id}. valid_ids={sorted(valid_ids)}",
                 progress_estimation=progress_estimation,
-                used_fallback=False,
                 reason="invalid_candidate_id",
             )
 
@@ -164,11 +166,13 @@ class OpenNavReasoner:
             selected_action=selected_action,
             thought=thought,
             progress_estimation=progress_estimation,
-            used_fallback=False,
             reason="ok",
             target_visible=None,
             target_bearing_hint="unknown",
             target_status="",
+            current_region_label=current_region_label,
+            region_confidence=max(0.0, min(1.0, region_confidence)),
+            region_changed=region_changed,
         )
 
     def build_candidate_choice_request(
@@ -184,6 +188,7 @@ class OpenNavReasoner:
         reacquire_context_text: str = "",
         obstacle_summary_text: str = "",
         semantic_map_summary: str = "",
+        current_step: RouteStep | None = None,
     ) -> CandidateChoiceRequest:
         prompt_progress_estimation = progress_estimation
         if prompt_progress_estimation is None:
@@ -192,9 +197,31 @@ class OpenNavReasoner:
                 progress_state=progress_state,
             )
         candidate_lines = "\n".join(_candidate_line(candidate) for candidate in candidate_set.candidates)
-        current_target = instruction_context.goal_phrase or (
-            instruction_context.landmarks[0] if instruction_context.landmarks else instruction_context.normalized_text
+        current_target = _step_subject(current_step) or "none"
+        current_step_text = _format_route_step(current_step)
+        context_region = (
+            "unknown"
+            if instruction_context.scene_context.current_region is None
+            else instruction_context.scene_context.current_region.canonical_label
         )
+        context_objects = [
+            item.canonical_label for item in instruction_context.scene_context.context_objects
+        ]
+        region_output_rules = ""
+        output_contract = "{reason, selected_candidate_id}"
+        if current_step is not None and current_step.step_type == "REGION_TRANSITION":
+            output_contract = (
+                "{reason, selected_candidate_id, current_region_label, "
+                "region_confidence, region_changed}"
+            )
+            region_output_rules = (
+                "\nREGION TRANSITION EVIDENCE:\n"
+                "- Classify the robot's CURRENT region from visible architectural and semantic cues.\n"
+                "- region_changed is true only when the image supports that the robot has crossed out of the stated start region.\n"
+                "- For a named destination region, region_changed requires current_region_label to match it.\n"
+                "- Do not claim a transition merely because a doorway is visible; the robot must be on the other side.\n"
+                "- region_confidence is a number in [0,1].\n"
+            )
         system_prompt = (
             "You are the high-level local VLN decision module for a wheeled robot.\n"
             "Inputs are: (a) one clean first-person camera image with numbered candidate markers, "
@@ -214,11 +241,17 @@ class OpenNavReasoner:
             "5. Avoid repeating a turn direction after recently losing a visible target unless the current image clearly shows the target there.\n"
             "6. Route turns are one-time relations. If route context says a relation turn was consumed, do not repeat it merely because words such as left/right remain in the instruction.\n"
             "7. Treat repetition_penalty=1.0 as a strong reason not to repeat that turn unless current visual evidence requires it.\n"
-            "8. Output valid JSON only, no markdown."
+            "8. Scene context objects are localization evidence, never goals unless the current typed step names them as a target.\n"
+            "9. Respect the current typed step and all global instruction constraints.\n"
+            f"{region_output_rules}"
+            "10. Output valid JSON only, no markdown."
         )
         valid_ids_text = ", ".join(str(candidate.slot_id) for candidate in candidate_set.candidates if candidate.valid)
         user_prompt = (
             f"Instruction: {instruction_context.normalized_text}\n"
+            f"Trusted start region: {context_region}\n"
+            f"Context objects (not targets): {context_objects or ['none']}\n"
+            f"Current typed step: {current_step_text}\n"
             f"Current target: {current_target}\n"
             f"\n"
             "Progress:\n"
@@ -246,7 +279,7 @@ class OpenNavReasoner:
             f"{candidate_lines}\n"
             f"Valid IDs: [{valid_ids_text}]\n"
             "\n"
-            "Output JSON: {reason, selected_candidate_id}\n"
+            f"Output JSON: {output_contract}\n"
             "selected_candidate_id: integer from Valid IDs\n"
             "reason: one short sentence explaining why this candidate is best"
         )
@@ -257,6 +290,40 @@ class OpenNavReasoner:
             max_tokens=256,
             temperature=0.2,
         )
+
+
+def _step_subject(step: RouteStep | None) -> str:
+    if step is None:
+        return ""
+    if step.step_type == "GO_TO":
+        return step.target
+    if step.step_type == "REGION_TRANSITION":
+        return step.to_region
+    if step.step_type == "TURN":
+        return f"turn {step.direction}"
+    return ""
+
+
+def _format_route_step(step: RouteStep | None) -> str:
+    if step is None:
+        return "none"
+    trigger = "none"
+    if step.trigger is not None:
+        trigger = f"{step.trigger.trigger_type}:{step.trigger.label or 'none'}"
+    return (
+        f"id={step.step_id}; type={step.step_type}; target={step.target or 'none'}; "
+        f"from_region={step.from_region or 'none'}; to_region={step.to_region or 'none'}; "
+        f"transition={step.transition or 'none'}; direction={step.direction}; "
+        f"trigger={trigger}; completion={step.completion}; constraints={list(step.constraints) or ['none']}"
+    )
+
+
+def _parse_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().lower() in {"1", "true", "yes"}
 
 
 def _candidate_line(candidate: WaypointCandidate) -> str:

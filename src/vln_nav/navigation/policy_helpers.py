@@ -2,22 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import numpy as np
 
 from .candidate_waypoint_predictor import CandidateSet, WaypointCandidate
 from .instruction_manager import InstructionContext, RouteStep
-
-# TODO: resolve circular imports when OpenNavPolicyConfig and ReacquireGuardContext
-# are extracted. Currently they are imported at call sites.
-
-
-_INVALID_LANDMARKS: set[str] = {
-    "none", "null", "unknown", "n/a", "na", "target", "object", "thing",
-    "place", "location", "area", "destination", "goal", "",
-}
-
 
 def _find_candidate(candidate_set: CandidateSet, slot_id: int | None) -> WaypointCandidate | None:
     if slot_id is None:
@@ -28,132 +16,11 @@ def _find_candidate(candidate_set: CandidateSet, slot_id: int | None) -> Waypoin
     return None
 
 
-def _is_valid_landmark(label: str) -> bool:
-    text = str(label).strip().lower()
-    return bool(text) and text not in _INVALID_LANDMARKS and len(text) >= 2
-
-
 def _route_steps(instruction_context: InstructionContext) -> list[RouteStep]:
-    steps: list[RouteStep] = []
-    for route_step in getattr(instruction_context, "route_steps", []) or []:
-        landmark = str(getattr(route_step, "landmark", "")).strip().lower()
-        if not _is_valid_landmark(landmark):
-            continue
-        directive = str(getattr(route_step, "directive", "")).strip()
-        behavior_type = str(getattr(route_step, "behavior_type", "go_to")).strip().lower() or "go_to"
-        steps.append(
-            RouteStep(
-                landmark=landmark,
-                directive=directive,
-                behavior_type=behavior_type,
-                reference_landmark=str(getattr(route_step, "reference_landmark", "")).strip().lower(),
-                relation_direction=str(getattr(route_step, "relation_direction", "none")).strip().lower() or "none",
-            )
-        )
-    if steps:
-        return steps
-
-    fallback_steps: list[RouteStep] = []
-    for raw_landmark in instruction_context.landmarks:
-        landmark = str(raw_landmark).strip().lower()
-        if _is_valid_landmark(landmark):
-            fallback_steps.append(
-                RouteStep(
-                    landmark=landmark,
-                    directive=f"go to {landmark}",
-                    behavior_type="go_to",
-                )
-            )
-    if fallback_steps:
-        return fallback_steps
-
-    fallback = str(instruction_context.goal_phrase or instruction_context.normalized_text).strip().lower()
-    if _is_valid_landmark(fallback):
-        return [RouteStep(landmark=fallback, directive=f"go to {fallback}", behavior_type="go_to")]
-    return []
-
-
-def _ordered_landmarks_from_steps(
-    route_steps: list[RouteStep],
-    instruction_context: InstructionContext,
-) -> list[str]:
-    ordered: list[str] = []
-    for route_step in route_steps:
-        landmark = str(getattr(route_step, "landmark", "")).strip().lower()
-        if _is_valid_landmark(landmark) and landmark not in ordered:
-            ordered.append(landmark)
-    for raw_landmark in instruction_context.landmarks:
-        landmark = str(raw_landmark).strip().lower()
-        if _is_valid_landmark(landmark) and landmark not in ordered:
-            ordered.append(landmark)
-    if not ordered:
-        fallback = str(instruction_context.goal_phrase or instruction_context.normalized_text).strip()
-        if fallback and _is_valid_landmark(fallback):
-            ordered.append(fallback)
-    return ordered
-
-
-def _pass_action_sequence(directive: str) -> list[str]:
-    text = str(directive).strip().lower()
-    if "right" in text:
-        return ["TURN_RIGHT", "FORWARD", "TURN_LEFT", "FORWARD"]
-    if "left" in text:
-        return ["TURN_LEFT", "FORWARD", "TURN_RIGHT", "FORWARD"]
-    return ["FORWARD"]
-
-
-def _direction_tokens_from_text(text: str) -> list[str]:
-    lowered = str(text).strip().lower()
-    tokens: list[str] = []
-    checks = [
-        ("left", ("left", "左")),
-        ("right", ("right", "右")),
-        ("forward", ("forward", "straight", "ahead", "front", "前", "直")),
-        ("backward", ("back", "backward", "后", "退")),
-        ("through", ("through", "go through", "穿过", "通过")),
-        ("pass", ("pass", "around", "绕过", "经过")),
-    ]
-    for token, aliases in checks:
-        if any(alias in lowered for alias in aliases):
-            tokens.append(token)
-    return tokens
-
-
-def _is_fresh_grounded_observation(observation) -> bool:
-    return (
-        bool(getattr(observation, "visible", False))
-        and str(getattr(observation, "reason", "")).strip().lower() == "ok"
-        and "reused" not in str(getattr(observation, "source", "")).strip().lower()
-        and bool(getattr(observation, "is_current_frame", True))
-        and getattr(observation, "depth_m", None) is not None
-        and getattr(observation, "estimated_world_xy", None) is not None
-    )
-
-
-def _format_reacquire_prompt_context(guard) -> str:
-    if not bool(guard.target_recently_visible) and not bool(guard.lost_after_visible):
-        return "none"
-    if bool(guard.lost_after_visible):
-        return (
-            "LOST_AFTER_VISIBLE active. "
-            f"previous_semantic_visible={int(guard.previous_semantic_visible)}; "
-            f"previous_grounded_visible={int(guard.previous_grounded_visible)}; "
-            f"current_grounded_visible={int(guard.current_grounded_visible)}; "
-            f"last_action={guard.last_action}; "
-            f"last_seen_bearing={guard.last_seen_bearing}; "
-            f"Forbidden action this step: {guard.forbidden_action}. "
-            "Do not choose the forbidden action. If the target is still not visible in the current image, "
-            "prefer a candidate that stops repeating the previous turn direction; if the target is visible again "
-            "in the current image, choose based on that current visual evidence. If you still choose the forbidden "
-            "action while the target is not visible, the runtime may replace it with a non-repeating valid candidate."
-        )
-    return (
-        "target_recently_visible=1 but LOST_AFTER_VISIBLE inactive. "
-        f"previous_semantic_visible={int(guard.previous_semantic_visible)}; "
-        f"previous_grounded_visible={int(guard.previous_grounded_visible)}; "
-        f"current_grounded_visible={int(guard.current_grounded_visible)}; "
-        f"last_action={guard.last_action}; last_seen_bearing={guard.last_seen_bearing}."
-    )
+    steps = list(instruction_context.route_steps)
+    if not steps:
+        raise ValueError("validated instruction graph has no route steps")
+    return steps
 
 
 def _relative_xy_from_anchor(
@@ -207,16 +74,6 @@ def _local_waypoint_to_world_xy(*, robot_pose, waypoint_local_xy: list[float]) -
         dtype=np.float32,
     )
     return np.asarray([float(robot_pose.x), float(robot_pose.y)], dtype=np.float32) + delta_world
-
-
-def _memory_anchor_local_xy(*, candidate: WaypointCandidate, bearing_hint: str) -> list[float]:
-    distance_m = max(0.8, float(candidate.travel_distance_m))
-    hint = str(bearing_hint).strip().lower()
-    if hint == "left":
-        return [float(distance_m * 0.75), float(distance_m * 0.65)]
-    if hint == "right":
-        return [float(distance_m * 0.75), float(-distance_m * 0.65)]
-    return [float(distance_m), 0.0]
 
 
 def _world_waypoint_to_local_xy(*, robot_pose, world_goal_xy: list[float]) -> tuple[float, float]:
@@ -310,28 +167,6 @@ def _nearest_candidate_for_local_goal(
             0 if candidate.valid else 1,
         ),
     )
-
-
-def _has_non_forbidden_valid_candidate(
-    *,
-    candidate_set: CandidateSet,
-    forbidden_action: str,
-    config,  # OpenNavPolicyConfig
-) -> bool:
-    forbidden = str(forbidden_action).strip().upper()
-    if forbidden not in {"TURN_LEFT", "TURN_RIGHT", "FORWARD", "STOP"}:
-        return True
-    for candidate in candidate_set.candidates:
-        if not bool(candidate.valid):
-            continue
-        action_name, _ = _candidate_to_primitive_action(
-            candidate,
-            turn_speed_scale=float(config.turn_speed_scale),
-            forward_speed_scale=float(config.forward_speed_scale),
-        )
-        if str(action_name).strip().upper() != forbidden:
-            return True
-    return False
 
 
 def _primitive_speed_scale(action_name: str, config) -> float:  # OpenNavPolicyConfig

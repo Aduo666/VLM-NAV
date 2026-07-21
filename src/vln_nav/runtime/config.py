@@ -34,8 +34,16 @@ class AppConfig:
     llm_upload_max_edge_px: int = 512
     camera_image_detail: str = "low"
     instruction: str = ""
-    instruction_preparse_enabled: bool = True
-    instruction_preparse_max_tokens: int = 384
+    instruction_parse_max_tokens: int = 768
+    instruction_parse_timeout_sec: int = 90
+    instruction_cache_enabled: bool = True
+    instruction_cache_path: str = str(PROJECT_ROOT / ".cache" / "instruction_plans.json")
+    region_transition_min_displacement_m: float = 1.0
+    region_transition_confirmations: int = 2
+    region_transition_min_confidence: float = 0.55
+    semantic_turn_min_yaw_deg: float = 45.0
+    semantic_turn_max_primitives: int = 6
+    semantic_turn_min_forward_clearance_m: float = 0.60
     visual_target_center_deadband_deg: float = 15.0
     candidate_slot_bearings_deg: list[float] = field(default_factory=lambda: [75.0, 35.0, 0.0, -35.0, -75.0])
     candidate_adaptive_enabled: bool = True
@@ -57,13 +65,9 @@ class AppConfig:
     progress_stall_distance_m: float = 0.08
     progress_spin_yaw_deg: float = 85.0
     policy_execution_steps: int = 24
-    turn_at_max_turns: int = 6
     arrival_distance_m: float = 1.4
     success_distance_m: float = 2.0
     landmark_arrival_confirmations: int = 2
-    recovery_enabled: bool = True
-    recovery_trigger_stalled_steps: int = 3
-    recovery_execution_steps: int = 18
     target_grounding_enabled: bool = True
     target_grounding_backend: str = "grounding_dino"
     target_grounding_call_period_sec: float = 1.5
@@ -107,7 +111,6 @@ class AppConfig:
     target_grounding_max_result_age_sec: float = 30.0
     target_grounding_max_result_pose_delta_m: float = 0.05
     target_grounding_max_result_yaw_delta_deg: float = 3.0
-    target_grounding_qwen_fallback_confirm_allowed: bool = False
     target_grounding_semantic_verification_enabled: bool = True
     target_grounding_semantic_verification_min_confidence: float = 0.70
     target_grounding_semantic_verification_max_edge_px: int = 768
@@ -135,14 +138,10 @@ class AppConfig:
     landmark_tracker_confirm_min_observations: int = 3
     landmark_tracker_confirm_max_anchor_jump_m: float = 0.50
     landmark_tracker_confirm_max_depth_jump_m: float = 0.80
-    landmark_tracker_turn_at_complete_requires_confirmed_anchor: bool = True
-    landmark_tracker_turn_at_complete_max_distance_m: float = 3.0
     landmark_map_enabled: bool = True
     landmark_map_anchor_ttl_sec: float = 120.0
     landmark_map_min_confidence: float = 0.20
     landmark_map_log_period_sec: float = 2.0
-    reacquire_guard_enabled: bool = True
-    reacquire_guard_recent_visible_sec: float = 20.0
     depth_debug_enabled: bool = True
     depth_debug_image_path: str = "debug/depth_debug.png"
 
@@ -332,12 +331,25 @@ def setup_logging(level: str) -> logging.Logger:
     logger = logging.getLogger("vln")
     logger.setLevel(numeric_level)
     logger.propagate = False
+    if getattr(logger, "_vln_handlers_initialized", False):
+        for handler in logger.handlers:
+            handler.setLevel(numeric_level)
+        return logger
     logger.handlers.clear()
 
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(numeric_level)
     console_handler.setFormatter(formatter)
+    console_handler.addFilter(_NavigationConsoleFilter())
     logger.addHandler(console_handler)
+
+    log_path = PROJECT_ROOT / "logs" / "vln.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    file_handler = logging.FileHandler(log_path, mode="w", encoding="utf-8")
+    file_handler.setLevel(numeric_level)
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    logger._vln_handlers_initialized = True  # type: ignore[attr-defined]
 
     for noisy_logger in (
         "asyncio",
@@ -351,6 +363,29 @@ def setup_logging(level: str) -> logging.Logger:
     ):
         logging.getLogger(noisy_logger).setLevel(logging.WARNING)
     return logger
+
+
+class _NavigationConsoleFilter(logging.Filter):
+    _TAGS = (
+        "[PLAN]",
+        "[NAV_STATE]",
+        "[LANDMARK_CONFIRMED]",
+        "[STEP_COMPLETE]",
+        "[SAFETY_HOLD]",
+        "[RECOVERY]",
+        "[ERROR]",
+        "[ROUTE_COMPLETE]",
+    )
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        if any(tag in message for tag in self._TAGS):
+            return True
+        if record.levelno >= logging.ERROR:
+            record.msg = f"[ERROR] {message}"
+            record.args = ()
+            return True
+        return False
 
 
 def load_config(config_path: str | None = None) -> AppConfig:
@@ -407,13 +442,45 @@ def load_config(config_path: str | None = None) -> AppConfig:
             _section_value(llm, legacy_deepseek, "camera_image_detail", "low"),
         ),
         instruction=_env_or_value("INSTRUCTION", opennav.get("instruction", "")),
-        instruction_preparse_enabled=_bool_env_or_value(
-            "INSTRUCTION_PREPARSE_ENABLED",
-            opennav.get("instruction_preparse_enabled", True),
+        instruction_parse_max_tokens=_int_env_or_value(
+            "INSTRUCTION_PARSE_MAX_TOKENS",
+            opennav.get("instruction_parse_max_tokens", 768),
         ),
-        instruction_preparse_max_tokens=_int_env_or_value(
-            "INSTRUCTION_PREPARSE_MAX_TOKENS",
-            opennav.get("instruction_preparse_max_tokens", 384),
+        instruction_parse_timeout_sec=_int_env_or_value(
+            "INSTRUCTION_PARSE_TIMEOUT_SEC",
+            opennav.get("instruction_parse_timeout_sec", 90),
+        ),
+        instruction_cache_enabled=_bool_env_or_value(
+            "INSTRUCTION_CACHE_ENABLED",
+            opennav.get("instruction_cache_enabled", True),
+        ),
+        instruction_cache_path=_env_or_value(
+            "INSTRUCTION_CACHE_PATH",
+            opennav.get("instruction_cache_path", str(PROJECT_ROOT / ".cache" / "instruction_plans.json")),
+        ),
+        region_transition_min_displacement_m=_float_env_or_value(
+            "REGION_TRANSITION_MIN_DISPLACEMENT_M",
+            opennav.get("region_transition_min_displacement_m", 1.0),
+        ),
+        region_transition_confirmations=_int_env_or_value(
+            "REGION_TRANSITION_CONFIRMATIONS",
+            opennav.get("region_transition_confirmations", 2),
+        ),
+        region_transition_min_confidence=_float_env_or_value(
+            "REGION_TRANSITION_MIN_CONFIDENCE",
+            opennav.get("region_transition_min_confidence", 0.55),
+        ),
+        semantic_turn_min_yaw_deg=_float_env_or_value(
+            "SEMANTIC_TURN_MIN_YAW_DEG",
+            opennav.get("semantic_turn_min_yaw_deg", 45.0),
+        ),
+        semantic_turn_max_primitives=_int_env_or_value(
+            "SEMANTIC_TURN_MAX_PRIMITIVES",
+            opennav.get("semantic_turn_max_primitives", 6),
+        ),
+        semantic_turn_min_forward_clearance_m=_float_env_or_value(
+            "SEMANTIC_TURN_MIN_FORWARD_CLEARANCE_M",
+            opennav.get("semantic_turn_min_forward_clearance_m", 0.60),
         ),
         visual_target_center_deadband_deg=_float_env_or_value(
             "VISUAL_TARGET_CENTER_DEADBAND_DEG",
@@ -499,10 +566,6 @@ def load_config(config_path: str | None = None) -> AppConfig:
             "POLICY_EXECUTION_STEPS",
             opennav.get("policy_execution_steps", 24),
         ),
-        turn_at_max_turns=_int_env_or_value(
-            "TURN_AT_MAX_TURNS",
-            opennav.get("turn_at_max_turns", 6),
-        ),
         arrival_distance_m=_float_env_or_value(
             "ARRIVAL_DISTANCE_M",
             opennav.get("arrival_distance_m", opennav.get("landmark_arrival_distance_m", 1.4)),
@@ -514,18 +577,6 @@ def load_config(config_path: str | None = None) -> AppConfig:
         landmark_arrival_confirmations=_int_env_or_value(
             "LANDMARK_ARRIVAL_CONFIRMATIONS",
             opennav.get("landmark_arrival_confirmations", 2),
-        ),
-        recovery_enabled=_bool_env_or_value(
-            "RECOVERY_ENABLED",
-            opennav.get("recovery_enabled", True),
-        ),
-        recovery_trigger_stalled_steps=_int_env_or_value(
-            "RECOVERY_TRIGGER_STALLED_STEPS",
-            opennav.get("recovery_trigger_stalled_steps", 3),
-        ),
-        recovery_execution_steps=_int_env_or_value(
-            "RECOVERY_EXECUTION_STEPS",
-            opennav.get("recovery_execution_steps", 18),
         ),
         target_grounding_enabled=_bool_env_or_value(
             "TARGET_GROUNDING_ENABLED",
@@ -707,10 +758,6 @@ def load_config(config_path: str | None = None) -> AppConfig:
             "TARGET_GROUNDING_MAX_RESULT_YAW_DELTA_DEG",
             target_grounding.get("max_result_yaw_delta_deg", 3.0),
         ),
-        target_grounding_qwen_fallback_confirm_allowed=_bool_env_or_value(
-            "TARGET_GROUNDING_QWEN_FALLBACK_CONFIRM_ALLOWED",
-            target_grounding.get("qwen_fallback_confirm_allowed", False),
-        ),
         target_grounding_semantic_verification_enabled=_bool_env_or_value(
             "TARGET_GROUNDING_SEMANTIC_VERIFICATION_ENABLED",
             target_grounding.get("semantic_verification_enabled", True),
@@ -825,14 +872,6 @@ def load_config(config_path: str | None = None) -> AppConfig:
             "LANDMARK_TRACKER_CONFIRM_MAX_DEPTH_JUMP_M",
             landmark_tracker.get("confirm_max_depth_jump_m", 0.80),
         ),
-        landmark_tracker_turn_at_complete_requires_confirmed_anchor=_bool_env_or_value(
-            "LANDMARK_TRACKER_TURN_AT_COMPLETE_REQUIRES_CONFIRMED_ANCHOR",
-            landmark_tracker.get("turn_at_complete_requires_confirmed_anchor", True),
-        ),
-        landmark_tracker_turn_at_complete_max_distance_m=_float_env_or_value(
-            "LANDMARK_TRACKER_TURN_AT_COMPLETE_MAX_DISTANCE_M",
-            landmark_tracker.get("turn_at_complete_max_distance_m", 3.0),
-        ),
         landmark_map_enabled=_bool_env_or_value(
             "LANDMARK_MAP_ENABLED",
             landmark_tracker.get("landmark_map_enabled", True),
@@ -848,14 +887,6 @@ def load_config(config_path: str | None = None) -> AppConfig:
         landmark_map_log_period_sec=_float_env_or_value(
             "LANDMARK_MAP_LOG_PERIOD_SEC",
             landmark_tracker.get("landmark_map_log_period_sec", 2.0),
-        ),
-        reacquire_guard_enabled=_bool_env_or_value(
-            "REACQUIRE_GUARD_ENABLED",
-            landmark_tracker.get("reacquire_guard_enabled", True),
-        ),
-        reacquire_guard_recent_visible_sec=_float_env_or_value(
-            "REACQUIRE_GUARD_RECENT_VISIBLE_SEC",
-            landmark_tracker.get("reacquire_guard_recent_visible_sec", 20.0),
         ),
         depth_debug_enabled=_bool_env_or_value(
             "DEPTH_DEBUG_ENABLED",

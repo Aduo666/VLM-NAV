@@ -14,7 +14,7 @@
         0.0,
         0.0
       ],
-      "instruction": "向前走找到轮椅，然后左转再直走找到楼梯"
+      "instruction": "Go forward to the wheelchair, then turn left and continue straight to the stairs."
     },
     {
       "id": "hospital_002",
@@ -29,7 +29,7 @@
         0.0,
         0.0
       ],
-      "instruction": "向前走看到黄色警告牌后右转，再直走停在垃圾桶前"
+      "instruction": "Go forward to the yellow warning sign, turn right, then continue straight and stop near the trash can."
     },
     {
       "id": "hospital_003",
@@ -44,7 +44,7 @@
         0.0,
         0.0
       ],
-      "instruction": "找到楼梯"
+      "instruction": "Find the stairs."
     },
     {
       "id": "hospital_004",

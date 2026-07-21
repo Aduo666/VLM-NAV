@@ -19,7 +19,7 @@ from ..control.controller import (
 )
 from ..navigation.candidate_waypoint_predictor import CandidateWaypointPredictor, CandidateWaypointPredictorConfig
 from ..navigation.depth_safety import DepthSafetyConfig, DepthSafetyMonitor
-from ..navigation.instruction_manager import InstructionManager
+from ..navigation.instruction_manager import InstructionContext, InstructionManager
 from ..navigation.landmark_map import LandmarkMap, LandmarkMapConfig, LandmarkMapEntry
 from ..navigation.landmark_tracker import LandmarkState, LandmarkTracker, LandmarkTrackerConfig
 from ..navigation.lidar_sensor import (
@@ -86,6 +86,12 @@ def main() -> int:
         )
         return 2
 
+    try:
+        instruction_context = _parse_instruction_preflight(config=config, logger=logger)
+    except Exception:
+        logger.exception("[ERROR] Instruction preflight failed before Isaac Sim startup.")
+        return 1
+
     os.environ.setdefault("OMNI_KIT_ACCEPT_EULA", "YES")
     simulation_settings = _build_simulation_app_settings(config=config, logger=logger)
 
@@ -94,7 +100,11 @@ def main() -> int:
     simulation_app = SimulationApp(simulation_settings)
 
     try:
-        run_navigation(simulation_app=simulation_app, config=config)
+        run_navigation(
+            simulation_app=simulation_app,
+            config=config,
+            instruction_context=instruction_context,
+        )
     except Exception:
         logger.exception("Navigation loop crashed.")
         return 1
@@ -102,6 +112,27 @@ def main() -> int:
         simulation_app.close()
 
     return 0
+
+
+def _parse_instruction_preflight(*, config: AppConfig, logger) -> InstructionContext:
+    parse_client = OpenNavLLMClient(
+        api_key=config.llm_api_key,
+        model_name=config.model_name,
+        base_url=config.api_base_url,
+        timeout_sec=max(1, int(config.instruction_parse_timeout_sec)),
+        retry_cooldown_sec=0.0,
+        upload_max_edge_px=0,
+        image_detail=config.camera_image_detail,
+        logger=logger,
+    )
+    instruction_manager = InstructionManager(
+        llm_client=parse_client,
+        logger=logger,
+        max_tokens=int(config.instruction_parse_max_tokens),
+        cache_enabled=bool(config.instruction_cache_enabled),
+        cache_path=str(config.instruction_cache_path),
+    )
+    return instruction_manager.parse(config.instruction)
 
 
 def _apply_task_overrides(*, config: AppConfig, task_id: str, tasks_file: Path, logger) -> str:
@@ -340,7 +371,12 @@ def _detect_display_active_gpu(*, logger) -> int | None:
     return None
 
 
-def run_navigation(*, simulation_app, config: AppConfig) -> None:
+def run_navigation(
+    *,
+    simulation_app,
+    config: AppConfig,
+    instruction_context: InstructionContext,
+) -> None:
     logger = setup_logging(config.log_level)
 
     llm_client = OpenNavLLMClient(
@@ -363,13 +399,6 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
         image_detail=config.camera_image_detail,
         logger=logger,
     )
-    instruction_manager = InstructionManager(
-        llm_client=llm_client,
-        logger=logger,
-        preparse_enabled=bool(config.instruction_preparse_enabled),
-        max_tokens=int(config.instruction_preparse_max_tokens),
-    )
-    instruction_context = instruction_manager.parse(config.instruction)
     logger.info("[Goal] instruction=%s", instruction_context.raw_text)
     logger.info(
         "[Goal] parse_source=%s parse_reason=%s task_type=%s route_steps=%s",
@@ -378,24 +407,24 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
         instruction_context.task_type,
         [
             {
-                "landmark": step.landmark,
-                "directive": step.directive,
-                "behavior_type": step.behavior_type,
+                "step_id": step.step_id,
+                "step_type": step.step_type,
+                "target": step.target,
+                "from_region": step.from_region,
+                "to_region": step.to_region,
+                "direction": step.direction,
             }
             for step in instruction_context.route_steps
         ],
     )
-    logger.info("[Goal] actions=%s", instruction_context.actions)
-    logger.info("[Goal] landmarks=%s", instruction_context.landmarks)
     logger.info(
-        "[Route] current_landmark=%s ordered_landmarks=%s arrival_distance_m=%.2f success_distance_m=%.2f tracker_min_visible=%s recovery_enabled=%s recovery_stalled_steps=%s",
-        instruction_context.goal_phrase or "none",
-        instruction_context.landmarks,
+        "[Route] context_region=%s context_objects=%s navigation_targets=%s arrival_distance_m=%.2f success_distance_m=%.2f tracker_min_visible=%s",
+        "unknown" if instruction_context.scene_context.current_region is None else instruction_context.scene_context.current_region.canonical_label,
+        [item.canonical_label for item in instruction_context.scene_context.context_objects],
+        instruction_context.navigation_target_labels,
         float(config.arrival_distance_m),
         float(config.success_distance_m),
         int(config.landmark_tracker_min_visible_count),
-        int(config.recovery_enabled),
-        int(config.recovery_trigger_stalled_steps),
     )
     logger.info(
         "[GroundingConfig] enabled=%s backend=%s call_period_sec=%.2f reuse_sec=%.2f pause_active=%s min_conf=%.2f depth_range=[%.2f, %.2f] coord=%s depth_region=%s min_depth_valid_ratio=%.2f semantic_verify=%s verify_min=%.2f dino_checkpoint=%s sam_enabled=%s sam_checkpoint=%s sam_model=%s",
@@ -426,15 +455,13 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
         float(config.target_tracker_min_depth_valid_ratio),
     )
     logger.info(
-        "[LandmarkTrackerConfig] arrival_distance=%.2f success_distance=%.2f min_visible=%s confirmations=%s landmark_map=%s map_ttl=%.1f reacquire_guard=%s recent_visible_sec=%.1f",
+        "[LandmarkTrackerConfig] arrival_distance=%.2f success_distance=%.2f min_visible=%s confirmations=%s landmark_map=%s map_ttl=%.1f",
         float(config.arrival_distance_m),
         float(config.success_distance_m),
         int(config.landmark_tracker_min_visible_count),
         int(config.landmark_tracker_arrival_confirmations),
         int(bool(config.landmark_map_enabled)),
         float(config.landmark_map_anchor_ttl_sec),
-        int(bool(config.reacquire_guard_enabled)),
-        float(config.reacquire_guard_recent_visible_sec),
     )
 
     observation_adapter = ObservationAdapter(
@@ -542,7 +569,6 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
             max_result_age_sec=float(config.target_grounding_max_result_age_sec),
             max_result_pose_delta_m=float(config.target_grounding_max_result_pose_delta_m),
             max_result_yaw_delta_deg=float(config.target_grounding_max_result_yaw_delta_deg),
-            qwen_fallback_confirm_allowed=bool(config.target_grounding_qwen_fallback_confirm_allowed),
             semantic_verification_enabled=bool(config.target_grounding_semantic_verification_enabled),
             semantic_verification_min_confidence=float(config.target_grounding_semantic_verification_min_confidence),
             semantic_verification_max_edge_px=int(config.target_grounding_semantic_verification_max_edge_px),
@@ -751,21 +777,19 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
             active_track_max_yaw_deg=float(config.active_track_max_yaw_deg),
             active_track_min_duration_sec=float(config.active_track_min_duration_sec),
             use_discrete_action_primitives=bool(config.use_discrete_action_primitives),
-            turn_at_max_turns=int(config.turn_at_max_turns),
-            turn_at_complete_max_distance_m=float(config.landmark_tracker_turn_at_complete_max_distance_m),
-            turn_at_complete_requires_confirmed_anchor=bool(config.landmark_tracker_turn_at_complete_requires_confirmed_anchor),
+            region_transition_min_displacement_m=float(config.region_transition_min_displacement_m),
+            region_transition_confirmations=int(config.region_transition_confirmations),
+            region_transition_min_confidence=float(config.region_transition_min_confidence),
+            semantic_turn_min_yaw_deg=float(config.semantic_turn_min_yaw_deg),
+            semantic_turn_max_primitives=int(config.semantic_turn_max_primitives),
+            semantic_turn_min_forward_clearance_m=float(config.semantic_turn_min_forward_clearance_m),
             confirm_min_observations=int(config.landmark_tracker_confirm_min_observations),
             confirm_confidence_threshold=float(config.landmark_tracker_confirm_confidence_threshold),
             visual_target_center_deadband_deg=float(config.visual_target_center_deadband_deg),
             landmark_arrival_confirmations=int(config.landmark_arrival_confirmations),
             landmark_arrival_window_size=int(config.landmark_tracker_arrival_window_size),
-            reacquire_guard_enabled=bool(config.reacquire_guard_enabled),
-            reacquire_guard_recent_visible_sec=float(config.reacquire_guard_recent_visible_sec),
             arrival_distance_m=float(config.arrival_distance_m),
             success_distance_m=float(config.success_distance_m),
-            recovery_enabled=bool(config.recovery_enabled),
-            recovery_trigger_stalled_steps=int(config.recovery_trigger_stalled_steps),
-            recovery_execution_steps=int(config.recovery_execution_steps),
         ),
         logger=logger,
     )
@@ -1117,6 +1141,7 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
     landmark_map_reached_synced: set[str] = set()
     global_pose_trace: list[tuple[float, float]] = []
     latest_global_map_image: Image.Image | None = None
+    skip_grounding_once = False
 
     for _ in range(config.warmup_steps):
         world.step(render=True)
@@ -1387,7 +1412,7 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
                 debug_video_recorder.close()
             continue
 
-        current_landmark = policy.current_landmark
+        current_landmark = policy.current_perception_target
         target_observation: TargetObservation | None = None
         landmark_map_entry = None
         grounding_waiting_for_keyframe = False
@@ -1401,6 +1426,7 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
             )
             allow_new_grounding = (
                 not perception_motion_active
+                and not skip_grounding_once
                 and target_tracker.should_request_grounding(
                     target_label=current_landmark,
                     timestamp_sec=sim_time_sec,
@@ -1415,6 +1441,8 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
                 frame_index=frame_index,
                 allow_new_request=allow_new_grounding,
             )
+            if skip_grounding_once:
+                skip_grounding_once = False
             grounding_waiting_for_keyframe = bool(
                 target_grounder.request_in_flight
                 and str(grounding_observation.reason).strip().lower()
@@ -1447,7 +1475,7 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
                 )
             landmark_state = landmark_tracker.update(
                 target_label=current_landmark,
-                behavior_type=policy.current_behavior_type,
+                behavior_type=policy.current_grounding_behavior_type,
                 observation=target_observation,
                 robot_pose=observation.pose,
                 timestamp_sec=sim_time_sec,
@@ -1494,11 +1522,8 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
                 robot_pose=observation.pose,
             )
         )
-        policy.set_topology_revisit_world_xy(
-            topological_memory.suggest_revisit_world_xy(
-                current_target=current_landmark,
-                robot_pose=observation.pose,
-            )
+        policy.set_topology_node_id(
+            topological_memory.current_node_id(robot_pose=observation.pose)
         )
 
         obstacle_summary = _extract_obstacle_summary(
@@ -1530,6 +1555,25 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
             last_action_name = "STOP"
             last_applied_wheel_velocity = 0.0
             last_applied_steering_angle = 0.0
+            continue
+        grounding_vlm_was_used = bool(
+            current_landmark
+            and grounding_observation is not None
+            and str(getattr(grounding_observation, "vlm_verification_reason", ""))
+            not in {"", "not_run", "auto_accept_high_detector_confidence"}
+        )
+        if grounding_vlm_was_used and not bool(
+            getattr(grounding_observation, "can_confirm", False)
+        ):
+            skip_grounding_once = True
+            drive_controller.apply("STOP", speed_scale=0.0)
+            last_action_name = "STOP"
+            last_applied_wheel_velocity = 0.0
+            last_applied_steering_angle = 0.0
+            logger.info(
+                "[NAV_STATE] perception_review target=%s result=rejected next=single_navigation_decision",
+                current_landmark,
+            )
             continue
         should_refresh_policy = True
         recovery_command = stuck_detector.recovery_command(now_sec=sim_time_sec)
@@ -1674,7 +1718,11 @@ def run_navigation(*, simulation_app, config: AppConfig) -> None:
         )
         if should_refresh_policy and policy_signature != last_logged_policy_signature:
             logger.info(
-                "[Decision] landmark=%s completed=%s route_complete=%s action=%s speed_scale=%.2f source=%s token=%s candidate=%s remaining=%s progress=%s replanned=%s local_goal_xy=%s goal_xy=%s",
+                "[NAV_STATE] step=%s/%s type=%s target=%s landmark=%s completed=%s route_complete=%s action=%s speed_scale=%.2f source=%s token=%s candidate=%s remaining=%s progress=%s replanned=%s local_goal_xy=%s goal_xy=%s",
+                int(step_result.current_step_index) + 1,
+                int(step_result.route_step_count),
+                step_result.current_step_type or "none",
+                step_result.current_target or "none",
                 step_result.current_landmark or "none",
                 step_result.completed_landmarks,
                 int(step_result.route_complete),
@@ -1919,6 +1967,13 @@ def _user_hold_step_result(step_result: PolicyStepResult) -> PolicyStepResult:
         current_landmark=step_result.current_landmark,
         completed_landmarks=list(step_result.completed_landmarks),
         route_complete=step_result.route_complete,
+        current_step_index=step_result.current_step_index,
+        route_step_count=step_result.route_step_count,
+        current_step_id=step_result.current_step_id,
+        current_step_type=step_result.current_step_type,
+        current_target=step_result.current_target,
+        navigation_status=step_result.navigation_status,
+        last_error=step_result.last_error,
     )
 
 
@@ -1938,6 +1993,12 @@ def _runtime_recovery_step_result(*, recovery_command, previous_step_result) -> 
         current_landmark="" if previous_step_result is None else str(previous_step_result.current_landmark),
         completed_landmarks=[] if previous_step_result is None else list(previous_step_result.completed_landmarks),
         route_complete=False if previous_step_result is None else bool(previous_step_result.route_complete),
+        current_step_index=0 if previous_step_result is None else int(previous_step_result.current_step_index),
+        route_step_count=0 if previous_step_result is None else int(previous_step_result.route_step_count),
+        current_step_id="" if previous_step_result is None else str(previous_step_result.current_step_id),
+        current_step_type="" if previous_step_result is None else str(previous_step_result.current_step_type),
+        current_target="" if previous_step_result is None else str(previous_step_result.current_target),
+        navigation_status="RECOVERY",
     )
 
 
@@ -2104,23 +2165,6 @@ def _save_current_target_debug_image(
         fp_draw.line((origin[0] - 35, origin[1], origin[0] + 35, origin[1]), fill=color, width=4)
         fp_draw.text((origin[0] + 42, origin[1] - 12), "no active target", fill=color, font=_debug_font(15))
 
-    heading_deg = float(np.degrees(heading_rad))
-    overlay_lines = [
-        f"candidate={step_result.selected_candidate_id} source={step_result.decision_source}",
-        f"landmark={step_result.current_landmark or 'none'} completed={step_result.completed_landmarks}",
-        f"policy={step_result.action_name} executed={executed_action}",
-        f"local_goal forward={local_forward:.2f}m left={local_left:.2f}m",
-        f"distance={distance_m:.2f}m heading={heading_deg:+.1f}deg",
-        "yellow marker=active subgoal; colored box=visual grounding/tracker",
-    ]
-    margin = 10
-    overlay_font = _debug_font(15)
-    line_height = 22
-    box_height = margin * 2 + line_height * len(overlay_lines)
-    fp_draw.rectangle((0, 0, fp_width, box_height), fill=(0, 0, 0))
-    for index, text in enumerate(overlay_lines):
-        fp_draw.text((margin, margin + index * line_height), text, fill=(255, 255, 255), font=overlay_font)
-
     occ_width = max(540, int(fp_width))
     occ_image = _load_occupancy_debug_panel(
         occupancy_image=map_image,
@@ -2128,9 +2172,34 @@ def _save_current_target_debug_image(
         width=occ_width,
         height=fp_height,
     )
-    canvas = Image.new("RGB", (occ_width + fp_width, fp_height), (0, 0, 0))
-    canvas.paste(occ_image, (0, 0))
-    canvas.paste(fp_image, (occ_width, 0))
+    heading_deg = float(np.degrees(heading_rad))
+    status_height = 92
+    canvas = Image.new(
+        "RGB",
+        (occ_width + fp_width, status_height + fp_height),
+        (16, 20, 25),
+    )
+    canvas.paste(occ_image, (0, status_height))
+    canvas.paste(fp_image, (occ_width, status_height))
+    status_draw = ImageDraw.Draw(canvas)
+    status_font = _debug_font(16)
+    status_lines = [
+        (
+            f"STEP {step_result.current_step_index + 1}/{max(1, step_result.route_step_count)}  "
+            f"{step_result.current_step_type or 'COMPLETE'}  target={step_result.current_target or 'none'}"
+        ),
+        (
+            f"ACTION policy={step_result.action_name} executed={executed_action}  "
+            f"source={step_result.decision_source} candidate={step_result.selected_candidate_id}"
+        ),
+        (
+            f"LANDMARK current={step_result.current_landmark or 'none'} "
+            f"completed={step_result.completed_landmarks or ['none']}  "
+            f"goal=({local_forward:.2f}m forward, {local_left:.2f}m left, {heading_deg:+.1f}deg)"
+        ),
+    ]
+    for index, line in enumerate(status_lines):
+        status_draw.text((14, 8 + index * 27), line, fill=(235, 240, 245), font=status_font)
 
     _save_image_atomic(canvas, output_path)
     return canvas

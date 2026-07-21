@@ -108,7 +108,7 @@ class StuckDetector:
             + float(self._config.recovery_turn_sec)
         )
         self._logger.warning(
-            "[Stuck] reason=%s displacement=%.3fm yaw_delta=%.1fdeg recovery=PAUSE+BACKWARD+%s",
+            "[RECOVERY] reason=%s displacement=%.3fm yaw_delta=%.1fdeg sequence=PAUSE+BACKWARD+%s",
             reason,
             displacement_m,
             yaw_delta_deg,
@@ -131,7 +131,7 @@ class StuckDetector:
         self._samples.clear()
         self._recovery_started_sec = float(now_sec)
         self._logger.warning(
-            "[Stuck] reason=%s recovery=PAUSE+BACKWARD+%s",
+            "[RECOVERY] reason=%s sequence=PAUSE+BACKWARD+%s",
             str(reason),
             self._recovery_turn_action,
         )

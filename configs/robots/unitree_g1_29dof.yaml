@@ -1,0 +1,89 @@
+schema_version: "1.0"
+
+identity:
+  name: "unitree_g1_29dof"
+  type: "unitree_g1_policy"
+
+asset:
+  usd_path: "src/unitree_model/g1_29dof/usd/g1_29dof_rev_1_0.usd"
+  prim_path: "/World/Robot/g1_29dof_rev_1_0"
+  articulation_path: "pelvis"
+
+spawn:
+  z_m: 0.8
+
+simulation:
+  physics_dt: 0.005
+  rendering_dt: 0.02
+  policy_decimation: 4
+
+sensors:
+  front_camera_prim_path: "torso_link/d435_link/Camera"
+  observer_camera_enabled: true
+  observer_camera_prim_path: "observeCamera"
+  camera_frequency_hz: 10
+  lidar_prim_path: "torso_link/mid360_link/Lidar"
+
+controller:
+  policy_path: "src/unitree_model/g1_29dof/policy/policy.pt"
+  deploy_config_path: "src/unitree_model/g1_29dof/policy/deploy.yaml"
+  inference_device: "cpu"
+  standup_duration_sec: 2.0
+  odom_filter_alpha: 0.20
+  sdk_joint_names:
+    - "left_hip_pitch_joint"
+    - "left_hip_roll_joint"
+    - "left_hip_yaw_joint"
+    - "left_knee_joint"
+    - "left_ankle_pitch_joint"
+    - "left_ankle_roll_joint"
+    - "right_hip_pitch_joint"
+    - "right_hip_roll_joint"
+    - "right_hip_yaw_joint"
+    - "right_knee_joint"
+    - "right_ankle_pitch_joint"
+    - "right_ankle_roll_joint"
+    - "waist_yaw_joint"
+    - "waist_roll_joint"
+    - "waist_pitch_joint"
+    - "left_shoulder_pitch_joint"
+    - "left_shoulder_roll_joint"
+    - "left_shoulder_yaw_joint"
+    - "left_elbow_joint"
+    - "left_wrist_roll_joint"
+    - "left_wrist_pitch_joint"
+    - "left_wrist_yaw_joint"
+    - "right_shoulder_pitch_joint"
+    - "right_shoulder_roll_joint"
+    - "right_shoulder_yaw_joint"
+    - "right_elbow_joint"
+    - "right_wrist_roll_joint"
+    - "right_wrist_pitch_joint"
+    - "right_wrist_yaw_joint"
+
+primitives:
+  forward_distance_m: 0.40
+  turn_angle_deg: 15.0
+  distance_tolerance_m: 0.04
+  turn_tolerance_deg: 1.5
+  forward_timeout_sec: 3.0
+  turn_timeout_sec: 6.0
+  forward_command: 0.35
+  turn_command: 1.0
+  settle_max_wait_sec: 0.60
+  settle_linear_speed_threshold_mps: 0.08
+  settle_angular_speed_threshold_radps: 0.08
+  settle_stable_duration_sec: 0.15
+
+geometry:
+  footprint_radius_m: 0.32
+  obstacle_stop_distance_m: 0.55
+  map_inflation_radius_m: 0.40
+  path_corridor_radius_m: 0.38
+  turn_clearance_radius_m: 0.42
+
+safety:
+  fall_detection_enabled: true
+  max_roll_pitch_deg: 35.0
+  min_base_height_m: 0.45
+  confirmation_sec: 0.30

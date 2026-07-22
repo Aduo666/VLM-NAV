@@ -9,21 +9,11 @@ from typing import Any
 
 import yaml
 
+from vln_nav.runtime.robot_profile import RobotProfile, load_robot_profile
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "configs" / "default.yaml"
-DEFAULT_ROBOT_USD_PATH = (
-    PROJECT_ROOT
-    / "src"
-    / "ros2_car_model_ws"
-    / "src"
-    / "1557"
-    / "urdf"
-    / "1557_all"
-    / "1557_all.usd"
-)
-
-
 @dataclass
 class AppConfig:
     llm_api_key: str = ""
@@ -164,7 +154,11 @@ class AppConfig:
     physics_gpu: int | None = 0
     multi_gpu: bool = False
 
-    robot_usd_path: Path = DEFAULT_ROBOT_USD_PATH
+    robot_profile_name: str = "agx"
+    robot_type: str = "agx_4ws"
+    robot_profile: RobotProfile | None = None
+    robot_policy_decimation: int = 1
+    robot_usd_path: Path = Path()
     robot_prim_path: str = "/World/Robot"
     robot_articulation_path: str = ""
     robot_init_position: list[float] = field(default_factory=lambda: [1.5, 4.0, 0.22])
@@ -215,6 +209,10 @@ class AppConfig:
     action_forward_distance_m: float = 0.55
     action_distance_tolerance_m: float = 0.04
     action_turn_tolerance_deg: float = 1.5
+    action_settle_max_wait_sec: float = 0.0
+    action_settle_linear_speed_threshold_mps: float = 0.0
+    action_settle_angular_speed_threshold_radps: float = 0.0
+    action_settle_stable_duration_sec: float = 0.0
     action_odom_completion_enabled: bool = True
     active_track_max_yaw_deg: float = 10.0
     active_track_min_duration_sec: float = 0.45
@@ -320,6 +318,8 @@ class AppConfig:
     viewport_target: list[float] = field(default_factory=lambda: [1.5, 4.0, 1.0])
     tip_stop_enabled: bool = False
     tip_stop_roll_pitch_deg: float = 28.0
+    tip_stop_min_base_height_m: float = 0.0
+    tip_stop_confirmation_sec: float = 0.0
 
     log_level: str = "INFO"
     motion_log_period_sec: float = 5.0
@@ -408,6 +408,17 @@ def load_config(config_path: str | None = None) -> AppConfig:
 
     sim = _section(file_data, "sim")
     robot = _section(file_data, "robot")
+    robot_extra_keys = sorted(set(robot) - {"profile"})
+    if robot_extra_keys:
+        raise ValueError(
+            "The robot section only accepts 'profile'; move robot-specific values to "
+            f"configs/robots/<profile>.yaml: {robot_extra_keys}"
+        )
+    robot_profile_name = str(robot.get("profile", "agx")).strip().lower()
+    robot_profile = load_robot_profile(profile_name=robot_profile_name, project_root=PROJECT_ROOT)
+    robot_primitives = robot_profile.primitives
+    robot_geometry = robot_profile.geometry
+    agx_controller = robot_profile.agx_controller
     camera = _section(file_data, "camera")
     llm = _section(file_data, "llm")
     legacy_deepseek = _section(file_data, "deepseek")
@@ -947,37 +958,23 @@ def load_config(config_path: str | None = None) -> AppConfig:
         active_gpu=_optional_int_env_or_value("ACTIVE_GPU", sim.get("active_gpu", None)),
         physics_gpu=_optional_int_env_or_value("PHYSICS_GPU", sim.get("physics_gpu", 0)),
         multi_gpu=_bool_env_or_value("MULTI_GPU", sim.get("multi_gpu", False)),
-        physics_dt=_float_env_or_value("PHYSICS_DT", sim.get("physics_dt", 1.0 / 60.0)),
-        rendering_dt=_float_env_or_value("RENDERING_DT", sim.get("rendering_dt", 1.0 / 60.0)),
+        physics_dt=float(robot_profile.simulation.physics_dt),
+        rendering_dt=float(robot_profile.simulation.rendering_dt),
         warmup_steps=_int_env_or_value("WARMUP_STEPS", sim.get("warmup_steps", 30)),
-        robot_usd_path=_resolve_path(
-            _env_or_value("ROBOT_USD_PATH", robot.get("usd_path", str(DEFAULT_ROBOT_USD_PATH)))
-        ),
-        robot_prim_path=_env_or_value("ROBOT_PRIM_PATH", robot.get("prim_path", "/World/Robot")),
-        robot_articulation_path=_env_or_value(
-            "ROBOT_ARTICULATION_PATH", robot.get("articulation_path", "")
-        ),
-        robot_init_position=_list_env_or_value(
-            "ROBOT_INIT_POSITION", robot.get("init_position", [1.5, 4.0, 0.22])
-        ),
-        robot_init_orientation_deg=_list_env_or_value(
-            "ROBOT_INIT_ORIENTATION_DEG",
-            robot.get("init_orientation_deg", [0.0, 0.0, 0.0]),
-        ),
+        robot_profile_name=robot_profile.name,
+        robot_type=robot_profile.robot_type,
+        robot_profile=robot_profile,
+        robot_policy_decimation=int(robot_profile.simulation.policy_decimation),
+        robot_usd_path=robot_profile.asset.usd_path,
+        robot_prim_path=robot_profile.asset.prim_path,
+        robot_articulation_path=robot_profile.asset.articulation_path,
+        robot_init_position=[1.5, 4.0, float(robot_profile.spawn_z_m)],
+        robot_init_orientation_deg=[0.0, 0.0, 0.0],
         camera_width=_int_env_or_value("CAMERA_WIDTH", camera.get("width", 640)),
         camera_height=_int_env_or_value("CAMERA_HEIGHT", camera.get("height", 480)),
-        front_camera_prim_path=_env_or_value(
-            "FRONT_CAMERA_PRIM_PATH",
-            camera.get("front_camera_prim_path", "link6/Camera"),
-        ),
-        observer_camera_enabled=_bool_env_or_value(
-            "OBSERVER_CAMERA_ENABLED",
-            camera.get("observer_enabled", True),
-        ),
-        observer_camera_prim_path=_env_or_value(
-            "OBSERVER_CAMERA_PRIM_PATH",
-            camera.get("observer_camera_prim_path", "dummy_base_link/observecamera"),
-        ),
+        front_camera_prim_path=robot_profile.sensors.front_camera_prim_path,
+        observer_camera_enabled=bool(robot_profile.sensors.observer_camera_enabled),
+        observer_camera_prim_path=robot_profile.sensors.observer_camera_prim_path,
         follow_front_camera_in_gui=_bool_env_or_value(
             "FOLLOW_FRONT_CAMERA_IN_GUI",
             camera.get("follow_front_camera_in_gui", False),
@@ -986,10 +983,7 @@ def load_config(config_path: str | None = None) -> AppConfig:
             "FOLLOW_OBSERVER_CAMERA_IN_GUI",
             camera.get("follow_observer_camera_in_gui", True),
         ),
-        sensor_frequency_hz=_int_env_or_value(
-            "SENSOR_FREQUENCY_HZ",
-            camera.get("sensor_frequency_hz", 15),
-        ),
+        sensor_frequency_hz=int(robot_profile.sensors.camera_frequency_hz),
         camera_horizontal_fov_deg=_float_env_or_value(
             "CAMERA_HORIZONTAL_FOV_DEG",
             camera.get("camera_horizontal_fov_deg", 90.0),
@@ -1014,10 +1008,7 @@ def load_config(config_path: str | None = None) -> AppConfig:
             "OBSTACLE_AVOIDANCE_ENABLED",
             camera.get("obstacle_avoidance_enabled", True),
         ),
-        obstacle_stop_distance_m=_float_env_or_value(
-            "OBSTACLE_STOP_DISTANCE_M",
-            camera.get("obstacle_stop_distance_m", 0.70),
-        ),
+        obstacle_stop_distance_m=float(robot_geometry.obstacle_stop_distance_m),
         obstacle_roi_vertical_range=_list_env_or_value(
             "OBSTACLE_ROI_VERTICAL_RANGE",
             camera.get("obstacle_roi_vertical_range", [0.55, 0.92]),
@@ -1066,70 +1057,28 @@ def load_config(config_path: str | None = None) -> AppConfig:
             "DEPTH_EVAL_PERIOD_SEC",
             camera.get("depth_eval_period_sec", 0.12),
         ),
-        wheel_drive_velocity=_float_env_or_value(
-            "WHEEL_DRIVE_VELOCITY", control.get("wheel_drive_velocity", 14.0)
-        ),
-        turn_drive_velocity=_float_env_or_value(
-            "TURN_DRIVE_VELOCITY", control.get("turn_drive_velocity", 6.0)
-        ),
-        steering_angle=_float_env_or_value("STEERING_ANGLE", control.get("steering_angle", 0.65)),
-        turn_mode=_env_or_value("TURN_MODE", control.get("turn_mode", "spin_4ws")),
-        turn_steering_angle=_float_env_or_value(
-            "TURN_STEERING_ANGLE",
-            control.get("turn_steering_angle", 0.50),
-        ),
-        rear_steering_ratio=_float_env_or_value(
-            "REAR_STEERING_RATIO",
-            control.get("rear_steering_ratio", 1.0),
-        ),
-        track_min_speed_scale=_float_env_or_value(
-            "TRACK_MIN_SPEED_SCALE",
-            control.get("track_min_speed_scale", 0.45),
-        ),
-        track_max_speed_scale=_float_env_or_value(
-            "TRACK_MAX_SPEED_SCALE",
-            control.get("track_max_speed_scale", 1.0),
-        ),
-        track_heading_gain=_float_env_or_value(
-            "TRACK_HEADING_GAIN",
-            control.get("track_heading_gain", 1.15),
-        ),
-        track_slow_heading_rad=_float_env_or_value(
-            "TRACK_SLOW_HEADING_RAD",
-            control.get("track_slow_heading_rad", 1.35),
-        ),
-        track_smoothing_alpha=_float_env_or_value(
-            "TRACK_SMOOTHING_ALPHA",
-            control.get("track_smoothing_alpha", 0.92),
-        ),
-        track_steering_sign=_float_env_or_value(
-            "TRACK_STEERING_SIGN",
-            control.get("track_steering_sign", -1.0),
-        ),
-        action_forward_duration_sec=_float_env_or_value(
-            "ACTION_FORWARD_DURATION_SEC",
-            control.get("action_forward_duration_sec", 0.8),
-        ),
-        action_turn_duration_sec=_float_env_or_value(
-            "ACTION_TURN_DURATION_SEC",
-            control.get("action_turn_duration_sec", 0.30),
-        ),
-        action_turn_angle_deg=_float_env_or_value(
-            "ACTION_TURN_ANGLE_DEG",
-            control.get("action_turn_angle_deg", 15.0),
-        ),
-        action_forward_distance_m=_float_env_or_value(
-            "ACTION_FORWARD_DISTANCE_M",
-            control.get("action_forward_distance_m", 0.55),
-        ),
-        action_distance_tolerance_m=_float_env_or_value(
-            "ACTION_DISTANCE_TOLERANCE_M",
-            control.get("action_distance_tolerance_m", 0.04),
-        ),
-        action_turn_tolerance_deg=_float_env_or_value(
-            "ACTION_TURN_TOLERANCE_DEG",
-            control.get("action_turn_tolerance_deg", 1.5),
-        ),
+        wheel_drive_velocity=0.0 if agx_controller is None else float(agx_controller.wheel_drive_velocity),
+        turn_drive_velocity=0.0 if agx_controller is None else float(agx_controller.turn_drive_velocity),
+        steering_angle=0.0 if agx_controller is None else float(agx_controller.steering_angle),
+        turn_mode="policy" if agx_controller is None else agx_controller.turn_mode,
+        turn_steering_angle=0.0 if agx_controller is None else float(agx_controller.turn_steering_angle),
+        rear_steering_ratio=0.0 if agx_controller is None else float(agx_controller.rear_steering_ratio),
+        track_min_speed_scale=0.0 if agx_controller is None else float(agx_controller.track_min_speed_scale),
+        track_max_speed_scale=0.0 if agx_controller is None else float(agx_controller.track_max_speed_scale),
+        track_heading_gain=0.0 if agx_controller is None else float(agx_controller.track_heading_gain),
+        track_slow_heading_rad=0.0 if agx_controller is None else float(agx_controller.track_slow_heading_rad),
+        track_smoothing_alpha=0.0 if agx_controller is None else float(agx_controller.track_smoothing_alpha),
+        track_steering_sign=0.0 if agx_controller is None else float(agx_controller.track_steering_sign),
+        action_forward_duration_sec=float(robot_primitives.forward_timeout_sec),
+        action_turn_duration_sec=float(robot_primitives.turn_timeout_sec),
+        action_turn_angle_deg=float(robot_primitives.turn_angle_deg),
+        action_forward_distance_m=float(robot_primitives.forward_distance_m),
+        action_distance_tolerance_m=float(robot_primitives.distance_tolerance_m),
+        action_turn_tolerance_deg=float(robot_primitives.turn_tolerance_deg),
+        action_settle_max_wait_sec=float(robot_primitives.settle_max_wait_sec),
+        action_settle_linear_speed_threshold_mps=float(robot_primitives.settle_linear_speed_threshold_mps),
+        action_settle_angular_speed_threshold_radps=float(robot_primitives.settle_angular_speed_threshold_radps),
+        action_settle_stable_duration_sec=float(robot_primitives.settle_stable_duration_sec),
         action_odom_completion_enabled=_bool_env_or_value(
             "ACTION_ODOM_COMPLETION_ENABLED",
             control.get("action_odom_completion_enabled", True),
@@ -1236,26 +1185,14 @@ def load_config(config_path: str | None = None) -> AppConfig:
             "OCCUPANCY_GRID_MAX_DEPTH_M",
             occupancy_grid.get("max_depth_m", 10.0),
         ),
-        occupancy_grid_inflation_radius_m=_float_env_or_value(
-            "OCCUPANCY_GRID_INFLATION_RADIUS_M",
-            occupancy_grid.get("inflation_radius_m", 0.26),
-        ),
+        occupancy_grid_inflation_radius_m=float(robot_geometry.map_inflation_radius_m),
         occupancy_grid_occupied_min_neighbors=_int_env_or_value(
             "OCCUPANCY_GRID_OCCUPIED_MIN_NEIGHBORS",
             occupancy_grid.get("occupied_min_neighbors", 3),
         ),
-        occupancy_grid_robot_radius_m=_float_env_or_value(
-            "OCCUPANCY_GRID_ROBOT_RADIUS_M",
-            occupancy_grid.get("robot_radius_m", 0.32),
-        ),
-        occupancy_grid_path_corridor_radius_m=_float_env_or_value(
-            "OCCUPANCY_GRID_PATH_CORRIDOR_RADIUS_M",
-            occupancy_grid.get("path_corridor_radius_m", 0.30),
-        ),
-        occupancy_grid_turn_clearance_radius_m=_float_env_or_value(
-            "OCCUPANCY_GRID_TURN_CLEARANCE_RADIUS_M",
-            occupancy_grid.get("turn_clearance_radius_m", 0.36),
-        ),
+        occupancy_grid_robot_radius_m=float(robot_geometry.footprint_radius_m),
+        occupancy_grid_path_corridor_radius_m=float(robot_geometry.path_corridor_radius_m),
+        occupancy_grid_turn_clearance_radius_m=float(robot_geometry.turn_clearance_radius_m),
         occupancy_grid_unknown_is_traversable=_bool_env_or_value(
             "OCCUPANCY_GRID_UNKNOWN_IS_TRAVERSABLE",
             occupancy_grid.get("unknown_is_traversable", False),
@@ -1361,10 +1298,7 @@ def load_config(config_path: str | None = None) -> AppConfig:
             map_candidates.get("semantic_weight", 0.45),
         ),
         lidar_enabled=_bool_env_or_value("LIDAR_ENABLED", lidar.get("enabled", True)),
-        lidar_prim_path=_env_or_value(
-            "LIDAR_PRIM_PATH",
-            lidar.get("prim_path", "dummy_base_link/base_link/Lidar_link"),
-        ),
+        lidar_prim_path=robot_profile.sensors.lidar_prim_path,
         lidar_child_name=_env_or_value(
             "LIDAR_CHILD_NAME",
             lidar.get("child_name", "lidar_sensor"),
@@ -1454,30 +1388,14 @@ def load_config(config_path: str | None = None) -> AppConfig:
             "STUCK_RECOVERY_TURN_ACTION",
             control.get("stuck_recovery_turn_action", "TURN_RIGHT"),
         ),
-        wheel_drive_damping=_float_env_or_value(
-            "WHEEL_DRIVE_DAMPING", control.get("wheel_drive_damping", 10000.0)
-        ),
-        steering_stiffness=_float_env_or_value(
-            "STEERING_STIFFNESS", control.get("steering_stiffness", 10000.0)
-        ),
-        steering_damping=_float_env_or_value(
-            "STEERING_DAMPING", control.get("steering_damping", 1000.0)
-        ),
-        hold_joint_stiffness=_float_env_or_value(
-            "HOLD_JOINT_STIFFNESS", control.get("hold_joint_stiffness", 20000.0)
-        ),
-        hold_joint_damping=_float_env_or_value(
-            "HOLD_JOINT_DAMPING", control.get("hold_joint_damping", 2000.0)
-        ),
-        left_wheel_joint_names=_list_env_or_value(
-            "LEFT_WHEEL_JOINTS", robot.get("left_wheel_joint_names", [])
-        ),
-        right_wheel_joint_names=_list_env_or_value(
-            "RIGHT_WHEEL_JOINTS", robot.get("right_wheel_joint_names", [])
-        ),
-        steering_joint_names=_list_env_or_value(
-            "STEERING_JOINTS", robot.get("steering_joint_names", [])
-        ),
+        wheel_drive_damping=0.0 if agx_controller is None else float(agx_controller.wheel_drive_damping),
+        steering_stiffness=0.0 if agx_controller is None else float(agx_controller.steering_stiffness),
+        steering_damping=0.0 if agx_controller is None else float(agx_controller.steering_damping),
+        hold_joint_stiffness=0.0 if agx_controller is None else float(agx_controller.hold_joint_stiffness),
+        hold_joint_damping=0.0 if agx_controller is None else float(agx_controller.hold_joint_damping),
+        left_wheel_joint_names=[] if agx_controller is None else list(agx_controller.left_wheel_joint_names),
+        right_wheel_joint_names=[] if agx_controller is None else list(agx_controller.right_wheel_joint_names),
+        steering_joint_names=[] if agx_controller is None else list(agx_controller.steering_joint_names),
         scene_usd_path=_env_or_value("SCENE_USD_PATH", scene.get("usd_path", "usd/hospital.usd")),
         scene_prim_path=_env_or_value("SCENE_PRIM_PATH", scene.get("prim_path", "/World/Environment")),
         add_default_ground_plane=_bool_env_or_value(
@@ -1500,20 +1418,22 @@ def load_config(config_path: str | None = None) -> AppConfig:
             "VIEWPORT_TARGET",
             scene.get("viewport_target", [1.5, 4.0, 1.0]),
         ),
-        tip_stop_enabled=_bool_env_or_value(
-            "TIP_STOP_ENABLED",
-            scene.get("tip_stop_enabled", False),
-        ),
-        tip_stop_roll_pitch_deg=_float_env_or_value(
-            "TIP_STOP_ROLL_PITCH_DEG",
-            scene.get("tip_stop_roll_pitch_deg", 28.0),
-        ),
+        tip_stop_enabled=bool(robot_profile.safety.fall_detection_enabled),
+        tip_stop_roll_pitch_deg=float(robot_profile.safety.max_roll_pitch_deg),
+        tip_stop_min_base_height_m=float(robot_profile.safety.min_base_height_m),
+        tip_stop_confirmation_sec=float(robot_profile.safety.confirmation_sec),
         log_level=_env_or_value("LOG_LEVEL", logging_section.get("level", "INFO")),
         motion_log_period_sec=_float_env_or_value(
             "MOTION_LOG_PERIOD_SEC",
             logging_section.get("motion_log_period_sec", 5.0),
         ),
     )
+
+    if robot_profile.is_g1 and not bool(config.use_discrete_action_primitives):
+        raise ValueError(
+            "unitree_g1_29dof requires control.use_discrete_action_primitives=true; "
+            "TRACK_TARGET is not supported by the G1 locomotion backend"
+        )
 
     return config
 

@@ -10,7 +10,7 @@ CAPTAINav connects natural-language instructions, RGB-D perception, LiDAR mappin
 |---|---|
 | Simulator | Isaac Sim |
 | Python | python3.11 |
-| Robot | Mobile Robot |
+| Robots | AGX 4WS / Unitree G1 29-DoF |
 | Policy | VLM-guided VLN prototype |
 | Actions | Discrete atomic primitives |
 
@@ -26,8 +26,8 @@ Click it to open the full-resolution H.264 recording.
 
 ## Features
 
-- **Isaac Sim 5.1**: scene USD loading, custom robot USD, cameras, LiDAR, viewport setup.
-- **Custom 4-wheel-steering control**: FORWARD / TURN_LEFT / TURN_RIGHT atomic primitives with odometry-based completion.
+- **Isaac Sim 5.1**: scene USD loading, robot profiles, cameras, LiDAR, viewport setup.
+- **Swappable locomotion backends**: the AGX uses the existing 4WS joint controller; Unitree G1 uses a 480-input/29-output TorchScript locomotion policy on CPU. Both expose FORWARD / TURN_LEFT / TURN_RIGHT / STOP primitives with odometry-based completion.
 - **Semantic grounding + memory**: local GroundingDINO keeps multiple proposals, preserves instance continuity, and sends only low-confidence crops to the VLM for verification; confirmed landmark anchors remain persistent.
 - **Typed instruction graph**: one startup parse separates trusted scene context from executable `GO_TO`, `REGION_TRANSITION`, and `TURN` steps; validated plans are cached by instruction and schema version.
 - **Aligned action representation**: at stopped decision keyframes, the VLM chooses exactly one safe candidate outcome that maps one-to-one to TURN_LEFT / FORWARD / TURN_RIGHT.
@@ -126,6 +126,53 @@ The launch scripts use the currently active conda environment. If you need to la
 CONDA_ENV_NAME=vlmnav bash scripts/run_nav.sh
 ```
 
+### Robot Profiles
+
+Robot selection is intentionally a single configuration switch in `configs/default.yaml`:
+
+```yaml
+robot:
+  profile: "agx"  # or "unitree_g1_29dof"
+```
+
+Robot-specific assets, sensor prims, simulation rates, geometry, safety limits, primitive parameters, and controller settings live only in:
+
+```text
+configs/robots/agx.yaml
+configs/robots/unitree_g1_29dof.yaml
+```
+
+The G1 profile expects these local files:
+
+```text
+src/unitree_model/g1_29dof/
+  policy/policy.pt
+  policy/deploy.yaml
+  usd/g1_29dof_rev_1_0.usd
+  usd/configuration/g1_29dof_rev_1_0_base.usd
+  usd/configuration/g1_29dof_rev_1_0_physics.usd
+  usd/configuration/g1_29dof_rev_1_0_sensor.usd
+```
+
+Its resolved sensor prims are strict: missing paths terminate startup instead of creating fallback sensors.
+
+```text
+/World/Robot/g1_29dof_rev_1_0/torso_link/d435_link/Camera
+/World/Robot/g1_29dof_rev_1_0/observeCamera
+/World/Robot/g1_29dof_rev_1_0/torso_link/mid360_link/Lidar
+```
+
+Task files continue to provide `x`, `y`, and yaw. Spawn height is owned by the robot profile (`0.0 m` for AGX and `0.8 m` for G1), so tasks do not need robot-specific z values. G1 uses active zero-command balance for STOP and terminates navigation on a confirmed fall while keeping the simulator open.
+
+Before running VLN with a newly edited robot asset, run the profile smoke test:
+
+```bash
+# Uses the profile currently selected in configs/default.yaml.
+bash scripts/run_robot_smoke_test.sh --headless
+```
+
+The acceptance sequence is stand, FORWARD, STOP, TURN_LEFT, STOP, TURN_RIGHT, STOP. It fails on missing assets, articulation/joint mismatches, missing sensors, invalid policy observations/actions, or primitive timeout.
+
 ### Task Authoring Panel
 
 ```bash
@@ -175,7 +222,9 @@ English language instruction
        complete only after semantic + odometry + topology agreement
   -> TURN: 15-degree corridor scan, stable early exit after 45 degrees,
            and best-heading recovery within a 105-degree bound
-  -> low-level 4WS controller
+  -> robot-profile locomotion backend
+       AGX: low-level 4WS joint controller
+       G1: CPU TorchScript policy -> 29 joint position targets
 ```
 
 During primitive execution, the loop does not request VLM decisions or run heavy grounding. It continues odometry completion, LiDAR hit/miss mapping, hard safety checks, and low-level control. A stopped decision keyframe permits at most one VLM request: semantic verification or candidate/region reasoning, never both.
@@ -193,15 +242,12 @@ Instruction parsing is fail-closed and runs before Isaac Sim starts. It uses a d
 All main configuration lives in `configs/default.yaml`.
 
 ```yaml
+robot:
+  profile: "agx"
+
 llm:
   model_name: "Qwen/Qwen3-VL-30B-A3B-Instruct"
   api_base_url: "https://api.siliconflow.cn/v1"
-
-control:
-  use_discrete_action_primitives: true
-  action_forward_distance_m: 0.55
-  action_turn_angle_deg: 15.0
-  action_odom_completion_enabled: true
 
 target_grounding:
   enabled: true
@@ -240,6 +286,8 @@ map_candidates:
   max_candidates: 3
 ```
 
+Robot-specific primitive distances, turn angles, controller gains, timing, footprint, sensor paths, and physics rates are deliberately absent from `configs/default.yaml`; edit the selected file under `configs/robots/` instead.
+
 Tasks are stored in `configs/instructions.json`. Each task can specify scene path, robot start pose, instruction text, and task metadata.
 
 ## Debug Outputs
@@ -271,6 +319,6 @@ The console intentionally shows only navigation milestones: `[PLAN]`, `[NAV_STAT
 
 ## Research Context
 
-CAPTAINav adapts ideas from VLN, ObjectNav, open-vocabulary grounding, semantic memory, and map-aware robot navigation into an Isaac Sim workflow for a custom wheel-driven robot.
+CAPTAINav adapts ideas from VLN, ObjectNav, open-vocabulary grounding, semantic memory, and map-aware robot navigation into an Isaac Sim workflow with interchangeable wheeled and humanoid locomotion backends.
 
 Inspired by R2R, VLN-CE, DUET, NavGPT, Open-Nav, Safe-VLN, and CA-Nav.

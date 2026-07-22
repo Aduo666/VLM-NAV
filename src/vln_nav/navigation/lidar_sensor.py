@@ -24,6 +24,7 @@ class PhysXLidarConfig:
     sector_merge_keep_sec: float
     draw_points: bool
     draw_lines: bool
+    require_existing_sensor: bool = False
 
 
 @dataclass
@@ -130,6 +131,12 @@ class PhysXLidarReader:
                 self._interface = _range_sensor.acquire_lidar_sensor_interface()
                 self._initialized = True
                 return True
+            if bool(self._config.require_existing_sensor):
+                self._logger.error(
+                    "[Lidar] required USD sensor is missing or is not a PhysX Lidar prim: %s",
+                    requested_path,
+                )
+                return False
             parent_path = requested_path if requested_prim.IsValid() else str(requested_path).rsplit("/", 1)[0]
             child_name = str(self._config.child_name).strip() or "lidar_sensor"
             managed_path = f"{str(parent_path).rstrip('/')}/{child_name}"

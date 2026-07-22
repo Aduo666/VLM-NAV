@@ -5,8 +5,6 @@ sim:
   active_gpu: auto
   physics_gpu: 0
   multi_gpu: false
-  physics_dt: 0.0166667
-  rendering_dt: 0.0166667
   warmup_steps: 30
 
 llm:
@@ -134,22 +132,13 @@ landmark_tracker:
   low_confidence_min_yaw_deg: 10.0
 
 robot:
-  usd_path: "src/ros2_car_model_ws/src/1557/urdf/1557_all/1557_all.usd"
-  prim_path: "/World/Robot"
-  articulation_path: ""
-  left_wheel_joint_names: []
-  right_wheel_joint_names: []
-  steering_joint_names: []
+  profile: "unitree_g1_29dof"
 
 camera:
   width: 640
   height: 480
-  front_camera_prim_path: "link6/Camera"
-  observer_enabled: true
-  observer_camera_prim_path: "dummy_base_link/observecamera"
   follow_front_camera_in_gui: false
   follow_observer_camera_in_gui: true
-  sensor_frequency_hz: 15
   camera_horizontal_fov_deg: 90.0
   interactive_confirmation_enabled: false
   roi_vertical_range: [0.45, 0.85]
@@ -160,7 +149,6 @@ camera:
   depth_debug_enabled: false
   depth_debug_image_path: "debug/local/depth_debug.png"
   obstacle_avoidance_enabled: true
-  obstacle_stop_distance_m: 0.65
   obstacle_roi_vertical_range: [0.50, 0.95]
   obstacle_center_width_ratio: 0.34
   obstacle_side_width_ratio: 0.30
@@ -173,18 +161,6 @@ camera:
   replanning_cooldown_sec: 0.5
 
 control:
-  wheel_drive_velocity: 14.0
-  turn_drive_velocity: 6.0
-  steering_angle: 0.65
-  turn_mode: "spin_4ws"
-  turn_steering_angle: 0.50
-  rear_steering_ratio: 1.0
-  track_min_speed_scale: 0.45
-  track_max_speed_scale: 1.0
-  track_heading_gain: 1.15
-  track_slow_heading_rad: 1.35
-  track_smoothing_alpha: 0.92
-  track_steering_sign: -1.0
   use_discrete_action_primitives: true
   stuck_detection_enabled: true
   stuck_window_sec: 2.0
@@ -194,20 +170,9 @@ control:
   stuck_recovery_reverse_sec: 0.65
   stuck_recovery_turn_sec: 0.35
   stuck_recovery_turn_action: "TURN_RIGHT"
-  action_forward_duration_sec: 1.40
-  action_turn_duration_sec: 1.00
-  action_turn_angle_deg: 15.0
-  action_forward_distance_m: 0.55
-  action_distance_tolerance_m: 0.04
-  action_turn_tolerance_deg: 1.5
   action_odom_completion_enabled: true
   active_track_max_yaw_deg: 10.0
   active_track_min_duration_sec: 0.45
-  wheel_drive_damping: 10000.0
-  steering_stiffness: 10000.0
-  steering_damping: 1000.0
-  hold_joint_stiffness: 20000.0
-  hold_joint_damping: 2000.0
 
 odom:
   enabled: true
@@ -240,11 +205,7 @@ occupancy_grid:
   depth_roi_vertical_range: [0.38, 0.72]
   min_depth_m: 0.40
   max_depth_m: 10.0
-  inflation_radius_m: 0.26
   occupied_min_neighbors: 3
-  robot_radius_m: 0.32
-  path_corridor_radius_m: 0.30
-  turn_clearance_radius_m: 0.36
   unknown_is_traversable: false
   unknown_cell_cost: 0.80
   debug_enabled: false
@@ -276,7 +237,6 @@ map_candidates:
 
 lidar:
   enabled: true
-  prim_path: "dummy_base_link/base_link/Lidar_link"
   child_name: "Lidar"
   horizontal_fov_deg: 180.0
   vertical_fov_deg: 10.0
@@ -302,8 +262,6 @@ scene:
   stage_load_timeout_sec: 120.0
   viewport_eye: [7.0, -2.0, 4.0]
   viewport_target: [1.5, 4.0, 1.0]
-  tip_stop_enabled: false
-  tip_stop_roll_pitch_deg: 28.0
 
 logging:
   level: "INFO"

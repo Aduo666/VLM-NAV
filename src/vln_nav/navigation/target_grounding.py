@@ -116,6 +116,10 @@ class _GroundingRequest:
     frame_index: int = -1
     preferred_bbox: tuple[int, int, int, int] | None = None
     preferred_world_xy: list[float] | None = None
+    camera_intrinsics: np.ndarray | None = None
+    camera_view_matrix_ros: np.ndarray | None = None
+    robot_world_position_xyz: np.ndarray | None = None
+    robot_world_orientation_wxyz: np.ndarray | None = None
 
 
 @dataclass
@@ -198,6 +202,10 @@ class TargetGrounder:
         frame_index: int = -1,
         allow_new_request: bool = True,
         preferred_world_xy: list[float] | None = None,
+        camera_intrinsics: np.ndarray | None = None,
+        camera_view_matrix_ros: np.ndarray | None = None,
+        robot_world_position_xyz: np.ndarray | None = None,
+        robot_world_orientation_wxyz: np.ndarray | None = None,
     ) -> TargetObservation:
         target_label = str(target_label).strip() or "target"
         if target_label.lower() in {"none", "null", "unknown", "n/a", "na", "target", "object", "thing", "place", "location"}:
@@ -251,6 +259,10 @@ class TargetGrounder:
                 timestamp_sec=timestamp_sec,
                 frame_index=frame_index,
                 preferred_world_xy=preferred_world_xy,
+                camera_intrinsics=camera_intrinsics,
+                camera_view_matrix_ros=camera_view_matrix_ros,
+                robot_world_position_xyz=robot_world_position_xyz,
+                robot_world_orientation_wxyz=robot_world_orientation_wxyz,
             )
         except Exception as exc:
             self._logger.warning("[GroundingReject] target=%s reason=image_prepare_failed error=%s", target_label, exc)
@@ -478,6 +490,10 @@ class TargetGrounder:
         timestamp_sec: float,
         frame_index: int = -1,
         preferred_world_xy: list[float] | None = None,
+        camera_intrinsics: np.ndarray | None = None,
+        camera_view_matrix_ros: np.ndarray | None = None,
+        robot_world_position_xyz: np.ndarray | None = None,
+        robot_world_orientation_wxyz: np.ndarray | None = None,
     ) -> _GroundingRequest:
         image = Image.fromarray(rgb[:, :, :3].copy()).convert("RGB")
         original_size = (int(image.width), int(image.height))
@@ -517,6 +533,12 @@ class TargetGrounder:
                 None
                 if preferred_world_xy is None
                 else [float(preferred_world_xy[0]), float(preferred_world_xy[1])]
+            ),
+            camera_intrinsics=_copy_optional_matrix(camera_intrinsics, shape=(3, 3)),
+            camera_view_matrix_ros=_copy_optional_matrix(camera_view_matrix_ros, shape=(4, 4)),
+            robot_world_position_xyz=_copy_optional_vector(robot_world_position_xyz, min_length=3),
+            robot_world_orientation_wxyz=_copy_optional_vector(
+                robot_world_orientation_wxyz, min_length=4
             ),
         )
 
@@ -719,6 +741,10 @@ class TargetGrounder:
                 image_height=int(image_height),
                 horizontal_fov_deg=float(self._config.horizontal_fov_deg),
                 robot_pose=request.robot_pose,
+                camera_intrinsics=request.camera_intrinsics,
+                camera_view_matrix_ros=request.camera_view_matrix_ros,
+                robot_world_position_xyz=request.robot_world_position_xyz,
+                robot_world_orientation_wxyz=request.robot_world_orientation_wxyz,
             )
         high_confidence = float(confidence) >= float(
             self._config.semantic_verification_auto_accept_confidence
@@ -1243,8 +1269,30 @@ def _rough_detection_world_xy(
         image_height=int(request.rgb_shape[0]),
         horizontal_fov_deg=float(config.horizontal_fov_deg),
         robot_pose=request.robot_pose,
+        camera_intrinsics=request.camera_intrinsics,
+        camera_view_matrix_ros=request.camera_view_matrix_ros,
+        robot_world_position_xyz=request.robot_world_position_xyz,
+        robot_world_orientation_wxyz=request.robot_world_orientation_wxyz,
     )
     return list(geometry.world_xy)
+
+
+def _copy_optional_matrix(value: np.ndarray | None, *, shape: tuple[int, int]) -> np.ndarray | None:
+    if value is None:
+        return None
+    matrix = np.asarray(value, dtype=np.float64)
+    if matrix.shape != shape or not np.all(np.isfinite(matrix)):
+        raise ValueError(f"Expected finite matrix with shape {shape}, got {matrix.shape}")
+    return matrix.copy()
+
+
+def _copy_optional_vector(value: np.ndarray | None, *, min_length: int) -> np.ndarray | None:
+    if value is None:
+        return None
+    vector = np.asarray(value, dtype=np.float64).reshape(-1)
+    if vector.size < int(min_length) or not np.all(np.isfinite(vector[:min_length])):
+        raise ValueError(f"Expected a finite vector with at least {min_length} values")
+    return vector.copy()
 
 
 def _bbox_center(bbox: tuple[int, int, int, int]) -> tuple[float, float]:

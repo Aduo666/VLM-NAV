@@ -1,0 +1,74 @@
+schema_version: "1.0"
+
+identity:
+  name: "agx"
+  type: "agx_4ws"
+
+asset:
+  usd_path: "src/ros2_car_model_ws/src/1557/urdf/1557_all/1557_all.usd"
+  prim_path: "/World/Robot"
+  articulation_path: "dummy_base_link"
+
+spawn:
+  z_m: 0.0
+
+simulation:
+  physics_dt: 0.0166667
+  rendering_dt: 0.0166667
+  policy_decimation: 1
+
+sensors:
+  front_camera_prim_path: "link6/Camera"
+  observer_camera_enabled: true
+  observer_camera_prim_path: "dummy_base_link/observecamera"
+  camera_frequency_hz: 15
+  lidar_prim_path: "dummy_base_link/base_link/Lidar_link/Lidar"
+
+controller:
+  left_wheel_joint_names: ["fl_wheel", "rl_wheel"]
+  right_wheel_joint_names: ["fr_wheel", "rr_wheel"]
+  steering_joint_names: ["fl_steering_joint", "fr_steering_joint", "rl_steering_joint", "rr_steering_joint"]
+  wheel_drive_velocity: 14.0
+  turn_drive_velocity: 6.0
+  steering_angle: 0.65
+  turn_mode: "spin_4ws"
+  turn_steering_angle: 0.50
+  rear_steering_ratio: 1.0
+  track_min_speed_scale: 0.45
+  track_max_speed_scale: 1.0
+  track_heading_gain: 1.15
+  track_slow_heading_rad: 1.35
+  track_smoothing_alpha: 0.92
+  track_steering_sign: -1.0
+  wheel_drive_damping: 10000.0
+  steering_stiffness: 10000.0
+  steering_damping: 1000.0
+  hold_joint_stiffness: 20000.0
+  hold_joint_damping: 2000.0
+
+primitives:
+  forward_distance_m: 0.55
+  turn_angle_deg: 15.0
+  distance_tolerance_m: 0.04
+  turn_tolerance_deg: 1.5
+  forward_timeout_sec: 0.80
+  turn_timeout_sec: 0.30
+  forward_command: 14.0
+  turn_command: 6.0
+  settle_max_wait_sec: 0.0
+  settle_linear_speed_threshold_mps: 0.0
+  settle_angular_speed_threshold_radps: 0.0
+  settle_stable_duration_sec: 0.0
+
+geometry:
+  footprint_radius_m: 0.32
+  obstacle_stop_distance_m: 0.65
+  map_inflation_radius_m: 0.26
+  path_corridor_radius_m: 0.30
+  turn_clearance_radius_m: 0.36
+
+safety:
+  fall_detection_enabled: false
+  max_roll_pitch_deg: 28.0
+  min_base_height_m: 0.0
+  confirmation_sec: 0.0

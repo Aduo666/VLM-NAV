@@ -27,9 +27,16 @@ class SimOdometrySensor:
     it without touching the VLN policy, tracker, or visualizer.
     """
 
-    def __init__(self, *, logger, source: str = "isaac_world_pose") -> None:
+    def __init__(
+        self,
+        *,
+        logger,
+        source: str = "isaac_world_pose",
+        pose_filter_alpha: float = 1.0,
+    ) -> None:
         self._logger = logger.getChild("odom")
         self._source = str(source)
+        self._pose_filter_alpha = float(np.clip(pose_filter_alpha, 0.0, 1.0))
         self._origin_position_xy: np.ndarray | None = None
         self._origin_yaw_rad: float | None = None
         self._last_pose: Pose2D | None = None
@@ -53,11 +60,25 @@ class SimOdometrySensor:
             self._origin_position_xy = world_xy.copy()
             self._origin_yaw_rad = float(world_yaw_rad)
 
-        pose = Pose2D(
+        raw_pose = Pose2D(
             x=float(world_xy[0] - self._origin_position_xy[0]),
             y=float(world_xy[1] - self._origin_position_xy[1]),
             yaw_rad=float(_wrap_angle_rad(world_yaw_rad - float(self._origin_yaw_rad or 0.0))),
         )
+        if self._last_pose is None or self._pose_filter_alpha >= 1.0:
+            pose = raw_pose
+        else:
+            alpha = self._pose_filter_alpha
+            pose = Pose2D(
+                x=float((1.0 - alpha) * self._last_pose.x + alpha * raw_pose.x),
+                y=float((1.0 - alpha) * self._last_pose.y + alpha * raw_pose.y),
+                yaw_rad=float(
+                    _wrap_angle_rad(
+                        self._last_pose.yaw_rad
+                        + alpha * _wrap_angle_rad(raw_pose.yaw_rad - self._last_pose.yaw_rad)
+                    )
+                ),
+            )
 
         delta_distance_m = 0.0
         delta_yaw_rad = 0.0
@@ -75,11 +96,12 @@ class SimOdometrySensor:
         self._last_timestamp_sec = float(timestamp_sec)
         if not self._logged_ready:
             self._logger.info(
-                "[Odom] source=%s origin_world_xy=[%.3f,%.3f] origin_yaw_deg=%.1f",
+                "[Odom] source=%s origin_world_xy=[%.3f,%.3f] origin_yaw_deg=%.1f filter_alpha=%.2f",
                 self._source,
                 float(self._origin_position_xy[0]),
                 float(self._origin_position_xy[1]),
                 float(np.degrees(float(self._origin_yaw_rad or 0.0))),
+                self._pose_filter_alpha,
             )
             self._logged_ready = True
 

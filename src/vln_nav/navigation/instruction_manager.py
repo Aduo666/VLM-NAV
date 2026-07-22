@@ -11,7 +11,7 @@ from pathlib import Path
 
 
 INSTRUCTION_SCHEMA_VERSION = "2.0"
-INSTRUCTION_PROMPT_VERSION = "2026-07-22.1"
+INSTRUCTION_PROMPT_VERSION = "2026-07-22.2"
 SUPPORTED_STEP_TYPES = {"GO_TO", "REGION_TRANSITION", "TURN"}
 SUPPORTED_DIRECTIONS = {"none", "left", "right", "forward"}
 
@@ -204,12 +204,23 @@ class InstructionManager:
                 f"validation_errors={validation_errors}"
             )
         repaired_payload = _extract_json_object(str(result.content))
+        repaired_payload, removed_labels = _canonicalize_context_target_overlap(repaired_payload)
+        if removed_labels:
+            self._logger.warning(
+                "[INSTRUCTION_NORMALIZE] removed GO_TO targets from repaired "
+                "scene_context.context_objects labels=%s",
+                removed_labels,
+            )
         context, repaired_errors = _context_from_payload(
             raw_instruction=raw_instruction,
             normalized=normalized,
             payload=repaired_payload,
             parsing_source="llm_repair",
-            parsing_reason="repaired_after_validation",
+            parsing_reason=(
+                "repaired_after_validation_and_context_normalization"
+                if removed_labels
+                else "repaired_after_validation"
+            ),
         )
         if repaired_errors:
             raise InstructionPlanError(
@@ -339,9 +350,51 @@ def _instruction_repair_prompt(
     return (
         _instruction_user_prompt(normalized)
         + "\nThe previous JSON failed deterministic validation. Repair it without changing the instruction meaning.\n"
+        + "MANDATORY FINAL CHECK: collect every target from route_steps whose step_type is GO_TO, "
+        + "then remove all entities with those labels from scene_context.context_objects. "
+        + "The intersection of those two label sets must be empty.\n"
         + f"Validation errors: {json.dumps(validation_errors, ensure_ascii=True)}\n"
         + f"Previous JSON: {json.dumps(original_payload, ensure_ascii=True)}"
     )
+
+
+def _canonicalize_context_target_overlap(payload: dict) -> tuple[dict, list[str]]:
+    """Remove a redundant context classification after the single LLM repair attempt."""
+    if not isinstance(payload, dict):
+        return payload, []
+    route_steps = payload.get("route_steps")
+    scene_context = payload.get("scene_context")
+    if not isinstance(route_steps, list) or not isinstance(scene_context, dict):
+        return payload, []
+    context_objects = scene_context.get("context_objects")
+    if not isinstance(context_objects, list):
+        return payload, []
+
+    go_to_labels = {
+        _canonical_label(step.get("target"))
+        for step in route_steps
+        if isinstance(step, dict) and str(step.get("step_type", "")).strip().upper() == "GO_TO"
+    }
+    go_to_labels.discard("")
+    if not go_to_labels:
+        return payload, []
+
+    kept_objects: list = []
+    removed_labels: list[str] = []
+    for item in context_objects:
+        label = _canonical_label(item.get("canonical_label")) if isinstance(item, dict) else ""
+        if label and label in go_to_labels:
+            removed_labels.append(label)
+            continue
+        kept_objects.append(item)
+    if not removed_labels:
+        return payload, []
+
+    normalized_payload = dict(payload)
+    normalized_scene_context = dict(scene_context)
+    normalized_scene_context["context_objects"] = kept_objects
+    normalized_payload["scene_context"] = normalized_scene_context
+    return normalized_payload, _dedupe_keep_order(removed_labels)
 
 
 def _context_from_payload(

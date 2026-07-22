@@ -234,6 +234,47 @@ class InstructionExecutionTest(unittest.TestCase):
         self.assertEqual(plan.parsing_source, "llm_repair")
         self.assertEqual(plan.scene_context.context_objects, ())
 
+    def test_repeated_context_target_overlap_is_canonicalized_after_repair(self) -> None:
+        invalid = {
+            "schema_version": "2.0",
+            "scene_context": {
+                "current_region": None,
+                "context_objects": [
+                    {"canonical_label": "wheelchair", "source_span": "wheelchair"},
+                ],
+            },
+            "navigation_targets": [
+                {"canonical_label": "wheelchair", "source_span": "wheelchair"},
+            ],
+            "route_steps": [
+                {
+                    "step_id": "step_1",
+                    "step_type": "GO_TO",
+                    "source_span": "go to the wheelchair",
+                    "target": "wheelchair",
+                    "direction": "none",
+                    "trigger": {"trigger_type": "NONE", "label": ""},
+                    "constraints": [],
+                },
+            ],
+        }
+        client = _FakeLLM([invalid, invalid])
+        with tempfile.TemporaryDirectory() as temp_dir:
+            plan = InstructionManager(
+                llm_client=client,
+                logger=_logger(),
+                cache_path=Path(temp_dir) / "plans.json",
+            ).parse("Go to the wheelchair.")
+
+        self.assertEqual(client.calls, 2)
+        self.assertEqual(plan.parsing_source, "llm_repair")
+        self.assertEqual(
+            plan.parsing_reason,
+            "repaired_after_validation_and_context_normalization",
+        )
+        self.assertEqual(plan.scene_context.context_objects, ())
+        self.assertEqual(plan.navigation_target_labels, ["wheelchair"])
+
     def test_region_transition_requires_semantics_odometry_and_topology(self) -> None:
         step = RouteStep(
             step_id="step_1",

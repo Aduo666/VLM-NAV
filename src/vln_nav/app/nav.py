@@ -11,12 +11,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-from ..control.controller import (
-    SteeringDriveController,
-    resolve_front_steering_joint_groups,
-    resolve_hold_joint_names,
-    resolve_wheel_joint_groups,
-)
+from ..control.locomotion import create_locomotion_controller
 from ..navigation.candidate_waypoint_predictor import CandidateWaypointPredictor, CandidateWaypointPredictorConfig
 from ..navigation.depth_safety import DepthSafetyConfig, DepthSafetyMonitor
 from ..navigation.instruction_manager import InstructionContext, InstructionManager
@@ -191,7 +186,8 @@ def _apply_task_overrides(*, config: AppConfig, task_id: str, tasks_file: Path, 
 
     start_position = selected.get("robot_start_position", None)
     if isinstance(start_position, list) and len(start_position) >= 3:
-        config.robot_init_position = [float(start_position[0]), float(start_position[1]), float(start_position[2])]
+        spawn_z_m = 0.0 if config.robot_profile is None else float(config.robot_profile.spawn_z_m)
+        config.robot_init_position = [float(start_position[0]), float(start_position[1]), spawn_z_m]
 
     start_orientation = selected.get("robot_start_orientation_deg", None)
     if isinstance(start_orientation, list) and len(start_orientation) >= 3:
@@ -518,7 +514,11 @@ def run_navigation(
             displacement_threshold_m=float(config.stuck_displacement_threshold_m),
             yaw_threshold_deg=float(config.stuck_yaw_threshold_deg),
             recovery_pause_sec=float(config.stuck_recovery_pause_sec),
-            recovery_reverse_sec=float(config.stuck_recovery_reverse_sec),
+            recovery_reverse_sec=(
+                0.0
+                if config.robot_profile is not None and config.robot_profile.is_g1
+                else float(config.stuck_recovery_reverse_sec)
+            ),
             recovery_turn_sec=float(config.stuck_recovery_turn_sec),
             recovery_turn_action=str(config.stuck_recovery_turn_action),
         ),
@@ -647,7 +647,14 @@ def run_navigation(
         ),
         logger=logger,
     )
-    odom_sensor = SimOdometrySensor(logger=logger, source=str(config.odom_source))
+    odom_filter_alpha = 1.0
+    if config.robot_profile is not None and config.robot_profile.g1_controller is not None:
+        odom_filter_alpha = float(config.robot_profile.g1_controller.odom_filter_alpha)
+    odom_sensor = SimOdometrySensor(
+        logger=logger,
+        source=str(config.odom_source),
+        pose_filter_alpha=odom_filter_alpha,
+    )
     occupancy_grid = OccupancyGridMapper(
         config=OccupancyGridConfig(
             enabled=bool(config.occupancy_grid_enabled),
@@ -731,6 +738,7 @@ def run_navigation(
                 sector_merge_keep_sec=float(config.lidar_sector_merge_keep_sec),
                 draw_points=bool(config.lidar_draw_points),
                 draw_lines=bool(config.lidar_draw_lines),
+                require_existing_sensor=bool(config.robot_profile is not None and config.robot_profile.is_g1),
             ),
             robot_root_path=str(config.robot_prim_path),
             logger=logger,
@@ -886,13 +894,27 @@ def run_navigation(
         rotation_deg=config.robot_init_orientation_deg,
     )
 
-    articulation_path = config.robot_articulation_path or _find_articulation_root_path(
-        stage=stage,
-        root_path=config.robot_prim_path,
+    articulation_path = (
+        _resolve_robot_relative_prim_path(
+            robot_root_path=config.robot_prim_path,
+            prim_path=config.robot_articulation_path,
+        )
+        if str(config.robot_articulation_path).strip()
+        else _find_articulation_root_path(stage=stage, root_path=config.robot_prim_path)
     )
     logger.info("Using articulation prim: %s", articulation_path)
+    if config.robot_profile is not None and config.robot_profile.is_g1:
+        articulation_prim = stage.GetPrimAtPath(articulation_path)
+        if not articulation_prim or not articulation_prim.IsValid():
+            raise RuntimeError(f"Required G1 articulation prim does not exist: {articulation_path}")
 
-    robot = world.scene.add(RobotArticulation(prim_path=articulation_path, name="custom_robot"))
+    robot = world.scene.add(
+        RobotArticulation(
+            prim_path=articulation_path,
+            name="custom_robot",
+            reset_xform_properties=not config.robot_profile.is_g1,
+        )
+    )
     front_camera_prim_path = _resolve_robot_relative_prim_path(
         robot_root_path=config.robot_prim_path,
         prim_path=config.front_camera_prim_path,
@@ -905,12 +927,14 @@ def run_navigation(
         stage=stage,
         prim_path=front_camera_prim_path,
         kind="front camera",
+        strict=bool(config.robot_profile is not None and config.robot_profile.is_g1),
     )
     if config.observer_camera_enabled:
         observer_camera_prim_path = _resolve_existing_prim_path(
             stage=stage,
             prim_path=observer_camera_prim_path,
             kind="observer camera",
+            strict=bool(config.robot_profile is not None and config.robot_profile.is_g1),
         )
     logger.info("Using front camera prim: %s", front_camera_prim_path)
     if config.observer_camera_enabled:
@@ -956,6 +980,12 @@ def run_navigation(
         actual_camera_hfov_deg = float(config.camera_horizontal_fov_deg)
     configured_camera_hfov_deg = float(config.camera_horizontal_fov_deg)
     config.camera_horizontal_fov_deg = actual_camera_hfov_deg
+    try:
+        front_camera_intrinsics = np.asarray(camera.get_intrinsics_matrix(), dtype=np.float64).reshape(3, 3)
+    except Exception as exc:
+        raise RuntimeError(
+            "Front camera must expose pinhole intrinsics for calibrated landmark projection"
+        ) from exc
     observation_adapter.set_horizontal_fov_deg(actual_camera_hfov_deg)
     candidate_predictor.set_horizontal_fov_deg(actual_camera_hfov_deg)
     target_grounder.set_horizontal_fov_deg(actual_camera_hfov_deg)
@@ -976,7 +1006,17 @@ def run_navigation(
         observer_camera.initialize()
         logger.info("observer camera initialize() complete")
         _attach_camera_annotators(camera=observer_camera, logger=logger, enable_depth=False)
-    lidar_reader.initialize(stage=stage)
+    lidar_initialized = lidar_reader.initialize(stage=stage)
+    if (
+        config.robot_profile is not None
+        and config.robot_profile.is_g1
+        and bool(config.lidar_enabled)
+        and not bool(lidar_initialized)
+    ):
+        raise RuntimeError(
+            "The G1 profile requires its USD LiDAR prim to exist at "
+            f"{config.robot_prim_path.rstrip('/')}/{config.lidar_prim_path.lstrip('/')}"
+        )
 
     _bind_viewport_to_camera(
         camera_prim_path=front_camera_prim_path,
@@ -992,67 +1032,25 @@ def run_navigation(
 
     available_joint_names = _get_joint_names(robot)
     logger.info("Detected articulation DOFs: %s", available_joint_names)
-    left_joint_names, right_joint_names, steering_joint_names, error_message = resolve_wheel_joint_groups(
-        available_joint_names=available_joint_names,
-        configured_left=config.left_wheel_joint_names,
-        configured_right=config.right_wheel_joint_names,
-        configured_steering=config.steering_joint_names,
-    )
-    if error_message:
-        raise RuntimeError(
-            f"{error_message}\n"
-            f"Available articulation DOFs: {available_joint_names}\n"
-            "Example config for this robot:\n"
-            "left_wheel_joint_names: [fl_wheel, rl_wheel]\n"
-            "right_wheel_joint_names: [fr_wheel, rr_wheel]"
-        )
-
-    front_steering_joint_names, passive_steering_joint_names = resolve_front_steering_joint_groups(
-        steering_joint_names
-    )
-    hold_joint_names = resolve_hold_joint_names(
-        available_joint_names=available_joint_names,
-        wheel_joint_names=[*left_joint_names, *right_joint_names],
-        steering_joint_names=steering_joint_names,
-    )
-    hold_joint_targets = _build_hold_joint_targets(
+    if config.robot_profile is None:
+        raise RuntimeError("Robot profile was not loaded")
+    drive_controller = create_locomotion_controller(
+        profile=config.robot_profile,
         robot=robot,
-        available_joint_names=available_joint_names,
-        hold_joint_names=hold_joint_names,
-    )
-    drive_controller = SteeringDriveController(
         stage=stage,
         articulation_path=articulation_path,
-        robot_root_path=config.robot_prim_path,
-        left_wheel_joint_names=left_joint_names,
-        right_wheel_joint_names=right_joint_names,
-        steering_joint_names=front_steering_joint_names,
-        passive_steering_joint_names=passive_steering_joint_names,
-        hold_joint_targets=hold_joint_targets,
-        wheel_drive_velocity=config.wheel_drive_velocity,
-        turn_drive_velocity=config.turn_drive_velocity,
-        steering_angle=config.steering_angle,
-        turn_mode=config.turn_mode,
-        turn_steering_angle=config.turn_steering_angle,
-        rear_steering_ratio=config.rear_steering_ratio,
-        wheel_drive_damping=config.wheel_drive_damping,
-        steering_stiffness=config.steering_stiffness,
-        steering_damping=config.steering_damping,
-        hold_joint_stiffness=config.hold_joint_stiffness,
-        hold_joint_damping=config.hold_joint_damping,
-        track_steering_sign=config.track_steering_sign,
+        available_joint_names=available_joint_names,
         logger=logger,
     )
     logger.info(
-        "[DriveConfig] left_wheels=%s right_wheels=%s front_steering=%s rear_steering=%s turn_mode=%s turn_steering_angle=%.3f rear_steering_ratio=%.2f track_steering_sign=%.1f discrete_primitives=%s",
-        left_joint_names,
-        right_joint_names,
-        front_steering_joint_names,
-        passive_steering_joint_names,
-        config.turn_mode,
-        float(config.turn_steering_angle),
-        float(config.rear_steering_ratio),
-        float(config.track_steering_sign),
+        "[RobotProfile] name=%s type=%s usd=%s physics_dt=%.4f render_dt=%.4f decimation=%s spawn_z=%.2f discrete_primitives=%s",
+        config.robot_profile.name,
+        config.robot_profile.robot_type,
+        config.robot_profile.asset.usd_path,
+        float(config.physics_dt),
+        float(config.rendering_dt),
+        int(config.robot_policy_decimation),
+        float(config.robot_profile.spawn_z_m),
         int(bool(config.use_discrete_action_primitives)),
     )
     logger.info(
@@ -1159,15 +1157,48 @@ def run_navigation(
     sim_time_sec = 0.0
     route_complete_handled = False
     navigation_finished = False
+    navigation_failed = False
+    fall_condition_started_sec: float | None = None
+    primitive_settle_started_sec: float | None = None
+    primitive_settle_stable_started_sec: float | None = None
     landmark_map_reached_synced: set[str] = set()
     global_pose_trace: list[tuple[float, float]] = []
     latest_global_map_image: Image.Image | None = None
     skip_grounding_once = False
 
-    for _ in range(config.warmup_steps):
-        world.step(render=True)
-        sim_time_sec += float(config.physics_dt)
+    warmup_steps = int(config.warmup_steps)
+    g1_render_stride = 1
+    if config.robot_profile.is_g1 and config.robot_profile.g1_controller is not None:
+        warmup_steps = max(
+            warmup_steps,
+            int(np.ceil(config.robot_profile.g1_controller.standup_duration_sec / config.physics_dt)),
+        )
+        render_ratio = float(config.rendering_dt) / float(config.physics_dt)
+        g1_render_stride = max(1, int(round(render_ratio)))
+        if not np.isclose(render_ratio, float(g1_render_stride), rtol=0.0, atol=1.0e-6):
+            raise RuntimeError(
+                "G1 rendering_dt must be an integer multiple of physics_dt: "
+                f"rendering_dt={config.rendering_dt} physics_dt={config.physics_dt}"
+            )
+        logger.info(
+            "[G1Startup] zero-command stabilization duration=%.2fs steps=%s "
+            "policy_decimation=%s render_stride=%s",
+            float(config.robot_profile.g1_controller.standup_duration_sec),
+            warmup_steps,
+            int(config.robot_profile.simulation.policy_decimation),
+            g1_render_stride,
+        )
         drive_controller.apply("STOP", speed_scale=0.0)
+    for warmup_index in range(warmup_steps):
+        if config.robot_profile.is_g1:
+            drive_controller.advance_physics()
+            world.step(render=False)
+            if (warmup_index + 1) % g1_render_stride == 0:
+                world.render()
+        else:
+            drive_controller.apply("STOP", speed_scale=0.0)
+            world.step(render=True)
+        sim_time_sec += float(config.physics_dt)
     logger.info("Warmup complete, controller is armed.")
     occupancy_bootstrap_end_sec = sim_time_sec
     occupancy_bootstrap_deadline_sec = sim_time_sec
@@ -1182,8 +1213,15 @@ def run_navigation(
         )
 
     while simulation_app.is_running():
-        world.step(render=True)
-        sim_time_sec += float(config.physics_dt)
+        if config.robot_profile.is_g1:
+            for _ in range(g1_render_stride):
+                drive_controller.advance_physics()
+                world.step(render=False)
+                sim_time_sec += float(config.physics_dt)
+            world.render()
+        else:
+            world.step(render=True)
+            sim_time_sec += float(config.physics_dt)
         frame_index += 1
         loop_now = time.monotonic()
         position, orientation = _get_world_pose(robot)
@@ -1203,17 +1241,34 @@ def run_navigation(
                 initial_quaternion_xyzw=initial_robot_orientation_xyzw,
                 current_quaternion_xyzw=orientation,
             )
-            if (
+            fall_condition = bool(
                 abs(float(roll_deg)) >= float(config.tip_stop_roll_pitch_deg)
                 or abs(float(pitch_deg)) >= float(config.tip_stop_roll_pitch_deg)
-            ):
-                logger.warning(
-                    "Robot tip detected relative_roll=%.1f relative_pitch=%.1f. Stopping simulation.",
-                    float(roll_deg),
-                    float(pitch_deg),
-                )
-                drive_controller.apply("STOP", speed_scale=0.0)
-                break
+                or float(position[2]) < float(config.tip_stop_min_base_height_m)
+            )
+            if fall_condition:
+                if fall_condition_started_sec is None:
+                    fall_condition_started_sec = sim_time_sec
+                fall_duration_sec = sim_time_sec - float(fall_condition_started_sec)
+                if (
+                    not navigation_failed
+                    and fall_duration_sec >= float(config.tip_stop_confirmation_sec)
+                ):
+                    navigation_failed = True
+                    navigation_finished = True
+                    drive_controller.apply("STOP", speed_scale=0.0)
+                    target_grounder.close()
+                    debug_video_recorder.close()
+                    logger.error(
+                        "[NAVIGATION_FAILED] reason=robot_fall roll_deg=%.1f pitch_deg=%.1f "
+                        "base_z_m=%.3f confirmation_sec=%.2f; simulation remains open with active standing",
+                        float(roll_deg),
+                        float(pitch_deg),
+                        float(position[2]),
+                        float(fall_duration_sec),
+                    )
+            else:
+                fall_condition_started_sec = None
 
         if navigation_finished:
             drive_controller.apply("STOP", speed_scale=0.0)
@@ -1369,6 +1424,62 @@ def run_navigation(
             )
             continue
 
+        settle_required = bool(
+            active_step_result is not None
+            and str(getattr(active_step_result, "decision_source", "")).strip().upper()
+            == "PRIMITIVE_COMPLETE"
+            and float(config.action_settle_max_wait_sec) > 0.0
+        )
+        if settle_required:
+            if primitive_settle_started_sec is None:
+                primitive_settle_started_sec = sim_time_sec
+                primitive_settle_stable_started_sec = None
+            linear_speed = abs(float(odom_state.linear_velocity_mps))
+            angular_speed = abs(float(odom_state.angular_velocity_radps))
+            stable_now = bool(
+                linear_speed <= float(config.action_settle_linear_speed_threshold_mps)
+                and angular_speed <= float(config.action_settle_angular_speed_threshold_radps)
+            )
+            if stable_now:
+                if primitive_settle_stable_started_sec is None:
+                    primitive_settle_stable_started_sec = sim_time_sec
+            else:
+                primitive_settle_stable_started_sec = None
+            settle_elapsed = sim_time_sec - float(primitive_settle_started_sec)
+            stable_elapsed = (
+                0.0
+                if primitive_settle_stable_started_sec is None
+                else sim_time_sec - float(primitive_settle_stable_started_sec)
+            )
+            settle_complete = bool(
+                stable_elapsed >= float(config.action_settle_stable_duration_sec)
+                or settle_elapsed >= float(config.action_settle_max_wait_sec)
+            )
+            if not settle_complete:
+                last_applied_wheel_velocity, last_applied_steering_angle = drive_controller.apply(
+                    "STOP", speed_scale=0.0
+                )
+                last_action_name = "STOP"
+                last_policy_feedback = ExecutionFeedback(
+                    applied_action="STOP",
+                    wheel_velocity=last_applied_wheel_velocity,
+                    steering_angle=last_applied_steering_angle,
+                )
+                continue
+            logger.info(
+                "[PrimitiveSettle] complete elapsed_sec=%.2f stable_sec=%.2f linear_mps=%.3f angular_radps=%.3f",
+                float(settle_elapsed),
+                float(stable_elapsed),
+                float(linear_speed),
+                float(angular_speed),
+            )
+            active_step_result = None
+            primitive_settle_started_sec = None
+            primitive_settle_stable_started_sec = None
+        elif _is_executing_motion_step(active_step_result):
+            primitive_settle_started_sec = None
+            primitive_settle_stable_started_sec = None
+
         # --- Fast path during active primitive execution ---
         is_motion_active = _is_executing_motion_step(active_step_result)
         if is_motion_active:
@@ -1438,6 +1549,14 @@ def run_navigation(
         landmark_map_entry = None
         grounding_waiting_for_keyframe = False
         if current_landmark:
+            try:
+                front_camera_view_matrix_ros = np.asarray(
+                    camera.get_view_matrix_ros(), dtype=np.float64
+                ).reshape(4, 4)
+            except Exception as exc:
+                raise RuntimeError(
+                    "Front camera ROS view matrix is unavailable for landmark projection"
+                ) from exc
             remembered_landmark_entry = landmark_map.get(current_landmark)
             target_tracker.set_target_label(current_landmark)
             tracker_can_cover_motion = target_tracker.lifecycle in {"TRACKING", "LOST_TEMP"}
@@ -1467,6 +1586,10 @@ def run_navigation(
                     if remembered_landmark_entry is None
                     else list(remembered_landmark_entry.world_xy)
                 ),
+                camera_intrinsics=front_camera_intrinsics,
+                camera_view_matrix_ros=front_camera_view_matrix_ros,
+                robot_world_position_xyz=position,
+                robot_world_orientation_wxyz=orientation,
             )
             if skip_grounding_once:
                 skip_grounding_once = False
@@ -1487,6 +1610,10 @@ def run_navigation(
                 robot_pose=observation.pose,
                 timestamp_sec=sim_time_sec,
                 frame_index=frame_index,
+                camera_intrinsics=front_camera_intrinsics,
+                camera_view_matrix_ros=front_camera_view_matrix_ros,
+                robot_world_position_xyz=position,
+                robot_world_orientation_wxyz=orientation,
             )
             target_observation = _select_target_observation(
                 grounding_observation=grounding_observation,
@@ -2536,10 +2663,16 @@ def _resolve_robot_relative_prim_path(*, robot_root_path: str, prim_path: str) -
     return f"{str(robot_root_path).rstrip('/')}/{candidate.lstrip('/')}"
 
 
-def _resolve_existing_prim_path(*, stage, prim_path: str, kind: str) -> str:
+def _resolve_existing_prim_path(*, stage, prim_path: str, kind: str, strict: bool = False) -> str:
     prim = stage.GetPrimAtPath(prim_path)
     if prim and prim.IsValid():
+        if "camera" in str(kind).lower() and prim.GetTypeName() != "Camera":
+            raise RuntimeError(
+                f"Configured {kind} prim has type {prim.GetTypeName()!r}, expected 'Camera': {prim_path}"
+            )
         return prim_path
+    if strict:
+        raise RuntimeError(f"Required {kind} prim does not exist at the configured path: {prim_path}")
 
     head, slash, tail = prim_path.rpartition("/")
     if slash and tail:
@@ -2669,29 +2802,12 @@ def _set_local_xform(*, stage, prim_path: str, translation: list[float], rotatio
     rotate_op.Set(tuple(float(value) for value in rotation_deg))
 
 
-def _build_hold_joint_targets(*, robot, available_joint_names: list[str], hold_joint_names: list[str]) -> dict[str, float]:
-    joint_positions = _get_joint_positions(robot)
-    return {
-        name: float(joint_positions[available_joint_names.index(name)])
-        for name in hold_joint_names
-        if name in available_joint_names
-    }
-
-
 def _get_joint_names(robot) -> list[str]:
     try:
         names = robot.dof_names
     except Exception as exc:
         raise RuntimeError(f"Unable to query articulation DOF names: {exc}") from exc
     return [str(name) for name in names]
-
-
-def _get_joint_positions(robot) -> np.ndarray:
-    positions = robot.get_joint_positions()
-    if positions is None:
-        return np.zeros((0,), dtype=np.float32)
-    positions = _to_numpy_array(positions)
-    return np.asarray(positions, dtype=np.float32).reshape(-1)
 
 
 def _get_world_pose(robot) -> tuple[np.ndarray, np.ndarray]:

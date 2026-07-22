@@ -142,6 +142,10 @@ class TargetTracker:
         robot_pose: Pose2D,
         timestamp_sec: float,
         frame_index: int,
+        camera_intrinsics: np.ndarray | None = None,
+        camera_view_matrix_ros: np.ndarray | None = None,
+        robot_world_position_xyz: np.ndarray | None = None,
+        robot_world_orientation_wxyz: np.ndarray | None = None,
     ) -> TargetObservation:
         label = self._label or "target"
         if not bool(self._config.enabled):
@@ -173,6 +177,10 @@ class TargetTracker:
             robot_pose=robot_pose,
             timestamp_sec=timestamp_sec,
             frame_index=frame_index,
+            camera_intrinsics=camera_intrinsics,
+            camera_view_matrix_ros=camera_view_matrix_ros,
+            robot_world_position_xyz=robot_world_position_xyz,
+            robot_world_orientation_wxyz=robot_world_orientation_wxyz,
         )
         self._last_observation = observation
         self._log_state(timestamp_sec=timestamp_sec, reason=observation.reason, bbox=bbox)
@@ -205,6 +213,10 @@ class TargetTracker:
         robot_pose: Pose2D,
         timestamp_sec: float,
         frame_index: int,
+        camera_intrinsics: np.ndarray | None = None,
+        camera_view_matrix_ros: np.ndarray | None = None,
+        robot_world_position_xyz: np.ndarray | None = None,
+        robot_world_orientation_wxyz: np.ndarray | None = None,
     ) -> TargetObservation:
         x0, y0, x1, y1 = bbox
         width = max(1, x1 - x0)
@@ -272,6 +284,10 @@ class TargetTracker:
             image_height=int(image_h),
             horizontal_fov_deg=float(self._config.horizontal_fov_deg),
             robot_pose=robot_pose,
+            camera_intrinsics=camera_intrinsics,
+            camera_view_matrix_ros=camera_view_matrix_ros,
+            robot_world_position_xyz=robot_world_position_xyz,
+            robot_world_orientation_wxyz=robot_world_orientation_wxyz,
         )
         return TargetObservation(
             label=self._label or "target",

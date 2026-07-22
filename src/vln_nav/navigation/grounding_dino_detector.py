@@ -31,14 +31,12 @@ class GroundingDinoConfig:
     box_threshold: float
     text_threshold: float
     text_encoder_path: str = ""
+    max_detections: int = 5
+    nms_iou_threshold: float = 0.50
 
 
 class GroundingDinoDetector:
-    """Lazy local GroundingDINO wrapper.
-
-    The dependency is optional. If the repo/checkpoint is unavailable, callers
-    should fall back to the VLM grounding path.
-    """
+    """Lazy local GroundingDINO wrapper for the required grounding backend."""
 
     def __init__(self, *, config: GroundingDinoConfig, logger) -> None:
         self._config = config
@@ -58,10 +56,14 @@ class GroundingDinoDetector:
         )
 
     def detect(self, *, rgb: np.ndarray, target_label: str) -> tuple[GroundingDinoDetection | None, str]:
+        detections, reason = self.detect_all(rgb=rgb, target_label=target_label)
+        return (detections[0] if detections else None), reason
+
+    def detect_all(self, *, rgb: np.ndarray, target_label: str) -> tuple[list[GroundingDinoDetection], str]:
         if not bool(self._config.enabled):
-            return None, "grounding_dino_disabled"
+            return [], "grounding_dino_disabled"
         if self._load_failed_reason is not None:
-            return None, self._load_failed_reason
+            return [], self._load_failed_reason
         if not self.available:
             missing = [
                 name
@@ -72,17 +74,17 @@ class GroundingDinoDetector:
                 )
                 if not _path_exists(value)
             ]
-            return None, f"grounding_dino_missing_{'_'.join(missing) or 'files'}"
+            return [], f"grounding_dino_missing_{'_'.join(missing) or 'files'}"
         text_encoder_path = Path(self._config.text_encoder_path).expanduser()
         if not text_encoder_path.is_dir() or not (text_encoder_path / "config.json").is_file():
-            return None, "grounding_dino_missing_text_encoder"
+            return [], "grounding_dino_missing_text_encoder"
         model, reason = self._load_model()
         if model is None:
-            return None, reason
+            return [], reason
 
         image_rgb = np.asarray(rgb, dtype=np.uint8)
         if image_rgb.ndim != 3 or image_rgb.shape[-1] < 3:
-            return None, "invalid_rgb"
+            return [], "invalid_rgb"
         image_bgr = image_rgb[:, :, :3][:, :, ::-1].copy()
         try:
             with _suppress_grounding_dino_noise():
@@ -94,32 +96,40 @@ class GroundingDinoDetector:
                 )
         except Exception as exc:
             self._logger.warning("[GroundingDINO] predict_failed target=%s error=%s", target_label, exc)
-            return None, "grounding_dino_predict_failed"
+            return [], "grounding_dino_predict_failed"
 
         xyxy = np.asarray(getattr(detections, "xyxy", []), dtype=np.float32)
         confidence = np.asarray(getattr(detections, "confidence", []), dtype=np.float32)
         if xyxy.size == 0 or confidence.size == 0:
-            return None, "grounding_dino_no_detection"
+            return [], "grounding_dino_no_detection"
 
-        best_idx = int(np.argmax(confidence))
         height, width = image_rgb.shape[:2]
-        x0, y0, x1, y1 = xyxy[best_idx].tolist()
-        bbox = (
-            int(np.clip(round(x0), 0, width - 1)),
-            int(np.clip(round(y0), 0, height - 1)),
-            int(np.clip(round(x1), 0, width)),
-            int(np.clip(round(y1), 0, height)),
+        proposals: list[GroundingDinoDetection] = []
+        for index in np.argsort(-confidence).tolist():
+            x0, y0, x1, y1 = xyxy[int(index)].tolist()
+            bbox = (
+                int(np.clip(round(x0), 0, width - 1)),
+                int(np.clip(round(y0), 0, height - 1)),
+                int(np.clip(round(x1), 0, width)),
+                int(np.clip(round(y1), 0, height)),
+            )
+            if not (bbox[0] < bbox[2] and bbox[1] < bbox[3]):
+                continue
+            proposals.append(
+                GroundingDinoDetection(
+                    bbox=bbox,
+                    confidence=float(confidence[int(index)]),
+                    phrase=str(target_label).strip().lower(),
+                )
+            )
+        kept = _nms_detections(
+            proposals,
+            iou_threshold=float(self._config.nms_iou_threshold),
+            max_detections=max(1, int(self._config.max_detections)),
         )
-        if not (bbox[0] < bbox[2] and bbox[1] < bbox[3]):
-            return None, "grounding_dino_invalid_bbox"
-        return (
-            GroundingDinoDetection(
-                bbox=bbox,
-                confidence=float(confidence[best_idx]),
-                phrase=str(target_label).strip().lower(),
-            ),
-            "ok",
-        )
+        if not kept:
+            return [], "grounding_dino_invalid_bbox"
+        return kept, "ok"
 
     def _load_model(self):
         if self._model is not None:
@@ -181,6 +191,35 @@ def _path_exists(value: str) -> bool:
     if not str(value).strip():
         return False
     return Path(value).expanduser().exists()
+
+
+def _nms_detections(
+    detections: list[GroundingDinoDetection],
+    *,
+    iou_threshold: float,
+    max_detections: int,
+) -> list[GroundingDinoDetection]:
+    kept: list[GroundingDinoDetection] = []
+    threshold = float(np.clip(iou_threshold, 0.0, 1.0))
+    for detection in sorted(detections, key=lambda item: float(item.confidence), reverse=True):
+        if any(_bbox_iou(detection.bbox, item.bbox) > threshold for item in kept):
+            continue
+        kept.append(detection)
+        if len(kept) >= max(1, int(max_detections)):
+            break
+    return kept
+
+
+def _bbox_iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+    ix0 = max(int(a[0]), int(b[0]))
+    iy0 = max(int(a[1]), int(b[1]))
+    ix1 = min(int(a[2]), int(b[2]))
+    iy1 = min(int(a[3]), int(b[3]))
+    intersection = max(0, ix1 - ix0) * max(0, iy1 - iy0)
+    area_a = max(0, int(a[2]) - int(a[0])) * max(0, int(a[3]) - int(a[1]))
+    area_b = max(0, int(b[2]) - int(b[0])) * max(0, int(b[3]) - int(b[1]))
+    union = area_a + area_b - intersection
+    return 0.0 if union <= 0 else float(intersection / union)
 
 
 def _set_noisy_library_log_levels() -> None:

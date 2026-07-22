@@ -561,6 +561,10 @@ def run_navigation(
             grounding_dino_box_threshold=float(config.target_grounding_dino_box_threshold),
             grounding_dino_text_threshold=float(config.target_grounding_dino_text_threshold),
             grounding_dino_text_encoder_path=str(config.target_grounding_dino_text_encoder_path),
+            grounding_dino_max_detections=int(config.target_grounding_dino_max_detections),
+            grounding_dino_nms_iou_threshold=float(
+                config.target_grounding_dino_nms_iou_threshold
+            ),
             sam_checkpoint_path=str(config.target_grounding_sam_checkpoint_path),
             sam_model_type=str(config.target_grounding_sam_model_type),
             sam_device=str(config.target_grounding_sam_device),
@@ -613,6 +617,12 @@ def run_navigation(
             confirm_max_anchor_jump_m=float(config.landmark_tracker_confirm_max_anchor_jump_m),
             confirm_max_depth_jump_m=float(config.landmark_tracker_confirm_max_depth_jump_m),
             potential_confidence_threshold=float(config.landmark_tracker_potential_confidence_threshold),
+            low_confidence_min_translation_m=float(
+                config.landmark_tracker_low_confidence_min_translation_m
+            ),
+            low_confidence_min_yaw_deg=float(
+                config.landmark_tracker_low_confidence_min_yaw_deg
+            ),
         ),
         logger=logger,
     )
@@ -781,8 +791,19 @@ def run_navigation(
             region_transition_confirmations=int(config.region_transition_confirmations),
             region_transition_min_confidence=float(config.region_transition_min_confidence),
             semantic_turn_min_yaw_deg=float(config.semantic_turn_min_yaw_deg),
+            semantic_turn_max_yaw_deg=float(config.semantic_turn_max_yaw_deg),
             semantic_turn_max_primitives=int(config.semantic_turn_max_primitives),
             semantic_turn_min_forward_clearance_m=float(config.semantic_turn_min_forward_clearance_m),
+            semantic_turn_alignment_confirmations=int(
+                config.semantic_turn_alignment_confirmations
+            ),
+            semantic_turn_corridor_center_tolerance_deg=float(
+                config.semantic_turn_corridor_center_tolerance_deg
+            ),
+            semantic_turn_same_corridor_tolerance_deg=float(
+                config.semantic_turn_same_corridor_tolerance_deg
+            ),
+            local_detour_max_turn_primitives=int(config.local_detour_max_turn_primitives),
             confirm_min_observations=int(config.landmark_tracker_confirm_min_observations),
             confirm_confidence_threshold=float(config.landmark_tracker_confirm_confidence_threshold),
             visual_target_center_deadband_deg=float(config.visual_target_center_deadband_deg),
@@ -1417,6 +1438,7 @@ def run_navigation(
         landmark_map_entry = None
         grounding_waiting_for_keyframe = False
         if current_landmark:
+            remembered_landmark_entry = landmark_map.get(current_landmark)
             target_tracker.set_target_label(current_landmark)
             tracker_can_cover_motion = target_tracker.lifecycle in {"TRACKING", "LOST_TEMP"}
             perception_motion_active = (
@@ -1440,6 +1462,11 @@ def run_navigation(
                 timestamp_sec=sim_time_sec,
                 frame_index=frame_index,
                 allow_new_request=allow_new_grounding,
+                preferred_world_xy=(
+                    None
+                    if remembered_landmark_entry is None
+                    else list(remembered_landmark_entry.world_xy)
+                ),
             )
             if skip_grounding_once:
                 skip_grounding_once = False
@@ -1606,6 +1633,9 @@ def run_navigation(
         if str(step_result.decision_source) in {
             "APPROACH_SAFETY_HOLD",
             "VISUAL_TARGET_SAFETY_HOLD",
+            "LOCAL_DETOUR_SAFETY_HOLD",
+            "TURN_SCAN_SAFETY_HOLD",
+            "TURN_ALIGNMENT_SAFETY_HOLD",
         }:
             runtime_approach_hold_streak += 1
             if runtime_approach_hold_streak >= 3:
@@ -1614,7 +1644,7 @@ def run_navigation(
                     reason="approach_path_unreachable",
                 )
                 runtime_approach_hold_streak = 0
-        else:
+        elif str(step_result.decision_source) != "REPLAN_COOLDOWN":
             runtime_approach_hold_streak = 0
         for completed_label in step_result.completed_landmarks:
             completed_key = str(completed_label).strip().lower()

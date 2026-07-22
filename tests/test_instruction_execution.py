@@ -196,6 +196,44 @@ class InstructionExecutionTest(unittest.TestCase):
             ["REGION_TRANSITION", "TURN", "GO_TO"],
         )
 
+    def test_context_target_overlap_requires_repair(self) -> None:
+        invalid = {
+            "schema_version": "2.0",
+            "scene_context": {
+                "current_region": None,
+                "context_objects": [
+                    {"canonical_label": "wheelchair", "source_span": "wheelchair"},
+                ],
+            },
+            "navigation_targets": [
+                {"canonical_label": "wheelchair", "source_span": "wheelchair"},
+            ],
+            "route_steps": [
+                {
+                    "step_id": "step_1",
+                    "step_type": "GO_TO",
+                    "source_span": "find the wheelchair",
+                    "target": "wheelchair",
+                    "direction": "none",
+                    "trigger": {"trigger_type": "NONE", "label": ""},
+                    "constraints": [],
+                },
+            ],
+        }
+        repaired = json.loads(json.dumps(invalid))
+        repaired["scene_context"]["context_objects"] = []
+        client = _FakeLLM([invalid, repaired])
+        with tempfile.TemporaryDirectory() as temp_dir:
+            plan = InstructionManager(
+                llm_client=client,
+                logger=_logger(),
+                cache_path=Path(temp_dir) / "plans.json",
+            ).parse("Find the wheelchair.")
+
+        self.assertEqual(client.calls, 2)
+        self.assertEqual(plan.parsing_source, "llm_repair")
+        self.assertEqual(plan.scene_context.context_objects, ())
+
     def test_region_transition_requires_semantics_odometry_and_topology(self) -> None:
         step = RouteStep(
             step_id="step_1",

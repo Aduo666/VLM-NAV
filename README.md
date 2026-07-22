@@ -1,29 +1,38 @@
-VLM-NAV
+CAPTAINav: Confidence-Gated Semantic Anchors and Primitive-Aligned Typed Instruction Navigation
 =======
 
-**An Isaac Sim 5.1 vision-language navigation testbed for a custom 4-wheel-steering robot.**
 
-VLM-NAV connects natural-language instructions, RGB-D perception, LiDAR mapping, open-vocabulary grounding, VLM reasoning, and low-level wheel/steering control into a runnable closed-loop navigation stack.
+**A Hybrid Navigation Method Based on Confidence-Gated Semantic Anchors, Typed Instruction Execution, and Primitive-Aligned VLM Search.**
+
+CAPTAINav connects natural-language instructions, RGB-D perception, LiDAR mapping, open-vocabulary grounding, VLM reasoning, and low-level wheel/steering control into a runnable closed-loop navigation stack.
 
 | | |
 |---|---|
-| Simulator | Isaac Sim 5.1 from pip |
-| Python | Conda environment `vlmnav` |
-| Robot | Custom 4WS USD |
-| Policy | VLM-guided ObjectNav / VLN prototype |
+| Simulator | Isaac Sim |
+| Python | python3.11 |
+| Robot | Mobile Robot |
+| Policy | VLM-guided VLN prototype |
 | Actions | Discrete atomic primitives |
 
-![VLM-NAV overview](docs/assets/hero.png)
+![CAPTAINav overview](docs/assets/hero.png)
+
+## Demo
+
+> **Instruction:** "You are currently in the hospital lobby. You need to go straight to find the wheelchair, then turn left, and in front of the stairs, turn right to find the yellow warning sign and stop in front of it."
+
+[![CAPTAINav navigation demo](docs/assets/demo.gif)](https://raw.githubusercontent.com/Aduo666/VLM-NAV/main/docs/assets/display.mp4)
+
+Click it to open the full-resolution H.264 recording.
 
 ## Features
 
-- **Isaac Sim 5.1 pip runtime**: scene USD loading, custom robot USD, cameras, LiDAR, viewport setup.
+- **Isaac Sim 5.1**: scene USD loading, custom robot USD, cameras, LiDAR, viewport setup.
 - **Custom 4-wheel-steering control**: FORWARD / TURN_LEFT / TURN_RIGHT atomic primitives with odometry-based completion.
-- **Semantic grounding + memory**: mandatory local GroundingDINO proposals plus VLM verification maintain confirmed landmark anchors; reached anchors remain persistent.
+- **Semantic grounding + memory**: local GroundingDINO keeps multiple proposals, preserves instance continuity, and sends only low-confidence crops to the VLM for verification; confirmed landmark anchors remain persistent.
 - **Typed instruction graph**: one startup parse separates trusted scene context from executable `GO_TO`, `REGION_TRANSITION`, and `TURN` steps; validated plans are cached by instruction and schema version.
 - **Aligned action representation**: at stopped decision keyframes, the VLM chooses exactly one safe candidate outcome that maps one-to-one to TURN_LEFT / FORWARD / TURN_RIGHT.
 - **Region-aware execution**: room transitions require consistent visual region evidence, odometry displacement, and a topology-node change rather than keyword matching alone.
-- **Search / approach separation**: VLM exploration is used while a landmark is unknown; fresh verified image evidence directly centers/approaches the target, while a confirmed off-screen anchor is followed through occupancy-grid A*.
+- **Search / approach separation**: VLM exploration is used while a landmark is unknown; fresh verified image evidence directly approaches the target, while a confirmed off-screen anchor is followed through occupancy-grid A* with bounded local detours when the direct route is blocked.
 - **Fast primitive execution**: during an atomic action, expensive decision-time perception is skipped; odometry, depth safety, drive control, and LiDAR/map updates remain active.
 - **Local and evaluation flows**: normal debugging uses `debug/local` and `logs/nav_latest.log`; dataset evaluation uses `debug/eval` plus eval outputs.
 
@@ -69,7 +78,7 @@ The default model and API endpoint are configured in `configs/default.yaml`.
 
 ### 4. Install Local GroundingDINO
 
-GroundingDINO is required by the current main navigation method. It proposes open-vocabulary boxes; the VLM verifies each proposal before it may create a confirmed landmark anchor. The navigation path no longer falls back to VLM-generated boxes.
+GroundingDINO is required by the current main navigation method. It keeps up to five distinct open-vocabulary proposals after NMS. High-confidence detections use short temporal/geometric confirmation; lower-confidence detections are verified from a clean object crop by the VLM and require a second consistent observation from a different viewpoint. The navigation path does not fall back to VLM-generated boxes.
 
 ```bash
 conda activate vlmnav
@@ -164,7 +173,8 @@ English language instruction
        unknown target -> one VLM candidate choice at a stopped keyframe
   -> REGION_TRANSITION: candidate choice + region evidence
        complete only after semantic + odometry + topology agreement
-  -> TURN: bounded repeated 15-degree primitives until heading alignment
+  -> TURN: 15-degree corridor scan, stable early exit after 45 degrees,
+           and best-heading recovery within a 105-degree bound
   -> low-level 4WS controller
 ```
 
@@ -197,10 +207,13 @@ target_grounding:
   enabled: true
   backend: "grounding_dino"
   grounding_dino_text_encoder_path: "weights/grounded_sam/bert-base-uncased"
+  grounding_dino_max_detections: 5
   semantic_verification_enabled: true
   semantic_verification_min_confidence: 0.50
+  semantic_verification_auto_accept_confidence: 0.75
 
 landmark_tracker:
+  confirm_confidence_threshold: 0.75
   confirm_min_observations: 2
   confirm_max_anchor_jump_m: 0.75
 
@@ -213,7 +226,9 @@ opennav:
   region_transition_confirmations: 2
   region_transition_min_confidence: 0.55
   semantic_turn_min_yaw_deg: 45.0
-  semantic_turn_max_primitives: 6
+  semantic_turn_max_yaw_deg: 105.0
+  semantic_turn_max_primitives: 7
+  semantic_turn_alignment_confirmations: 2
   visual_target_center_deadband_deg: 15.0
   arrival_distance_m: 2.0
   success_distance_m: 3.0
@@ -246,14 +261,6 @@ logs/
 
 The console intentionally shows only navigation milestones: `[PLAN]`, `[NAV_STATE]`, `[LANDMARK_CONFIRMED]`, `[STEP_COMPLETE]`, `[SAFETY_HOLD]`, `[RECOVERY]`, `[ERROR]`, and `[ROUTE_COMPLETE]`. Full component logs are overwritten in `logs/vln.log` on each run. The human debug frame keeps its status bar outside the imagery: north-up global map on the left and uncropped first-person RGB on the right.
 
-## Demo
-
-The current prototype can complete simple landmark-driven navigation, but candidate choice can still oscillate in cluttered scenes.
-
-[![Watch the VLM-NAV demo](docs/assets/display_thumb.png)](docs/assets/display.mp4)
-
-Click the preview to watch the H.264 demo directly with GitHub's video player.
-
 ## Known Limitations
 
 - VLM API latency is still the dominant delay between atomic primitives.
@@ -264,6 +271,6 @@ Click the preview to watch the H.264 demo directly with GitHub's video player.
 
 ## Research Context
 
-VLM-NAV adapts ideas from VLN, ObjectNav, open-vocabulary grounding, semantic memory, and map-aware robot navigation into an Isaac Sim workflow for a custom wheel-driven robot.
+CAPTAINav adapts ideas from VLN, ObjectNav, open-vocabulary grounding, semantic memory, and map-aware robot navigation into an Isaac Sim workflow for a custom wheel-driven robot.
 
 Inspired by R2R, VLN-CE, DUET, NavGPT, Open-Nav, Safe-VLN, and CA-Nav.

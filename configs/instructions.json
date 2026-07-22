@@ -20,21 +20,6 @@
       "id": "hospital_002",
       "scene_usd_path": "usd/hospital.usd",
       "robot_start_position": [
-        13.0,
-        7.0,
-        0.0
-      ],
-      "robot_start_orientation_deg": [
-        0.0,
-        0.0,
-        0.0
-      ],
-      "instruction": "Go forward to the yellow warning sign, turn right, then continue straight and stop near the trash can."
-    },
-    {
-      "id": "hospital_003",
-      "scene_usd_path": "usd/hospital.usd",
-      "robot_start_position": [
         1.5,
         4.0,
         0.0
@@ -44,14 +29,14 @@
         0.0,
         0.0
       ],
-      "instruction": "Find the stairs."
+      "instruction": "You are currently in the hospital lobby. You need to go straight to find the wheelchair, then turn left, and in front of the stairs, turn right to find the yellow warning sign and stop in front of it."
     },
     {
-      "id": "hospital_004",
+      "id": "hospital_003",
       "scene_usd_path": "usd/hospital.usd",
       "robot_start_position": [
-        12.2986,
-        11.0719,
+        11.5476,
+        10.1805,
         0.0
       ],
       "robot_start_orientation_deg": [
@@ -59,7 +44,8 @@
         0.0,
         0.0
       ],
-      "instruction": "sss"
+      "instruction": "Go forward to the yellow warning sign, turn right, then continue straight and stop near the trash can."
     }
+
   ]
 }

@@ -42,8 +42,13 @@ class AppConfig:
     region_transition_confirmations: int = 2
     region_transition_min_confidence: float = 0.55
     semantic_turn_min_yaw_deg: float = 45.0
-    semantic_turn_max_primitives: int = 6
+    semantic_turn_max_yaw_deg: float = 105.0
+    semantic_turn_max_primitives: int = 7
     semantic_turn_min_forward_clearance_m: float = 0.60
+    semantic_turn_alignment_confirmations: int = 2
+    semantic_turn_corridor_center_tolerance_deg: float = 12.0
+    semantic_turn_same_corridor_tolerance_deg: float = 20.0
+    local_detour_max_turn_primitives: int = 2
     visual_target_center_deadband_deg: float = 15.0
     candidate_slot_bearings_deg: list[float] = field(default_factory=lambda: [75.0, 35.0, 0.0, -35.0, -75.0])
     candidate_adaptive_enabled: bool = True
@@ -100,6 +105,8 @@ class AppConfig:
     target_grounding_dino_device: str = "cuda"
     target_grounding_dino_box_threshold: float = 0.45
     target_grounding_dino_text_threshold: float = 0.25
+    target_grounding_dino_max_detections: int = 5
+    target_grounding_dino_nms_iou_threshold: float = 0.50
     target_grounding_dino_text_encoder_path: str = str(
         PROJECT_ROOT / "weights" / "grounded_sam" / "bert-base-uncased"
     )
@@ -114,7 +121,7 @@ class AppConfig:
     target_grounding_semantic_verification_enabled: bool = True
     target_grounding_semantic_verification_min_confidence: float = 0.70
     target_grounding_semantic_verification_max_edge_px: int = 768
-    target_grounding_semantic_verification_auto_accept_confidence: float = 1.01
+    target_grounding_semantic_verification_auto_accept_confidence: float = 0.75
     target_grounding_pause_during_active_primitive: bool = True
     target_tracker_enabled: bool = True
     target_tracker_type: str = "CSRT"
@@ -138,6 +145,8 @@ class AppConfig:
     landmark_tracker_confirm_min_observations: int = 3
     landmark_tracker_confirm_max_anchor_jump_m: float = 0.50
     landmark_tracker_confirm_max_depth_jump_m: float = 0.80
+    landmark_tracker_low_confidence_min_translation_m: float = 0.20
+    landmark_tracker_low_confidence_min_yaw_deg: float = 10.0
     landmark_map_enabled: bool = True
     landmark_map_anchor_ttl_sec: float = 120.0
     landmark_map_min_confidence: float = 0.20
@@ -474,13 +483,33 @@ def load_config(config_path: str | None = None) -> AppConfig:
             "SEMANTIC_TURN_MIN_YAW_DEG",
             opennav.get("semantic_turn_min_yaw_deg", 45.0),
         ),
+        semantic_turn_max_yaw_deg=_float_env_or_value(
+            "SEMANTIC_TURN_MAX_YAW_DEG",
+            opennav.get("semantic_turn_max_yaw_deg", 105.0),
+        ),
         semantic_turn_max_primitives=_int_env_or_value(
             "SEMANTIC_TURN_MAX_PRIMITIVES",
-            opennav.get("semantic_turn_max_primitives", 6),
+            opennav.get("semantic_turn_max_primitives", 7),
         ),
         semantic_turn_min_forward_clearance_m=_float_env_or_value(
             "SEMANTIC_TURN_MIN_FORWARD_CLEARANCE_M",
             opennav.get("semantic_turn_min_forward_clearance_m", 0.60),
+        ),
+        semantic_turn_alignment_confirmations=_int_env_or_value(
+            "SEMANTIC_TURN_ALIGNMENT_CONFIRMATIONS",
+            opennav.get("semantic_turn_alignment_confirmations", 2),
+        ),
+        semantic_turn_corridor_center_tolerance_deg=_float_env_or_value(
+            "SEMANTIC_TURN_CORRIDOR_CENTER_TOLERANCE_DEG",
+            opennav.get("semantic_turn_corridor_center_tolerance_deg", 12.0),
+        ),
+        semantic_turn_same_corridor_tolerance_deg=_float_env_or_value(
+            "SEMANTIC_TURN_SAME_CORRIDOR_TOLERANCE_DEG",
+            opennav.get("semantic_turn_same_corridor_tolerance_deg", 20.0),
+        ),
+        local_detour_max_turn_primitives=_int_env_or_value(
+            "LOCAL_DETOUR_MAX_TURN_PRIMITIVES",
+            opennav.get("local_detour_max_turn_primitives", 2),
         ),
         visual_target_center_deadband_deg=_float_env_or_value(
             "VISUAL_TARGET_CENTER_DEADBAND_DEG",
@@ -708,6 +737,14 @@ def load_config(config_path: str | None = None) -> AppConfig:
             "GROUNDING_DINO_TEXT_THRESHOLD",
             target_grounding.get("grounding_dino_text_threshold", 0.25),
         ),
+        target_grounding_dino_max_detections=_int_env_or_value(
+            "GROUNDING_DINO_MAX_DETECTIONS",
+            target_grounding.get("grounding_dino_max_detections", 5),
+        ),
+        target_grounding_dino_nms_iou_threshold=_float_env_or_value(
+            "GROUNDING_DINO_NMS_IOU_THRESHOLD",
+            target_grounding.get("grounding_dino_nms_iou_threshold", 0.50),
+        ),
         target_grounding_dino_text_encoder_path=str(
             _resolve_path(
                 _env_or_value(
@@ -772,7 +809,7 @@ def load_config(config_path: str | None = None) -> AppConfig:
         ),
         target_grounding_semantic_verification_auto_accept_confidence=_float_env_or_value(
             "TARGET_GROUNDING_SEMANTIC_VERIFICATION_AUTO_ACCEPT_CONFIDENCE",
-            target_grounding.get("semantic_verification_auto_accept_confidence", 1.01),
+            target_grounding.get("semantic_verification_auto_accept_confidence", 0.75),
         ),
         target_grounding_pause_during_active_primitive=_bool_env_or_value(
             "TARGET_GROUNDING_PAUSE_DURING_ACTIVE_PRIMITIVE",
@@ -871,6 +908,14 @@ def load_config(config_path: str | None = None) -> AppConfig:
         landmark_tracker_confirm_max_depth_jump_m=_float_env_or_value(
             "LANDMARK_TRACKER_CONFIRM_MAX_DEPTH_JUMP_M",
             landmark_tracker.get("confirm_max_depth_jump_m", 0.80),
+        ),
+        landmark_tracker_low_confidence_min_translation_m=_float_env_or_value(
+            "LANDMARK_TRACKER_LOW_CONFIDENCE_MIN_TRANSLATION_M",
+            landmark_tracker.get("low_confidence_min_translation_m", 0.20),
+        ),
+        landmark_tracker_low_confidence_min_yaw_deg=_float_env_or_value(
+            "LANDMARK_TRACKER_LOW_CONFIDENCE_MIN_YAW_DEG",
+            landmark_tracker.get("low_confidence_min_yaw_deg", 10.0),
         ),
         landmark_map_enabled=_bool_env_or_value(
             "LANDMARK_MAP_ENABLED",

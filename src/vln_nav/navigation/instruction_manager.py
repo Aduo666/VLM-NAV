@@ -11,7 +11,7 @@ from pathlib import Path
 
 
 INSTRUCTION_SCHEMA_VERSION = "2.0"
-INSTRUCTION_PROMPT_VERSION = "2026-07-21.1"
+INSTRUCTION_PROMPT_VERSION = "2026-07-22.1"
 SUPPORTED_STEP_TYPES = {"GO_TO", "REGION_TRANSITION", "TURN"}
 SUPPORTED_DIRECTIONS = {"none", "left", "right", "forward"}
 
@@ -318,7 +318,7 @@ def _instruction_user_prompt(instruction: str) -> str:
         "}\n\n"
         "Rules:\n"
         "1. scene_context is trusted prior information, not an execution target.\n"
-        "2. Objects merely described as nearby belong only in context_objects.\n"
+        "2. Objects merely described as nearby belong only in context_objects. Never duplicate a GO_TO target in context_objects.\n"
         "3. find/go to/navigate to/approach an object becomes GO_TO with SEMANTIC_AND_DISTANCE.\n"
         "4. Leaving or entering a room becomes REGION_TRANSITION.\n"
         "5. A directional turn becomes TURN; if it follows another step, use AFTER_PREVIOUS_STEP.\n"
@@ -456,9 +456,12 @@ def _context_from_payload(
             f"expected={_dedupe_keep_order(go_to_labels)} actual={target_labels}"
         )
     context_labels = {entity.canonical_label for entity in context_objects}
-    for target in go_to_labels:
-        if target in context_labels and target not in target_labels:
-            errors.append(f"context object {target} cannot become a GO_TO target without explicit target role")
+    overlapping_labels = sorted(context_labels.intersection(go_to_labels))
+    if overlapping_labels:
+        errors.append(
+            "scene_context.context_objects must exclude GO_TO navigation targets "
+            f"overlap={overlapping_labels}"
+        )
 
     task_type = "objectnav" if len(route_steps) == 1 and route_steps[0].step_type == "GO_TO" else "vln"
     instruction_id = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]

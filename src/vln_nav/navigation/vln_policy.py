@@ -70,8 +70,13 @@ class OpenNavPolicyConfig:
     region_transition_confirmations: int = 2
     region_transition_min_confidence: float = 0.55
     semantic_turn_min_yaw_deg: float = 45.0
-    semantic_turn_max_primitives: int = 6
+    semantic_turn_max_yaw_deg: float = 105.0
+    semantic_turn_max_primitives: int = 7
     semantic_turn_min_forward_clearance_m: float = 0.60
+    semantic_turn_alignment_confirmations: int = 2
+    semantic_turn_corridor_center_tolerance_deg: float = 12.0
+    semantic_turn_same_corridor_tolerance_deg: float = 20.0
+    local_detour_max_turn_primitives: int = 2
     confirm_min_observations: int = 3
     confirm_confidence_threshold: float = 0.50
     visual_target_center_deadband_deg: float = 15.0
@@ -100,6 +105,23 @@ class PolicyStepResult:
     current_target: str = ""
     navigation_status: str = "RUNNING"
     last_error: str = ""
+
+
+@dataclass(frozen=True)
+class _TurnCorridorSample:
+    robot_yaw_rad: float
+    directed_yaw_deg: float
+    corridor_world_yaw_rad: float
+    local_heading_deg: float
+    forward_clearance_m: float
+    score: float
+
+
+@dataclass
+class _LocalDetourState:
+    target_label: str
+    turn_action: str
+    turns_taken: int
 
 
 class OpenNavVLNPolicy:
@@ -166,7 +188,10 @@ class OpenNavVLNPolicy:
         self._semantic_turn_step_id = ""
         self._semantic_turn_start_yaw_rad: float | None = None
         self._semantic_turn_primitives_taken = 0
+        self._semantic_turn_samples: list[_TurnCorridorSample] = []
+        self._semantic_turn_return_yaw_rad: float | None = None
         self._satisfied_turn_triggers: set[str] = set()
+        self._local_detour_state: _LocalDetourState | None = None
         self._topology_node_id: int | None = None
         self._region_transition = RegionTransitionManager(
             config=RegionTransitionConfig(
@@ -426,6 +451,17 @@ class OpenNavVLNPolicy:
             left_panel_image_path=None,
         )
 
+        detour_result = self._continue_local_detour(
+            observation=observation,
+            candidate_set=candidate_set,
+            progress_signal=progress_state.progress_signal,
+            debug_image_path=debug_image_path,
+            now=now,
+        )
+        if detour_result is not None:
+            self._safety_context_text = ""
+            return detour_result
+
         # Fresh verified image evidence outranks a projected world anchor.
         visual_candidate, visual_desired_action, visual_bearing_deg = (
             self._verified_visual_target_candidate(candidate_set=candidate_set)
@@ -452,6 +488,18 @@ class OpenNavVLNPolicy:
                 debug_image_path=debug_image_path,
             )
         if visual_desired_action is not None:
+            detour_result = self._start_visual_local_detour(
+                observation=observation,
+                candidate_set=candidate_set,
+                desired_action=visual_desired_action,
+                target_bearing_deg=visual_bearing_deg,
+                progress_signal=progress_state.progress_signal,
+                debug_image_path=debug_image_path,
+                now=now,
+            )
+            if detour_result is not None:
+                self._safety_context_text = ""
+                return detour_result
             self._safety_context_text = ""
             self._next_replan_time = now + float(self._config.replanning_cooldown_sec)
             return PolicyStepResult(
@@ -486,6 +534,35 @@ class OpenNavVLNPolicy:
             return semantic_result
 
         if semantic_landmark_entry is not None:
+            detour_candidate = self._best_anchor_detour_candidate(
+                observation=observation,
+                candidate_set=candidate_set,
+                anchor_world_xy=semantic_landmark_entry.world_xy,
+            )
+            if detour_candidate is not None:
+                action_name, speed_scale = _candidate_to_primitive_action(
+                    detour_candidate,
+                    turn_speed_scale=float(self._config.turn_speed_scale),
+                    forward_speed_scale=float(self._config.forward_speed_scale),
+                )
+                self._logger.warning(
+                    "[LocalDetour] target=%s reason=confirmed_anchor_no_astar_path action=%s candidate=%s",
+                    self._current_target_text(),
+                    action_name,
+                    detour_candidate.slot_id,
+                )
+                self._safety_context_text = ""
+                return self._start_candidate_primitive(
+                    observation=observation,
+                    candidate=detour_candidate,
+                    action_name=action_name,
+                    speed_scale=speed_scale,
+                    now=now,
+                    progress_signal=progress_state.progress_signal,
+                    decision_source="ANCHOR_LOCAL_DETOUR",
+                    reasoning_summary="confirmed target anchor retained; move through safest progress-making local corridor and replan",
+                    debug_image_path=debug_image_path,
+                )
             self._safety_context_text = ""
             self._next_replan_time = now + float(self._config.replanning_cooldown_sec)
             self._logger.error(
@@ -624,6 +701,188 @@ class OpenNavVLNPolicy:
             desired_action,
         )
         return None, desired_action, bearing_deg
+
+    def _start_visual_local_detour(
+        self,
+        *,
+        observation: VLNObservation,
+        candidate_set: CandidateSet,
+        desired_action: str,
+        target_bearing_deg: float,
+        progress_signal: str,
+        debug_image_path: str | Path | None,
+        now: float,
+    ) -> PolicyStepResult | None:
+        turn_candidate = self._best_detour_turn_candidate(
+            candidate_set=candidate_set,
+            target_bearing_deg=target_bearing_deg,
+        )
+        if turn_candidate is None:
+            return None
+        turn_action, speed_scale = _candidate_to_primitive_action(
+            turn_candidate,
+            turn_speed_scale=float(self._config.turn_speed_scale),
+            forward_speed_scale=float(self._config.forward_speed_scale),
+        )
+        self._local_detour_state = _LocalDetourState(
+            target_label=self._current_target_text(),
+            turn_action=turn_action,
+            turns_taken=1,
+        )
+        self._logger.warning(
+            "[LocalDetour] target=%s direct=%s blocked=1 detour=%s bearing_deg=%+.1f",
+            self._current_target_text(),
+            desired_action,
+            turn_action,
+            float(target_bearing_deg),
+        )
+        return self._start_candidate_primitive(
+            observation=observation,
+            candidate=turn_candidate,
+            action_name=turn_action,
+            speed_scale=speed_scale,
+            now=now,
+            progress_signal=progress_signal,
+            decision_source="VISUAL_TARGET_LOCAL_DETOUR",
+            reasoning_summary=(
+                f"direct visual action {desired_action} is blocked; commit {turn_action} then one safe forward primitive"
+            ),
+            debug_image_path=debug_image_path,
+        )
+
+    def _continue_local_detour(
+        self,
+        *,
+        observation: VLNObservation,
+        candidate_set: CandidateSet,
+        progress_signal: str,
+        debug_image_path: str | Path | None,
+        now: float,
+    ) -> PolicyStepResult | None:
+        state = self._local_detour_state
+        if state is None:
+            return None
+        if state.target_label != self._current_target_text():
+            self._local_detour_state = None
+            return None
+
+        forward_candidate = self._best_candidate_for_action(
+            candidate_set=candidate_set,
+            action_name="FORWARD",
+        )
+        if forward_candidate is not None:
+            self._local_detour_state = None
+            return self._start_candidate_primitive(
+                observation=observation,
+                candidate=forward_candidate,
+                action_name="FORWARD",
+                speed_scale=float(self._config.forward_speed_scale),
+                now=now,
+                progress_signal=progress_signal,
+                decision_source="LOCAL_DETOUR_FORWARD",
+                reasoning_summary=(
+                    f"detour side={state.turn_action} established a safe corridor; advance once before target recentering"
+                ),
+                debug_image_path=debug_image_path,
+            )
+
+        max_turns = max(1, int(self._config.local_detour_max_turn_primitives))
+        turn_candidate = self._best_candidate_for_action(
+            candidate_set=candidate_set,
+            action_name=state.turn_action,
+        )
+        if turn_candidate is not None and state.turns_taken < max_turns:
+            state.turns_taken += 1
+            return self._start_candidate_primitive(
+                observation=observation,
+                candidate=turn_candidate,
+                action_name=state.turn_action,
+                speed_scale=float(self._config.turn_speed_scale),
+                now=now,
+                progress_signal=progress_signal,
+                decision_source="VISUAL_TARGET_LOCAL_DETOUR",
+                reasoning_summary=(
+                    f"continue committed detour {state.turn_action} turn {state.turns_taken}/{max_turns}"
+                ),
+                debug_image_path=debug_image_path,
+            )
+
+        self._local_detour_state = None
+        self._next_replan_time = now + float(self._config.replanning_cooldown_sec)
+        return self._hold_result(
+            decision_source="LOCAL_DETOUR_SAFETY_HOLD",
+            reasoning_summary="local detour exhausted without a safe forward corridor; request bounded runtime recovery",
+            progress_signal=progress_signal,
+            debug_image_path=debug_image_path,
+            replanned=True,
+            last_error="local_detour_exhausted",
+        )
+
+    def _best_detour_turn_candidate(
+        self,
+        *,
+        candidate_set: CandidateSet,
+        target_bearing_deg: float,
+    ) -> WaypointCandidate | None:
+        candidates: list[tuple[float, WaypointCandidate]] = []
+        for candidate in candidate_set.candidates:
+            if not bool(candidate.valid):
+                continue
+            action_name, _ = _candidate_to_primitive_action(
+                candidate,
+                turn_speed_scale=float(self._config.turn_speed_scale),
+                forward_speed_scale=float(self._config.forward_speed_scale),
+            )
+            if action_name not in {"TURN_LEFT", "TURN_RIGHT"}:
+                continue
+            target_side_bonus = 0.0
+            if target_bearing_deg < 0.0 and action_name == "TURN_LEFT":
+                target_side_bonus = 0.15
+            elif target_bearing_deg > 0.0 and action_name == "TURN_RIGHT":
+                target_side_bonus = 0.15
+            recent_penalty = 0.0
+            if self._recent_primitive_actions:
+                opposite = "TURN_RIGHT" if action_name == "TURN_LEFT" else "TURN_LEFT"
+                if self._recent_primitive_actions[-1] == opposite:
+                    recent_penalty = 0.20
+            score = (
+                float(candidate.clearance_score)
+                + 0.20 * float(candidate.depth_support.get("min_clearance_m", 0.0))
+                + target_side_bonus
+                - recent_penalty
+            )
+            candidates.append((score, candidate))
+        if not candidates:
+            return None
+        return max(candidates, key=lambda item: item[0])[1]
+
+    def _best_anchor_detour_candidate(
+        self,
+        *,
+        observation: VLNObservation,
+        candidate_set: CandidateSet,
+        anchor_world_xy: list[float],
+    ) -> WaypointCandidate | None:
+        target_local = _world_waypoint_to_local_xy(
+            robot_pose=observation.pose,
+            world_goal_xy=anchor_world_xy,
+        )
+        target_heading_deg = float(np.degrees(np.arctan2(target_local[1], max(1e-6, target_local[0]))))
+        ranked: list[tuple[float, WaypointCandidate]] = []
+        for candidate in candidate_set.candidates:
+            if not bool(candidate.valid):
+                continue
+            heading_error = abs(float(candidate.heading_delta_deg) - target_heading_deg)
+            heading_score = max(0.0, 1.0 - heading_error / 90.0)
+            score = (
+                float(candidate.clearance_score)
+                + 0.35 * heading_score
+                + 0.10 * float(candidate.depth_support.get("min_clearance_m", 0.0))
+            )
+            ranked.append((score, candidate))
+        if not ranked:
+            return None
+        return max(ranked, key=lambda item: item[0])[1]
 
     def _start_candidate_primitive(
         self,
@@ -876,6 +1135,7 @@ class OpenNavVLNPolicy:
 
     def cancel_active_goal(self) -> None:
         self._clear_active_goal()
+        self._local_detour_state = None
 
     def set_safety_context(self, text: str) -> None:
         self._safety_context_text = str(text).strip()
@@ -1052,11 +1312,14 @@ class OpenNavVLNPolicy:
             self._semantic_turn_step_id = step.step_id
             self._semantic_turn_start_yaw_rad = float(observation.pose.yaw_rad)
             self._semantic_turn_primitives_taken = 0
+            self._semantic_turn_samples.clear()
+            self._semantic_turn_return_yaw_rad = None
             self._logger.info(
-                "[NAV_STATE] turn=start step=%s direction=%s min_yaw_deg=%.1f max_primitives=%s",
+                "[NAV_STATE] turn=start step=%s direction=%s yaw_range_deg=[%.1f,%.1f] max_primitives=%s",
                 step.step_id,
                 step.direction,
                 float(self._config.semantic_turn_min_yaw_deg),
+                float(self._config.semantic_turn_max_yaw_deg),
                 int(self._config.semantic_turn_max_primitives),
             )
 
@@ -1072,6 +1335,7 @@ class OpenNavVLNPolicy:
         if step.direction == "right":
             directed_yaw_deg *= -1.0
         min_yaw_deg = max(1.0, float(self._config.semantic_turn_min_yaw_deg))
+        max_yaw_deg = max(min_yaw_deg, float(self._config.semantic_turn_max_yaw_deg))
         forward_candidate = self._best_candidate_for_action(
             candidate_set=candidate_set,
             action_name="FORWARD",
@@ -1084,33 +1348,125 @@ class OpenNavVLNPolicy:
                     forward_candidate.depth_support.get("median_depth", 0.0),
                 )
             )
-        heading_aligned = (
-            directed_yaw_deg >= min_yaw_deg
-            and forward_candidate is not None
-            and forward_clearance_m >= float(self._config.semantic_turn_min_forward_clearance_m)
+        sample = self._turn_corridor_sample(
+            observation=observation,
+            candidate_set=candidate_set,
+            directed_yaw_deg=directed_yaw_deg,
         )
-        max_primitives = max(1, int(self._config.semantic_turn_max_primitives))
-        budget_exhausted = self._semantic_turn_primitives_taken >= max_primitives
-        if heading_aligned or budget_exhausted:
-            reason = "heading_aligned" if heading_aligned else "bounded_turn_budget_complete"
+        if sample is not None and (
+            not self._semantic_turn_samples
+            or abs(float(np.degrees(_wrap_angle_rad(
+                sample.robot_yaw_rad - self._semantic_turn_samples[-1].robot_yaw_rad
+            ))))
+            >= max(1.0, 0.35 * float(self._config.active_turn_angle_deg))
+        ):
+            self._semantic_turn_samples.append(sample)
             self._logger.info(
-                "[STEP_COMPLETE] step=%s type=TURN reason=%s yaw_deg=%.1f primitives=%s",
+                "[TurnScan] step=%s yaw_deg=%.1f corridor_local_deg=%+.1f clearance_m=%.2f score=%.2f samples=%s",
                 step.step_id,
-                reason,
                 directed_yaw_deg,
-                self._semantic_turn_primitives_taken,
+                sample.local_heading_deg,
+                sample.forward_clearance_m,
+                sample.score,
+                len(self._semantic_turn_samples),
             )
-            self._advance_current_step(
+
+        if self._semantic_turn_return_yaw_rad is not None:
+            return_error_deg = float(np.degrees(_wrap_angle_rad(
+                self._semantic_turn_return_yaw_rad - float(observation.pose.yaw_rad)
+            )))
+            return_tolerance_deg = max(
+                float(self._config.active_turn_tolerance_deg),
+                0.5 * float(self._config.active_turn_angle_deg),
+            )
+            if (
+                abs(return_error_deg) <= return_tolerance_deg
+                and forward_candidate is not None
+                and forward_clearance_m >= float(self._config.semantic_turn_min_forward_clearance_m)
+            ):
+                return self._complete_semantic_turn(
+                    observation=observation,
+                    progress_signal=progress_state.progress_signal,
+                    debug_image_path=debug_image_path,
+                    directed_yaw_deg=directed_yaw_deg,
+                    reason="best_corridor_heading_recovered",
+                )
+            if abs(return_error_deg) <= return_tolerance_deg:
+                return self._hold_result(
+                    decision_source="TURN_ALIGNMENT_SAFETY_HOLD",
+                    reasoning_summary="best scanned heading reached but its forward corridor is no longer safe",
+                    progress_signal=progress_state.progress_signal,
+                    debug_image_path=debug_image_path,
+                    replanned=True,
+                    last_error="turn_best_corridor_became_blocked",
+                )
+            correction_action = "TURN_LEFT" if return_error_deg > 0.0 else "TURN_RIGHT"
+            correction_candidate = self._best_candidate_for_action(
+                candidate_set=candidate_set,
+                action_name=correction_action,
+            )
+            if correction_candidate is None:
+                return self._hold_result(
+                    decision_source="TURN_ALIGNMENT_SAFETY_HOLD",
+                    reasoning_summary=f"cannot safely correct toward recorded best corridor ({return_error_deg:+.1f}deg)",
+                    progress_signal=progress_state.progress_signal,
+                    debug_image_path=debug_image_path,
+                    replanned=True,
+                    last_error="turn_alignment_candidate_unavailable",
+                )
+            return self._start_candidate_primitive(
                 observation=observation,
-                source="SemanticTurn",
-                reason=reason,
+                candidate=correction_candidate,
+                action_name=correction_action,
+                speed_scale=float(_primitive_speed_scale(correction_action, self._config)),
+                now=now,
+                progress_signal=progress_state.progress_signal,
+                decision_source="SEMANTIC_TURN_CORRECTION",
+                reasoning_summary=f"return to best scanned corridor; heading_error_deg={return_error_deg:+.1f}",
+                debug_image_path=debug_image_path,
             )
-            return self._hold_result(
-                decision_source="TURN_COMPLETE",
-                reasoning_summary=reason,
+
+        if directed_yaw_deg >= min_yaw_deg and self._turn_alignment_is_stable():
+            return self._complete_semantic_turn(
+                observation=observation,
                 progress_signal=progress_state.progress_signal,
                 debug_image_path=debug_image_path,
-                replanned=False,
+                directed_yaw_deg=directed_yaw_deg,
+                reason="stable_corridor_early_exit",
+            )
+
+        max_primitives = max(1, int(self._config.semantic_turn_max_primitives))
+        scan_exhausted = (
+            directed_yaw_deg >= max_yaw_deg
+            or self._semantic_turn_primitives_taken >= max_primitives
+        )
+        if scan_exhausted:
+            best_sample = self._best_turn_corridor_sample(
+                step_direction=step.direction,
+                start_yaw_rad=turn_start_yaw,
+                min_yaw_deg=min_yaw_deg,
+                max_yaw_deg=max_yaw_deg,
+            )
+            if best_sample is None:
+                return self._hold_result(
+                    decision_source="TURN_SCAN_SAFETY_HOLD",
+                    reasoning_summary="bounded turn scan found no safe corridor; runtime recovery must create a new viewpoint",
+                    progress_signal=progress_state.progress_signal,
+                    debug_image_path=debug_image_path,
+                    replanned=True,
+                    last_error="turn_scan_no_safe_corridor",
+                )
+            self._semantic_turn_return_yaw_rad = float(best_sample.corridor_world_yaw_rad)
+            self._logger.info(
+                "[TurnScan] step=%s scan_complete=1 best_world_yaw_deg=%.1f best_score=%.2f",
+                step.step_id,
+                float(np.degrees(best_sample.corridor_world_yaw_rad)),
+                best_sample.score,
+            )
+            return self._semantic_turn_step(
+                observation=observation,
+                progress_state=progress_state,
+                now=now,
             )
 
         turn_candidate = self._best_candidate_for_action(
@@ -1147,6 +1503,116 @@ class OpenNavVLNPolicy:
                 f"directed_yaw_deg={directed_yaw_deg:.1f}"
             ),
             debug_image_path=debug_image_path,
+        )
+
+    def _turn_corridor_sample(
+        self,
+        *,
+        observation: VLNObservation,
+        candidate_set: CandidateSet,
+        directed_yaw_deg: float,
+    ) -> _TurnCorridorSample | None:
+        valid = [candidate for candidate in candidate_set.candidates if bool(candidate.valid)]
+        if not valid:
+            return None
+        corridor = max(
+            valid,
+            key=lambda item: (
+                float(item.clearance_score)
+                + 0.20 * float(item.depth_support.get("min_clearance_m", 0.0)),
+                -abs(float(item.heading_delta_deg)),
+            ),
+        )
+        clearance_m = float(
+            corridor.depth_support.get(
+                "min_clearance_m",
+                corridor.depth_support.get("median_depth", 0.0),
+            )
+        )
+        if clearance_m < float(self._config.semantic_turn_min_forward_clearance_m):
+            return None
+        local_heading_rad = float(np.deg2rad(float(corridor.heading_delta_deg)))
+        corridor_world_yaw_rad = _wrap_angle_rad(float(observation.pose.yaw_rad) + local_heading_rad)
+        score = float(corridor.clearance_score) + 0.20 * clearance_m
+        return _TurnCorridorSample(
+            robot_yaw_rad=float(observation.pose.yaw_rad),
+            directed_yaw_deg=float(directed_yaw_deg),
+            corridor_world_yaw_rad=float(corridor_world_yaw_rad),
+            local_heading_deg=float(corridor.heading_delta_deg),
+            forward_clearance_m=clearance_m,
+            score=score,
+        )
+
+    def _turn_alignment_is_stable(self) -> bool:
+        required = max(2, int(self._config.semantic_turn_alignment_confirmations))
+        if len(self._semantic_turn_samples) < required:
+            return False
+        recent = self._semantic_turn_samples[-required:]
+        latest = recent[-1]
+        if abs(latest.local_heading_deg) > float(
+            self._config.semantic_turn_corridor_center_tolerance_deg
+        ):
+            return False
+        reference_yaw = recent[0].corridor_world_yaw_rad
+        max_delta_deg = max(
+            abs(float(np.degrees(_wrap_angle_rad(item.corridor_world_yaw_rad - reference_yaw))))
+            for item in recent[1:]
+        )
+        return max_delta_deg <= float(self._config.semantic_turn_same_corridor_tolerance_deg)
+
+    def _best_turn_corridor_sample(
+        self,
+        *,
+        step_direction: str,
+        start_yaw_rad: float,
+        min_yaw_deg: float,
+        max_yaw_deg: float,
+    ) -> _TurnCorridorSample | None:
+        eligible: list[_TurnCorridorSample] = []
+        for sample in self._semantic_turn_samples:
+            delta_deg = float(np.degrees(_wrap_angle_rad(
+                sample.corridor_world_yaw_rad - float(start_yaw_rad)
+            )))
+            if step_direction == "right":
+                delta_deg *= -1.0
+            if min_yaw_deg <= delta_deg <= max_yaw_deg:
+                eligible.append(sample)
+        if not eligible:
+            return None
+        return max(
+            eligible,
+            key=lambda item: (item.score, -abs(item.local_heading_deg)),
+        )
+
+    def _complete_semantic_turn(
+        self,
+        *,
+        observation: VLNObservation,
+        progress_signal: str,
+        debug_image_path: str | Path | None,
+        directed_yaw_deg: float,
+        reason: str,
+    ) -> PolicyStepResult:
+        step = self._current_route_step()
+        self._logger.info(
+            "[STEP_COMPLETE] step=%s type=TURN reason=%s yaw_deg=%.1f primitives=%s samples=%s",
+            "none" if step is None else step.step_id,
+            reason,
+            directed_yaw_deg,
+            self._semantic_turn_primitives_taken,
+            len(self._semantic_turn_samples),
+        )
+        self._advance_current_step(
+            observation=observation,
+            source="SemanticTurn",
+            reason=reason,
+        )
+        return self._hold_result(
+            decision_source="TURN_COMPLETE",
+            reasoning_summary=reason,
+            progress_signal=progress_signal,
+            debug_image_path=debug_image_path,
+            replanned=False,
         )
 
     def _region_transition_step(
@@ -1805,6 +2271,9 @@ class OpenNavVLNPolicy:
         self._semantic_turn_step_id = ""
         self._semantic_turn_start_yaw_rad = None
         self._semantic_turn_primitives_taken = 0
+        self._semantic_turn_samples.clear()
+        self._semantic_turn_return_yaw_rad = None
+        self._local_detour_state = None
         self._region_transition.reset()
         self._landmark_tracker_state = None
         self._landmark_map_entry = None

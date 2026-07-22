@@ -58,6 +58,8 @@ class LandmarkTrackerConfig:
     confirm_max_anchor_jump_m: float = 0.50
     confirm_max_depth_jump_m: float = 0.80
     potential_confidence_threshold: float = 0.50
+    low_confidence_min_translation_m: float = 0.20
+    low_confidence_min_yaw_deg: float = 10.0
 
 
 @dataclass
@@ -73,6 +75,9 @@ class _PendingConfirmedCandidate:
     count: int
     last_xy: np.ndarray
     last_depth_m: float | None = None
+    first_robot_pose: Pose2D | None = None
+    requires_viewpoint_confirmation: bool = False
+    distinct_viewpoint_observed: bool = False
 
 
 class LandmarkTracker:
@@ -232,6 +237,10 @@ class LandmarkTracker:
 
             # Only high-confidence fresh current-frame from confirmable source enters confirmed pipeline
             high_conf = float(observation.confidence) >= float(self._config.confirm_confidence_threshold)
+            low_confidence_vlm_verified = bool(
+                getattr(observation, "requires_viewpoint_confirmation", False)
+                and getattr(observation, "vlm_verified", False)
+            )
             semantic_source = str(getattr(observation, "semantic_source", "")).strip().lower()
             can_confirm = bool(
                 getattr(observation, "can_confirm", False)
@@ -239,7 +248,7 @@ class LandmarkTracker:
             )
             has_world = observation.estimated_world_xy is not None
 
-            if current_fresh and has_world and high_conf and can_confirm:
+            if current_fresh and has_world and (high_conf or low_confidence_vlm_verified) and can_confirm:
                 self._try_confirm_candidate(
                     label=label,
                     state=state,
@@ -247,7 +256,7 @@ class LandmarkTracker:
                 )
             elif current_fresh and has_world and semantic_source != "opencv_tracker":
                 reasons = []
-                if not high_conf:
+                if not high_conf and not low_confidence_vlm_verified:
                     reasons.append("low_confidence")
                 if not can_confirm:
                     reasons.append("semantic_source_not_confirmable")
@@ -380,13 +389,22 @@ class LandmarkTracker:
         candidate = np.asarray(observation.estimated_world_xy, dtype=np.float32).reshape(2)
         confirm_max_anchor_jump = max(0.05, float(self._config.confirm_max_anchor_jump_m))
         confirm_max_depth_jump = max(0.05, float(self._config.confirm_max_depth_jump_m))
-        required = max(1, int(self._config.confirm_min_observations))
+        requires_viewpoint_confirmation = bool(
+            getattr(observation, "requires_viewpoint_confirmation", False)
+        )
+        required = max(
+            2 if requires_viewpoint_confirmation else 1,
+            int(self._config.confirm_min_observations),
+        )
 
         pending = self._pending_confirmed.get(label)
+        request_pose = getattr(observation, "request_robot_pose", None)
         if pending is None:
             pending = _PendingConfirmedCandidate(
                 xy_sum=candidate.copy(), count=1, last_xy=candidate.copy(),
                 last_depth_m=observation.depth_m,
+                first_robot_pose=request_pose,
+                requires_viewpoint_confirmation=requires_viewpoint_confirmation,
             )
             self._pending_confirmed[label] = pending
             if required <= 1:
@@ -411,6 +429,47 @@ class LandmarkTracker:
             )
             return
 
+        if pending.requires_viewpoint_confirmation != requires_viewpoint_confirmation:
+            self._pending_confirmed[label] = _PendingConfirmedCandidate(
+                xy_sum=candidate.copy(),
+                count=1,
+                last_xy=candidate.copy(),
+                last_depth_m=observation.depth_m,
+                first_robot_pose=request_pose,
+                requires_viewpoint_confirmation=requires_viewpoint_confirmation,
+            )
+            self._logger.info(
+                "[LandmarkConfirm] target=%s evidence_mode_changed confirm_wait=1/%s",
+                label,
+                int(required),
+            )
+            return
+
+        if (
+            pending.requires_viewpoint_confirmation
+            and not pending.distinct_viewpoint_observed
+            and not _is_distinct_viewpoint(
+                first_pose=pending.first_robot_pose,
+                current_pose=request_pose,
+                min_translation_m=float(self._config.low_confidence_min_translation_m),
+                min_yaw_deg=float(self._config.low_confidence_min_yaw_deg),
+            )
+        ):
+            pending.last_xy = candidate.copy()
+            pending.last_depth_m = observation.depth_m
+            self._logger.info(
+                "[LandmarkConfirm] target=%s low_confidence_waiting_distinct_viewpoint "
+                "translation_m>=%.2f_or_yaw_deg>=%.1f confirm_wait=%s/%s",
+                label,
+                float(self._config.low_confidence_min_translation_m),
+                float(self._config.low_confidence_min_yaw_deg),
+                int(pending.count),
+                int(required),
+            )
+            return
+        if pending.requires_viewpoint_confirmation:
+            pending.distinct_viewpoint_observed = True
+
         # Check anchor jump from last pending candidate
         jump = float(np.linalg.norm(candidate - pending.last_xy))
         if jump > confirm_max_anchor_jump:
@@ -422,6 +481,8 @@ class LandmarkTracker:
             self._pending_confirmed[label] = _PendingConfirmedCandidate(
                 xy_sum=candidate.copy(), count=1, last_xy=candidate.copy(),
                 last_depth_m=observation.depth_m,
+                first_robot_pose=request_pose,
+                requires_viewpoint_confirmation=requires_viewpoint_confirmation,
             )
             return
 
@@ -436,6 +497,8 @@ class LandmarkTracker:
                 self._pending_confirmed[label] = _PendingConfirmedCandidate(
                     xy_sum=candidate.copy(), count=1, last_xy=candidate.copy(),
                     last_depth_m=observation.depth_m,
+                    first_robot_pose=request_pose,
+                    requires_viewpoint_confirmation=requires_viewpoint_confirmation,
                 )
                 return
 
@@ -666,6 +729,28 @@ def _distance_to_anchor(*, robot_pose: Pose2D, anchor_world_xy: list[float] | No
         dtype=np.float32,
     )
     return float(np.linalg.norm(delta))
+
+
+def _is_distinct_viewpoint(
+    *,
+    first_pose: Pose2D | None,
+    current_pose: Pose2D | None,
+    min_translation_m: float,
+    min_yaw_deg: float,
+) -> bool:
+    if first_pose is None or current_pose is None:
+        return False
+    translation_m = float(np.hypot(
+        float(current_pose.x) - float(first_pose.x),
+        float(current_pose.y) - float(first_pose.y),
+    ))
+    yaw_delta_rad = float(current_pose.yaw_rad) - float(first_pose.yaw_rad)
+    yaw_delta_rad = float(np.arctan2(np.sin(yaw_delta_rad), np.cos(yaw_delta_rad)))
+    yaw_delta_deg = abs(float(np.degrees(yaw_delta_rad)))
+    return bool(
+        translation_m >= max(0.0, float(min_translation_m))
+        or yaw_delta_deg >= max(0.0, float(min_yaw_deg))
+    )
 
 
 def _is_observation_transient(observation: TargetObservation) -> bool:

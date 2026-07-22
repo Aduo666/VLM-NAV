@@ -27,8 +27,13 @@ opennav:
   region_transition_confirmations: 2
   region_transition_min_confidence: 0.55
   semantic_turn_min_yaw_deg: 45.0
-  semantic_turn_max_primitives: 6
+  semantic_turn_max_yaw_deg: 105.0
+  semantic_turn_max_primitives: 7
   semantic_turn_min_forward_clearance_m: 0.60
+  semantic_turn_alignment_confirmations: 2
+  semantic_turn_corridor_center_tolerance_deg: 12.0
+  semantic_turn_same_corridor_tolerance_deg: 20.0
+  local_detour_max_turn_primitives: 2
   visual_target_center_deadband_deg: 15.0
   candidate_slot_bearings_deg: [35.0, 18.0, 0.0, -18.0, -35.0]
   candidate_adaptive_enabled: true
@@ -83,6 +88,8 @@ target_grounding:
   grounding_dino_device: "cuda:0"
   grounding_dino_box_threshold: 0.45
   grounding_dino_text_threshold: 0.25
+  grounding_dino_max_detections: 5
+  grounding_dino_nms_iou_threshold: 0.50
   grounding_dino_text_encoder_path: "weights/grounded_sam/bert-base-uncased"
   sam_checkpoint_path: "weights/grounded_sam/sam_vit_h_4b8939.pth"
   sam_model_type: "vit_h"
@@ -95,7 +102,7 @@ target_grounding:
   semantic_verification_enabled: true
   semantic_verification_min_confidence: 0.50
   semantic_verification_max_edge_px: 768
-  semantic_verification_auto_accept_confidence: 1.01
+  semantic_verification_auto_accept_confidence: 0.75
   pause_during_active_primitive: true
   tracker_enabled: true
   tracker_type: "CSRT"
@@ -118,11 +125,13 @@ landmark_tracker:
   landmark_map_anchor_ttl_sec: 120.0
   landmark_map_min_confidence: 0.20
   landmark_map_log_period_sec: 2.0
-  confirm_confidence_threshold: 0.65
+  confirm_confidence_threshold: 0.75
   potential_confidence_threshold: 0.50
   confirm_min_observations: 2
   confirm_max_anchor_jump_m: 0.75
   confirm_max_depth_jump_m: 3.0
+  low_confidence_min_translation_m: 0.20
+  low_confidence_min_yaw_deg: 10.0
 
 robot:
   usd_path: "src/ros2_car_model_ws/src/1557/urdf/1557_all/1557_all.usd"

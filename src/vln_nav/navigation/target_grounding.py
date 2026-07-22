@@ -10,7 +10,11 @@ from typing import Any
 import numpy as np
 from PIL import Image
 
-from .grounding_dino_detector import GroundingDinoConfig, GroundingDinoDetector
+from .grounding_dino_detector import (
+    GroundingDinoConfig,
+    GroundingDinoDetection,
+    GroundingDinoDetector,
+)
 from .observation_adapter import Pose2D
 from .open_nav_client import OpenNavLLMClient
 from .sam_segmenter import SamSegmenter, SamSegmenterConfig
@@ -47,6 +51,7 @@ class TargetObservation:
     vlm_verified: bool = False
     vlm_verification_confidence: float = 0.0
     vlm_verification_reason: str = ""
+    requires_viewpoint_confirmation: bool = False
 
 
 @dataclass
@@ -81,6 +86,8 @@ class TargetGroundingConfig:
     grounding_dino_box_threshold: float = 0.45
     grounding_dino_text_threshold: float = 0.25
     grounding_dino_text_encoder_path: str = "weights/grounded_sam/bert-base-uncased"
+    grounding_dino_max_detections: int = 5
+    grounding_dino_nms_iou_threshold: float = 0.50
     sam_checkpoint_path: str = "weights/grounded_sam/sam_vit_h_4b8939.pth"
     sam_model_type: str = "vit_h"
     sam_device: str = "cuda"
@@ -92,7 +99,7 @@ class TargetGroundingConfig:
     semantic_verification_enabled: bool = True
     semantic_verification_min_confidence: float = 0.70
     semantic_verification_max_edge_px: int = 768
-    semantic_verification_auto_accept_confidence: float = 1.01
+    semantic_verification_auto_accept_confidence: float = 0.75
 
 
 @dataclass
@@ -107,6 +114,8 @@ class _GroundingRequest:
     original_size: tuple[int, int]
     image_png_bytes: bytes
     frame_index: int = -1
+    preferred_bbox: tuple[int, int, int, int] | None = None
+    preferred_world_xy: list[float] | None = None
 
 
 @dataclass
@@ -140,6 +149,8 @@ class TargetGrounder:
         self._last_observation_wall_sec = -float("inf")
         self._last_observation_log_signature: tuple | None = None
         self._last_observation_log_wall_sec = -float("inf")
+        self._last_verification_signature: tuple | None = None
+        self._last_verification_result: tuple[bool, float, str] | None = None
         self._grounding_dino = GroundingDinoDetector(
             config=GroundingDinoConfig(
                 enabled=True,
@@ -150,6 +161,8 @@ class TargetGrounder:
                 box_threshold=float(config.grounding_dino_box_threshold),
                 text_threshold=float(config.grounding_dino_text_threshold),
                 text_encoder_path=str(config.grounding_dino_text_encoder_path),
+                max_detections=int(config.grounding_dino_max_detections),
+                nms_iou_threshold=float(config.grounding_dino_nms_iou_threshold),
             ),
             logger=logger,
         )
@@ -184,6 +197,7 @@ class TargetGrounder:
         timestamp_sec: float,
         frame_index: int = -1,
         allow_new_request: bool = True,
+        preferred_world_xy: list[float] | None = None,
     ) -> TargetObservation:
         target_label = str(target_label).strip() or "target"
         if target_label.lower() in {"none", "null", "unknown", "n/a", "na", "target", "object", "thing", "place", "location"}:
@@ -236,6 +250,7 @@ class TargetGrounder:
                 robot_pose=robot_pose,
                 timestamp_sec=timestamp_sec,
                 frame_index=frame_index,
+                preferred_world_xy=preferred_world_xy,
             )
         except Exception as exc:
             self._logger.warning("[GroundingReject] target=%s reason=image_prepare_failed error=%s", target_label, exc)
@@ -316,6 +331,9 @@ class TargetGrounder:
             vlm_verified=bool(self._last_observation.vlm_verified),
             vlm_verification_confidence=float(self._last_observation.vlm_verification_confidence),
             vlm_verification_reason=str(self._last_observation.vlm_verification_reason),
+            requires_viewpoint_confirmation=bool(
+                self._last_observation.requires_viewpoint_confirmation
+            ),
         )
 
     def _collect_finished_request(self, *, timestamp_sec: float, wall_time_sec: float, current_robot_pose: Pose2D | None = None) -> TargetObservation | None:
@@ -418,9 +436,26 @@ class TargetGrounder:
         return False
 
     def _call_grounding(self, request: _GroundingRequest) -> tuple[str, str]:
-        detection, reason = self._grounding_dino.detect(rgb=request.rgb, target_label=request.target_label)
-        if detection is None:
+        detections, reason = self._grounding_dino.detect_all(
+            rgb=request.rgb,
+            target_label=request.target_label,
+        )
+        if not detections:
             return "", reason
+        detection, selected_index, selection_reason = _select_grounding_detection(
+            detections=detections,
+            request=request,
+            config=self._config,
+        )
+        self._logger.info(
+            "[GroundingInstanceSelect] target=%s proposals=%s selected=%s confidence=%.2f bbox=%s reason=%s",
+            request.target_label,
+            len(detections),
+            selected_index,
+            float(detection.confidence),
+            list(detection.bbox),
+            selection_reason,
+        )
         payload = {
             "visible": True,
             "label": request.target_label,
@@ -428,6 +463,8 @@ class TargetGrounder:
             "confidence": float(detection.confidence),
             "coordinate_mode": "original_pixels",
             "source": "grounding_dino",
+            "proposal_count": len(detections),
+            "selected_instance_index": selected_index,
         }
         return json.dumps(payload), "ok"
 
@@ -440,6 +477,7 @@ class TargetGrounder:
         robot_pose: Pose2D,
         timestamp_sec: float,
         frame_index: int = -1,
+        preferred_world_xy: list[float] | None = None,
     ) -> _GroundingRequest:
         image = Image.fromarray(rgb[:, :, :3].copy()).convert("RGB")
         original_size = (int(image.width), int(image.height))
@@ -467,6 +505,19 @@ class TargetGrounder:
             original_size=original_size,
             image_png_bytes=buffer.getvalue(),
             frame_index=int(frame_index),
+            preferred_bbox=(
+                tuple(self._last_observation.bbox)
+                if self._last_observation is not None
+                and self._last_observation.label == target_label
+                and self._last_observation.bbox is not None
+                and bool(self._last_observation.can_confirm)
+                else None
+            ),
+            preferred_world_xy=(
+                None
+                if preferred_world_xy is None
+                else [float(preferred_world_xy[0]), float(preferred_world_xy[1])]
+            ),
         )
 
     def _parse_and_validate(self, *, content: str, request: _GroundingRequest) -> TargetObservation:
@@ -669,8 +720,12 @@ class TargetGrounder:
                 horizontal_fov_deg=float(self._config.horizontal_fov_deg),
                 robot_pose=request.robot_pose,
             )
+        high_confidence = float(confidence) >= float(
+            self._config.semantic_verification_auto_accept_confidence
+        )
+        requires_viewpoint_confirmation = False
         if can_confirm and bool(self._config.semantic_verification_enabled):
-            if float(confidence) >= float(self._config.semantic_verification_auto_accept_confidence):
+            if high_confidence:
                 vlm_verified = True
                 vlm_verification_confidence = 1.0
                 vlm_verification_reason = "auto_accept_high_detector_confidence"
@@ -681,6 +736,7 @@ class TargetGrounder:
                     detector_confidence=float(confidence),
                     semantic_source=semantic_source,
                 )
+                requires_viewpoint_confirmation = bool(vlm_verified)
             if not vlm_verified or vlm_verification_confidence < float(self._config.semantic_verification_min_confidence):
                 can_confirm = False
                 self._logger.info(
@@ -724,6 +780,7 @@ class TargetGrounder:
             vlm_verified=vlm_verified,
             vlm_verification_confidence=float(vlm_verification_confidence),
             vlm_verification_reason=str(vlm_verification_reason),
+            requires_viewpoint_confirmation=bool(requires_viewpoint_confirmation),
         )
 
     def _verify_detection_semantics(
@@ -734,6 +791,23 @@ class TargetGrounder:
         detector_confidence: float,
         semantic_source: str,
     ) -> tuple[bool, float, str]:
+        verification_signature = _verification_signature(
+            target_label=request.target_label,
+            bbox=bbox,
+            robot_pose=request.robot_pose,
+        )
+        if (
+            verification_signature == self._last_verification_signature
+            and self._last_verification_result is not None
+        ):
+            cached = self._last_verification_result
+            self._logger.info(
+                "[GroundingVerify] target=%s result=reused_same_observation verified=%s vlm_conf=%.2f",
+                request.target_label,
+                int(bool(cached[0])),
+                float(cached[1]),
+            )
+            return cached
         image_bytes = _build_verification_image_bytes(
             rgb=request.rgb,
             bbox=bbox,
@@ -741,15 +815,15 @@ class TargetGrounder:
         )
         system_prompt = (
             "You are a strict visual verification module for robot navigation. "
-            "You must decide whether the marked region is actually the requested target. "
+            "You must decide whether the cropped object is actually the requested target. "
             "Return strict JSON only."
         )
         user_prompt = (
             f"Target label: {request.target_label}\n"
             f"Detector source: {semantic_source}\n"
             f"Detector confidence: {float(detector_confidence):.2f}\n"
-            "The image shows the full camera view with a red bbox and a zoomed crop of the same bbox. "
-            "Verify the marked region semantically. Reject shadows, floor texture, reflections, wall patterns, or unrelated objects.\n"
+            "The image contains only the candidate crop. Verify its object category. "
+            "Reject shadows, floor texture, reflections, wall patterns, or unrelated objects.\n"
             "Return exactly one JSON object:\n"
             '{"is_target": true, "confidence": 0.0, "reason": "short reason"}'
         )
@@ -779,7 +853,10 @@ class TargetGrounder:
             float(confidence),
             reason[:120],
         )
-        return bool(verified), float(confidence), reason
+        verified_result = (bool(verified), float(confidence), reason)
+        self._last_verification_signature = verification_signature
+        self._last_verification_result = verified_result
+        return verified_result
 
 
 def _empty_observation(target_label: str, timestamp_sec: float, reason: str) -> TargetObservation:
@@ -807,6 +884,7 @@ def _empty_observation(target_label: str, timestamp_sec: float, reason: str) -> 
         vlm_verified=False,
         vlm_verification_confidence=0.0,
         vlm_verification_reason="",
+        requires_viewpoint_confirmation=False,
     )
 
 
@@ -849,6 +927,7 @@ def _copy_observation_with_timestamp(
         vlm_verified=bool(observation.vlm_verified),
         vlm_verification_confidence=float(observation.vlm_verification_confidence),
         vlm_verification_reason=str(observation.vlm_verification_reason),
+        requires_viewpoint_confirmation=bool(observation.requires_viewpoint_confirmation),
     )
 
 
@@ -1006,39 +1085,200 @@ def _build_verification_image_bytes(
         min(height, ymax + margin_y),
     )
 
-    full = image.copy()
-    from PIL import ImageDraw
-
-    draw = ImageDraw.Draw(full)
-    for offset in range(4):
-        draw.rectangle(
-            (xmin - offset, ymin - offset, xmax + offset, ymax + offset),
-            outline=(255, 0, 0),
-        )
     crop = image.crop(crop_box)
     resampling = Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
-    crop_height = height
-    if crop.height > 0:
-        crop_width = max(1, int(round(crop.width * (float(crop_height) / float(crop.height)))))
-        crop = crop.resize((crop_width, crop_height), resampling)
-
-    canvas = Image.new("RGB", (full.width + crop.width, height), (0, 0, 0))
-    canvas.paste(full, (0, 0))
-    canvas.paste(crop, (full.width, 0))
-    max_edge = max(canvas.size)
+    max_edge = max(crop.size)
     max_edge_px = max(1, int(max_edge_px))
     if max_edge > max_edge_px:
         scale = float(max_edge_px) / float(max_edge)
-        canvas = canvas.resize(
+        crop = crop.resize(
             (
-                max(1, int(round(canvas.width * scale))),
-                max(1, int(round(canvas.height * scale))),
+                max(1, int(round(crop.width * scale))),
+                max(1, int(round(crop.height * scale))),
             ),
             resampling,
         )
     buffer = io.BytesIO()
-    canvas.save(buffer, format="PNG", optimize=True)
+    crop.save(buffer, format="PNG", optimize=True)
     return buffer.getvalue()
+
+
+def _select_grounding_detection(
+    *,
+    detections: list[GroundingDinoDetection],
+    request: _GroundingRequest,
+    config: TargetGroundingConfig,
+) -> tuple[GroundingDinoDetection, int, str]:
+    if len(detections) == 1:
+        return detections[0], 0, "single_proposal"
+
+    preferred_world_xy = getattr(request, "preferred_world_xy", None)
+    if preferred_world_xy is not None:
+        world_matches: list[tuple[float, int, GroundingDinoDetection]] = []
+        for index, detection in enumerate(detections):
+            world_xy = _rough_detection_world_xy(
+                detection=detection,
+                request=request,
+                config=config,
+            )
+            if world_xy is None:
+                continue
+            distance_m = float(np.linalg.norm(
+                np.asarray(world_xy, dtype=np.float32)
+                - np.asarray(preferred_world_xy, dtype=np.float32)
+            ))
+            world_matches.append((distance_m, index, detection))
+        if world_matches:
+            distance_m, best_index, best_detection = min(world_matches, key=lambda item: item[0])
+            if distance_m <= 1.5:
+                return best_detection, int(best_index), "confirmed_anchor_instance_continuity"
+
+    if request.preferred_bbox is not None:
+        continuity_scores: list[tuple[float, int]] = []
+        image_h, image_w = request.rgb_shape
+        diagonal = max(1.0, float(np.hypot(image_w, image_h)))
+        previous_center = _bbox_center(request.preferred_bbox)
+        for index, detection in enumerate(detections):
+            iou = _bbox_iou(request.preferred_bbox, detection.bbox)
+            center = _bbox_center(detection.bbox)
+            center_distance = float(np.hypot(
+                center[0] - previous_center[0],
+                center[1] - previous_center[1],
+            )) / diagonal
+            score = 2.0 * iou + max(0.0, 1.0 - 4.0 * center_distance) + 0.25 * float(
+                detection.confidence
+            )
+            continuity_scores.append((score, index))
+        _, best_index = max(continuity_scores)
+        best_detection = detections[best_index]
+        best_iou = _bbox_iou(request.preferred_bbox, best_detection.bbox)
+        best_center = _bbox_center(best_detection.bbox)
+        previous_center = _bbox_center(request.preferred_bbox)
+        normalized_center_distance = float(np.hypot(
+            best_center[0] - previous_center[0],
+            best_center[1] - previous_center[1],
+        )) / max(1.0, float(np.hypot(request.rgb_shape[1], request.rgb_shape[0])))
+        if best_iou >= 0.10 or normalized_center_distance <= 0.18:
+            return best_detection, int(best_index), "temporal_instance_continuity"
+
+    high_confidence = [
+        (index, detection)
+        for index, detection in enumerate(detections)
+        if float(detection.confidence)
+        >= float(config.semantic_verification_auto_accept_confidence)
+    ]
+    credible = high_confidence or [
+        (index, detection)
+        for index, detection in enumerate(detections)
+        if float(detection.confidence) >= float(config.min_confidence)
+    ]
+    if not credible:
+        credible = list(enumerate(detections))
+
+    ranked: list[tuple[float, int, GroundingDinoDetection, float | None]] = []
+    for index, detection in credible:
+        depth_m = _rough_bbox_depth_m(
+            depth=request.depth,
+            bbox=detection.bbox,
+            config=config,
+        )
+        confidence_span = max(1e-6, 1.0 - float(config.min_confidence))
+        confidence_score = float(np.clip(
+            (float(detection.confidence) - float(config.min_confidence)) / confidence_span,
+            0.0,
+            1.0,
+        ))
+        depth_score = 0.0 if depth_m is None else 1.0 / (1.0 + max(0.0, float(depth_m)))
+        score = 0.55 * confidence_score + 0.45 * depth_score
+        ranked.append((score, int(index), detection, depth_m))
+    _, best_index, best_detection, best_depth = max(ranked, key=lambda item: item[0])
+    reason = "confidence_and_nearest_valid_depth"
+    if best_depth is None:
+        reason = "highest_confidence_without_valid_depth"
+    return best_detection, best_index, reason
+
+
+def _rough_bbox_depth_m(
+    *,
+    depth: np.ndarray | None,
+    bbox: tuple[int, int, int, int],
+    config: TargetGroundingConfig,
+) -> float | None:
+    if depth is None or np.asarray(depth).ndim != 2:
+        return None
+    value, valid_ratio, _, _ = _bbox_depth_mask_statistic(
+        depth=np.asarray(depth, dtype=np.float32),
+        bbox=bbox,
+        min_depth_m=float(config.min_depth_m),
+        max_depth_m=float(config.max_depth_m),
+        statistic=str(config.depth_statistic),
+        depth_region="center_patch",
+        center_patch_ratio=float(config.center_patch_ratio),
+        mask_tolerance_ratio=float(config.depth_mask_tolerance_ratio),
+        mask_min_pixels=int(config.depth_mask_min_pixels),
+    )
+    if value is None or float(valid_ratio) < float(config.min_depth_valid_ratio):
+        return None
+    return float(value)
+
+
+def _rough_detection_world_xy(
+    *,
+    detection: GroundingDinoDetection,
+    request: _GroundingRequest,
+    config: TargetGroundingConfig,
+) -> list[float] | None:
+    depth_m = _rough_bbox_depth_m(
+        depth=request.depth,
+        bbox=detection.bbox,
+        config=config,
+    )
+    if depth_m is None:
+        return None
+    center_uv = _bbox_center(detection.bbox)
+    geometry = estimate_target_world_xy(
+        center_uv=center_uv,
+        depth_m=float(depth_m),
+        image_width=int(request.rgb_shape[1]),
+        image_height=int(request.rgb_shape[0]),
+        horizontal_fov_deg=float(config.horizontal_fov_deg),
+        robot_pose=request.robot_pose,
+    )
+    return list(geometry.world_xy)
+
+
+def _bbox_center(bbox: tuple[int, int, int, int]) -> tuple[float, float]:
+    return (
+        0.5 * (float(bbox[0]) + float(bbox[2])),
+        0.5 * (float(bbox[1]) + float(bbox[3])),
+    )
+
+
+def _bbox_iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+    ix0 = max(int(a[0]), int(b[0]))
+    iy0 = max(int(a[1]), int(b[1]))
+    ix1 = min(int(a[2]), int(b[2]))
+    iy1 = min(int(a[3]), int(b[3]))
+    intersection = max(0, ix1 - ix0) * max(0, iy1 - iy0)
+    area_a = max(0, int(a[2]) - int(a[0])) * max(0, int(a[3]) - int(a[1]))
+    area_b = max(0, int(b[2]) - int(b[0])) * max(0, int(b[3]) - int(b[1]))
+    union = area_a + area_b - intersection
+    return 0.0 if union <= 0 else float(intersection / union)
+
+
+def _verification_signature(
+    *,
+    target_label: str,
+    bbox: tuple[int, int, int, int],
+    robot_pose: Pose2D,
+) -> tuple:
+    return (
+        str(target_label).strip().lower(),
+        tuple(int(round(float(value) / 8.0)) for value in bbox),
+        int(round(float(robot_pose.x) / 0.05)),
+        int(round(float(robot_pose.y) / 0.05)),
+        int(round(float(np.degrees(robot_pose.yaw_rad)) / 3.0)),
+    )
 
 
 def _bbox_depth_mask_statistic(

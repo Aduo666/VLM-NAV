@@ -20,9 +20,9 @@ simulation:
 sensors:
   front_camera_prim_path: "torso_link/d435_link/Camera"
   observer_camera_enabled: true
-  observer_camera_prim_path: "observeCamera"
+  observer_camera_prim_path: "torso_link/observeCamera"
   camera_frequency_hz: 10
-  lidar_prim_path: "torso_link/mid360_link/Lidar"
+  lidar_prim_path: "torso_link/Lidar"
 
 controller:
   policy_path: "src/unitree_model/g1_29dof/policy/policy.pt"

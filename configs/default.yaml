@@ -133,7 +133,7 @@ landmark_tracker:
 
 robot:
   profile: "unitree_g1_29dof"
-
+  #profile: "agx"
 camera:
   width: 640
   height: 480

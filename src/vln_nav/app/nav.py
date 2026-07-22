@@ -1972,26 +1972,58 @@ def run_navigation(
         if loop_now - last_motion_log_time >= float(config.motion_log_period_sec):
             delta = position - last_logged_position
             joint_readback = drive_controller.readback()
-            logger.info(
-                "[Motion] policy_action=%s exec_action=%s token=%s mode=%s world_pos=[%.3f, %.3f, %.3f] odom=[%.3f, %.3f, %.1fdeg] delta=[%.3f, %.3f, %.3f] wheel_joint_target_rad_s=%.3f steering_joint_target_rad=%.3f steering_actual=%s wheel_actual=%s",
-                step_result.action_name,
-                safety_decision.action_name,
-                active_command_token,
-                "discrete_primitive" if bool(config.use_discrete_action_primitives) else "continuous_waypoint",
-                float(position[0]),
-                float(position[1]),
-                float(position[2]),
-                float(observation.pose.x),
-                float(observation.pose.y),
-                float(np.degrees(observation.pose.yaw_rad)),
-                float(delta[0]),
-                float(delta[1]),
-                float(delta[2]),
-                float(last_applied_wheel_velocity),
-                float(last_applied_steering_angle),
-                _format_joint_map(joint_readback["steering_position"]),
-                _format_joint_map(joint_readback["wheel_velocity"]),
-            )
+            if config.robot_profile.is_g1:
+                command_velocity = joint_readback["command_velocity"]
+                policy_action = joint_readback["policy_action"]
+                joint_tracking = joint_readback["joint_tracking"]
+                logger.info(
+                    "[Motion:G1] policy_action=%s exec_action=%s token=%s "
+                    "world_pos=[%.3f, %.3f, %.3f] odom=[%.3f, %.3f, %.1fdeg] "
+                    "delta=[%.3f, %.3f, %.3f] command=[%.3f, %.3f, %.3f] "
+                    "policy_abs_max=%.3f joint_error_max=%.3frad joint_error_mean=%.3frad",
+                    step_result.action_name,
+                    safety_decision.action_name,
+                    active_command_token,
+                    float(position[0]),
+                    float(position[1]),
+                    float(position[2]),
+                    float(observation.pose.x),
+                    float(observation.pose.y),
+                    float(np.degrees(observation.pose.yaw_rad)),
+                    float(delta[0]),
+                    float(delta[1]),
+                    float(delta[2]),
+                    float(command_velocity["linear_x_mps"]),
+                    float(command_velocity["linear_y_mps"]),
+                    float(command_velocity["angular_z_radps"]),
+                    max((abs(float(value)) for value in policy_action.values()), default=0.0),
+                    float(joint_tracking["max_error_rad"]),
+                    float(joint_tracking["mean_error_rad"]),
+                )
+            else:
+                logger.info(
+                    "[Motion:AGX] policy_action=%s exec_action=%s token=%s mode=%s "
+                    "world_pos=[%.3f, %.3f, %.3f] odom=[%.3f, %.3f, %.1fdeg] "
+                    "delta=[%.3f, %.3f, %.3f] wheel_joint_target_rad_s=%.3f "
+                    "steering_joint_target_rad=%.3f steering_actual=%s wheel_actual=%s",
+                    step_result.action_name,
+                    safety_decision.action_name,
+                    active_command_token,
+                    "discrete_primitive" if bool(config.use_discrete_action_primitives) else "continuous_waypoint",
+                    float(position[0]),
+                    float(position[1]),
+                    float(position[2]),
+                    float(observation.pose.x),
+                    float(observation.pose.y),
+                    float(np.degrees(observation.pose.yaw_rad)),
+                    float(delta[0]),
+                    float(delta[1]),
+                    float(delta[2]),
+                    float(last_applied_wheel_velocity),
+                    float(last_applied_steering_angle),
+                    _format_joint_map(joint_readback["steering_position"]),
+                    _format_joint_map(joint_readback["wheel_velocity"]),
+                )
             last_motion_log_time = loop_now
             last_logged_position = position.copy()
 

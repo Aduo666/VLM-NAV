@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -9,7 +10,7 @@ import numpy as np
 from vln_nav.navigation.observation_adapter import Pose2D
 from vln_nav.navigation.spatial_transform import estimate_target_world_xy
 from vln_nav.runtime.config import PROJECT_ROOT, load_config
-from vln_nav.runtime.robot_profile import load_robot_profile
+from vln_nav.runtime.robot_profile import _validate_profile_files, load_robot_profile
 
 
 class RobotProfileTest(unittest.TestCase):
@@ -74,6 +75,12 @@ class RobotProfileTest(unittest.TestCase):
             handle.flush()
             with self.assertRaisesRegex(ValueError, "TRACK_TARGET is not supported"):
                 load_config(handle.name)
+
+    def test_g1_rejects_spawn_height_below_fall_threshold(self) -> None:
+        profile = load_robot_profile(profile_name="unitree_g1_29dof", project_root=PROJECT_ROOT)
+        invalid_profile = replace(profile, spawn_z_m=0.0)
+        with self.assertRaisesRegex(ValueError, "pelvis/root height"):
+            _validate_profile_files(invalid_profile)
 
 
 if __name__ == "__main__":

@@ -133,6 +133,9 @@ class G1PolicyController:
         raise RuntimeError("TRACK_TARGET is not supported by the unitree_g1_29dof profile")
 
     def readback(self) -> dict[str, Any]:
+        joint_positions = np.asarray(self._robot.get_joint_positions(), dtype=np.float32).reshape(-1)
+        policy_joint_positions = joint_positions[self._joint_indices]
+        joint_targets = self._action_offset + self._action_scale * self._last_action
         return {
             "command_velocity": {
                 "linear_x_mps": float(self._command[0]),
@@ -141,6 +144,10 @@ class G1PolicyController:
             },
             "policy_action": {
                 name: float(value) for name, value in zip(self._policy_joint_names, self._last_action)
+            },
+            "joint_tracking": {
+                "max_error_rad": float(np.max(np.abs(joint_targets - policy_joint_positions))),
+                "mean_error_rad": float(np.mean(np.abs(joint_targets - policy_joint_positions))),
             },
         }
 

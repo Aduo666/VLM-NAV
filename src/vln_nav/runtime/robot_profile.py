@@ -392,6 +392,12 @@ def _validate_profile_files(profile: RobotProfile) -> None:
         raise FileNotFoundError(f"Robot USD does not exist: {profile.asset.usd_path}")
     if profile.g1_controller is None:
         return
+    if profile.spawn_z_m <= profile.safety.min_base_height_m:
+        raise ValueError(
+            "G1 spawn.z_m is the pelvis/root height above the scene floor, not the floor "
+            f"elevation; expected > safety.min_base_height_m ({profile.safety.min_base_height_m:.2f} m), "
+            f"got {profile.spawn_z_m:.2f} m"
+        )
     if not profile.g1_controller.policy_path.is_file():
         raise FileNotFoundError(f"G1 TorchScript policy does not exist: {profile.g1_controller.policy_path}")
     if not profile.g1_controller.deploy_config_path.is_file():

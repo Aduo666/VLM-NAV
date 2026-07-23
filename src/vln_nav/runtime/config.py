@@ -24,7 +24,7 @@ class AppConfig:
     llm_upload_max_edge_px: int = 512
     camera_image_detail: str = "low"
     instruction: str = ""
-    instruction_parse_max_tokens: int = 768
+    instruction_parse_max_tokens: int = 2048
     instruction_parse_timeout_sec: int = 90
     instruction_cache_enabled: bool = True
     instruction_cache_path: str = str(PROJECT_ROOT / ".cache" / "instruction_plans.json")
@@ -48,6 +48,13 @@ class AppConfig:
     semantic_turn_corridor_max_clearance_m: float = 4.0
     semantic_turn_max_recovery_attempts: int = 2
     local_detour_max_turn_primitives: int = 2
+    traverse_heading_correction_limit_deg: float = 30.0
+    traverse_candidate_heading_tolerance_deg: float = 22.0
+    traverse_min_progress_m: float = 0.50
+    traverse_pass_margin_m: float = 0.20
+    traverse_review_min_progress_m: float = 1.00
+    traverse_review_min_translation_m: float = 0.20
+    traverse_max_recovery_attempts: int = 2
     visual_target_center_deadband_deg: float = 15.0
     candidate_slot_bearings_deg: list[float] = field(default_factory=lambda: [75.0, 35.0, 0.0, -35.0, -75.0])
     candidate_adaptive_enabled: bool = True
@@ -58,7 +65,6 @@ class AppConfig:
     candidate_max_travel_distance_m: float = 1.35
     candidate_min_free_ratio: float = 0.28
     candidate_column_half_width_px: int = 26
-    candidate_debug_image_path: str = "debug/llm_request.png"
     target_debug_enabled: bool = True
     target_debug_image_path: str = "debug/vln_debug.png"
     debug_video_enabled: bool = True
@@ -260,13 +266,6 @@ class AppConfig:
     occupancy_grid_turn_clearance_radius_m: float = 0.36
     occupancy_grid_unknown_is_traversable: bool = False
     occupancy_grid_unknown_cell_cost: float = 0.80
-    occupancy_grid_debug_enabled: bool = True
-    occupancy_grid_debug_image_path: str = "debug/local_map.png"
-    occupancy_grid_debug_update_period_sec: float = 0.5
-    occupancy_grid_debug_width: int = 900
-    occupancy_grid_debug_height: int = 900
-    occupancy_grid_debug_view_size_m: float = 8.0
-    occupancy_grid_debug_show_free_space: bool = False
     occupancy_grid_lidar_bootstrap_sec: float = 0.8
     occupancy_grid_lidar_bootstrap_min_fov_deg: float = 165.0
     occupancy_grid_lidar_bootstrap_max_wait_sec: float = 3.0
@@ -476,7 +475,7 @@ def load_config(config_path: str | None = None) -> AppConfig:
         instruction=_env_or_value("INSTRUCTION", opennav.get("instruction", "")),
         instruction_parse_max_tokens=_int_env_or_value(
             "INSTRUCTION_PARSE_MAX_TOKENS",
-            opennav.get("instruction_parse_max_tokens", 768),
+            opennav.get("instruction_parse_max_tokens", 2048),
         ),
         instruction_parse_timeout_sec=_int_env_or_value(
             "INSTRUCTION_PARSE_TIMEOUT_SEC",
@@ -570,6 +569,34 @@ def load_config(config_path: str | None = None) -> AppConfig:
             "LOCAL_DETOUR_MAX_TURN_PRIMITIVES",
             opennav.get("local_detour_max_turn_primitives", 2),
         ),
+        traverse_heading_correction_limit_deg=_float_env_or_value(
+            "TRAVERSE_HEADING_CORRECTION_LIMIT_DEG",
+            opennav.get("traverse_heading_correction_limit_deg", 30.0),
+        ),
+        traverse_candidate_heading_tolerance_deg=_float_env_or_value(
+            "TRAVERSE_CANDIDATE_HEADING_TOLERANCE_DEG",
+            opennav.get("traverse_candidate_heading_tolerance_deg", 22.0),
+        ),
+        traverse_min_progress_m=_float_env_or_value(
+            "TRAVERSE_MIN_PROGRESS_M",
+            opennav.get("traverse_min_progress_m", 0.50),
+        ),
+        traverse_pass_margin_m=_float_env_or_value(
+            "TRAVERSE_PASS_MARGIN_M",
+            opennav.get("traverse_pass_margin_m", 0.20),
+        ),
+        traverse_review_min_progress_m=_float_env_or_value(
+            "TRAVERSE_REVIEW_MIN_PROGRESS_M",
+            opennav.get("traverse_review_min_progress_m", 1.00),
+        ),
+        traverse_review_min_translation_m=_float_env_or_value(
+            "TRAVERSE_REVIEW_MIN_TRANSLATION_M",
+            opennav.get("traverse_review_min_translation_m", 0.20),
+        ),
+        traverse_max_recovery_attempts=_int_env_or_value(
+            "TRAVERSE_MAX_RECOVERY_ATTEMPTS",
+            opennav.get("traverse_max_recovery_attempts", 2),
+        ),
         visual_target_center_deadband_deg=_float_env_or_value(
             "VISUAL_TARGET_CENTER_DEADBAND_DEG",
             opennav.get("visual_target_center_deadband_deg", 15.0),
@@ -609,10 +636,6 @@ def load_config(config_path: str | None = None) -> AppConfig:
         candidate_column_half_width_px=_int_env_or_value(
             "CANDIDATE_COLUMN_HALF_WIDTH_PX",
             opennav.get("candidate_column_half_width_px", 26),
-        ),
-        candidate_debug_image_path=_env_or_value(
-            "CANDIDATE_DEBUG_IMAGE_PATH",
-            opennav.get("candidate_debug_image_path", "debug/llm_request.png"),
         ),
         target_debug_enabled=_bool_env_or_value(
             "TARGET_DEBUG_ENABLED",
@@ -1260,34 +1283,6 @@ def load_config(config_path: str | None = None) -> AppConfig:
         occupancy_grid_unknown_cell_cost=_float_env_or_value(
             "OCCUPANCY_GRID_UNKNOWN_CELL_COST",
             occupancy_grid.get("unknown_cell_cost", 0.80),
-        ),
-        occupancy_grid_debug_enabled=_bool_env_or_value(
-            "OCCUPANCY_GRID_DEBUG_ENABLED",
-            occupancy_grid.get("debug_enabled", True),
-        ),
-        occupancy_grid_debug_image_path=_env_or_value(
-            "OCCUPANCY_GRID_DEBUG_IMAGE_PATH",
-            occupancy_grid.get("debug_image_path", "debug/local_map.png"),
-        ),
-        occupancy_grid_debug_update_period_sec=_float_env_or_value(
-            "OCCUPANCY_GRID_DEBUG_UPDATE_PERIOD_SEC",
-            occupancy_grid.get("debug_update_period_sec", 0.5),
-        ),
-        occupancy_grid_debug_width=_int_env_or_value(
-            "OCCUPANCY_GRID_DEBUG_WIDTH",
-            occupancy_grid.get("debug_width", 900),
-        ),
-        occupancy_grid_debug_height=_int_env_or_value(
-            "OCCUPANCY_GRID_DEBUG_HEIGHT",
-            occupancy_grid.get("debug_height", 900),
-        ),
-        occupancy_grid_debug_view_size_m=_float_env_or_value(
-            "OCCUPANCY_GRID_DEBUG_VIEW_SIZE_M",
-            occupancy_grid.get("debug_view_size_m", 8.0),
-        ),
-        occupancy_grid_debug_show_free_space=_bool_env_or_value(
-            "OCCUPANCY_GRID_DEBUG_SHOW_FREE_SPACE",
-            occupancy_grid.get("debug_show_free_space", False),
         ),
         occupancy_grid_lidar_bootstrap_sec=_float_env_or_value(
             "OCCUPANCY_GRID_LIDAR_BOOTSTRAP_SEC",

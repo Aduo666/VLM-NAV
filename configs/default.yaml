@@ -7,6 +7,10 @@ sim:
   multi_gpu: false
   warmup_steps: 30
 
+robot:
+  profile: "unitree_g1_29dof"
+  #profile: "agx"
+
 llm:
   api_key: "sk-bduqejichuzwbbzuesgwfvwswcetzfagmfkyadbpkzykfjjh"
   api_base_url: "https://api.siliconflow.cn/v1"
@@ -17,7 +21,7 @@ llm:
   camera_image_detail: "high"
 
 opennav:
-  instruction_parse_max_tokens: 768
+  instruction_parse_max_tokens: 2048
   instruction_parse_timeout_sec: 90
   instruction_cache_enabled: true
   instruction_cache_path: ".cache/instruction_plans.json"
@@ -41,6 +45,13 @@ opennav:
   semantic_turn_corridor_max_clearance_m: 4.0
   semantic_turn_max_recovery_attempts: 2
   local_detour_max_turn_primitives: 2
+  traverse_heading_correction_limit_deg: 30.0
+  traverse_candidate_heading_tolerance_deg: 22.0
+  traverse_min_progress_m: 0.50
+  traverse_pass_margin_m: 0.20
+  traverse_review_min_progress_m: 1.00
+  traverse_review_min_translation_m: 0.20
+  traverse_max_recovery_attempts: 2
   visual_target_center_deadband_deg: 15.0
   candidate_slot_bearings_deg: [35.0, 18.0, 0.0, -18.0, -35.0]
   candidate_adaptive_enabled: true
@@ -51,7 +62,6 @@ opennav:
   candidate_max_travel_distance_m: 1.35
   candidate_min_free_ratio: 0.28
   candidate_column_half_width_px: 26
-  candidate_debug_image_path: "debug/local/llm_request.png"
   target_debug_enabled: true
   target_debug_image_path: "debug/local/vln_debug.png"
   debug_video_enabled: false
@@ -140,12 +150,9 @@ landmark_tracker:
   low_confidence_min_translation_m: 0.20
   low_confidence_min_yaw_deg: 10.0
 
-robot:
-  profile: "unitree_g1_29dof"
-  #profile: "agx"
 camera:
-  width: 640
-  height: 480
+  width: 1280
+  height: 960
   follow_front_camera_in_gui: false
   follow_observer_camera_in_gui: true
   observer_video_enabled: true
@@ -220,13 +227,6 @@ occupancy_grid:
   occupied_min_neighbors: 3
   unknown_is_traversable: false
   unknown_cell_cost: 0.80
-  debug_enabled: true
-  debug_image_path: "debug/local/local_map.png"
-  debug_update_period_sec: 0.5
-  debug_width: 900
-  debug_height: 900
-  debug_view_size_m: 8.0
-  debug_show_free_space: false
   lidar_bootstrap_sec: 0.8
   lidar_bootstrap_min_fov_deg: 165.0
   lidar_bootstrap_max_wait_sec: 3.0

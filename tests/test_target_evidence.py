@@ -167,6 +167,59 @@ class TargetEvidenceTest(unittest.TestCase):
         )
         self.assertFalse(policy._turn_alignment_is_stable())
 
+    def test_depth_invalid_target_can_be_triangulated_from_two_viewpoints(self) -> None:
+        tracker = LandmarkTracker(
+            config=LandmarkTrackerConfig(
+                arrival_visible_depth_m=1.0,
+                arrival_anchor_radius_m=1.0,
+                min_visible_count=1,
+                arrival_confirmations=1,
+                max_lost_count=3,
+                anchor_update_min_consistent_observations=2,
+                anchor_update_max_jump_m=1.0,
+                arrival_window_size=3,
+                confirm_confidence_threshold=0.75,
+                confirm_min_observations=2,
+                confirm_max_anchor_jump_m=0.5,
+                confirm_max_depth_jump_m=0.8,
+                potential_confidence_threshold=0.5,
+                low_confidence_min_translation_m=0.2,
+                low_confidence_min_yaw_deg=10.0,
+            ),
+            logger=_logger(),
+        )
+        target_xy = np.asarray([2.0, 1.0], dtype=np.float64)
+        first_pose = Pose2D(0.0, 0.0, 0.0)
+        first = tracker.update(
+            target_label="tv",
+            behavior_type="pass_cue",
+            observation=_bearing_only_observation(
+                label="tv",
+                pose=first_pose,
+                target_xy=target_xy,
+                timestamp_sec=1.0,
+            ),
+            robot_pose=first_pose,
+            timestamp_sec=1.0,
+        )
+        self.assertIsNone(first.estimated_world_xy)
+
+        second_pose = Pose2D(0.3, 0.0, 0.0)
+        second = tracker.update(
+            target_label="tv",
+            behavior_type="pass_cue",
+            observation=_bearing_only_observation(
+                label="tv",
+                pose=second_pose,
+                target_xy=target_xy,
+                timestamp_sec=2.0,
+            ),
+            robot_pose=second_pose,
+            timestamp_sec=2.0,
+        )
+        self.assertEqual(second.evidence_level, "confirmed")
+        np.testing.assert_allclose(second.estimated_world_xy, target_xy, atol=0.05)
+
 
 def _low_confidence_observation(pose: Pose2D, *, timestamp_sec: float) -> TargetObservation:
     return TargetObservation(
@@ -193,6 +246,45 @@ def _low_confidence_observation(pose: Pose2D, *, timestamp_sec: float) -> Target
         vlm_verification_confidence=0.90,
         vlm_verification_reason="match",
         requires_viewpoint_confirmation=True,
+    )
+
+
+def _bearing_only_observation(
+    *,
+    label: str,
+    pose: Pose2D,
+    target_xy: np.ndarray,
+    timestamp_sec: float,
+) -> TargetObservation:
+    delta = np.asarray(target_xy, dtype=np.float64) - np.asarray(
+        [pose.x, pose.y],
+        dtype=np.float64,
+    )
+    world_heading = float(np.arctan2(delta[1], delta[0]))
+    image_right_positive_bearing = float(pose.yaw_rad) - world_heading
+    return TargetObservation(
+        label=label,
+        visible=True,
+        bbox=(20, 20, 80, 90),
+        center_uv=(50.0, 55.0),
+        confidence=0.85,
+        depth_m=None,
+        bearing_rad=image_right_positive_bearing,
+        estimated_world_xy=None,
+        depth_valid_ratio=0.0,
+        area_ratio=0.10,
+        source="grounding_dino:original_pixels",
+        reason="depth_invalid",
+        timestamp_sec=timestamp_sec,
+        request_sim_time_sec=timestamp_sec,
+        request_robot_pose=pose,
+        is_current_frame=True,
+        evidence_level="confirmed_candidate",
+        semantic_source="grounding_dino",
+        can_confirm=True,
+        vlm_verified=True,
+        vlm_verification_confidence=0.90,
+        vlm_verification_reason="match",
     )
 
 

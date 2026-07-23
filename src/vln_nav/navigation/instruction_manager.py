@@ -10,10 +10,24 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 
-INSTRUCTION_SCHEMA_VERSION = "2.0"
-INSTRUCTION_PROMPT_VERSION = "2026-07-22.2"
-SUPPORTED_STEP_TYPES = {"GO_TO", "REGION_TRANSITION", "TURN"}
+INSTRUCTION_SCHEMA_VERSION = "3.0"
+INSTRUCTION_PROMPT_VERSION = "2026-07-23.1"
+SUPPORTED_STEP_TYPES = {"GO_TO", "TRAVERSE", "REGION_TRANSITION", "TURN"}
 SUPPORTED_DIRECTIONS = {"none", "left", "right", "forward"}
+SUPPORTED_CUE_ROLES = {"PASS_CUE", "TURN_CUE", "TRANSITION_CUE", "CONTEXT_CUE"}
+SUPPORTED_CUE_SIDES = {"none", "left", "right", "center"}
+SUPPORTED_RELATIONS = {
+    "LEFT_OF",
+    "RIGHT_OF",
+    "IN_FRONT_OF",
+    "BEHIND_TARGET",
+    "NEAR",
+}
+SUPPORTED_TRAVERSE_COMPLETIONS = {
+    "CUE_PASSED",
+    "REGION_BOUNDARY",
+    "NEXT_EVENT_CONFIRMED",
+}
 
 
 class InstructionPlanError(RuntimeError):
@@ -39,6 +53,22 @@ class StepTrigger:
 
 
 @dataclass(frozen=True)
+class RouteCue:
+    label: str
+    role: str
+    expected_side: str = "none"
+    source_span: str = ""
+
+
+@dataclass(frozen=True)
+class SemanticRelation:
+    target: str
+    relation: str
+    reference: str
+    source_span: str = ""
+
+
+@dataclass(frozen=True)
 class RouteStep:
     step_id: str
     step_type: str
@@ -50,12 +80,16 @@ class RouteStep:
     direction: str = "none"
     trigger: StepTrigger | None = None
     completion: str = ""
+    cues: tuple[RouteCue, ...] = ()
+    relations: tuple[SemanticRelation, ...] = ()
     constraints: tuple[str, ...] = ()
 
     @property
     def perception_target(self) -> str:
         if self.step_type == "GO_TO":
             return self.target
+        if self.cues:
+            return self.cues[0].label
         if self.step_type == "TURN" and self.trigger is not None:
             if self.trigger.trigger_type == "NEAR_OBJECT":
                 return self.trigger.label
@@ -101,13 +135,14 @@ class InstructionManager:
         self._max_tokens = max(256, int(max_tokens))
         self._cache_enabled = bool(cache_enabled)
         self._cache_path = Path(cache_path).expanduser()
+        self._model_name = str(getattr(llm_client, "model_name", "")).strip()
 
     def parse(self, raw_instruction: str) -> InstructionContext:
         normalized = _normalize_instruction(raw_instruction)
         if not normalized:
             raise InstructionPlanError("[INSTRUCTION_FATAL] instruction is empty")
 
-        cache_key = _instruction_cache_key(normalized)
+        cache_key = _instruction_cache_key(normalized, model_name=self._model_name)
         cached = self._load_cached(cache_key=cache_key, raw_instruction=raw_instruction)
         if cached is not None:
             self._logger.info(
@@ -132,6 +167,7 @@ class InstructionManager:
             image_png_bytes=None,
             max_tokens=self._max_tokens,
             temperature=0.0,
+            json_response=True,
         )
         if result.failed or not str(result.content).strip():
             raise InstructionPlanError(
@@ -197,6 +233,7 @@ class InstructionManager:
             image_png_bytes=None,
             max_tokens=self._max_tokens,
             temperature=0.0,
+            json_response=True,
         )
         if result.failed or not str(result.content).strip():
             raise InstructionPlanError(
@@ -236,6 +273,12 @@ class InstructionManager:
             record = cache.get("plans", {}).get(cache_key)
             if not isinstance(record, dict):
                 return None
+            if str(record.get("schema_version", "")) != INSTRUCTION_SCHEMA_VERSION:
+                return None
+            if str(record.get("prompt_version", "")) != INSTRUCTION_PROMPT_VERSION:
+                return None
+            if str(record.get("model_name", "")) != self._model_name:
+                return None
             context, errors = _context_from_payload(
                 raw_instruction=raw_instruction,
                 normalized=_normalize_instruction(raw_instruction),
@@ -264,6 +307,9 @@ class InstructionManager:
             cache["prompt_version"] = INSTRUCTION_PROMPT_VERSION
             cache.setdefault("plans", {})[cache_key] = {
                 "instruction": context.normalized_text,
+                "schema_version": INSTRUCTION_SCHEMA_VERSION,
+                "prompt_version": INSTRUCTION_PROMPT_VERSION,
+                "model_name": self._model_name,
                 "plan": _context_to_payload(context),
             }
             self._cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -294,7 +340,8 @@ def _instruction_system_prompt() -> str:
         "Return strict JSON only, with no markdown or commentary.\n"
         "Never turn scene-description objects into navigation targets unless the instruction explicitly commands the robot to find, approach, or navigate to them.\n"
         "Distinguish trusted starting context, context objects, action triggers, regions, and true navigation targets.\n"
-        "The only supported step types are GO_TO, REGION_TRANSITION, and TURN.\n"
+        "The only supported step types are GO_TO, TRAVERSE, REGION_TRANSITION, and TURN.\n"
+        "Use TRAVERSE for directional route segments such as walking down a hallway or passing a cue; never encode such a segment as an empty GO_TO.\n"
         "Preserve temporal order and explicit directional relations.\n"
         "Do not invent objects, regions, or actions absent from the instruction."
     )
@@ -314,7 +361,7 @@ def _instruction_user_prompt(instruction: str) -> str:
         '  "route_steps": [\n'
         "    {\n"
         '      "step_id": "step_1",\n'
-        '      "step_type": "GO_TO|REGION_TRANSITION|TURN",\n'
+        '      "step_type": "GO_TO|TRAVERSE|REGION_TRANSITION|TURN",\n'
         '      "source_span": "exact supporting phrase",\n'
         '      "target": "object label or empty",\n'
         '      "from_region": "region label or empty",\n'
@@ -322,7 +369,23 @@ def _instruction_user_prompt(instruction: str) -> str:
         '      "transition": "enter|exit|empty",\n'
         '      "direction": "none|left|right|forward",\n'
         '      "trigger": {"trigger_type": "NONE|NEAR_OBJECT|AFTER_PREVIOUS_STEP", "label": ""},\n'
-        '      "completion": "SEMANTIC_AND_DISTANCE|REGION_CHANGED|NAMED_REGION_CONFIRMED|HEADING_ALIGNED",\n'
+        '      "completion": "SEMANTIC_AND_DISTANCE|CUE_PASSED|REGION_BOUNDARY|NEXT_EVENT_CONFIRMED|REGION_CHANGED|NAMED_REGION_CONFIRMED|HEADING_ALIGNED",\n'
+        '      "cues": [\n'
+        "        {\n"
+        '          "label": "route cue label",\n'
+        '          "role": "PASS_CUE|TURN_CUE|TRANSITION_CUE|CONTEXT_CUE",\n'
+        '          "expected_side": "none|left|right|center",\n'
+        '          "source_span": "exact supporting phrase"\n'
+        "        }\n"
+        "      ],\n"
+        '      "relations": [\n'
+        "        {\n"
+        '          "target": "GO_TO target",\n'
+        '          "relation": "LEFT_OF|RIGHT_OF|IN_FRONT_OF|BEHIND_TARGET|NEAR",\n'
+        '          "reference": "reference object",\n'
+        '          "source_span": "exact supporting phrase"\n'
+        "        }\n"
+        "      ],\n"
         '      "constraints": ["short global semantic constraint"]\n'
         "    }\n"
         "  ]\n"
@@ -331,13 +394,18 @@ def _instruction_user_prompt(instruction: str) -> str:
         "1. scene_context is trusted prior information, not an execution target.\n"
         "2. Objects merely described as nearby belong only in context_objects. Never duplicate a GO_TO target in context_objects.\n"
         "3. find/go to/navigate to/approach an object becomes GO_TO with SEMANTIC_AND_DISTANCE.\n"
-        "4. Leaving or entering a room becomes REGION_TRANSITION.\n"
-        "5. A directional turn becomes TURN; if it follows another step, use AFTER_PREVIOUS_STEP.\n"
-        "6. 'turn at/near object' uses NEAR_OBJECT and does not make that object a GO_TO target.\n"
-        "7. 'go straight to X' is GO_TO(X) with direction=forward, not an infinite forward step.\n"
-        "8. navigation_targets contains exactly the GO_TO targets, in first-use order.\n"
-        "9. Use concise lowercase English canonical labels.\n"
-        "10. If no current region is stated, return empty strings for current_region."
+        "4. Directional travel without an object destination becomes TRAVERSE, never GO_TO with an empty target.\n"
+        "5. A TRAVERSE must have direction and a finite completion: CUE_PASSED, REGION_BOUNDARY, or NEXT_EVENT_CONFIRMED.\n"
+        "6. 'passing X on the right/left' creates a PASS_CUE on TRAVERSE or REGION_TRANSITION; X is not a GO_TO target.\n"
+        "7. Leaving or entering a room becomes REGION_TRANSITION. Travel details inside the same entering clause are cues on that transition, not a duplicate TRAVERSE.\n"
+        "8. A directional turn becomes TURN; if it follows another step, use AFTER_PREVIOUS_STEP. 'turn left into a doorway' creates a TURN_CUE for doorway.\n"
+        "9. 'turn at/near object' uses NEAR_OBJECT and does not make that object a GO_TO target.\n"
+        "10. 'go straight to X' is GO_TO(X) with direction=forward, not an infinite forward step.\n"
+        "11. Spatial descriptions that distinguish a GO_TO instance become relations. For 'window behind the bed', target=bed, relation=BEHIND_TARGET, reference=large window.\n"
+        "12. navigation_targets contains exactly the GO_TO targets, in first-use order. Route cues and relation references are excluded.\n"
+        "13. Use concise lowercase English canonical labels.\n"
+        "14. If no current region is stated, return empty strings for current_region.\n"
+        "15. Do not emit empty objects in cues or relations; use empty lists when absent."
     )
 
 
@@ -409,6 +477,10 @@ def _context_from_payload(
     if not isinstance(payload, dict):
         payload = {}
         errors.append("root must be an object")
+    if str(payload.get("schema_version", "")).strip() != INSTRUCTION_SCHEMA_VERSION:
+        errors.append(
+            f"schema_version must be {INSTRUCTION_SCHEMA_VERSION}"
+        )
 
     scene_payload = payload.get("scene_context", {})
     if not isinstance(scene_payload, dict):
@@ -452,12 +524,47 @@ def _context_from_payload(
             errors.append(f"{prefix}.direction unsupported: {direction}")
             direction = "none"
         trigger = _trigger_from_value(item.get("trigger"), errors=errors, prefix=prefix)
+        cues = tuple(_cue_list(item.get("cues"), errors=errors, prefix=prefix))
+        relations = tuple(_relation_list(item.get("relations"), errors=errors, prefix=prefix))
         constraints = tuple(_clean_string_list(item.get("constraints")))
+        requested_completion = str(item.get("completion", "")).strip().upper()
 
         if step_type == "GO_TO":
             if not target:
                 errors.append(f"{prefix}.target is required for GO_TO")
             completion = "SEMANTIC_AND_DISTANCE"
+            from_region = ""
+            to_region = ""
+            transition = ""
+            if cues:
+                errors.append(f"{prefix}.cues are not supported for GO_TO; use relations")
+            for relation in relations:
+                if relation.target != target:
+                    errors.append(
+                        f"{prefix}.relations target must match GO_TO target={target}"
+                    )
+        elif step_type == "TRAVERSE":
+            if direction not in {"forward", "left", "right"}:
+                errors.append(f"{prefix}.direction is required for TRAVERSE")
+            if requested_completion not in SUPPORTED_TRAVERSE_COMPLETIONS:
+                errors.append(
+                    f"{prefix}.completion must be one of {sorted(SUPPORTED_TRAVERSE_COMPLETIONS)}"
+                )
+            completion = requested_completion
+            if completion == "CUE_PASSED" and not any(
+                cue.role == "PASS_CUE" for cue in cues
+            ):
+                errors.append(f"{prefix}.CUE_PASSED requires a PASS_CUE")
+            invalid_roles = sorted(
+                {cue.role for cue in cues if cue.role not in {"PASS_CUE", "CONTEXT_CUE"}}
+            )
+            if invalid_roles:
+                errors.append(
+                    f"{prefix}.TRAVERSE cue roles unsupported: {invalid_roles}"
+                )
+            if relations:
+                errors.append(f"{prefix}.relations are only supported for GO_TO")
+            target = ""
             from_region = ""
             to_region = ""
             transition = ""
@@ -476,6 +583,19 @@ def _context_from_payload(
                 else "NAMED_REGION_CONFIRMED"
             )
             target = ""
+            if relations:
+                errors.append(f"{prefix}.relations are only supported for GO_TO")
+            invalid_roles = sorted(
+                {
+                    cue.role
+                    for cue in cues
+                    if cue.role not in {"PASS_CUE", "TRANSITION_CUE", "CONTEXT_CUE"}
+                }
+            )
+            if invalid_roles:
+                errors.append(
+                    f"{prefix}.REGION_TRANSITION cue roles unsupported: {invalid_roles}"
+                )
         else:
             if direction not in {"left", "right"}:
                 errors.append(f"{prefix}.direction must be left or right for TURN")
@@ -484,6 +604,13 @@ def _context_from_payload(
             from_region = ""
             to_region = ""
             transition = ""
+            if relations:
+                errors.append(f"{prefix}.relations are only supported for GO_TO")
+            invalid_roles = sorted(
+                {cue.role for cue in cues if cue.role != "TURN_CUE"}
+            )
+            if invalid_roles:
+                errors.append(f"{prefix}.TURN cue roles unsupported: {invalid_roles}")
 
         route_steps.append(
             RouteStep(
@@ -497,6 +624,8 @@ def _context_from_payload(
                 direction=direction,
                 trigger=trigger,
                 completion=completion,
+                cues=cues,
+                relations=relations,
                 constraints=constraints,
             )
         )
@@ -585,6 +714,85 @@ def _trigger_from_value(value, *, errors: list[str], prefix: str) -> StepTrigger
     return StepTrigger(trigger_type=trigger_type, label=label)
 
 
+def _cue_list(value, *, errors: list[str], prefix: str) -> list[RouteCue]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        errors.append(f"{prefix}.cues must be a list")
+        return []
+    result: list[RouteCue] = []
+    for index, item in enumerate(value):
+        cue_prefix = f"{prefix}.cues[{index}]"
+        if not isinstance(item, dict):
+            errors.append(f"{cue_prefix} must be an object")
+            continue
+        label = _canonical_label(item.get("label"))
+        role = str(item.get("role", "")).strip().upper()
+        expected_side = str(item.get("expected_side", "none")).strip().lower() or "none"
+        source_span = str(item.get("source_span", "")).strip()
+        if not label:
+            errors.append(f"{cue_prefix}.label is required")
+        if role not in SUPPORTED_CUE_ROLES:
+            errors.append(f"{cue_prefix}.role unsupported: {role or 'empty'}")
+        if expected_side not in SUPPORTED_CUE_SIDES:
+            errors.append(f"{cue_prefix}.expected_side unsupported: {expected_side}")
+        if not source_span:
+            errors.append(f"{cue_prefix}.source_span is required")
+        if label and role in SUPPORTED_CUE_ROLES and expected_side in SUPPORTED_CUE_SIDES:
+            result.append(
+                RouteCue(
+                    label=label,
+                    role=role,
+                    expected_side=expected_side,
+                    source_span=source_span,
+                )
+            )
+    return result
+
+
+def _relation_list(
+    value,
+    *,
+    errors: list[str],
+    prefix: str,
+) -> list[SemanticRelation]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        errors.append(f"{prefix}.relations must be a list")
+        return []
+    result: list[SemanticRelation] = []
+    for index, item in enumerate(value):
+        relation_prefix = f"{prefix}.relations[{index}]"
+        if not isinstance(item, dict):
+            errors.append(f"{relation_prefix} must be an object")
+            continue
+        target = _canonical_label(item.get("target"))
+        relation = str(item.get("relation", "")).strip().upper()
+        reference = _canonical_label(item.get("reference"))
+        source_span = str(item.get("source_span", "")).strip()
+        if not target:
+            errors.append(f"{relation_prefix}.target is required")
+        if relation not in SUPPORTED_RELATIONS:
+            errors.append(
+                f"{relation_prefix}.relation unsupported: {relation or 'empty'}"
+            )
+        if not reference:
+            errors.append(f"{relation_prefix}.reference is required")
+        if not source_span:
+            errors.append(f"{relation_prefix}.source_span is required")
+        if target and relation in SUPPORTED_RELATIONS and reference:
+            result.append(
+                SemanticRelation(
+                    target=target,
+                    relation=relation,
+                    reference=reference,
+                    source_span=source_span,
+                )
+            )
+    return result
+
+
 def _context_to_payload(context: InstructionContext) -> dict:
     return {
         "schema_version": context.schema_version,
@@ -613,6 +821,8 @@ def _context_to_payload(context: InstructionContext) -> dict:
                     else asdict(step.trigger)
                 ),
                 "completion": step.completion,
+                "cues": [asdict(item) for item in step.cues],
+                "relations": [asdict(item) for item in step.relations],
                 "constraints": list(step.constraints),
             }
             for step in context.route_steps
@@ -620,8 +830,11 @@ def _context_to_payload(context: InstructionContext) -> dict:
     }
 
 
-def _instruction_cache_key(normalized: str) -> str:
-    material = f"{INSTRUCTION_SCHEMA_VERSION}|{INSTRUCTION_PROMPT_VERSION}|{normalized}"
+def _instruction_cache_key(normalized: str, *, model_name: str) -> str:
+    material = (
+        f"{INSTRUCTION_SCHEMA_VERSION}|{INSTRUCTION_PROMPT_VERSION}|"
+        f"{model_name}|{normalized}"
+    )
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 

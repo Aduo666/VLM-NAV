@@ -127,6 +127,7 @@ class _GroundingRequest:
     expected_turn_direction: str = ""
     turn_start_yaw_rad: float | None = None
     turn_direction_tolerance_deg: float = 10.0
+    semantic_relation_text: str = ""
 
 
 @dataclass
@@ -217,6 +218,7 @@ class TargetGrounder:
         expected_turn_direction: str = "",
         turn_start_yaw_rad: float | None = None,
         turn_direction_tolerance_deg: float = 10.0,
+        semantic_relation_text: str = "",
     ) -> TargetObservation:
         target_label = str(target_label).strip() or "target"
         if target_label.lower() in {"none", "null", "unknown", "n/a", "na", "target", "object", "thing", "place", "location"}:
@@ -278,6 +280,7 @@ class TargetGrounder:
                 expected_turn_direction=expected_turn_direction,
                 turn_start_yaw_rad=turn_start_yaw_rad,
                 turn_direction_tolerance_deg=turn_direction_tolerance_deg,
+                semantic_relation_text=semantic_relation_text,
             )
         except Exception as exc:
             self._logger.warning("[GroundingReject] target=%s reason=image_prepare_failed error=%s", target_label, exc)
@@ -477,6 +480,16 @@ class TargetGrounder:
             request=request,
             config=self._config,
         )
+        if str(request.semantic_relation_text).strip() and len(detections) > 1:
+            relation_selection = self._select_detection_by_relation(
+                request=request,
+                detections=detections,
+            )
+            if relation_selection is None:
+                return "", "relation_disambiguation_failed"
+            selected_index, relation_reason = relation_selection
+            detection = detections[selected_index]
+            selection_reason = f"semantic_relation:{relation_reason}"
         self._logger.info(
             "[GroundingInstanceSelect] target=%s proposals=%s selected=%s confidence=%.2f bbox=%s reason=%s",
             request.target_label,
@@ -516,6 +529,7 @@ class TargetGrounder:
         expected_turn_direction: str = "",
         turn_start_yaw_rad: float | None = None,
         turn_direction_tolerance_deg: float = 10.0,
+        semantic_relation_text: str = "",
     ) -> _GroundingRequest:
         image = Image.fromarray(rgb[:, :, :3].copy()).convert("RGB")
         original_size = (int(image.width), int(image.height))
@@ -568,7 +582,86 @@ class TargetGrounder:
                 None if turn_start_yaw_rad is None else float(turn_start_yaw_rad)
             ),
             turn_direction_tolerance_deg=max(0.0, float(turn_direction_tolerance_deg)),
+            semantic_relation_text=str(semantic_relation_text).strip(),
         )
+
+    def _select_detection_by_relation(
+        self,
+        *,
+        request: _GroundingRequest,
+        detections: list[GroundingDinoDetection],
+    ) -> tuple[int, str] | None:
+        image_bytes = _build_relation_contact_sheet_bytes(
+            rgb=request.rgb,
+            detections=detections,
+            max_edge_px=int(self._config.semantic_verification_max_edge_px),
+        )
+        result = self._llm.chat(
+            request_name="target_relation_disambiguation",
+            system_prompt=(
+                "You are a strict object-instance disambiguation module for robot "
+                "navigation. Select only the candidate that satisfies the supplied "
+                "spatial relation. Return JSON only."
+            ),
+            user_prompt=(
+                f"Target category: {request.target_label}\n"
+                f"Required relation: {request.semantic_relation_text}\n"
+                "The image is a contact sheet of numbered candidate context crops. "
+                "Select the matching instance. If none satisfies the relation, set "
+                "selected_index to -1.\n"
+                '{"selected_index": 0, "confidence": 0.0, "reason": "short reason"}'
+            ),
+            image_png_bytes=image_bytes,
+            max_tokens=96,
+            temperature=0.0,
+            json_response=True,
+        )
+        if result.failed or not result.content:
+            self._logger.warning(
+                "[GroundingRelation] target=%s failed=%s",
+                request.target_label,
+                result.reason,
+            )
+            return None
+        try:
+            payload = _parse_json_object(result.content)
+            selected_index = int(payload.get("selected_index", -1))
+            confidence = float(
+                np.clip(
+                    _parse_float(payload.get("confidence"), default=0.0),
+                    0.0,
+                    1.0,
+                )
+            )
+            reason = str(payload.get("reason", "")).strip() or "no_reason"
+        except Exception as exc:
+            self._logger.warning(
+                "[GroundingRelation] target=%s invalid_json=%s",
+                request.target_label,
+                exc,
+            )
+            return None
+        if (
+            selected_index < 0
+            or selected_index >= len(detections)
+            or confidence < float(self._config.semantic_verification_min_confidence)
+        ):
+            self._logger.info(
+                "[GroundingRelation] target=%s rejected_index=%s confidence=%.2f reason=%s",
+                request.target_label,
+                selected_index,
+                confidence,
+                reason[:120],
+            )
+            return None
+        self._logger.info(
+            "[GroundingRelation] target=%s selected=%s confidence=%.2f reason=%s",
+            request.target_label,
+            selected_index,
+            confidence,
+            reason[:120],
+        )
+        return selected_index, reason
 
     def _parse_and_validate(self, *, content: str, request: _GroundingRequest) -> TargetObservation:
         try:
@@ -820,8 +913,12 @@ class TargetGrounder:
             request=request,
             camera_bearing_rad=bearing_rad,
         )
-        turn_relation_verified = False
-        turn_relation_reason = "not_required"
+        turn_relation_verified = bool(turn_direction_consistent is True)
+        turn_relation_reason = (
+            "geometric_turn_direction_consistent"
+            if turn_relation_verified
+            else "not_required"
+        )
         if (
             can_confirm
             and turn_direction_consistent is False
@@ -1462,6 +1559,63 @@ def _select_grounding_detection(
     if best_depth is None:
         reason = "highest_confidence_without_valid_depth"
     return best_detection, best_index, reason
+
+
+def _build_relation_contact_sheet_bytes(
+    *,
+    rgb: np.ndarray,
+    detections: list[GroundingDinoDetection],
+    max_edge_px: int,
+) -> bytes:
+    source = Image.fromarray(np.asarray(rgb, dtype=np.uint8)[..., :3]).convert("RGB")
+    panel_size = 256
+    columns = min(3, max(1, len(detections)))
+    rows = int(np.ceil(len(detections) / float(columns)))
+    sheet = Image.new(
+        "RGB",
+        (columns * panel_size, rows * panel_size),
+        (20, 20, 20),
+    )
+    for index, detection in enumerate(detections):
+        xmin, ymin, xmax, ymax = [int(value) for value in detection.bbox]
+        width = max(1, xmax - xmin)
+        height = max(1, ymax - ymin)
+        expand_x = int(round(0.75 * width))
+        expand_y = int(round(0.75 * height))
+        crop_box = (
+            max(0, xmin - expand_x),
+            max(0, ymin - expand_y),
+            min(source.width, xmax + expand_x),
+            min(source.height, ymax + expand_y),
+        )
+        crop = source.crop(crop_box)
+        crop.thumbnail((panel_size - 12, panel_size - 12), Image.Resampling.LANCZOS)
+        panel = Image.new("RGB", (panel_size, panel_size), (20, 20, 20))
+        offset = (
+            (panel_size - crop.width) // 2,
+            (panel_size - crop.height) // 2,
+        )
+        panel.paste(crop, offset)
+        draw = ImageDraw.Draw(panel)
+        draw.rectangle((4, 4, 58, 34), fill=(0, 0, 0))
+        draw.text((12, 9), str(index), fill=(255, 225, 50))
+        sheet.paste(
+            panel,
+            ((index % columns) * panel_size, (index // columns) * panel_size),
+        )
+    max_edge = max(sheet.size)
+    if max_edge > max(1, int(max_edge_px)):
+        scale = float(max_edge_px) / float(max_edge)
+        sheet = sheet.resize(
+            (
+                max(1, int(round(sheet.width * scale))),
+                max(1, int(round(sheet.height * scale))),
+            ),
+            Image.Resampling.LANCZOS,
+        )
+    buffer = io.BytesIO()
+    sheet.save(buffer, format="PNG", optimize=True)
+    return buffer.getvalue()
 
 
 def _detection_turn_direction_score(

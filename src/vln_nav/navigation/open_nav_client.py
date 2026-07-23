@@ -18,6 +18,7 @@ class ChatResult:
     content: str
     failed: bool
     reason: str
+    finish_reason: str = ""
 
 
 class OpenNavLLMClient:
@@ -51,6 +52,10 @@ class OpenNavLLMClient:
     def available(self) -> bool:
         return bool(self._api_key)
 
+    @property
+    def model_name(self) -> str:
+        return self._model_name
+
     def chat(
         self,
         *,
@@ -60,6 +65,7 @@ class OpenNavLLMClient:
         image_png_bytes: bytes | None = None,
         max_tokens: int = 512,
         temperature: float = 0.2,
+        json_response: bool = False,
     ) -> ChatResult:
         if not self.available:
             return ChatResult(content="", failed=True, reason="llm_unavailable")
@@ -113,6 +119,8 @@ class OpenNavLLMClient:
             "stream": False,
             "max_tokens": int(max_tokens),
         }
+        if bool(json_response):
+            payload["response_format"] = {"type": "json_object"}
 
         request = urllib.request.Request(
             url=f"{self._base_url}/chat/completions",
@@ -140,11 +148,27 @@ class OpenNavLLMClient:
 
         try:
             response_json = json.loads(raw_body)
-            content = str(response_json["choices"][0]["message"]["content"])
+            choice = response_json["choices"][0]
+            content = str(choice["message"]["content"])
+            finish_reason = str(choice.get("finish_reason", "")).strip().lower()
         except Exception as exc:
             self._register_failure()
             self._logger.warning("Open-Nav LLM response parse failed name=%s: %s", request_name, exc)
             return ChatResult(content="", failed=True, reason="llm_parse_failed")
+
+        if finish_reason == "length":
+            self._register_failure()
+            self._logger.error(
+                "[LLM] truncated name=%s max_tokens=%s",
+                request_name,
+                int(max_tokens),
+            )
+            return ChatResult(
+                content=content,
+                failed=True,
+                reason="llm_output_truncated",
+                finish_reason=finish_reason,
+            )
 
         latency_ms = (time.monotonic() - request_started) * 1000.0
         self._cooldown_until = 0.0
@@ -156,7 +180,12 @@ class OpenNavLLMClient:
             int(image_png_bytes is not None),
             int(max_tokens),
         )
-        return ChatResult(content=content, failed=False, reason="ok")
+        return ChatResult(
+            content=content,
+            failed=False,
+            reason="ok",
+            finish_reason=finish_reason,
+        )
 
     def _register_failure(self) -> None:
         self._consecutive_failures += 1

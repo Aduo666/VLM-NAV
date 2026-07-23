@@ -80,6 +80,13 @@ class _PendingConfirmedCandidate:
     distinct_viewpoint_observed: bool = False
 
 
+@dataclass(frozen=True)
+class _BearingRay:
+    origin_xy: np.ndarray
+    direction_xy: np.ndarray
+    confidence: float
+
+
 class LandmarkTracker:
     """Track one language landmark with candidate/confirmed anchor separation.
 
@@ -99,6 +106,7 @@ class LandmarkTracker:
         self._last_anchor_log_time_by_label: dict[str, float] = {}
         self._last_anchor_log_xy_by_label: dict[str, list[float]] = {}
         self._reach_windows: dict[str, deque[bool]] = {}
+        self._bearing_rays: dict[str, deque[_BearingRay]] = {}
 
     def reset(self, label: str | None = None) -> None:
         if label is None:
@@ -106,12 +114,14 @@ class LandmarkTracker:
             self._pending_anchors.clear()
             self._pending_confirmed.clear()
             self._reach_windows.clear()
+            self._bearing_rays.clear()
             return
         key = _normalize_label(label)
         self._states.pop(key, None)
         self._pending_anchors.pop(key, None)
         self._pending_confirmed.pop(key, None)
         self._reach_windows.pop(key, None)
+        self._bearing_rays.pop(key, None)
 
     def update(
         self,
@@ -269,6 +279,20 @@ class LandmarkTracker:
                         int(can_confirm),
                         getattr(observation, "semantic_source", "unknown"),
                     )
+            elif (
+                fresh_visible
+                and is_depth_invalid
+                and bool(getattr(observation, "is_current_frame", True))
+                and observation.bearing_rad is not None
+                and (high_conf or low_confidence_vlm_verified)
+                and can_confirm
+            ):
+                self._try_confirm_from_bearings(
+                    label=label,
+                    state=state,
+                    observation=observation,
+                    robot_pose=robot_pose,
+                )
 
             state.status = "visible"
             if state.evidence_level == "confirmed":
@@ -334,6 +358,121 @@ class LandmarkTracker:
         self._states[label] = state
         self._log_state_if_needed(state=state, observation=observation, timestamp_sec=timestamp_sec)
         return state
+
+    def _try_confirm_from_bearings(
+        self,
+        *,
+        label: str,
+        state: LandmarkState,
+        observation: TargetObservation,
+        robot_pose: Pose2D,
+    ) -> None:
+        request_pose = observation.request_robot_pose or robot_pose
+        world_bearing = float(request_pose.yaw_rad) - float(observation.bearing_rad)
+        origin = np.asarray(
+            [float(request_pose.x), float(request_pose.y)],
+            dtype=np.float64,
+        )
+        direction = np.asarray(
+            [np.cos(world_bearing), np.sin(world_bearing)],
+            dtype=np.float64,
+        )
+        rays = self._bearing_rays.setdefault(label, deque(maxlen=8))
+        if rays:
+            translation_m = float(np.linalg.norm(origin - rays[-1].origin_xy))
+            heading_delta_deg = abs(
+                float(
+                    np.degrees(
+                        np.arctan2(
+                            np.cross(rays[-1].direction_xy, direction),
+                            np.dot(rays[-1].direction_xy, direction),
+                        )
+                    )
+                )
+            )
+            if translation_m < max(
+                0.05, float(self._config.low_confidence_min_translation_m)
+            ):
+                self._logger.info(
+                    "[BearingTriangulation] target=%s waiting_baseline translation_m=%.2f "
+                    "bearing_delta_deg=%.1f",
+                    label,
+                    translation_m,
+                    heading_delta_deg,
+                )
+                return
+        rays.append(
+            _BearingRay(
+                origin_xy=origin,
+                direction_xy=direction,
+                confidence=float(observation.confidence),
+            )
+        )
+        required = max(2, int(self._config.confirm_min_observations))
+        if len(rays) < required:
+            self._logger.info(
+                "[BearingTriangulation] target=%s rays=%s/%s",
+                label,
+                len(rays),
+                required,
+            )
+            return
+
+        identity = np.eye(2, dtype=np.float64)
+        normal_sum = np.zeros((2, 2), dtype=np.float64)
+        rhs_sum = np.zeros(2, dtype=np.float64)
+        for ray in rays:
+            normal = identity - np.outer(ray.direction_xy, ray.direction_xy)
+            normal_sum += normal
+            rhs_sum += normal @ ray.origin_xy
+        if abs(float(np.linalg.det(normal_sum))) < 1.0e-4:
+            self._logger.info(
+                "[BearingTriangulation] target=%s rejected=ill_conditioned rays=%s",
+                label,
+                len(rays),
+            )
+            return
+        estimate = np.linalg.solve(normal_sum, rhs_sum)
+        residuals: list[float] = []
+        forward_ranges: list[float] = []
+        for ray in rays:
+            delta = estimate - ray.origin_xy
+            forward_ranges.append(float(np.dot(delta, ray.direction_xy)))
+            residuals.append(
+                abs(float(np.cross(ray.direction_xy, delta)))
+            )
+        max_residual_m = max(residuals, default=float("inf"))
+        if (
+            min(forward_ranges, default=-1.0) <= 0.0
+            or max_residual_m > max(0.25, float(self._config.confirm_max_anchor_jump_m))
+        ):
+            self._logger.info(
+                "[BearingTriangulation] target=%s rejected=geometry "
+                "min_forward_m=%.2f max_residual_m=%.2f",
+                label,
+                min(forward_ranges, default=-1.0),
+                max_residual_m,
+            )
+            return
+
+        state.estimated_world_xy = [float(estimate[0]), float(estimate[1])]
+        state.candidate_world_xy = list(state.estimated_world_xy)
+        state.confirmed_observation_count = len(rays)
+        state.confirmed_confidence = float(
+            min(ray.confidence for ray in rays)
+        )
+        state.confidence = state.confirmed_confidence
+        state.last_confirmed_depth_m = None
+        state.evidence_level = "confirmed"
+        self._logger.info(
+            "[BearingTriangulation] target=%s confirmed_anchor=%s rays=%s "
+            "max_residual_m=%.2f confidence=%.2f",
+            label,
+            _format_xy(state.estimated_world_xy),
+            len(rays),
+            max_residual_m,
+            state.confirmed_confidence,
+        )
 
     def _log_state_if_needed(
         self,

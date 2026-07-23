@@ -24,6 +24,7 @@ SPLIT=val_unseen EPISODE_ID="some_episode_id" bash eval/vlnpe/run.sh
 - `eval/current_episode.json` — 当前运行的 episode（自动加载）
 - `debug/eval/vln_debug.png` — 调试图
 - `debug/eval/videos/vln_debug.mp4` — 录像
+- `debug/eval/results/<episode>_<time>.json` — 结构化运行结果与失败阶段
 - `logs/nav_latest.log` — 日志
 
 ## 环境变量

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import io
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+from PIL import Image
 
 from .candidate_waypoint_predictor import CandidateSet, CandidateWaypointPredictor, WaypointCandidate
 from .instruction_manager import InstructionContext, RouteStep
@@ -91,6 +93,13 @@ class OpenNavPolicyConfig:
     semantic_turn_corridor_max_clearance_m: float = 4.0
     semantic_turn_max_recovery_attempts: int = 2
     local_detour_max_turn_primitives: int = 2
+    traverse_heading_correction_limit_deg: float = 30.0
+    traverse_candidate_heading_tolerance_deg: float = 22.0
+    traverse_min_progress_m: float = 0.50
+    traverse_pass_margin_m: float = 0.20
+    traverse_review_min_progress_m: float = 1.00
+    traverse_review_min_translation_m: float = 0.20
+    traverse_max_recovery_attempts: int = 2
     confirm_min_observations: int = 3
     confirm_confidence_threshold: float = 0.50
     visual_target_center_deadband_deg: float = 15.0
@@ -119,6 +128,9 @@ class PolicyStepResult:
     current_target: str = ""
     navigation_status: str = "RUNNING"
     last_error: str = ""
+    traverse_locked_heading_deg: float | None = None
+    traverse_progress_m: float = 0.0
+    traverse_cue_status: str = ""
 
 
 @dataclass(frozen=True)
@@ -179,6 +191,21 @@ def _turn_target_observation_consistent(
         )
         return bool(delta_deg <= 25.0)
     return True
+
+
+def _clean_rgb_png_bytes(rgb) -> bytes | None:
+    if rgb is None:
+        return None
+    image = np.asarray(rgb, dtype=np.uint8)
+    if image.ndim != 3 or image.shape[2] < 3:
+        return None
+    buffer = io.BytesIO()
+    Image.fromarray(image[..., :3].copy(), mode="RGB").save(
+        buffer,
+        format="PNG",
+        optimize=True,
+    )
+    return buffer.getvalue()
 
 
 class OpenNavVLNPolicy:
@@ -310,6 +337,13 @@ class OpenNavVLNPolicy:
             self._last_applied_action = str(execution_feedback.applied_action).strip().upper()
 
         progress_state = self._progress_manager.state
+        if self.current_step_type == "TRAVERSE":
+            traverse_result = self._update_traverse_progress(
+                observation=observation,
+                progress_state=progress_state,
+            )
+            if traverse_result is not None:
+                return traverse_result
         if self.current_step_type == "GO_TO" and self._maybe_advance_landmark(observation=observation):
             self._clear_active_goal()
         if self._route_complete:
@@ -324,10 +358,7 @@ class OpenNavVLNPolicy:
                 reasoning_summary="all typed instruction steps completed",
                 progress_signal=progress_state.progress_signal,
                 replanned=False,
-                debug_image_path=(
-                    None if self._candidate_predictor.last_saved_debug_path is None
-                    else str(self._candidate_predictor.last_saved_debug_path)
-                ),
+                debug_image_path=None,
                 **self._route_result_kwargs(),
             )
 
@@ -421,10 +452,7 @@ class OpenNavVLNPolicy:
                         reasoning_summary=f"{replan_reason}; requesting a fresh visual decision",
                         progress_signal=progress_state.progress_signal,
                         replanned=False,
-                        debug_image_path=(
-                            None if self._candidate_predictor.last_saved_debug_path is None
-                            else str(self._candidate_predictor.last_saved_debug_path)
-                        ),
+                        debug_image_path=None,
                         **self._route_result_kwargs(),
                     )
                 return PolicyStepResult(
@@ -438,10 +466,7 @@ class OpenNavVLNPolicy:
                     reasoning_summary=self._last_decision_summary,
                     progress_signal=progress_state.progress_signal,
                     replanned=False,
-                    debug_image_path=(
-                        None if self._candidate_predictor.last_saved_debug_path is None
-                        else str(self._candidate_predictor.last_saved_debug_path)
-                    ),
+                    debug_image_path=None,
                     **self._route_result_kwargs(),
                 )
 
@@ -465,6 +490,338 @@ class OpenNavVLNPolicy:
             observation=observation,
             progress_state=progress_state,
             now=now,
+        )
+
+    def _update_traverse_progress(
+        self,
+        *,
+        observation: VLNObservation,
+        progress_state,
+    ) -> PolicyStepResult | None:
+        step = self._current_route_step()
+        if step is None or step.step_type != "TRAVERSE":
+            return None
+        cue = step.cues[0] if step.cues else None
+        traverse = self._progress_manager.begin_traverse(
+            step_id=step.step_id,
+            robot_pose=observation.pose,
+            cue_label="" if cue is None else cue.label,
+            cue_expected_side="none" if cue is None else cue.expected_side,
+        )
+        traverse = self._progress_manager.update_traverse_motion(
+            robot_pose=observation.pose
+        )
+
+        entry = self._landmark_map_entry
+        confirmed_anchor = bool(
+            cue is not None
+            and entry is not None
+            and str(entry.label).strip().lower() == cue.label
+            and bool(entry.confirmed)
+            and self._traverse_cue_side_consistent(
+                step=step,
+                anchor_world_xy=entry.world_xy,
+            )
+        )
+        traverse = self._progress_manager.update_traverse_cue(
+            robot_pose=observation.pose,
+            anchor_world_xy=(
+                None if not confirmed_anchor or entry is None else entry.world_xy
+            ),
+            confirmed=confirmed_anchor,
+            pass_margin_m=float(self._config.traverse_pass_margin_m),
+            min_progress_m=float(self._config.traverse_min_progress_m),
+        )
+        if not bool(traverse.cue_passed):
+            return None
+
+        if entry is not None:
+            entry.passed = True
+            if not entry.reached:
+                entry.status = "passed"
+        return self._complete_traverse(
+            observation=observation,
+            progress_signal=progress_state.progress_signal,
+            source="TRAVERSE_GEOMETRY_COMPLETE",
+            reason=(
+                f"confirmed cue {traverse.cue_label} crossed at "
+                f"progress={traverse.measured_progress_m:.2f}m"
+            ),
+            debug_image_path=None,
+        )
+
+    def _traverse_cue_side_consistent(
+        self,
+        *,
+        step: RouteStep,
+        anchor_world_xy: list[float],
+    ) -> bool:
+        traverse = self._progress_manager.state.traverse
+        expected = str(traverse.cue_expected_side).strip().lower()
+        if expected in {"", "none", "center"}:
+            return True
+        anchor = np.asarray(anchor_world_xy, dtype=np.float64).reshape(2)
+        start = np.asarray(
+            [float(traverse.start_x), float(traverse.start_y)],
+            dtype=np.float64,
+        )
+        left_axis = np.asarray(
+            [
+                -np.sin(float(traverse.locked_heading_rad)),
+                np.cos(float(traverse.locked_heading_rad)),
+            ],
+            dtype=np.float64,
+        )
+        lateral_m = float(np.dot(anchor - start, left_axis))
+        consistent = bool(
+            (expected == "left" and lateral_m > 0.0)
+            or (expected == "right" and lateral_m < 0.0)
+        )
+        if not consistent:
+            self._logger.warning(
+                "[TraverseCueReject] step=%s cue=%s expected_side=%s lateral_m=%.2f",
+                step.step_id,
+                traverse.cue_label,
+                expected,
+                lateral_m,
+            )
+        return consistent
+
+    def _apply_traverse_candidate_constraints(
+        self,
+        *,
+        observation: VLNObservation,
+        candidate_set: CandidateSet,
+    ) -> None:
+        traverse = self._progress_manager.state.traverse
+        if not traverse.active:
+            return
+        correction_limit_rad = float(
+            np.deg2rad(max(1.0, float(self._config.traverse_heading_correction_limit_deg)))
+        )
+        tolerance_rad = float(
+            np.deg2rad(max(1.0, float(self._config.traverse_candidate_heading_tolerance_deg)))
+        )
+        locked_heading = float(traverse.locked_heading_rad)
+        current_yaw = float(observation.pose.yaw_rad)
+        prevalid: list[WaypointCandidate] = []
+        for candidate in candidate_set.candidates:
+            candidate.depth_support["pre_traverse_valid"] = int(bool(candidate.valid))
+            if not bool(candidate.valid):
+                continue
+            candidate_heading = current_yaw + float(
+                np.deg2rad(candidate.heading_delta_deg)
+            )
+            locked_error = abs(_wrap_angle_rad(candidate_heading - locked_heading))
+            if locked_error <= correction_limit_rad:
+                prevalid.append(candidate)
+
+        corrected_heading = locked_heading
+        if prevalid:
+            best = max(
+                prevalid,
+                key=lambda item: (
+                    float(item.clearance_score)
+                    + 0.10 * float(item.depth_support.get("min_clearance_m", 0.0))
+                    - 0.30
+                    * abs(
+                        _wrap_angle_rad(
+                            current_yaw
+                            + float(np.deg2rad(item.heading_delta_deg))
+                            - locked_heading
+                        )
+                    )
+                    / max(correction_limit_rad, 1.0e-6)
+                ),
+            )
+            corrected_heading = current_yaw + float(
+                np.deg2rad(best.heading_delta_deg)
+            )
+        self._progress_manager.update_traverse_heading(
+            corrected_heading_rad=corrected_heading
+        )
+
+        for candidate in candidate_set.candidates:
+            candidate_heading = current_yaw + float(
+                np.deg2rad(candidate.heading_delta_deg)
+            )
+            heading_error = abs(
+                _wrap_angle_rad(candidate_heading - corrected_heading)
+            )
+            candidate.depth_support["route_alignment"] = float(
+                max(0.0, np.cos(heading_error))
+            )
+            if bool(candidate.valid) and heading_error > tolerance_rad:
+                candidate.valid = False
+                candidate.depth_support["traverse_filter_reason"] = (
+                    "outside_locked_heading_corridor"
+                )
+
+        valid_by_action: dict[str, list[WaypointCandidate]] = {}
+        for candidate in candidate_set.candidates:
+            if not bool(candidate.valid):
+                continue
+            action = _candidate_to_primitive_action(
+                candidate,
+                turn_speed_scale=float(self._config.turn_speed_scale),
+                forward_speed_scale=float(self._config.forward_speed_scale),
+            )[0]
+            valid_by_action.setdefault(action, []).append(candidate)
+        for action, candidates in valid_by_action.items():
+            keep = max(
+                candidates,
+                key=lambda item: (
+                    float(item.depth_support.get("route_alignment", 0.0)),
+                    float(item.clearance_score),
+                    float(item.depth_support.get("min_clearance_m", 0.0)),
+                ),
+            )
+            for candidate in candidates:
+                if candidate is keep:
+                    candidate.depth_support["primitive_action"] = action
+                    continue
+                candidate.valid = False
+                candidate.depth_support["traverse_filter_reason"] = (
+                    "duplicate_primitive_outcome"
+                )
+
+        self._apply_traverse_reversal_gate(candidate_set=candidate_set)
+        candidate_set.valid_count = sum(
+            int(bool(candidate.valid)) for candidate in candidate_set.candidates
+        )
+        candidate_set.predictor_debug["traverse_locked_heading_deg"] = round(
+            float(np.degrees(locked_heading)),
+            1,
+        )
+        candidate_set.predictor_debug["traverse_corrected_heading_deg"] = round(
+            float(np.degrees(corrected_heading)),
+            1,
+        )
+
+    def _apply_traverse_reversal_gate(self, *, candidate_set: CandidateSet) -> None:
+        if not self._recent_primitive_actions:
+            return
+        previous = self._recent_primitive_actions[-1]
+        opposite = {
+            "TURN_LEFT": "TURN_RIGHT",
+            "TURN_RIGHT": "TURN_LEFT",
+        }.get(previous)
+        if opposite is None:
+            return
+        valid_actions = {
+            _candidate_to_primitive_action(
+                candidate,
+                turn_speed_scale=float(self._config.turn_speed_scale),
+                forward_speed_scale=float(self._config.forward_speed_scale),
+            )[0]
+            for candidate in candidate_set.candidates
+            if bool(candidate.valid)
+        }
+        if valid_actions == {opposite}:
+            return
+        state = self._landmark_tracker_state
+        observation = None if state is None else state.last_observation
+        new_visual_evidence = bool(
+            observation is not None
+            and observation.visible
+            and observation.is_current_frame
+            and observation.bearing_rad is not None
+            and (
+                (opposite == "TURN_LEFT" and float(observation.bearing_rad) < 0.0)
+                or (opposite == "TURN_RIGHT" and float(observation.bearing_rad) > 0.0)
+            )
+        )
+        if new_visual_evidence or bool(self._safety_context_text):
+            return
+        for candidate in candidate_set.candidates:
+            if not bool(candidate.valid):
+                continue
+            action = _candidate_to_primitive_action(
+                candidate,
+                turn_speed_scale=float(self._config.turn_speed_scale),
+                forward_speed_scale=float(self._config.forward_speed_scale),
+            )[0]
+            if action == opposite:
+                candidate.valid = False
+                candidate.depth_support["traverse_filter_reason"] = (
+                    "reverse_turn_without_new_evidence"
+                )
+
+    def _apply_traverse_review(
+        self,
+        *,
+        observation: VLNObservation,
+        decision,
+        progress_signal: str,
+        debug_image_path: str | Path | None,
+    ) -> PolicyStepResult | None:
+        if self.current_step_type != "TRAVERSE":
+            return None
+        traverse = self._progress_manager.state.traverse
+        if (
+            bool(traverse.cue_confirmed)
+            or float(traverse.measured_progress_m)
+            < float(self._config.traverse_review_min_progress_m)
+        ):
+            return None
+        likely_complete = str(
+            getattr(decision, "route_progress_status", "CONTINUE")
+        ).strip().upper() == "LIKELY_COMPLETE"
+        traverse = self._progress_manager.record_traverse_review(
+            likely_complete=likely_complete,
+            min_translation_m=float(self._config.traverse_review_min_translation_m),
+        )
+        self._logger.info(
+            "[TraverseReview] step=%s status=%s confirmations=%s/2 progress_m=%.2f "
+            "evidence=%s",
+            traverse.step_id,
+            traverse.review_stage,
+            traverse.review_confirmations,
+            traverse.measured_progress_m,
+            str(getattr(decision, "route_progress_evidence", ""))[:160],
+        )
+        if traverse.review_confirmations < 2:
+            return None
+        return self._complete_traverse(
+            observation=observation,
+            progress_signal=progress_signal,
+            source="TRAVERSE_VLM_REVIEW_COMPLETE",
+            reason=(
+                "two distinct stopped keyframes agreed route segment is complete; "
+                f"evidence={getattr(decision, 'route_progress_evidence', '')}"
+            ),
+            debug_image_path=debug_image_path,
+        )
+
+    def _complete_traverse(
+        self,
+        *,
+        observation: VLNObservation,
+        progress_signal: str,
+        source: str,
+        reason: str,
+        debug_image_path: str | Path | None,
+    ) -> PolicyStepResult:
+        step = self._current_route_step()
+        completed_step_id = "none" if step is None else step.step_id
+        self._progress_manager.finish_traverse()
+        self._logger.info(
+            "[STEP_COMPLETE] step=%s type=TRAVERSE source=%s reason=%s",
+            completed_step_id,
+            source,
+            reason,
+        )
+        self._advance_current_step(
+            observation=observation,
+            source=source,
+            reason=reason,
+        )
+        return self._hold_result(
+            decision_source=source,
+            reasoning_summary=reason,
+            progress_signal=progress_signal,
+            debug_image_path=debug_image_path,
+            replanned=True,
         )
 
     def _clean_decision_step(
@@ -497,6 +854,11 @@ class OpenNavVLNPolicy:
                 observation=observation,
                 candidate_set=candidate_set,
             )
+        if self.current_step_type == "TRAVERSE":
+            self._apply_traverse_candidate_constraints(
+                observation=observation,
+                candidate_set=candidate_set,
+            )
         self._last_candidate_set = candidate_set
 
         semantic_plan = None
@@ -518,23 +880,15 @@ class OpenNavVLNPolicy:
                     exc,
                 )
 
-        if self._occupancy_grid is not None:
-            self._occupancy_grid.save_debug(
+        debug_image_path = None
+        if self.current_step_type == "TRAVERSE" and candidate_set.valid_count <= 0:
+            return self._traverse_recovery_step(
                 observation=observation,
                 candidate_set=candidate_set,
-                semantic_entries=list(self._all_landmark_map_entries),
-                semantic_plan=semantic_plan,
+                progress_signal=progress_state.progress_signal,
+                debug_image_path=debug_image_path,
+                now=now,
             )
-        debug_image_path = self._candidate_predictor.save_debug(
-            observation=observation,
-            candidate_set=candidate_set,
-            target_observation=(
-                None
-                if self._landmark_tracker_state is None
-                else self._landmark_tracker_state.last_observation
-            ),
-            left_panel_image_path=None,
-        )
 
         detour_result = self._continue_local_detour(
             observation=observation,
@@ -548,9 +902,13 @@ class OpenNavVLNPolicy:
             return detour_result
 
         # Fresh verified image evidence outranks a projected world anchor.
-        visual_candidate, visual_desired_action, visual_bearing_deg = (
-            self._verified_visual_target_candidate(candidate_set=candidate_set)
-        )
+        visual_candidate = None
+        visual_desired_action = None
+        visual_bearing_deg = 0.0
+        if self.current_step_type == "GO_TO":
+            visual_candidate, visual_desired_action, visual_bearing_deg = (
+                self._verified_visual_target_candidate(candidate_set=candidate_set)
+            )
         if visual_desired_action is not None and visual_candidate is not None:
             action_name, speed_scale = _candidate_to_primitive_action(
                 visual_candidate,
@@ -670,15 +1028,12 @@ class OpenNavVLNPolicy:
                 **self._route_result_kwargs(),
             )
 
-        annotated_png_bytes = None
-        if debug_image_path is not None and Path(debug_image_path).exists():
-            annotated_png_bytes = Path(debug_image_path).read_bytes()
+        annotated_png_bytes = _clean_rgb_png_bytes(observation.rgb)
         decision = self._reasoner.choose_candidate(
             instruction_context=self._instruction_context,
             candidate_set=candidate_set,
             progress_state=progress_state,
             annotated_image_png_bytes=annotated_png_bytes,
-            annotated_image_path=None if debug_image_path is None else str(debug_image_path),
             target_memory_text=self._grounded_target_context(),
             safety_context_text=self._safety_context_text,
             route_context_text=self._route_context_text(robot_pose=observation.pose),
@@ -688,6 +1043,14 @@ class OpenNavVLNPolicy:
             current_step=self._current_route_step(),
         )
         self._safety_context_text = ""
+        traverse_completion = self._apply_traverse_review(
+            observation=observation,
+            decision=decision,
+            progress_signal=progress_state.progress_signal,
+            debug_image_path=debug_image_path,
+        )
+        if traverse_completion is not None:
+            return traverse_completion
         selected_candidate = _find_candidate(candidate_set, decision.selected_candidate_id)
         if selected_candidate is None or not bool(selected_candidate.valid):
             self._next_replan_time = now + float(self._config.replanning_cooldown_sec)
@@ -729,6 +1092,92 @@ class OpenNavVLNPolicy:
             decision_source="VLM_SEARCH_PRIMITIVE",
             reasoning_summary=decision.thought,
             debug_image_path=debug_image_path,
+        )
+
+    def _traverse_recovery_step(
+        self,
+        *,
+        observation: VLNObservation,
+        candidate_set: CandidateSet,
+        progress_signal: str,
+        debug_image_path: str | Path | None,
+        now: float,
+    ) -> PolicyStepResult:
+        traverse = self._progress_manager.state.traverse
+        attempts = self._progress_manager.increment_traverse_recovery()
+        maximum = max(0, int(self._config.traverse_max_recovery_attempts))
+        recovery_candidates: list[WaypointCandidate] = []
+        for candidate in candidate_set.candidates:
+            if not bool(candidate.depth_support.get("pre_traverse_valid", 0)):
+                continue
+            action = _candidate_to_primitive_action(
+                candidate,
+                turn_speed_scale=float(self._config.turn_speed_scale),
+                forward_speed_scale=float(self._config.forward_speed_scale),
+            )[0]
+            if action in {"TURN_LEFT", "TURN_RIGHT"}:
+                recovery_candidates.append(candidate)
+        if attempts <= maximum and recovery_candidates:
+            current_yaw = float(observation.pose.yaw_rad)
+            selected = max(
+                recovery_candidates,
+                key=lambda item: (
+                    -abs(
+                        _wrap_angle_rad(
+                            current_yaw
+                            + float(np.deg2rad(item.heading_delta_deg))
+                            - float(traverse.locked_heading_rad)
+                        )
+                    ),
+                    float(item.clearance_score),
+                ),
+            )
+            selected.valid = True
+            action_name, speed_scale = _candidate_to_primitive_action(
+                selected,
+                turn_speed_scale=float(self._config.turn_speed_scale),
+                forward_speed_scale=float(self._config.forward_speed_scale),
+            )
+            self._logger.warning(
+                "[TraverseRecovery] step=%s attempt=%s/%s action=%s reason=no_candidate_in_direction_corridor",
+                traverse.step_id,
+                attempts,
+                maximum,
+                action_name,
+            )
+            return self._start_candidate_primitive(
+                observation=observation,
+                candidate=selected,
+                action_name=action_name,
+                speed_scale=speed_scale,
+                now=now,
+                progress_signal=progress_signal,
+                decision_source="TRAVERSE_RECOVERY_PRIMITIVE",
+                reasoning_summary=(
+                    "bounded observation turn toward the closest safe heading; "
+                    "the locked traverse direction is retained"
+                ),
+                debug_image_path=debug_image_path,
+            )
+        self._logger.error(
+            "[TRAVERSE_SAFETY_HOLD] step=%s recovery=%s/%s reason=no_safe_directional_candidate",
+            traverse.step_id,
+            attempts,
+            maximum,
+        )
+        return self._hold_result(
+            decision_source="TRAVERSE_SAFETY_HOLD",
+            reasoning_summary=(
+                "no safe candidate is consistent with the locked traverse direction"
+            ),
+            progress_signal=progress_signal,
+            debug_image_path=debug_image_path,
+            replanned=True,
+            last_error=(
+                "traverse_recovery_exhausted"
+                if attempts > maximum
+                else "traverse_no_safe_candidate"
+            ),
         )
 
     def _verified_visual_target_candidate(
@@ -1278,6 +1727,8 @@ class OpenNavVLNPolicy:
             return ""
         if step.step_type != "TURN":
             return step.perception_target
+        if step.cues:
+            return step.cues[0].label
         if (
             step.trigger is not None
             and step.trigger.trigger_type == "NEAR_OBJECT"
@@ -1305,6 +1756,12 @@ class OpenNavVLNPolicy:
         target = self.active_perception_target
         if not target:
             return "none"
+        if self.current_step_type == "TRAVERSE":
+            return "pass_cue"
+        if self.current_step_type == "REGION_TRANSITION":
+            return "transition_cue"
+        if self.current_step_type == "TURN" and self._current_route_step().cues:
+            return "turn_cue"
         if self.current_step_type == "TURN" and target != self.current_perception_target:
             return "turn_lookahead"
         return "go_to"
@@ -1337,6 +1794,35 @@ class OpenNavVLNPolicy:
     @property
     def current_direction_clause(self) -> str:
         return self._current_direction_clause()
+
+    @property
+    def current_semantic_relation_text(self) -> str:
+        step = self._current_route_step()
+        if step is None or step.step_type != "GO_TO" or not step.relations:
+            return ""
+        descriptions: list[str] = []
+        for item in step.relations:
+            if item.relation == "BEHIND_TARGET":
+                descriptions.append(
+                    f"select the {item.target} that has the {item.reference} behind it"
+                )
+            elif item.relation == "IN_FRONT_OF":
+                descriptions.append(
+                    f"select the {item.target} in front of the {item.reference}"
+                )
+            elif item.relation == "LEFT_OF":
+                descriptions.append(
+                    f"select the {item.target} left of the {item.reference}"
+                )
+            elif item.relation == "RIGHT_OF":
+                descriptions.append(
+                    f"select the {item.target} right of the {item.reference}"
+                )
+            else:
+                descriptions.append(
+                    f"select the {item.target} near the {item.reference}"
+                )
+        return "; ".join(descriptions)
 
     def set_landmark_state(self, state: LandmarkState | None) -> None:
         self._landmark_tracker_state = state
@@ -1543,8 +2029,24 @@ class OpenNavVLNPolicy:
 
         if (
             self._semantic_turn_primitives_taken >= 1
-            and self._turn_lookahead_target_is_ready()
+            and (
+                self._turn_cue_is_ready(step=step)
+                or self._turn_lookahead_target_is_ready()
+            )
         ):
+            if self._turn_cue_is_ready(step=step):
+                cue = step.cues[0]
+                state = self._landmark_tracker_state
+                return self._complete_semantic_turn(
+                    observation=observation,
+                    progress_signal=progress_state.progress_signal,
+                    debug_image_path=debug_image_path,
+                    directed_yaw_deg=directed_yaw_deg,
+                    reason=(
+                        f"turn_cue_confirmed label={cue.label} "
+                        f"confidence={0.0 if state is None else state.confidence:.2f}"
+                    ),
+                )
             hypothesis = self._semantic_turn_target_hypothesis
             return self._complete_semantic_turn(
                 observation=observation,
@@ -1709,6 +2211,24 @@ class OpenNavVLNPolicy:
             local_heading_deg=float(estimate.local_heading_deg),
             forward_clearance_m=clearance_m,
             score=float(estimate.score),
+        )
+
+    def _turn_cue_is_ready(self, *, step: RouteStep) -> bool:
+        if not step.cues:
+            return False
+        cue = step.cues[0]
+        state = self._landmark_tracker_state
+        observation = None if state is None else state.last_observation
+        if state is None or observation is None:
+            return False
+        if str(state.label).strip().lower() != cue.label:
+            return False
+        return bool(
+            observation.visible
+            and observation.is_current_frame
+            and observation.can_confirm
+            and observation.vlm_verified
+            and observation.turn_relation_verified
         )
 
     def _turn_lookahead_target_is_ready(self) -> bool:
@@ -1978,7 +2498,6 @@ class OpenNavVLNPolicy:
             candidate_set=candidate_set,
             progress_state=progress_state,
             annotated_image_png_bytes=annotated_png_bytes,
-            annotated_image_path=None if debug_image_path is None else str(debug_image_path),
             target_memory_text="none",
             safety_context_text=self._safety_context_text,
             route_context_text=self._route_context_text(robot_pose=observation.pose),
@@ -2101,26 +2620,9 @@ class OpenNavVLNPolicy:
                 observation=observation,
                 candidate_set=candidate_set,
             )
-            self._occupancy_grid.save_debug(
-                observation=observation,
-                candidate_set=candidate_set,
-                semantic_entries=list(self._all_landmark_map_entries),
-                semantic_plan=None,
-            )
         self._last_candidate_set = candidate_set
-        debug_image_path = self._candidate_predictor.save_debug(
-            observation=observation,
-            candidate_set=candidate_set,
-            target_observation=(
-                None
-                if self._landmark_tracker_state is None
-                else self._landmark_tracker_state.last_observation
-            ),
-            left_panel_image_path=None,
-        )
-        image_bytes = None
-        if debug_image_path is not None and Path(debug_image_path).exists():
-            image_bytes = Path(debug_image_path).read_bytes()
+        debug_image_path = None
+        image_bytes = _clean_rgb_png_bytes(observation.rgb)
         return candidate_set, debug_image_path, image_bytes
 
     def _best_candidate_for_action(
@@ -2178,7 +2680,7 @@ class OpenNavVLNPolicy:
         )
 
     def _semantic_landmark_entry(self) -> LandmarkMapEntry | None:
-        if not self.current_perception_target:
+        if self.current_step_type != "GO_TO" or not self.current_perception_target:
             return None
         current_target = self._current_target_text().strip().lower()
         if not current_target or current_target in {"none", "null", "unknown", "n/a", "na", "target", "object", "thing", "place", "location"}:
@@ -2293,10 +2795,7 @@ class OpenNavVLNPolicy:
                 reasoning_summary="invalid primitive action; stopped for replanning",
                 progress_signal=progress_signal,
                 replanned=False,
-                debug_image_path=(
-                    None if self._candidate_predictor.last_saved_debug_path is None
-                    else str(self._candidate_predictor.last_saved_debug_path)
-                ),
+                debug_image_path=None,
                 **self._route_result_kwargs(),
             )
 
@@ -2361,10 +2860,7 @@ class OpenNavVLNPolicy:
                 reasoning_summary=f"{action_name} primitive completed by {completion_reason}; stopping and replanning",
                 progress_signal=progress_signal,
                 replanned=False,
-                debug_image_path=(
-                    None if self._candidate_predictor.last_saved_debug_path is None
-                    else str(self._candidate_predictor.last_saved_debug_path)
-                ),
+                debug_image_path=None,
                 **self._route_result_kwargs(),
             )
 
@@ -2383,10 +2879,7 @@ class OpenNavVLNPolicy:
             reasoning_summary=self._last_decision_summary,
             progress_signal=progress_signal,
             replanned=False,
-            debug_image_path=(
-                None if self._candidate_predictor.last_saved_debug_path is None
-                else str(self._candidate_predictor.last_saved_debug_path)
-            ),
+            debug_image_path=None,
             **self._route_result_kwargs(),
         )
 
@@ -2415,6 +2908,11 @@ class OpenNavVLNPolicy:
             current_target = (
                 current_step.target
                 or current_step.to_region
+                or (
+                    current_step.cues[0].label
+                    if current_step.cues
+                    else ""
+                )
                 or (f"turn {current_step.direction}" if current_step.step_type == "TURN" else "")
             )
         return {
@@ -2427,6 +2925,25 @@ class OpenNavVLNPolicy:
             "current_step_type": "" if current_step is None else current_step.step_type,
             "current_target": current_target,
             "navigation_status": "ROUTE_COMPLETE" if self._route_complete else "RUNNING",
+            "traverse_locked_heading_deg": (
+                float(
+                    np.degrees(
+                        self._progress_manager.state.traverse.locked_heading_rad
+                    )
+                )
+                if self._progress_manager.state.traverse.active
+                else None
+            ),
+            "traverse_progress_m": float(
+                self._progress_manager.state.traverse.measured_progress_m
+            ),
+            "traverse_cue_status": (
+                "passed"
+                if self._progress_manager.state.traverse.cue_passed
+                else "confirmed"
+                if self._progress_manager.state.traverse.cue_confirmed
+                else self._progress_manager.state.traverse.review_stage.lower()
+            ),
         }
 
     def _current_arrival_distance_m(self) -> float:
@@ -2660,6 +3177,8 @@ class OpenNavVLNPolicy:
                 f"{step.step_id}:{step.step_type}:target={step.target or 'none'}:"
                 f"from={step.from_region or 'none'}:to={step.to_region or 'none'}:"
                 f"direction={step.direction}:completion={step.completion}:"
+                f"cues={[f'{cue.role}:{cue.label}:{cue.expected_side}' for cue in step.cues] or ['none']}:"
+                f"relations={[f'{relation.target}:{relation.relation}:{relation.reference}' for relation in step.relations] or ['none']}:"
                 f"status={'complete' if step.step_id in self._completed_step_ids else ('current' if step == current_route_step else 'pending')}"
             )
             for step in self._route_steps
@@ -2675,6 +3194,18 @@ class OpenNavVLNPolicy:
         ]
         if self._topology_summary:
             lines.append(self._topology_summary)
+        traverse = self._progress_manager.state.traverse
+        if traverse.active:
+            lines.append(
+                "traverse_state="
+                f"locked_heading_deg={np.degrees(traverse.locked_heading_rad):.1f},"
+                f"corrected_heading_deg={np.degrees(traverse.corrected_heading_rad):.1f},"
+                f"progress_m={traverse.measured_progress_m:.2f},"
+                f"cue={traverse.cue_label or 'none'},"
+                f"cue_confirmed={int(traverse.cue_confirmed)},"
+                f"cue_passed={int(traverse.cue_passed)},"
+                f"review={traverse.review_stage}:{traverse.review_confirmations}/2"
+            )
         if self._completed_landmarks:
             previous = self._completed_landmarks[-1]
             previous_anchor = self._landmark_anchors.get(previous)

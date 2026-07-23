@@ -35,6 +35,8 @@ class LandmarkMapEntry:
     reached: bool = False
     confirmed_observation_count: int = 0
     evidence_level: str = "confirmed"
+    semantic_role: str = "GOAL"
+    passed: bool = False
 
     @property
     def confirmed(self) -> bool:
@@ -82,7 +84,14 @@ class LandmarkMap:
         existing = self._entries.get(label)
 
         behavior = str(state.behavior_type).strip().lower()
-        map_anchor_allowed = behavior in {"go_to", "turn_at", "turn_lookahead"}
+        map_anchor_allowed = behavior in {
+            "go_to",
+            "pass_cue",
+            "turn_at",
+            "turn_cue",
+            "turn_lookahead",
+            "transition_cue",
+        }
         has_confirmed_anchor = (
             state.estimated_world_xy is not None
             and bool(state.can_complete)
@@ -130,6 +139,8 @@ class LandmarkMap:
                 reached=reached,
                 confirmed_observation_count=int(state.confirmed_observation_count),
                 evidence_level=str(state.evidence_level),
+                semantic_role=_semantic_role_for_behavior(behavior),
+                passed=bool(existing is not None and existing.passed),
             )
             self._entries[label] = entry
             self._log_entry_if_needed(entry=entry, timestamp_sec=float(timestamp_sec))
@@ -166,6 +177,17 @@ class LandmarkMap:
             return
         entry.reached = True
         entry.status = "reached"
+        entry.last_seen_time_sec = float(timestamp_sec)
+        self._log_entry_if_needed(entry=entry, timestamp_sec=float(timestamp_sec))
+
+    def mark_passed(self, label: str, *, timestamp_sec: float) -> None:
+        key = _normalize_label(label)
+        entry = self._entries.get(key)
+        if entry is None:
+            return
+        entry.passed = True
+        if not entry.reached:
+            entry.status = "passed"
         entry.last_seen_time_sec = float(timestamp_sec)
         self._log_entry_if_needed(entry=entry, timestamp_sec=float(timestamp_sec))
 
@@ -227,6 +249,7 @@ class LandmarkMap:
             label
             for label, entry in self._entries.items()
             if not bool(entry.reached)
+            and not bool(entry.passed)
             and float(timestamp_sec) - float(entry.last_seen_time_sec) > ttl
         ]
         for label in expired:
@@ -239,6 +262,7 @@ class LandmarkMap:
             _format_xy_bucket(entry.world_xy, bucket_m=0.10),
             None if entry.anchor_distance_m is None else round(float(entry.anchor_distance_m), 1),
             bool(entry.reached),
+            bool(entry.passed),
         )
         last_signature = self._last_log_signature_by_label.get(entry.label)
         last_time = self._last_log_time_by_label.get(entry.label, -float("inf"))
@@ -250,8 +274,11 @@ class LandmarkMap:
         self._last_log_signature_by_label[entry.label] = signature
         self._last_log_time_by_label[entry.label] = float(timestamp_sec)
         self._logger.info(
-            "[LandmarkMap] target=%s status=%s evidence=%s confidence=%.2f world=%s distance=%s forward=%s left=%s updates=%s reached=%s source=%s",
+            "[LandmarkMap] target=%s role=%s status=%s evidence=%s confidence=%.2f "
+            "world=%s distance=%s forward=%s left=%s updates=%s reached=%s "
+            "passed=%s source=%s",
             entry.label,
+            entry.semantic_role,
             entry.status,
             entry.evidence_level,
             float(entry.confidence),
@@ -261,6 +288,7 @@ class LandmarkMap:
             _format_optional_float(entry.robot_left_m),
             int(entry.update_count),
             int(bool(entry.reached)),
+            int(bool(entry.passed)),
             entry.source,
         )
 
@@ -286,6 +314,17 @@ def _bearing_hint(*, left_m: float) -> str:
 
 def _normalize_label(label: str) -> str:
     return str(label).strip().lower() or "target"
+
+
+def _semantic_role_for_behavior(behavior: str) -> str:
+    normalized = str(behavior).strip().lower()
+    if normalized == "pass_cue":
+        return "PASS_CUE"
+    if normalized in {"turn_at", "turn_cue", "turn_lookahead"}:
+        return "TURN_CUE"
+    if normalized == "transition_cue":
+        return "TRANSITION_CUE"
+    return "GOAL"
 
 
 def _format_optional_float(value: float | None) -> str:

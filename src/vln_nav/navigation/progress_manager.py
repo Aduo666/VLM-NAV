@@ -6,7 +6,32 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from .candidate_waypoint_predictor import CandidateSet
-from .observation_adapter import VLNObservation
+from .observation_adapter import Pose2D, VLNObservation
+
+
+@dataclass
+class TraverseProgressState:
+    step_id: str = ""
+    active: bool = False
+    start_x: float = 0.0
+    start_y: float = 0.0
+    start_yaw_rad: float = 0.0
+    locked_heading_rad: float = 0.0
+    corrected_heading_rad: float = 0.0
+    measured_progress_m: float = 0.0
+    cue_label: str = ""
+    cue_expected_side: str = "none"
+    cue_anchor_world_xy: list[float] | None = None
+    cue_confirmed: bool = False
+    cue_passed: bool = False
+    previous_anchor_projection_m: float | None = None
+    review_stage: str = "NONE"
+    review_confirmations: int = 0
+    last_review_progress_m: float | None = None
+    recovery_attempts: int = 0
+    last_pose_x: float = 0.0
+    last_pose_y: float = 0.0
+    last_pose_yaw_rad: float = 0.0
 
 
 @dataclass
@@ -21,6 +46,7 @@ class ProgressState:
     progress_signal: str = "NO_PROGRESS"
     history_text: str = "none"
     last_reasoning_summary: str = "none"
+    traverse: TraverseProgressState = field(default_factory=TraverseProgressState)
 
 
 class ProgressManager:
@@ -44,6 +70,7 @@ class ProgressManager:
         self._last_yaw: float | None = None
         self._last_update_time_sec: float | None = None
         self._min_update_period_sec = 0.75
+        self._traverse = TraverseProgressState()
 
     @property
     def state(self) -> ProgressState:
@@ -128,6 +155,7 @@ class ProgressManager:
             progress_signal=progress_signal,
             history_text=self._compose_history_text(),
             last_reasoning_summary=str(reasoning_summary).strip() or "none",
+            traverse=self._traverse,
         )
 
         self._last_pose = pose.copy()
@@ -141,8 +169,137 @@ class ProgressManager:
         self._last_pose = pose.copy()
         self._last_yaw = float(observation.pose.yaw_rad)
         self._last_update_time_sec = float(observation.meta.get("timestamp_sec", 0.0))
-        self._state = ProgressState(step_index=0)
+        self._state = ProgressState(step_index=0, traverse=self._traverse)
         return self._state
+
+    def begin_traverse(
+        self,
+        *,
+        step_id: str,
+        robot_pose: Pose2D,
+        cue_label: str,
+        cue_expected_side: str,
+    ) -> TraverseProgressState:
+        if self._traverse.active and self._traverse.step_id == str(step_id):
+            return self._traverse
+        self._traverse = TraverseProgressState(
+            step_id=str(step_id),
+            active=True,
+            start_x=float(robot_pose.x),
+            start_y=float(robot_pose.y),
+            start_yaw_rad=float(robot_pose.yaw_rad),
+            locked_heading_rad=float(robot_pose.yaw_rad),
+            corrected_heading_rad=float(robot_pose.yaw_rad),
+            cue_label=str(cue_label).strip().lower(),
+            cue_expected_side=str(cue_expected_side).strip().lower() or "none",
+            last_pose_x=float(robot_pose.x),
+            last_pose_y=float(robot_pose.y),
+            last_pose_yaw_rad=float(robot_pose.yaw_rad),
+        )
+        self._state.traverse = self._traverse
+        return self._traverse
+
+    def update_traverse_motion(self, *, robot_pose: Pose2D) -> TraverseProgressState:
+        if not self._traverse.active:
+            return self._traverse
+        dx = float(robot_pose.x) - float(self._traverse.start_x)
+        dy = float(robot_pose.y) - float(self._traverse.start_y)
+        heading = float(self._traverse.locked_heading_rad)
+        self._traverse.measured_progress_m = float(
+            dx * np.cos(heading) + dy * np.sin(heading)
+        )
+        self._traverse.last_pose_x = float(robot_pose.x)
+        self._traverse.last_pose_y = float(robot_pose.y)
+        self._traverse.last_pose_yaw_rad = float(robot_pose.yaw_rad)
+        self._state.traverse = self._traverse
+        return self._traverse
+
+    def update_traverse_heading(self, *, corrected_heading_rad: float) -> None:
+        if not self._traverse.active:
+            return
+        self._traverse.corrected_heading_rad = float(corrected_heading_rad)
+
+    def update_traverse_cue(
+        self,
+        *,
+        robot_pose: Pose2D,
+        anchor_world_xy: list[float] | None,
+        confirmed: bool,
+        pass_margin_m: float,
+        min_progress_m: float,
+    ) -> TraverseProgressState:
+        if not self._traverse.active:
+            return self._traverse
+        self._traverse.cue_confirmed = bool(confirmed and anchor_world_xy is not None)
+        if not self._traverse.cue_confirmed:
+            return self._traverse
+        anchor = np.asarray(anchor_world_xy, dtype=np.float64).reshape(2)
+        robot = np.asarray([float(robot_pose.x), float(robot_pose.y)], dtype=np.float64)
+        heading = float(self._traverse.locked_heading_rad)
+        forward_axis = np.asarray([np.cos(heading), np.sin(heading)], dtype=np.float64)
+        projection_m = float(np.dot(robot - anchor, forward_axis))
+        previous = self._traverse.previous_anchor_projection_m
+        self._traverse.cue_anchor_world_xy = [float(anchor[0]), float(anchor[1])]
+        crossed_plane = bool(
+            previous is not None
+            and float(previous) < 0.0
+            and projection_m >= max(0.05, float(pass_margin_m))
+        )
+        first_confirmed_after_crossing = bool(
+            previous is None
+            and projection_m >= max(0.05, float(pass_margin_m))
+        )
+        if (
+            (crossed_plane or first_confirmed_after_crossing)
+            and float(self._traverse.measured_progress_m) >= max(0.0, float(min_progress_m))
+        ):
+            self._traverse.cue_passed = True
+        self._traverse.previous_anchor_projection_m = projection_m
+        self._state.traverse = self._traverse
+        return self._traverse
+
+    def record_traverse_review(
+        self,
+        *,
+        likely_complete: bool,
+        min_translation_m: float,
+    ) -> TraverseProgressState:
+        if not self._traverse.active:
+            return self._traverse
+        if bool(likely_complete):
+            if (
+                self._traverse.last_review_progress_m is not None
+                and abs(
+                    float(self._traverse.measured_progress_m)
+                    - float(self._traverse.last_review_progress_m)
+                )
+                < max(0.05, float(min_translation_m))
+            ):
+                return self._traverse
+            self._traverse.review_confirmations += 1
+            self._traverse.last_review_progress_m = float(
+                self._traverse.measured_progress_m
+            )
+            self._traverse.review_stage = (
+                "CONFIRMED"
+                if self._traverse.review_confirmations >= 2
+                else "LIKELY_COMPLETE"
+            )
+        else:
+            self._traverse.review_confirmations = 0
+            self._traverse.last_review_progress_m = None
+            self._traverse.review_stage = "CONTINUE"
+        return self._traverse
+
+    def increment_traverse_recovery(self) -> int:
+        if not self._traverse.active:
+            return 0
+        self._traverse.recovery_attempts += 1
+        return int(self._traverse.recovery_attempts)
+
+    def finish_traverse(self) -> None:
+        self._traverse.active = False
+        self._state.traverse = self._traverse
 
     def _compose_history_text(self) -> str:
         lines = []

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import json
 import os
+import re
 import subprocess
 import tempfile
 import time
@@ -68,6 +70,7 @@ def main() -> int:
         tasks_file=Path(args.tasks_file),
         logger=logger,
     )
+    evaluation_result_path = _resolve_evaluation_result_path(task_id=applied_task_id)
     logger.info("Loaded config from %s", Path(args.config).resolve())
     if applied_task_id:
         logger.info("Loaded task from %s: %s", Path(args.tasks_file).resolve(), applied_task_id)
@@ -83,9 +86,31 @@ def main() -> int:
 
     try:
         instruction_context = _parse_instruction_preflight(config=config, logger=logger)
-    except Exception:
+    except Exception as exc:
+        _write_evaluation_result(
+            output_path=evaluation_result_path,
+            status="FAILED",
+            task_id=applied_task_id,
+            config=config,
+            instruction_context=None,
+            step_result=None,
+            sim_time_sec=0.0,
+            failure_stage="instruction_preflight",
+            reason=str(exc),
+        )
         logger.exception("[ERROR] Instruction preflight failed before Isaac Sim startup.")
         return 1
+    _write_evaluation_result(
+        output_path=evaluation_result_path,
+        status="RUNNING",
+        task_id=applied_task_id,
+        config=config,
+        instruction_context=instruction_context,
+        step_result=None,
+        sim_time_sec=0.0,
+        failure_stage="",
+        reason="instruction plan validated",
+    )
 
     os.environ.setdefault("OMNI_KIT_ACCEPT_EULA", "YES")
     simulation_settings = _build_simulation_app_settings(config=config, logger=logger)
@@ -99,8 +124,21 @@ def main() -> int:
             simulation_app=simulation_app,
             config=config,
             instruction_context=instruction_context,
+            task_id=applied_task_id,
+            evaluation_result_path=evaluation_result_path,
         )
-    except Exception:
+    except Exception as exc:
+        _write_evaluation_result(
+            output_path=evaluation_result_path,
+            status="FAILED",
+            task_id=applied_task_id,
+            config=config,
+            instruction_context=instruction_context,
+            step_result=None,
+            sim_time_sec=0.0,
+            failure_stage="runtime_exception",
+            reason=str(exc),
+        )
         logger.exception("Navigation loop crashed.")
         return 1
     finally:
@@ -372,6 +410,8 @@ def run_navigation(
     simulation_app,
     config: AppConfig,
     instruction_context: InstructionContext,
+    task_id: str = "",
+    evaluation_result_path: Path | None = None,
 ) -> None:
     logger = setup_logging(config.log_level)
 
@@ -409,6 +449,23 @@ def run_navigation(
                 "from_region": step.from_region,
                 "to_region": step.to_region,
                 "direction": step.direction,
+                "completion": step.completion,
+                "cues": [
+                    {
+                        "label": cue.label,
+                        "role": cue.role,
+                        "side": cue.expected_side,
+                    }
+                    for cue in step.cues
+                ],
+                "relations": [
+                    {
+                        "target": relation.target,
+                        "relation": relation.relation,
+                        "reference": relation.reference,
+                    }
+                    for relation in step.relations
+                ],
             }
             for step in instruction_context.route_steps
         ],
@@ -485,7 +542,6 @@ def run_navigation(
             max_travel_distance_m=float(config.candidate_max_travel_distance_m),
             min_free_ratio=float(config.candidate_min_free_ratio),
             column_half_width_px=int(config.candidate_column_half_width_px),
-            debug_image_path=str(config.candidate_debug_image_path),
             adaptive_enabled=bool(config.candidate_adaptive_enabled),
             adaptive_count=int(config.candidate_adaptive_count),
             adaptive_min_spacing_deg=float(config.candidate_adaptive_min_spacing_deg),
@@ -675,13 +731,6 @@ def run_navigation(
             turn_clearance_radius_m=float(config.occupancy_grid_turn_clearance_radius_m),
             unknown_is_traversable=bool(config.occupancy_grid_unknown_is_traversable),
             unknown_cell_cost=float(config.occupancy_grid_unknown_cell_cost),
-            debug_enabled=bool(config.occupancy_grid_debug_enabled),
-            debug_image_path=str(config.occupancy_grid_debug_image_path),
-            debug_update_period_sec=float(config.occupancy_grid_debug_update_period_sec),
-            debug_width=int(config.occupancy_grid_debug_width),
-            debug_height=int(config.occupancy_grid_debug_height),
-            debug_view_size_m=float(config.occupancy_grid_debug_view_size_m),
-            debug_show_free_space=bool(config.occupancy_grid_debug_show_free_space),
             semantic_planner_enabled=bool(config.occupancy_grid_semantic_planner_enabled),
             semantic_goal_step_m=float(config.occupancy_grid_semantic_goal_step_m),
             semantic_goal_min_step_m=float(config.occupancy_grid_semantic_goal_min_step_m),
@@ -848,6 +897,23 @@ def run_navigation(
                 config.semantic_turn_max_recovery_attempts
             ),
             local_detour_max_turn_primitives=int(config.local_detour_max_turn_primitives),
+            traverse_heading_correction_limit_deg=float(
+                config.traverse_heading_correction_limit_deg
+            ),
+            traverse_candidate_heading_tolerance_deg=float(
+                config.traverse_candidate_heading_tolerance_deg
+            ),
+            traverse_min_progress_m=float(config.traverse_min_progress_m),
+            traverse_pass_margin_m=float(config.traverse_pass_margin_m),
+            traverse_review_min_progress_m=float(
+                config.traverse_review_min_progress_m
+            ),
+            traverse_review_min_translation_m=float(
+                config.traverse_review_min_translation_m
+            ),
+            traverse_max_recovery_attempts=int(
+                config.traverse_max_recovery_attempts
+            ),
             confirm_min_observations=int(config.landmark_tracker_confirm_min_observations),
             confirm_confidence_threshold=float(config.landmark_tracker_confirm_confidence_threshold),
             visual_target_center_deadband_deg=float(config.visual_target_center_deadband_deg),
@@ -896,24 +962,24 @@ def run_navigation(
 
     if getattr(config, "add_dome_light", False):
         try:
-            from pxr import UsdLux, Gf, UsdGeom
-            # Dome light for ambient outdoor lighting
+            from pxr import UsdLux
+
             dome = UsdLux.DomeLight.Define(stage, "/World/defaultDomeLight")
             dome.CreateIntensityAttr().Set(3000.0)
             dome.CreateExposureAttr().Set(2.0)
-
-            # Headlight attached to robot camera, follows the robot through rooms
-            headlight = UsdLux.SphereLight.Define(stage, f"{config.robot_prim_path}/headlight")
-            headlight.CreateIntensityAttr().Set(3000.0)
-            headlight.CreateExposureAttr().Set(2.0)
-            headlight.CreateRadiusAttr().Set(0.3)
-            # Position slightly ahead and above the camera
-            xform = UsdGeom.Xformable(headlight.GetPrim())
-            xform.AddTranslateOp().Set(Gf.Vec3f(1.5, 0.0, 1.8))
-
-            logger.info("Added dome+robot-headlight (add_dome_light=true)")
+            # InteriorNav scenes are closed meshes. Let the Dome act as ambient
+            # fill instead of being fully occluded by ceilings and exterior walls.
+            shadow_api = UsdLux.ShadowAPI.Apply(dome.GetPrim())
+            shadow_api.CreateShadowEnableAttr().Set(False)
+            logger.info(
+                "Added Dome Light: path=/World/defaultDomeLight "
+                "intensity=%s exposure=%s shadow_enabled=%s",
+                dome.GetIntensityAttr().Get(),
+                dome.GetExposureAttr().Get(),
+                shadow_api.GetShadowEnableAttr().Get(),
+            )
         except Exception as exc:
-            logger.warning("Failed to add lights: %s", exc)
+            logger.warning("Failed to add Dome Light: %s", exc)
 
     add_reference_to_stage(str(config.robot_usd_path), config.robot_prim_path)
     _wait_for_stage_assets(
@@ -1113,7 +1179,6 @@ def run_navigation(
         fps=float(config.observer_video_fps),
         logger=logger,
     )
-    logger.info("VLM request image output: %s", _resolve_output_path(config.candidate_debug_image_path))
     if config.target_debug_enabled:
         logger.info("Runtime debug image output: %s", target_debug_output_path)
     if config.occupancy_grid_enabled:
@@ -1309,6 +1374,20 @@ def run_navigation(
                     target_grounder.close()
                     debug_video_recorder.close()
                     observer_video_recorder.close()
+                    _write_evaluation_result(
+                        output_path=evaluation_result_path,
+                        status="FAILED",
+                        task_id=task_id,
+                        config=config,
+                        instruction_context=instruction_context,
+                        step_result=active_step_result,
+                        sim_time_sec=sim_time_sec,
+                        failure_stage="robot_fall",
+                        reason=(
+                            f"roll_deg={roll_deg:.1f} pitch_deg={pitch_deg:.1f} "
+                            f"base_z_m={float(position[2]):.3f}"
+                        ),
+                    )
                     logger.error(
                         "[NAVIGATION_FAILED] reason=robot_fall roll_deg=%.1f pitch_deg=%.1f "
                         "base_z_m=%.3f confirmation_sec=%.2f; simulation remains open with active standing",
@@ -1550,33 +1629,6 @@ def run_navigation(
         # --- Fast path during active primitive execution ---
         is_motion_active = _is_executing_motion_step(active_step_result)
         if is_motion_active:
-            motion_target = policy.active_perception_target
-            if motion_target and target_tracker.lifecycle in {"TRACKING", "LOST_TEMP"}:
-                target_tracker.set_target_label(motion_target)
-                try:
-                    motion_camera_view_matrix_ros = np.asarray(
-                        camera.get_view_matrix_ros(), dtype=np.float64
-                    ).reshape(4, 4)
-                except Exception:
-                    motion_camera_view_matrix_ros = None
-                target_tracker.update(
-                    rgb=front_rgb,
-                    depth=last_depth_image,
-                    robot_pose=observation.pose,
-                    timestamp_sec=sim_time_sec,
-                    frame_index=frame_index,
-                    camera_intrinsics=front_camera_intrinsics,
-                    camera_view_matrix_ros=motion_camera_view_matrix_ros,
-                    robot_world_position_xyz=position,
-                    robot_world_orientation_wxyz=orientation,
-                )
-                if frame_index % 30 == 0:
-                    logger.info(
-                        "[PerceptionScheduler] target=%s grounding=paused "
-                        "tracker=%s phase=active_primitive",
-                        motion_target,
-                        target_tracker.lifecycle,
-                    )
             proposed_step_result = policy.step(observation, execution_feedback=last_policy_feedback)
             active_step_result = proposed_step_result
             step_result = active_step_result
@@ -1637,6 +1689,17 @@ def run_navigation(
                 target_grounder.close()
                 debug_video_recorder.close()
                 observer_video_recorder.close()
+                _write_evaluation_result(
+                    output_path=evaluation_result_path,
+                    status="SUCCESS",
+                    task_id=task_id,
+                    config=config,
+                    instruction_context=instruction_context,
+                    step_result=step_result,
+                    sim_time_sec=sim_time_sec,
+                    failure_stage="",
+                    reason="all typed instruction steps completed",
+                )
             continue
 
         if policy.current_step_type == "TURN":
@@ -1704,21 +1767,25 @@ def run_navigation(
                 robot_world_position_xyz=position,
                 robot_world_orientation_wxyz=orientation,
                 force_semantic_verification=(
-                    policy.current_grounding_behavior_type == "turn_lookahead"
+                    policy.current_grounding_behavior_type
+                    in {"turn_cue", "turn_lookahead"}
                 ),
                 expected_turn_direction=(
                     policy.current_turn_direction
-                    if policy.current_grounding_behavior_type == "turn_lookahead"
+                    if policy.current_grounding_behavior_type
+                    in {"turn_cue", "turn_lookahead"}
                     else ""
                 ),
                 turn_start_yaw_rad=(
                     policy.current_turn_start_yaw_rad
-                    if policy.current_grounding_behavior_type == "turn_lookahead"
+                    if policy.current_grounding_behavior_type
+                    in {"turn_cue", "turn_lookahead"}
                     else None
                 ),
                 turn_direction_tolerance_deg=float(
                     policy.current_turn_direction_tolerance_deg
                 ),
+                semantic_relation_text=policy.current_semantic_relation_text,
             )
             if skip_grounding_once:
                 skip_grounding_once = False
@@ -1897,6 +1964,7 @@ def run_navigation(
             "LOCAL_DETOUR_SAFETY_HOLD",
             "TURN_SCAN_SAFETY_HOLD",
             "TURN_ALIGNMENT_SAFETY_HOLD",
+            "TRAVERSE_SAFETY_HOLD",
         }:
             runtime_approach_hold_streak += 1
             if runtime_approach_hold_streak >= 3:
@@ -2090,6 +2158,17 @@ def run_navigation(
             target_grounder.close()
             debug_video_recorder.close()
             observer_video_recorder.close()
+            _write_evaluation_result(
+                output_path=evaluation_result_path,
+                status="SUCCESS",
+                task_id=task_id,
+                config=config,
+                instruction_context=instruction_context,
+                step_result=step_result,
+                sim_time_sec=sim_time_sec,
+                failure_stage="",
+                reason="all typed instruction steps completed",
+            )
             logger.info("Route complete — navigation stopped; Isaac Sim scene remains open. Debug video saved: %s", debug_video_recorder.output_path)
             continue
 
@@ -2167,6 +2246,130 @@ def run_navigation(
     target_grounder.close()
     debug_video_recorder.close()
     observer_video_recorder.close()
+    if not navigation_finished:
+        _write_evaluation_result(
+            output_path=evaluation_result_path,
+            status="INTERRUPTED",
+            task_id=task_id,
+            config=config,
+            instruction_context=instruction_context,
+            step_result=active_step_result,
+            sim_time_sec=sim_time_sec,
+            failure_stage="simulation_closed",
+            reason="simulation closed before route completion",
+        )
+
+
+def _resolve_evaluation_result_path(*, task_id: str) -> Path | None:
+    configured_dir = str(os.getenv("VLN_EVAL_RESULTS_DIR", "")).strip()
+    if not configured_dir:
+        return None
+    output_dir = Path(configured_dir).expanduser()
+    if not output_dir.is_absolute():
+        output_dir = PROJECT_ROOT / output_dir
+    safe_task_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(task_id).strip()) or "episode"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return output_dir / f"{safe_task_id}_{timestamp}.json"
+
+
+def _write_evaluation_result(
+    *,
+    output_path: Path | None,
+    status: str,
+    task_id: str,
+    config: AppConfig,
+    instruction_context: InstructionContext | None,
+    step_result: PolicyStepResult | None,
+    sim_time_sec: float,
+    failure_stage: str,
+    reason: str,
+) -> None:
+    if output_path is None:
+        return
+    completed_count = (
+        0
+        if step_result is None
+        else min(
+            int(step_result.current_step_index)
+            + int(bool(step_result.route_complete)),
+            int(step_result.route_step_count),
+        )
+    )
+    route_steps: list[dict] = []
+    if instruction_context is not None:
+        for index, step in enumerate(instruction_context.route_steps):
+            if str(status).upper() == "SUCCESS" or index < completed_count:
+                step_status = "COMPLETED"
+            elif step_result is not None and index == int(step_result.current_step_index):
+                step_status = "CURRENT"
+            else:
+                step_status = "PENDING"
+            route_steps.append(
+                {
+                    "step_id": step.step_id,
+                    "step_type": step.step_type,
+                    "target": step.target,
+                    "direction": step.direction,
+                    "completion": step.completion,
+                    "cues": [
+                        {
+                            "label": cue.label,
+                            "role": cue.role,
+                            "expected_side": cue.expected_side,
+                        }
+                        for cue in step.cues
+                    ],
+                    "status": step_status,
+                }
+            )
+    payload = {
+        "schema_version": "captainav-eval-v1",
+        "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "status": str(status).upper(),
+        "failure_stage": str(failure_stage),
+        "reason": str(reason),
+        "task_id": str(task_id),
+        "instruction_id": (
+            "" if instruction_context is None else instruction_context.instruction_id
+        ),
+        "instruction": (
+            str(config.instruction)
+            if instruction_context is None
+            else instruction_context.raw_text
+        ),
+        "scene_usd_path": str(config.scene_usd_path),
+        "robot_profile": (
+            "" if config.robot_profile is None else str(config.robot_profile.name)
+        ),
+        "sim_time_sec": round(float(sim_time_sec), 3),
+        "current_step_index": (
+            None if step_result is None else int(step_result.current_step_index)
+        ),
+        "current_step_id": (
+            "" if step_result is None else str(step_result.current_step_id)
+        ),
+        "current_step_type": (
+            "" if step_result is None else str(step_result.current_step_type)
+        ),
+        "completed_landmarks": (
+            [] if step_result is None else list(step_result.completed_landmarks)
+        ),
+        "route_steps": route_steps,
+    }
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_path = tempfile.mkstemp(
+        prefix=f".{output_path.name}.",
+        suffix=".tmp",
+        dir=str(output_path.parent),
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+        os.replace(temporary_path, output_path)
+    finally:
+        if os.path.exists(temporary_path):
+            os.unlink(temporary_path)
 
 
 def _collect_detection_entries(
@@ -2203,6 +2406,16 @@ def _collect_detection_entries(
         reached=False,
         confirmed_observation_count=0,
         evidence_level="detection",
+        semantic_role=(
+            "PASS_CUE"
+            if str(state.behavior_type).strip().lower() == "pass_cue"
+            else "TURN_CUE"
+            if str(state.behavior_type).strip().lower()
+            in {"turn_cue", "turn_lookahead", "turn_at"}
+            else "TRANSITION_CUE"
+            if str(state.behavior_type).strip().lower() == "transition_cue"
+            else "GOAL"
+        ),
     )]
 
 
@@ -2299,6 +2512,9 @@ def _user_hold_step_result(step_result: PolicyStepResult) -> PolicyStepResult:
         current_target=step_result.current_target,
         navigation_status=step_result.navigation_status,
         last_error=step_result.last_error,
+        traverse_locked_heading_deg=step_result.traverse_locked_heading_deg,
+        traverse_progress_m=step_result.traverse_progress_m,
+        traverse_cue_status=step_result.traverse_cue_status,
     )
 
 
@@ -2324,6 +2540,21 @@ def _runtime_recovery_step_result(*, recovery_command, previous_step_result) -> 
         current_step_type="" if previous_step_result is None else str(previous_step_result.current_step_type),
         current_target="" if previous_step_result is None else str(previous_step_result.current_target),
         navigation_status="RECOVERY",
+        traverse_locked_heading_deg=(
+            None
+            if previous_step_result is None
+            else previous_step_result.traverse_locked_heading_deg
+        ),
+        traverse_progress_m=(
+            0.0
+            if previous_step_result is None
+            else float(previous_step_result.traverse_progress_m)
+        ),
+        traverse_cue_status=(
+            ""
+            if previous_step_result is None
+            else str(previous_step_result.traverse_cue_status)
+        ),
     )
 
 
@@ -2523,6 +2754,13 @@ def _save_current_target_debug_image(
             f"goal=({local_forward:.2f}m forward, {local_left:.2f}m left, {heading_deg:+.1f}deg)"
         ),
     ]
+    if step_result.current_step_type == "TRAVERSE":
+        status_lines[2] = (
+            f"TRAVERSE cue={step_result.current_landmark or 'none'} "
+            f"status={step_result.traverse_cue_status or 'none'} "
+            f"progress={step_result.traverse_progress_m:.2f}m "
+            f"locked_heading={step_result.traverse_locked_heading_deg}"
+        )
     for index, line in enumerate(status_lines):
         status_draw.text((14, 8 + index * 27), line, fill=(235, 240, 245), font=status_font)
 
@@ -3106,23 +3344,41 @@ def _save_global_occupancy_debug(
             continue
         lx, ly = world_to_px(float(world_xy[0]), float(world_xy[1]))
         reached = bool(getattr(entry, "reached", False))
+        passed = bool(getattr(entry, "passed", False))
         evidence = str(getattr(entry, "evidence_level", "")).strip().lower()
         confirmed = bool(getattr(entry, "confirmed", False)) or evidence == "confirmed"
         label = str(getattr(entry, "label", "landmark"))
-        if reached:
+        role = str(getattr(entry, "semantic_role", "GOAL"))
+        if reached or passed:
             color = (40, 235, 95)
             draw.ellipse((lx - 11, ly - 11, lx + 11, ly + 11), fill=color, outline=(255, 255, 255), width=3)
             draw.line((lx - 6, ly, lx - 1, ly + 6), fill=(0, 0, 0), width=3)
             draw.line((lx - 1, ly + 6, lx + 8, ly - 7), fill=(0, 0, 0), width=3)
-            draw.text((lx + 13, ly - 10), f"{label} DONE", fill=color, font=font_label)
+            status_text = "REACHED" if reached else "PASSED"
+            draw.text(
+                (lx + 13, ly - 10),
+                f"{label} {role} {status_text}",
+                fill=color,
+                font=font_label,
+            )
         elif confirmed:
             color = (220, 60, 220)
             draw.ellipse((lx - 9, ly - 9, lx + 9, ly + 9), fill=color, outline=(255, 255, 255), width=2)
-            draw.text((lx + 11, ly - 10), f"{label} confirmed", fill=color, font=font_label)
+            draw.text(
+                (lx + 11, ly - 10),
+                f"{label} {role} confirmed",
+                fill=color,
+                font=font_label,
+            )
         else:
             color = (255, 175, 40)
             draw.ellipse((lx - 7, ly - 7, lx + 7, ly + 7), outline=color, width=3)
-            draw.text((lx + 10, ly - 10), f"{label} potential", fill=color, font=font_label)
+            draw.text(
+                (lx + 10, ly - 10),
+                f"{label} {role} observed",
+                fill=color,
+                font=font_label,
+            )
 
     yaw = float(robot_pose.yaw_rad)
     robot_x = float(robot_pose.x)
@@ -3139,6 +3395,19 @@ def _save_global_occupancy_debug(
     draw.polygon([tip, rear_left, rear_right], fill=(40, 140, 255), outline=(255, 255, 255))
     rx, ry = world_to_px(robot_x, robot_y)
     draw.text((rx + 12, ry + 8), "robot", fill=(40, 140, 255), font=font_label)
+    if step_result is not None and step_result.traverse_locked_heading_deg is not None:
+        locked_rad = float(np.deg2rad(step_result.traverse_locked_heading_deg))
+        locked_tip = world_to_px(
+            robot_x + 1.2 * np.cos(locked_rad),
+            robot_y + 1.2 * np.sin(locked_rad),
+        )
+        draw.line((rx, ry, locked_tip[0], locked_tip[1]), fill=(255, 120, 20), width=4)
+        draw.text(
+            (locked_tip[0] + 6, locked_tip[1] - 10),
+            "TRAVERSE heading",
+            fill=(255, 120, 20),
+            font=font_small,
+        )
     draw.text(
         (12, height - 22),
         f"view=[{min_x:.1f},{max_x:.1f}]x[{min_y:.1f},{max_y:.1f}]m  pose=({robot_x:.2f},{robot_y:.2f}) yaw={np.degrees(yaw):+.1f}deg",
@@ -3149,74 +3418,6 @@ def _save_global_occupancy_debug(
     if output_path is not None:
         _save_image_atomic(image, output_path)
     return image
-
-
-def _save_lidar_raw_scan(
-    *,
-    beam_endpoints: np.ndarray,
-    beam_hits: np.ndarray,
-    current_beam_endpoints: np.ndarray | None = None,
-    current_beam_hits: np.ndarray | None = None,
-    output_path: Path,
-    fov_deg: float,
-) -> None:
-    if beam_endpoints.size == 0:
-        return
-    size = 620
-    margin = 40
-    max_range = 8.0
-    img = Image.new("RGB", (size, size), (14, 18, 22))
-    draw = ImageDraw.Draw(img)
-    cx, cy = size // 2, size // 2
-    scale = (size - 2 * margin) / (2.0 * max_range)
-
-    def to_pixel(fwd: float, left: float) -> tuple[int, int]:
-        px = int(cx + left * scale)
-        py = int(cy - fwd * scale)
-        return max(0, min(size - 1, px)), max(0, min(size - 1, py))
-
-    # Grid circles
-    for r_m in [2.0, 4.0, 6.0, 8.0]:
-        r_px = int(r_m * scale)
-        draw.ellipse((cx - r_px, cy - r_px, cx + r_px, cy + r_px), outline=(40, 45, 50), width=1)
-    # Forward line
-    draw.line((cx, cy, cx, margin), fill=(60, 65, 70), width=1)
-    draw.text((cx + 4, margin), "FWD", fill=(80, 90, 100), font=_debug_font(12))
-
-    # Draw merged binned endpoints first, then current-sector endpoints on top.
-    hits = beam_hits.astype(bool) if beam_hits.size else np.zeros((beam_endpoints.shape[0],), dtype=bool)
-    for i in range(beam_endpoints.shape[0]):
-        fwd, left = float(beam_endpoints[i, 0]), float(beam_endpoints[i, 1])
-        px, py = to_pixel(fwd, left)
-        if i < len(hits) and hits[i]:
-            draw.ellipse((px - 2, py - 2, px + 2, py + 2), fill=(70, 210, 255))
-        else:
-            draw.ellipse((px - 1, py - 1, px + 1, py + 1), fill=(60, 60, 70))
-
-    current_endpoints = np.asarray(current_beam_endpoints, dtype=np.float32) if current_beam_endpoints is not None else np.zeros((0, 2), dtype=np.float32)
-    current_hits = np.asarray(current_beam_hits, dtype=bool).reshape(-1) if current_beam_hits is not None else np.zeros((0,), dtype=bool)
-    if current_endpoints.ndim == 2 and current_endpoints.shape[1] >= 2:
-        for i in range(current_endpoints.shape[0]):
-            fwd, left = float(current_endpoints[i, 0]), float(current_endpoints[i, 1])
-            px, py = to_pixel(fwd, left)
-            if i < len(current_hits) and current_hits[i]:
-                draw.ellipse((px - 3, py - 3, px + 3, py + 3), fill=(40, 245, 100))
-            else:
-                draw.ellipse((px - 2, py - 2, px + 2, py + 2), fill=(120, 120, 130))
-
-    # Robot marker
-    draw.ellipse((cx - 6, cy - 6, cx + 6, cy + 6), fill=(220, 220, 220), outline=(255, 80, 80), width=2)
-
-    # Info text
-    merged_hit_count = int(np.count_nonzero(hits))
-    merged_total = int(beam_endpoints.shape[0])
-    current_hit_count = int(np.count_nonzero(current_hits))
-    current_total = int(current_endpoints.shape[0]) if current_endpoints.ndim == 2 else 0
-    draw.rectangle((0, 0, size, 50), fill=(0, 0, 0))
-    draw.text((8, 6), f"LIDAR DEBUG  merged_binned={merged_total}/{merged_hit_count} current={current_total}/{current_hit_count} fov={fov_deg:.0f}deg", fill=(230, 230, 230), font=_debug_font(13))
-    draw.text((8, 27), "green=current hits  cyan=motion-compensated binned hits  gray=miss/max-range", fill=(190, 200, 210), font=_debug_font(12))
-
-    _save_image_atomic(img, output_path)
 
 
 def _format_joint_map(values: dict[str, float]) -> str:
@@ -3369,6 +3570,14 @@ def _build_semantic_map_summary(
             continue
         is_goal = label == current_target.strip().lower()
         status = str(entry.evidence_level).strip()
+        role = str(getattr(entry, "semantic_role", "GOAL"))
+        lifecycle = (
+            "reached"
+            if bool(getattr(entry, "reached", False))
+            else "passed"
+            if bool(getattr(entry, "passed", False))
+            else status
+        )
         fwd_m = entry.robot_forward_m
         left_m = entry.robot_left_m
         if fwd_m is not None and left_m is not None:
@@ -3385,7 +3594,8 @@ def _build_semantic_map_summary(
         marker = ">> " if is_goal else ""
         confidence = f"conf={float(entry.confidence):.2f}" if entry.confidence else ""
         object_lines.append(
-            f"  {marker}{label}: {direction} {dist_str} [{status}] {confidence}"
+            f"  {marker}{label}: role={role} {direction} {dist_str} "
+            f"[{lifecycle}] {confidence}"
         )
     if object_lines:
         lines.append("Objects:")

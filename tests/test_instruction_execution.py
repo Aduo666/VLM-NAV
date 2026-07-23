@@ -7,7 +7,11 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from vln_nav.navigation.instruction_manager import InstructionManager, RouteStep
+from vln_nav.navigation.instruction_manager import (
+    INSTRUCTION_SCHEMA_VERSION,
+    InstructionManager,
+    RouteStep,
+)
 from vln_nav.navigation.observation_adapter import Pose2D
 from vln_nav.navigation.region_transition import (
     RegionTransitionConfig,
@@ -51,7 +55,7 @@ def _logger() -> logging.Logger:
 class InstructionExecutionTest(unittest.TestCase):
     def test_invalid_json_uses_exactly_one_repair_call(self) -> None:
         repaired_payload = {
-            "schema_version": "2.0",
+            "schema_version": INSTRUCTION_SCHEMA_VERSION,
             "scene_context": {"current_region": None, "context_objects": []},
             "navigation_targets": [
                 {"canonical_label": "stairs", "source_span": "stairs"},
@@ -82,7 +86,7 @@ class InstructionExecutionTest(unittest.TestCase):
 
     def test_hospital_instruction_compiles_to_typed_steps(self) -> None:
         payload = {
-            "schema_version": "2.0",
+            "schema_version": INSTRUCTION_SCHEMA_VERSION,
             "scene_context": {
                 "current_region": {"canonical_label": "hospital corridor", "source_span": ""},
                 "context_objects": [],
@@ -138,7 +142,7 @@ class InstructionExecutionTest(unittest.TestCase):
 
     def test_context_objects_are_not_navigation_targets(self) -> None:
         payload = {
-            "schema_version": "2.0",
+            "schema_version": INSTRUCTION_SCHEMA_VERSION,
             "scene_context": {
                 "current_region": {"canonical_label": "kitchen", "source_span": "in the kitchen"},
                 "context_objects": [
@@ -198,7 +202,7 @@ class InstructionExecutionTest(unittest.TestCase):
 
     def test_context_target_overlap_requires_repair(self) -> None:
         invalid = {
-            "schema_version": "2.0",
+            "schema_version": INSTRUCTION_SCHEMA_VERSION,
             "scene_context": {
                 "current_region": None,
                 "context_objects": [
@@ -236,7 +240,7 @@ class InstructionExecutionTest(unittest.TestCase):
 
     def test_repeated_context_target_overlap_is_canonicalized_after_repair(self) -> None:
         invalid = {
-            "schema_version": "2.0",
+            "schema_version": INSTRUCTION_SCHEMA_VERSION,
             "scene_context": {
                 "current_region": None,
                 "context_objects": [
@@ -318,6 +322,127 @@ class InstructionExecutionTest(unittest.TestCase):
         self.assertFalse(first.completed)
         self.assertTrue(second.completed)
         self.assertEqual(second.stable_confirmation_count, 2)
+
+    def test_interiornav_instruction_compiles_to_four_typed_steps(self) -> None:
+        payload = {
+            "schema_version": INSTRUCTION_SCHEMA_VERSION,
+            "scene_context": {
+                "current_region": {
+                    "canonical_label": "hallway",
+                    "source_span": "down a hallway",
+                },
+                "context_objects": [],
+            },
+            "navigation_targets": [
+                {"canonical_label": "bed", "source_span": "near the bed"},
+            ],
+            "route_steps": [
+                {
+                    "step_id": "step_1",
+                    "step_type": "TRAVERSE",
+                    "source_span": "Walks straight down a hallway, passing a wall-mounted TV on the right",
+                    "direction": "forward",
+                    "completion": "CUE_PASSED",
+                    "trigger": {"trigger_type": "NONE", "label": ""},
+                    "cues": [
+                        {
+                            "label": "wall-mounted tv",
+                            "role": "PASS_CUE",
+                            "expected_side": "right",
+                            "source_span": "wall-mounted TV on the right",
+                        }
+                    ],
+                    "relations": [],
+                    "constraints": [],
+                },
+                {
+                    "step_id": "step_2",
+                    "step_type": "TURN",
+                    "source_span": "Turns left into a doorway",
+                    "direction": "left",
+                    "trigger": {
+                        "trigger_type": "AFTER_PREVIOUS_STEP",
+                        "label": "",
+                    },
+                    "cues": [
+                        {
+                            "label": "doorway",
+                            "role": "TURN_CUE",
+                            "expected_side": "left",
+                            "source_span": "left into a doorway",
+                        }
+                    ],
+                    "relations": [],
+                    "constraints": [],
+                },
+                {
+                    "step_id": "step_3",
+                    "step_type": "REGION_TRANSITION",
+                    "source_span": "Continues straight, passing a patterned glass door on the right, and enters a bedroom",
+                    "from_region": "hallway",
+                    "to_region": "bedroom",
+                    "transition": "enter",
+                    "direction": "forward",
+                    "trigger": {
+                        "trigger_type": "AFTER_PREVIOUS_STEP",
+                        "label": "",
+                    },
+                    "cues": [
+                        {
+                            "label": "patterned glass door",
+                            "role": "PASS_CUE",
+                            "expected_side": "right",
+                            "source_span": "patterned glass door on the right",
+                        }
+                    ],
+                    "relations": [],
+                    "constraints": [],
+                },
+                {
+                    "step_id": "step_4",
+                    "step_type": "GO_TO",
+                    "source_span": "Stops near the bed, with the large window positioned behind the bed",
+                    "target": "bed",
+                    "direction": "none",
+                    "trigger": {
+                        "trigger_type": "AFTER_PREVIOUS_STEP",
+                        "label": "",
+                    },
+                    "cues": [],
+                    "relations": [
+                        {
+                            "target": "bed",
+                            "relation": "BEHIND_TARGET",
+                            "reference": "large window",
+                            "source_span": "large window positioned behind the bed",
+                        }
+                    ],
+                    "constraints": [],
+                },
+            ],
+        }
+        instruction = (
+            "Walks straight down a hallway, passing a wall-mounted TV on the right. "
+            "Turns left into a doorway. Continues straight, passing a patterned glass "
+            "door on the right, and enters a bedroom. Stops near the bed, with the "
+            "large window positioned behind the bed."
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            plan = InstructionManager(
+                llm_client=_FakeLLM([payload]),
+                logger=_logger(),
+                cache_path=Path(temp_dir) / "plans.json",
+            ).parse(instruction)
+
+        self.assertEqual(
+            [step.step_type for step in plan.route_steps],
+            ["TRAVERSE", "TURN", "REGION_TRANSITION", "GO_TO"],
+        )
+        self.assertEqual(plan.navigation_target_labels, ["bed"])
+        self.assertEqual(plan.route_steps[0].cues[0].role, "PASS_CUE")
+        self.assertEqual(plan.route_steps[0].cues[0].expected_side, "right")
+        self.assertEqual(plan.route_steps[2].to_region, "bedroom")
+        self.assertEqual(plan.route_steps[3].relations[0].relation, "BEHIND_TARGET")
 
 
 if __name__ == "__main__":

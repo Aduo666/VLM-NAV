@@ -29,12 +29,12 @@ Click it to open the full-resolution H.264 recording.
 - **Isaac Sim 5.1**: scene USD loading, robot profiles, cameras, LiDAR, viewport setup.
 - **Swappable locomotion backends**: the AGX uses the existing 4WS joint controller; Unitree G1 uses a 480-input/29-output TorchScript locomotion policy on CPU. Both expose FORWARD / TURN_LEFT / TURN_RIGHT / STOP primitives with odometry-based completion.
 - **Semantic grounding + memory**: local GroundingDINO keeps multiple proposals, preserves instance continuity, and sends only low-confidence crops to the VLM for verification; confirmed landmark anchors remain persistent.
-- **Typed instruction graph**: one startup parse separates trusted scene context from executable `GO_TO`, `REGION_TRANSITION`, and `TURN` steps; validated plans are cached by instruction and schema version.
+- **Typed instruction graph**: one startup parse separates trusted scene context from executable `TRAVERSE`, `TURN`, `REGION_TRANSITION`, and `GO_TO` steps. Route cues and target relations remain strongly typed, and validated plans are cached by instruction, schema, prompt, and model version.
 - **Aligned action representation**: at stopped decision keyframes, the VLM chooses exactly one safe candidate outcome that maps one-to-one to TURN_LEFT / FORWARD / TURN_RIGHT.
 - **Region-aware execution**: room transitions require consistent visual region evidence, odometry displacement, and a topology-node change rather than keyword matching alone.
 - **Search / approach separation**: VLM exploration is used while a landmark is unknown; fresh verified image evidence directly approaches the target, while a confirmed off-screen anchor is followed through occupancy-grid A* with bounded local detours when the direct route is blocked.
 - **Fast primitive execution**: during an atomic action, expensive decision-time perception is skipped; odometry, depth safety, drive control, and LiDAR/map updates remain active.
-- **Local and evaluation flows**: normal debugging uses `debug/local` and `logs/nav_latest.log`; dataset evaluation uses `debug/eval` plus eval outputs.
+- **Local and evaluation flows**: normal debugging uses `debug/local` and `logs/nav_latest.log`; dataset evaluation uses `debug/eval` and a structured per-episode result file.
 
 ![Core method](docs/assets/overview.png)
 
@@ -209,6 +209,7 @@ Data root: `/Data/qiang/InternData-N1/vln_pe`
 Scene root: `/Data/qiang/mp3d_pe`
 
 Each dataset has an adapter under `eval/<dataset>/adapter.py` that normalizes dataset episodes into the task format consumed by `nav.py`.
+Each evaluation run also writes `debug/eval/results/<episode>_<timestamp>.json` with typed-step progress and an explicit success or failure stage.
 
 ## Current Pipeline
 
@@ -216,7 +217,15 @@ Each dataset has an adapter under `eval/<dataset>/adapter.py` that normalizes da
 English language instruction
   -> one validated typed semantic graph (cached)
        scene context: localization evidence only
-       route steps: GO_TO / REGION_TRANSITION / TURN
+       route steps: TRAVERSE / TURN / REGION_TRANSITION / GO_TO
+       route cues: PASS_CUE / TURN_CUE / TRANSITION_CUE
+       target relations: LEFT_OF / RIGHT_OF / IN_FRONT_OF / BEHIND_TARGET / NEAR
+  -> TRAVERSE: lock the measured world heading at step entry
+       hard-filter unsafe or route-inconsistent candidates
+       confirm a pass cue by GroundingDINO + VLM identity evidence
+       finish after odometry crosses the confirmed cue-anchor plane
+       if no anchor is available, require two VLM completion reviews
+       from distinct translated stopped keyframes
   -> RGB-D + LiDAR + odometry observation
   -> GO_TO: GroundingDINO proposal + VLM semantic verification
        visible target -> deterministic centering/approach
@@ -235,11 +244,11 @@ English language instruction
        G1: CPU TorchScript policy -> 29 joint position targets
 ```
 
-During primitive execution, the loop does not request VLM decisions or run GroundingDINO. It continues odometry completion, LiDAR hit/miss mapping, hard safety checks, low-level control, and lightweight tracking only after a target has been acquired. Heavy grounding runs at the natural stopped keyframe after a primitive. A conflicting target direction may add one explicit spatial-relation verification request; it never changes low-level control directly.
+During primitive execution, the loop does not request VLM decisions, run GroundingDINO, update visual tracking, or replace the active subgoal. It continues odometry completion, LiDAR hit/miss mapping, hard safety checks, low-level control, and video recording. Semantic perception resumes at the natural stopped keyframe after the primitive. A conflicting target direction may add one explicit spatial-relation verification request; it never changes low-level control directly.
 
 The VLM input is intentionally split by role:
 
-- A first-person candidate image for visual choice.
+- A clean, uncropped first-person RGB image without candidate markers or debug overlays.
 - Structured text for semantic map, landmark memory, obstacle distances, route context, and candidate action metadata.
 - No raw occupancy image is sent to the VLM by default; occupancy visualization is mainly for human debugging.
 
@@ -272,7 +281,7 @@ landmark_tracker:
   confirm_max_anchor_jump_m: 0.75
 
 opennav:
-  instruction_parse_max_tokens: 768
+  instruction_parse_max_tokens: 2048
   instruction_parse_timeout_sec: 90
   instruction_cache_enabled: true
   instruction_cache_path: ".cache/instruction_plans.json"
@@ -287,6 +296,13 @@ opennav:
   semantic_turn_target_high_confidence: 0.75
   semantic_turn_target_medium_confidence: 0.50
   semantic_turn_max_recovery_attempts: 2
+  traverse_heading_correction_limit_deg: 30.0
+  traverse_candidate_heading_tolerance_deg: 22.0
+  traverse_min_progress_m: 0.50
+  traverse_pass_margin_m: 0.20
+  traverse_review_min_progress_m: 1.0
+  traverse_review_min_translation_m: 0.20
+  traverse_max_recovery_attempts: 2
   visual_target_center_deadband_deg: 15.0
   arrival_distance_m: 2.0
   success_distance_m: 3.0
@@ -308,16 +324,15 @@ Tasks are stored in `configs/instructions.json`. Each task can specify scene pat
 debug/
   local/
     vln_debug.png
-    llm_request.png
     observevideos/observer_YYYYMMDD_HHMMSS.mp4
     videos/vln_debug_YYYYMMDD_HHMMSS.mp4
   eval/
     vln_debug.png
     videos/vln_debug_YYYYMMDD_HHMMSS.mp4
+    results/<episode>_YYYYMMDD_HHMMSS.json
 
 logs/
   vln.log
-  last_candidate_choice_request.json
 ```
 
 The console intentionally shows only navigation milestones: `[PLAN]`, `[NAV_STATE]`, `[LANDMARK_CONFIRMED]`, `[STEP_COMPLETE]`, `[SAFETY_HOLD]`, `[RECOVERY]`, `[ERROR]`, and `[ROUTE_COMPLETE]`. Full component logs are overwritten in `logs/vln.log` on each run. The human debug frame keeps its status bar outside the imagery: north-up global map on the left and uncropped first-person RGB on the right.
@@ -328,7 +343,7 @@ The observer-camera recording is captured automatically at 10 FPS from the confi
 
 - VLM API latency is still the dominant delay between atomic primitives.
 - GroundingDINO proposals can still be ambiguous; VLM verification reduces but cannot eliminate false positives.
-- Detections without usable depth can guide image-space centering, but cannot create a world anchor or complete a landmark.
+- Detections without usable depth cannot complete a landmark immediately; two or more translated keyframes may recover an anchor through bearing triangulation when their rays are geometrically consistent.
 - Search decisions still depend on VLM quality, while confirmed-target approach is deterministic.
 - The system is a research prototype, not a benchmark-final VLN agent.
 

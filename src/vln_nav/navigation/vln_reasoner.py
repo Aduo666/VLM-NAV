@@ -2,18 +2,12 @@ from __future__ import annotations
 
 import json
 import logging
-import os
-import tempfile
 from dataclasses import dataclass
 
 from .candidate_waypoint_predictor import CandidateSet, WaypointCandidate
 from .instruction_manager import InstructionContext, RouteStep
 from .open_nav_client import OpenNavLLMClient
 from .progress_manager import ProgressState
-from ..runtime.config import PROJECT_ROOT
-
-
-LAST_CANDIDATE_CHOICE_DUMP_PATH = PROJECT_ROOT / "logs" / "last_candidate_choice_request.json"
 
 
 @dataclass
@@ -29,6 +23,8 @@ class ReasonerDecision:
     current_region_label: str = "unknown"
     region_confidence: float = 0.0
     region_changed: bool = False
+    route_progress_status: str = "CONTINUE"
+    route_progress_evidence: str = ""
 
 
 @dataclass
@@ -66,7 +62,6 @@ class OpenNavReasoner:
         candidate_set: CandidateSet,
         progress_state: ProgressState,
         annotated_image_png_bytes: bytes | None,
-        annotated_image_path: str | None = None,
         target_memory_text: str = "",
         safety_context_text: str = "",
         route_context_text: str = "",
@@ -93,7 +88,7 @@ class OpenNavReasoner:
             return ReasonerDecision(
                 selected_candidate_id=None,
                 selected_action=None,
-                thought="LLM is unavailable or candidate debug image is missing, so no decision was produced.",
+                thought="LLM is unavailable or the clean RGB observation is missing, so no decision was produced.",
                 progress_estimation=progress_estimation,
                 reason="llm_unavailable",
             )
@@ -111,53 +106,72 @@ class OpenNavReasoner:
             semantic_map_summary=semantic_map_summary,
             current_step=current_step,
         )
-        _dump_candidate_choice_request(
-            request_payload=request_payload,
-            image_path=annotated_image_path,
-        )
-        result = self._llm.chat(
-            request_name=request_payload.request_name,
-            system_prompt=request_payload.system_prompt,
-            user_prompt=request_payload.user_prompt,
-            image_png_bytes=annotated_image_png_bytes,
-            max_tokens=request_payload.max_tokens,
-            temperature=request_payload.temperature,
-        )
-        if result.failed or not result.content:
-            return ReasonerDecision(
-                selected_candidate_id=None,
-                selected_action=None,
-                thought=f"LLM did not return a usable candidate decision. reason={result.reason}",
-                progress_estimation=progress_estimation,
-                reason=result.reason,
-            )
-
-        try:
-            payload = _parse_json(result.content)
-            selected_candidate_id = int(payload.get("selected_candidate_id"))
-            thought = str(payload.get("reason", payload.get("thought", ""))).strip() or "No reason provided."
-            current_region_label = str(payload.get("current_region_label", "unknown")).strip().lower() or "unknown"
-            region_confidence = float(payload.get("region_confidence", 0.0))
-            region_changed = _parse_bool(payload.get("region_changed", False))
-        except Exception:
-            return ReasonerDecision(
-                selected_candidate_id=None,
-                selected_action=None,
-                thought="LLM returned non-JSON or malformed JSON for candidate selection.",
-                progress_estimation=progress_estimation,
-                reason="invalid_llm_output",
-            )
-
         valid_ids = {candidate.slot_id for candidate in valid_candidates}
-        if selected_candidate_id not in valid_ids:
+        user_prompt = request_payload.user_prompt
+        last_error = "invalid_llm_output"
+        parsed: dict | None = None
+        for attempt in range(2):
+            result = self._llm.chat(
+                request_name=(
+                    request_payload.request_name
+                    if attempt == 0
+                    else f"{request_payload.request_name}_repair"
+                ),
+                system_prompt=request_payload.system_prompt,
+                user_prompt=user_prompt,
+                image_png_bytes=annotated_image_png_bytes,
+                max_tokens=request_payload.max_tokens,
+                temperature=0.0 if attempt else request_payload.temperature,
+                json_response=True,
+            )
+            if result.failed or not result.content:
+                last_error = result.reason
+                break
+            try:
+                candidate_payload = _parse_json(result.content)
+                candidate_id = int(candidate_payload.get("selected_candidate_id"))
+            except Exception:
+                last_error = "invalid_llm_output"
+                candidate_payload = None
+                candidate_id = -1
+            if candidate_payload is not None and candidate_id in valid_ids:
+                parsed = candidate_payload
+                break
+            last_error = "invalid_candidate_id"
+            if attempt == 0:
+                user_prompt = (
+                    request_payload.user_prompt
+                    + "\n\nYour previous response was invalid. Return JSON only and choose "
+                    + f"exactly one selected_candidate_id from {sorted(valid_ids)}. "
+                    + f"Previous response: {result.content}"
+                )
+
+        if parsed is None:
             return ReasonerDecision(
                 selected_candidate_id=None,
                 selected_action=None,
-                thought=f"LLM selected invalid candidate id={selected_candidate_id}. valid_ids={sorted(valid_ids)}",
+                thought=(
+                    "LLM failed deterministic candidate validation after one repair. "
+                    f"valid_ids={sorted(valid_ids)}"
+                ),
                 progress_estimation=progress_estimation,
-                reason="invalid_candidate_id",
+                reason=last_error,
             )
 
+        selected_candidate_id = int(parsed["selected_candidate_id"])
+        thought = str(parsed.get("reason", parsed.get("thought", ""))).strip() or "No reason provided."
+        current_region_label = str(parsed.get("current_region_label", "unknown")).strip().lower() or "unknown"
+        region_confidence = float(parsed.get("region_confidence", 0.0))
+        region_changed = _parse_bool(parsed.get("region_changed", False))
+        route_progress_status = (
+            str(parsed.get("route_progress_status", "CONTINUE")).strip().upper()
+            or "CONTINUE"
+        )
+        if route_progress_status not in {"CONTINUE", "LIKELY_COMPLETE"}:
+            route_progress_status = "CONTINUE"
+        route_progress_evidence = str(
+            parsed.get("route_progress_evidence", "")
+        ).strip()
         selected_candidate = next(candidate for candidate in valid_candidates if candidate.slot_id == selected_candidate_id)
         selected_action = _candidate_primitive_action(selected_candidate)
 
@@ -173,6 +187,8 @@ class OpenNavReasoner:
             current_region_label=current_region_label,
             region_confidence=max(0.0, min(1.0, region_confidence)),
             region_changed=region_changed,
+            route_progress_status=route_progress_status,
+            route_progress_evidence=route_progress_evidence,
         )
 
     def build_candidate_choice_request(
@@ -209,6 +225,11 @@ class OpenNavReasoner:
         ]
         region_output_rules = ""
         output_contract = "{reason, selected_candidate_id}"
+        if current_step is not None and current_step.step_type == "TRAVERSE":
+            output_contract = (
+                "{reason, selected_candidate_id, route_progress_status, "
+                "route_progress_evidence}"
+            )
         if current_step is not None and current_step.step_type == "REGION_TRANSITION":
             output_contract = (
                 "{reason, selected_candidate_id, current_region_label, "
@@ -224,7 +245,7 @@ class OpenNavReasoner:
             )
         system_prompt = (
             "You are the high-level local VLN decision module for a wheeled robot.\n"
-            "Inputs are: (a) one clean first-person camera image with numbered candidate markers, "
+            "Inputs are: (a) one clean first-person camera image without overlays, "
             "(b) structured text map/memory/obstacle summaries, and (c) an explicit candidate action table.\n"
             "The occupancy map is NOT shown as an image here; use the structured text map and candidate table for spatial reasoning.\n"
             "\n"
@@ -243,8 +264,13 @@ class OpenNavReasoner:
             "7. Treat repetition_penalty=1.0 as a strong reason not to repeat that turn unless current visual evidence requires it.\n"
             "8. Scene context objects are localization evidence, never goals unless the current typed step names them as a target.\n"
             "9. Respect the current typed step and all global instruction constraints.\n"
+            "10. For TRAVERSE, obey the locked world heading and select only a candidate "
+            "that remains inside its allowed direction corridor.\n"
+            "11. For TRAVERSE, route_progress_status may be LIKELY_COMPLETE only when "
+            "the current image clearly supports that the pass cue was passed or the "
+            "next route event has been reached; otherwise use CONTINUE.\n"
             f"{region_output_rules}"
-            "10. Output valid JSON only, no markdown."
+            "12. Output valid JSON only, no markdown."
         )
         valid_ids_text = ", ".join(str(candidate.slot_id) for candidate in candidate_set.candidates if candidate.valid)
         user_prompt = (
@@ -281,7 +307,9 @@ class OpenNavReasoner:
             "\n"
             f"Output JSON: {output_contract}\n"
             "selected_candidate_id: integer from Valid IDs\n"
-            "reason: one short sentence explaining why this candidate is best"
+            "reason: one short sentence explaining why this candidate is best\n"
+            "For TRAVERSE also output route_progress_status=CONTINUE|LIKELY_COMPLETE "
+            "and one short route_progress_evidence string."
         )
         return CandidateChoiceRequest(
             request_name="candidate_choice",
@@ -301,6 +329,8 @@ def _step_subject(step: RouteStep | None) -> str:
         return step.to_region
     if step.step_type == "TURN":
         return f"turn {step.direction}"
+    if step.step_type == "TRAVERSE":
+        return step.cues[0].label if step.cues else f"traverse {step.direction}"
     return ""
 
 
@@ -314,7 +344,10 @@ def _format_route_step(step: RouteStep | None) -> str:
         f"id={step.step_id}; type={step.step_type}; target={step.target or 'none'}; "
         f"from_region={step.from_region or 'none'}; to_region={step.to_region or 'none'}; "
         f"transition={step.transition or 'none'}; direction={step.direction}; "
-        f"trigger={trigger}; completion={step.completion}; constraints={list(step.constraints) or ['none']}"
+        f"trigger={trigger}; completion={step.completion}; "
+        f"cues={[f'{cue.role}:{cue.label}:{cue.expected_side}' for cue in step.cues] or ['none']}; "
+        f"relations={[f'{relation.target}:{relation.relation}:{relation.reference}' for relation in step.relations] or ['none']}; "
+        f"constraints={list(step.constraints) or ['none']}"
     )
 
 
@@ -405,24 +438,3 @@ def _parse_json(content: str) -> dict:
     if start >= 0 and end >= start:
         text = text[start : end + 1]
     return json.loads(text)
-
-
-def _dump_candidate_choice_request(*, request_payload: CandidateChoiceRequest, image_path: str | None) -> None:
-    dump_payload = {
-        "request_name": request_payload.request_name,
-        "system_prompt": request_payload.system_prompt,
-        "user_prompt": request_payload.user_prompt,
-        "max_tokens": int(request_payload.max_tokens),
-        "temperature": float(request_payload.temperature),
-        "image_path": str(image_path or ""),
-    }
-    target = LAST_CANDIDATE_CHOICE_DUMP_PATH
-    target.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp_path = tempfile.mkstemp(prefix=f"{target.name}.", suffix=".tmp", dir=str(target.parent))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(dump_payload, handle, ensure_ascii=False, indent=2)
-        os.replace(temp_path, target)
-    finally:
-        if os.path.exists(temp_path):
-            os.unlink(temp_path)

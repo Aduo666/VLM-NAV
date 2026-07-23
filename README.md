@@ -224,14 +224,18 @@ English language instruction
        unknown target -> one VLM candidate choice at a stopped keyframe
   -> REGION_TRANSITION: candidate choice + region evidence
        complete only after semantic + odometry + topology agreement
-  -> TURN: 15-degree corridor scan, stable early exit after 45 degrees,
-           and best-heading recovery within a 105-degree bound
+  -> TURN: execute odometry-verified turn primitives in the instructed direction
+       stopped keyframes search for the next GO_TO landmark
+       high-confidence detections require VLM identity verification
+       otherwise fuse LiDAR + global occupancy into a true corridor centerline
+       exit on a stable corridor after 45 degrees, or return to the best safe
+       heading within a 105-degree scan; bounded recovery ends in SAFETY_HOLD
   -> robot-profile locomotion backend
        AGX: low-level 4WS joint controller
        G1: CPU TorchScript policy -> 29 joint position targets
 ```
 
-During primitive execution, the loop does not request VLM decisions or run heavy grounding. It continues odometry completion, LiDAR hit/miss mapping, hard safety checks, and low-level control. A stopped decision keyframe permits at most one VLM request: semantic verification or candidate/region reasoning, never both.
+During primitive execution, the loop does not request VLM decisions or run GroundingDINO. It continues odometry completion, LiDAR hit/miss mapping, hard safety checks, low-level control, and lightweight tracking only after a target has been acquired. Heavy grounding runs at the natural stopped keyframe after a primitive. A conflicting target direction may add one explicit spatial-relation verification request; it never changes low-level control directly.
 
 The VLM input is intentionally split by role:
 
@@ -279,6 +283,10 @@ opennav:
   semantic_turn_max_yaw_deg: 105.0
   semantic_turn_max_primitives: 7
   semantic_turn_alignment_confirmations: 2
+  semantic_turn_corridor_center_tolerance_deg: 10.0
+  semantic_turn_target_high_confidence: 0.75
+  semantic_turn_target_medium_confidence: 0.50
+  semantic_turn_max_recovery_attempts: 2
   visual_target_center_deadband_deg: 15.0
   arrival_distance_m: 2.0
   success_distance_m: 3.0

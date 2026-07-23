@@ -69,6 +69,7 @@ class RobotProfileTest(unittest.TestCase):
             robot_world_orientation_wxyz=np.asarray([1.0, 0.0, 0.0, 0.0]),
         )
         self.assertGreater(geometry.robot_frame_xy[1], 0.0)
+        self.assertLess(geometry.bearing_rad, 0.0)
         self.assertAlmostEqual(geometry.world_xy[0], 2.0, places=5)
 
     def test_g1_rejects_track_target_execution_mode(self) -> None:

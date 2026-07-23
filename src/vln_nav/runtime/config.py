@@ -36,8 +36,17 @@ class AppConfig:
     semantic_turn_max_primitives: int = 7
     semantic_turn_min_forward_clearance_m: float = 0.60
     semantic_turn_alignment_confirmations: int = 2
-    semantic_turn_corridor_center_tolerance_deg: float = 12.0
-    semantic_turn_same_corridor_tolerance_deg: float = 20.0
+    semantic_turn_corridor_center_tolerance_deg: float = 10.0
+    semantic_turn_same_corridor_tolerance_deg: float = 15.0
+    semantic_turn_target_high_confidence: float = 0.75
+    semantic_turn_target_medium_confidence: float = 0.50
+    semantic_turn_direction_tolerance_deg: float = 10.0
+    semantic_turn_corridor_half_fov_deg: float = 60.0
+    semantic_turn_corridor_step_deg: float = 5.0
+    semantic_turn_lidar_bin_half_width_deg: float = 3.0
+    semantic_turn_min_corridor_width_deg: float = 15.0
+    semantic_turn_corridor_max_clearance_m: float = 4.0
+    semantic_turn_max_recovery_attempts: int = 2
     local_detour_max_turn_primitives: int = 2
     visual_target_center_deadband_deg: float = 15.0
     candidate_slot_bearings_deg: list[float] = field(default_factory=lambda: [75.0, 35.0, 0.0, -35.0, -75.0])
@@ -515,11 +524,47 @@ def load_config(config_path: str | None = None) -> AppConfig:
         ),
         semantic_turn_corridor_center_tolerance_deg=_float_env_or_value(
             "SEMANTIC_TURN_CORRIDOR_CENTER_TOLERANCE_DEG",
-            opennav.get("semantic_turn_corridor_center_tolerance_deg", 12.0),
+            opennav.get("semantic_turn_corridor_center_tolerance_deg", 10.0),
         ),
         semantic_turn_same_corridor_tolerance_deg=_float_env_or_value(
             "SEMANTIC_TURN_SAME_CORRIDOR_TOLERANCE_DEG",
-            opennav.get("semantic_turn_same_corridor_tolerance_deg", 20.0),
+            opennav.get("semantic_turn_same_corridor_tolerance_deg", 15.0),
+        ),
+        semantic_turn_target_high_confidence=_float_env_or_value(
+            "SEMANTIC_TURN_TARGET_HIGH_CONFIDENCE",
+            opennav.get("semantic_turn_target_high_confidence", 0.75),
+        ),
+        semantic_turn_target_medium_confidence=_float_env_or_value(
+            "SEMANTIC_TURN_TARGET_MEDIUM_CONFIDENCE",
+            opennav.get("semantic_turn_target_medium_confidence", 0.50),
+        ),
+        semantic_turn_direction_tolerance_deg=_float_env_or_value(
+            "SEMANTIC_TURN_DIRECTION_TOLERANCE_DEG",
+            opennav.get("semantic_turn_direction_tolerance_deg", 10.0),
+        ),
+        semantic_turn_corridor_half_fov_deg=_float_env_or_value(
+            "SEMANTIC_TURN_CORRIDOR_HALF_FOV_DEG",
+            opennav.get("semantic_turn_corridor_half_fov_deg", 60.0),
+        ),
+        semantic_turn_corridor_step_deg=_float_env_or_value(
+            "SEMANTIC_TURN_CORRIDOR_STEP_DEG",
+            opennav.get("semantic_turn_corridor_step_deg", 5.0),
+        ),
+        semantic_turn_lidar_bin_half_width_deg=_float_env_or_value(
+            "SEMANTIC_TURN_LIDAR_BIN_HALF_WIDTH_DEG",
+            opennav.get("semantic_turn_lidar_bin_half_width_deg", 3.0),
+        ),
+        semantic_turn_min_corridor_width_deg=_float_env_or_value(
+            "SEMANTIC_TURN_MIN_CORRIDOR_WIDTH_DEG",
+            opennav.get("semantic_turn_min_corridor_width_deg", 15.0),
+        ),
+        semantic_turn_corridor_max_clearance_m=_float_env_or_value(
+            "SEMANTIC_TURN_CORRIDOR_MAX_CLEARANCE_M",
+            opennav.get("semantic_turn_corridor_max_clearance_m", 4.0),
+        ),
+        semantic_turn_max_recovery_attempts=_int_env_or_value(
+            "SEMANTIC_TURN_MAX_RECOVERY_ATTEMPTS",
+            opennav.get("semantic_turn_max_recovery_attempts", 2),
         ),
         local_detour_max_turn_primitives=_int_env_or_value(
             "LOCAL_DETOUR_MAX_TURN_PRIMITIVES",

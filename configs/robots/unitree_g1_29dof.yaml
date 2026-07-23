@@ -77,7 +77,7 @@ primitives:
 
 geometry:
   footprint_radius_m: 0.32
-  obstacle_stop_distance_m: 0.40
+  obstacle_stop_distance_m: 0.30
   map_inflation_radius_m: 0.40
   path_corridor_radius_m: 0.38
   turn_clearance_radius_m: 0.42

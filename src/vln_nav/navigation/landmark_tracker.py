@@ -291,9 +291,22 @@ class LandmarkTracker:
                 state.status = "searching"
 
         # Update can_complete
+        completion_required = max(1, int(self._config.confirm_min_observations))
+        if state.behavior_type == "turn_lookahead" and state.last_observation is not None:
+            completion_required = (
+                2
+                if bool(
+                    getattr(
+                        state.last_observation,
+                        "requires_viewpoint_confirmation",
+                        False,
+                    )
+                )
+                else 1
+            )
         state.can_complete = (
             state.estimated_world_xy is not None
-            and state.confirmed_observation_count >= int(self._config.confirm_min_observations)
+            and state.confirmed_observation_count >= completion_required
             and state.evidence_level == "confirmed"
         )
 
@@ -392,10 +405,13 @@ class LandmarkTracker:
         requires_viewpoint_confirmation = bool(
             getattr(observation, "requires_viewpoint_confirmation", False)
         )
-        required = max(
-            2 if requires_viewpoint_confirmation else 1,
-            int(self._config.confirm_min_observations),
-        )
+        if state.behavior_type == "turn_lookahead":
+            required = 2 if requires_viewpoint_confirmation else 1
+        else:
+            required = max(
+                2 if requires_viewpoint_confirmation else 1,
+                int(self._config.confirm_min_observations),
+            )
 
         pending = self._pending_confirmed.get(label)
         request_pose = getattr(observation, "request_robot_pose", None)

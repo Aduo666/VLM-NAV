@@ -47,6 +47,9 @@ class TargetTracker:
         self._identity_vlm_verified = False
         self._identity_vlm_confidence = 0.0
         self._identity_reason = ""
+        self._identity_turn_direction_consistent: bool | None = None
+        self._identity_turn_relation_verified = False
+        self._identity_turn_relation_reason = ""
         self._last_observation: TargetObservation | None = None
         self._last_log_signature: tuple | None = None
         self._last_log_time_sec = -float("inf")
@@ -77,6 +80,9 @@ class TargetTracker:
         self._identity_vlm_verified = False
         self._identity_vlm_confidence = 0.0
         self._identity_reason = ""
+        self._identity_turn_direction_consistent = None
+        self._identity_turn_relation_verified = False
+        self._identity_turn_relation_reason = ""
         self._last_observation = None
         self._last_log_signature = None
 
@@ -130,6 +136,15 @@ class TargetTracker:
         self._identity_vlm_verified = bool(getattr(observation, "vlm_verified", False))
         self._identity_vlm_confidence = float(getattr(observation, "vlm_verification_confidence", 0.0))
         self._identity_reason = str(getattr(observation, "vlm_verification_reason", ""))
+        self._identity_turn_direction_consistent = getattr(
+            observation, "turn_direction_consistent", None
+        )
+        self._identity_turn_relation_verified = bool(
+            getattr(observation, "turn_relation_verified", False)
+        )
+        self._identity_turn_relation_reason = str(
+            getattr(observation, "turn_relation_reason", "")
+        )
         self._last_observation = observation
         self._log_state(timestamp_sec=timestamp_sec, reason="initialized", bbox=bbox)
         return True
@@ -275,6 +290,9 @@ class TargetTracker:
                 vlm_verified=bool(self._identity_vlm_verified),
                 vlm_verification_confidence=float(self._identity_vlm_confidence),
                 vlm_verification_reason=self._identity_reason,
+                turn_direction_consistent=self._identity_turn_direction_consistent,
+                turn_relation_verified=bool(self._identity_turn_relation_verified),
+                turn_relation_reason=self._identity_turn_relation_reason,
             )
 
         geometry = estimate_target_world_xy(
@@ -314,6 +332,9 @@ class TargetTracker:
             vlm_verified=bool(self._identity_vlm_verified),
             vlm_verification_confidence=float(self._identity_vlm_confidence),
             vlm_verification_reason=self._identity_reason,
+            turn_direction_consistent=self._identity_turn_direction_consistent,
+            turn_relation_verified=bool(self._identity_turn_relation_verified),
+            turn_relation_reason=self._identity_turn_relation_reason,
         )
 
     def _bbox_area_reasonable(self, *, bbox: tuple[int, int, int, int], image_shape) -> bool:

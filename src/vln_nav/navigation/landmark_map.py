@@ -82,7 +82,7 @@ class LandmarkMap:
         existing = self._entries.get(label)
 
         behavior = str(state.behavior_type).strip().lower()
-        map_anchor_allowed = behavior in {"go_to", "turn_at"}
+        map_anchor_allowed = behavior in {"go_to", "turn_at", "turn_lookahead"}
         has_confirmed_anchor = (
             state.estimated_world_xy is not None
             and bool(state.can_complete)

@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from .grounding_dino_detector import (
     GroundingDinoConfig,
@@ -52,6 +52,9 @@ class TargetObservation:
     vlm_verification_confidence: float = 0.0
     vlm_verification_reason: str = ""
     requires_viewpoint_confirmation: bool = False
+    turn_direction_consistent: bool | None = None
+    turn_relation_verified: bool = False
+    turn_relation_reason: str = ""
 
 
 @dataclass
@@ -120,6 +123,10 @@ class _GroundingRequest:
     camera_view_matrix_ros: np.ndarray | None = None
     robot_world_position_xyz: np.ndarray | None = None
     robot_world_orientation_wxyz: np.ndarray | None = None
+    force_semantic_verification: bool = False
+    expected_turn_direction: str = ""
+    turn_start_yaw_rad: float | None = None
+    turn_direction_tolerance_deg: float = 10.0
 
 
 @dataclass
@@ -206,6 +213,10 @@ class TargetGrounder:
         camera_view_matrix_ros: np.ndarray | None = None,
         robot_world_position_xyz: np.ndarray | None = None,
         robot_world_orientation_wxyz: np.ndarray | None = None,
+        force_semantic_verification: bool = False,
+        expected_turn_direction: str = "",
+        turn_start_yaw_rad: float | None = None,
+        turn_direction_tolerance_deg: float = 10.0,
     ) -> TargetObservation:
         target_label = str(target_label).strip() or "target"
         if target_label.lower() in {"none", "null", "unknown", "n/a", "na", "target", "object", "thing", "place", "location"}:
@@ -263,6 +274,10 @@ class TargetGrounder:
                 camera_view_matrix_ros=camera_view_matrix_ros,
                 robot_world_position_xyz=robot_world_position_xyz,
                 robot_world_orientation_wxyz=robot_world_orientation_wxyz,
+                force_semantic_verification=force_semantic_verification,
+                expected_turn_direction=expected_turn_direction,
+                turn_start_yaw_rad=turn_start_yaw_rad,
+                turn_direction_tolerance_deg=turn_direction_tolerance_deg,
             )
         except Exception as exc:
             self._logger.warning("[GroundingReject] target=%s reason=image_prepare_failed error=%s", target_label, exc)
@@ -346,6 +361,9 @@ class TargetGrounder:
             requires_viewpoint_confirmation=bool(
                 self._last_observation.requires_viewpoint_confirmation
             ),
+            turn_direction_consistent=self._last_observation.turn_direction_consistent,
+            turn_relation_verified=bool(self._last_observation.turn_relation_verified),
+            turn_relation_reason=str(self._last_observation.turn_relation_reason),
         )
 
     def _collect_finished_request(self, *, timestamp_sec: float, wall_time_sec: float, current_robot_pose: Pose2D | None = None) -> TargetObservation | None:
@@ -494,6 +512,10 @@ class TargetGrounder:
         camera_view_matrix_ros: np.ndarray | None = None,
         robot_world_position_xyz: np.ndarray | None = None,
         robot_world_orientation_wxyz: np.ndarray | None = None,
+        force_semantic_verification: bool = False,
+        expected_turn_direction: str = "",
+        turn_start_yaw_rad: float | None = None,
+        turn_direction_tolerance_deg: float = 10.0,
     ) -> _GroundingRequest:
         image = Image.fromarray(rgb[:, :, :3].copy()).convert("RGB")
         original_size = (int(image.width), int(image.height))
@@ -540,6 +562,12 @@ class TargetGrounder:
             robot_world_orientation_wxyz=_copy_optional_vector(
                 robot_world_orientation_wxyz, min_length=4
             ),
+            force_semantic_verification=bool(force_semantic_verification),
+            expected_turn_direction=_normalize_turn_direction(expected_turn_direction),
+            turn_start_yaw_rad=(
+                None if turn_start_yaw_rad is None else float(turn_start_yaw_rad)
+            ),
+            turn_direction_tolerance_deg=max(0.0, float(turn_direction_tolerance_deg)),
         )
 
     def _parse_and_validate(self, *, content: str, request: _GroundingRequest) -> TargetObservation:
@@ -656,26 +684,33 @@ class TargetGrounder:
         aspect_ratio = max(float(bbox_width) / max(float(bbox_height), 1.0), float(bbox_height) / max(float(bbox_width), 1.0))
         if aspect_ratio > float(self._config.max_bbox_aspect_ratio):
             return _empty_observation(request.target_label, request.timestamp_sec, "bbox_aspect_invalid")
-        if request.depth is None or np.asarray(request.depth).ndim != 2:
-            return _empty_observation(request.target_label, request.timestamp_sec, "depth_unavailable")
-
         mask: np.ndarray | None = None
         segmentation_source = str(self._config.depth_region)
         depth_m = None
         valid_ratio = 0.0
         mask_area_ratio = 0.0
         center_uv = (float(xmin + xmax) * 0.5, float(ymin + ymax) * 0.5)
+        depth_available = bool(
+            request.depth is not None and np.asarray(request.depth).ndim == 2
+        )
 
         segmentation = self._sam.segment(rgb=request.rgb, bbox=bbox)
         if segmentation is not None:
             mask = np.asarray(segmentation.mask, dtype=bool)
-            depth_m, valid_ratio, mask_area_ratio, center_uv = _mask_depth_statistic(
-                depth=np.asarray(request.depth, dtype=np.float32),
-                mask=mask,
-                min_depth_m=float(self._config.min_depth_m),
-                max_depth_m=float(self._config.max_depth_m),
-                statistic=str(self._config.depth_statistic),
+            mask_area_ratio = float(
+                np.count_nonzero(mask) / max(1, image_height * image_width)
             )
+            ys, xs = np.nonzero(mask)
+            if xs.size > 0:
+                center_uv = (float(np.mean(xs)), float(np.mean(ys)))
+            if depth_available:
+                depth_m, valid_ratio, mask_area_ratio, center_uv = _mask_depth_statistic(
+                    depth=np.asarray(request.depth, dtype=np.float32),
+                    mask=mask,
+                    min_depth_m=float(self._config.min_depth_m),
+                    max_depth_m=float(self._config.max_depth_m),
+                    statistic=str(self._config.depth_statistic),
+                )
             segmentation_source = segmentation.source
             self._logger.debug(
                 "[SAM] target=%s score=%.3f mask_area=%.3f depth=%s valid_ratio=%.2f",
@@ -686,7 +721,10 @@ class TargetGrounder:
                 float(valid_ratio),
             )
 
-        if depth_m is None or valid_ratio < float(self._config.min_depth_valid_ratio):
+        if depth_available and (
+            depth_m is None
+            or valid_ratio < float(self._config.min_depth_valid_ratio)
+        ):
             if segmentation is not None:
                 self._logger.debug(
                     "[SAMFallback] target=%s reason=mask_depth_invalid depth=%s valid_ratio=%.2f fallback=%s",
@@ -708,6 +746,10 @@ class TargetGrounder:
                 mask_min_pixels=int(self._config.depth_mask_min_pixels),
             )
             segmentation_source = str(self._config.depth_region)
+        elif not depth_available:
+            segmentation_source = (
+                segmentation_source if segmentation is not None else "no_depth"
+            )
         # Bearing from bbox center (works with or without depth)
         cx_px = (float(image_width) - 1.0) * 0.5
         half_fov_rad = float(np.deg2rad(float(self._config.horizontal_fov_deg)) * 0.5)
@@ -751,7 +793,7 @@ class TargetGrounder:
         )
         requires_viewpoint_confirmation = False
         if can_confirm and bool(self._config.semantic_verification_enabled):
-            if high_confidence:
+            if high_confidence and not bool(request.force_semantic_verification):
                 vlm_verified = True
                 vlm_verification_confidence = 1.0
                 vlm_verification_reason = "auto_accept_high_detector_confidence"
@@ -762,7 +804,7 @@ class TargetGrounder:
                     detector_confidence=float(confidence),
                     semantic_source=semantic_source,
                 )
-                requires_viewpoint_confirmation = bool(vlm_verified)
+                requires_viewpoint_confirmation = bool(vlm_verified and not high_confidence)
             if not vlm_verified or vlm_verification_confidence < float(self._config.semantic_verification_min_confidence):
                 can_confirm = False
                 self._logger.info(
@@ -773,6 +815,46 @@ class TargetGrounder:
                     float(vlm_verification_confidence),
                     vlm_verification_reason,
                 )
+
+        turn_direction_consistent = _turn_direction_consistency(
+            request=request,
+            camera_bearing_rad=bearing_rad,
+        )
+        turn_relation_verified = False
+        turn_relation_reason = "not_required"
+        if (
+            can_confirm
+            and turn_direction_consistent is False
+            and request.expected_turn_direction in {"left", "right"}
+        ):
+            (
+                relation_consistent,
+                relation_confidence,
+                turn_relation_reason,
+            ) = self._verify_turn_relation(
+                request=request,
+                bbox=bbox,
+                detector_confidence=float(confidence),
+                camera_bearing_rad=float(bearing_rad),
+            )
+            turn_relation_verified = bool(
+                relation_consistent
+                and relation_confidence
+                >= float(self._config.semantic_verification_min_confidence)
+            )
+            turn_direction_consistent = bool(turn_relation_verified)
+            if not turn_relation_verified:
+                can_confirm = False
+            self._logger.info(
+                "[TurnRelationVerify] target=%s expected=%s bearing_deg=%+.1f "
+                "verified=%s confidence=%.2f reason=%s",
+                request.target_label,
+                request.expected_turn_direction,
+                float(np.degrees(bearing_rad)),
+                int(turn_relation_verified),
+                float(relation_confidence),
+                turn_relation_reason[:120],
+            )
 
         evidence_level = "confirmed_candidate" if can_confirm else "potential"
         if geometry is not None:
@@ -807,6 +889,9 @@ class TargetGrounder:
             vlm_verification_confidence=float(vlm_verification_confidence),
             vlm_verification_reason=str(vlm_verification_reason),
             requires_viewpoint_confirmation=bool(requires_viewpoint_confirmation),
+            turn_direction_consistent=turn_direction_consistent,
+            turn_relation_verified=turn_relation_verified,
+            turn_relation_reason=turn_relation_reason,
         )
 
     def _verify_detection_semantics(
@@ -884,6 +969,64 @@ class TargetGrounder:
         self._last_verification_result = verified_result
         return verified_result
 
+    def _verify_turn_relation(
+        self,
+        *,
+        request: _GroundingRequest,
+        bbox: tuple[int, int, int, int],
+        detector_confidence: float,
+        camera_bearing_rad: float,
+    ) -> tuple[bool, float, str]:
+        image_bytes = _build_relation_image_bytes(
+            rgb=request.rgb,
+            bbox=bbox,
+            max_edge_px=int(self._config.semantic_verification_max_edge_px),
+        )
+        system_prompt = (
+            "You are a strict spatial-relation verifier for robot navigation. "
+            "The outlined object identity has already been checked. Determine whether "
+            "that object is plausibly reached by following the instructed turn from "
+            "the turn-start heading. Return strict JSON only."
+        )
+        user_prompt = (
+            f"Target label: {request.target_label}\n"
+            f"Expected turn direction: {request.expected_turn_direction}\n"
+            f"Current image bearing (right-positive): "
+            f"{float(np.degrees(camera_bearing_rad)):+.1f} degrees\n"
+            f"Target direction from turn-start heading (expected-direction-positive): "
+            f"{_turn_directed_target_delta_deg(request=request, camera_bearing_rad=camera_bearing_rad):+.1f} degrees\n"
+            f"Detector confidence: {float(detector_confidence):.2f}\n"
+            "The full first-person image contains one outlined candidate. Judge its "
+            "spatial consistency with the expected turn. Do not reclassify unrelated "
+            "objects as consistent merely because they are visible.\n"
+            "Return exactly one JSON object:\n"
+            '{"relation_consistent": true, "confidence": 0.0, "reason": "short reason"}'
+        )
+        result = self._llm.chat(
+            request_name="turn_target_relation_verify",
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            image_png_bytes=image_bytes,
+            max_tokens=96,
+            temperature=0.0,
+        )
+        if result.failed or not result.content:
+            return False, 0.0, result.reason or "relation_llm_failed"
+        try:
+            payload = _parse_json_object(result.content)
+            consistent = _parse_bool(payload.get("relation_consistent"))
+            confidence = float(
+                np.clip(
+                    _parse_float(payload.get("confidence"), default=0.0),
+                    0.0,
+                    1.0,
+                )
+            )
+            reason = str(payload.get("reason", "")).strip() or "no_reason"
+        except Exception as exc:
+            return False, 0.0, f"relation_invalid_json:{exc}"
+        return bool(consistent), confidence, reason
+
 
 def _empty_observation(target_label: str, timestamp_sec: float, reason: str) -> TargetObservation:
     return TargetObservation(
@@ -911,6 +1054,9 @@ def _empty_observation(target_label: str, timestamp_sec: float, reason: str) -> 
         vlm_verification_confidence=0.0,
         vlm_verification_reason="",
         requires_viewpoint_confirmation=False,
+        turn_direction_consistent=None,
+        turn_relation_verified=False,
+        turn_relation_reason="",
     )
 
 
@@ -954,6 +1100,9 @@ def _copy_observation_with_timestamp(
         vlm_verification_confidence=float(observation.vlm_verification_confidence),
         vlm_verification_reason=str(observation.vlm_verification_reason),
         requires_viewpoint_confirmation=bool(observation.requires_viewpoint_confirmation),
+        turn_direction_consistent=observation.turn_direction_consistent,
+        turn_relation_verified=bool(observation.turn_relation_verified),
+        turn_relation_reason=str(observation.turn_relation_reason),
     )
 
 
@@ -1129,6 +1278,88 @@ def _build_verification_image_bytes(
     return buffer.getvalue()
 
 
+def _build_relation_image_bytes(
+    *,
+    rgb: np.ndarray,
+    bbox: tuple[int, int, int, int],
+    max_edge_px: int,
+) -> bytes:
+    image = Image.fromarray(np.asarray(rgb, dtype=np.uint8)[:, :, :3].copy()).convert("RGB")
+    width, height = image.size
+    xmin, ymin, xmax, ymax = [int(value) for value in bbox]
+    xmin = max(0, min(width - 1, xmin))
+    ymin = max(0, min(height - 1, ymin))
+    xmax = max(xmin + 1, min(width, xmax))
+    ymax = max(ymin + 1, min(height, ymax))
+    draw = ImageDraw.Draw(image)
+    line_width = max(2, int(round(min(width, height) / 180.0)))
+    draw.rectangle((xmin, ymin, xmax - 1, ymax - 1), outline=(255, 190, 0), width=line_width)
+    max_edge_px = max(1, int(max_edge_px))
+    max_edge = max(image.size)
+    if max_edge > max_edge_px:
+        scale = float(max_edge_px) / float(max_edge)
+        resampling = Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
+        image = image.resize(
+            (
+                max(1, int(round(image.width * scale))),
+                max(1, int(round(image.height * scale))),
+            ),
+            resampling,
+        )
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG", optimize=True)
+    return buffer.getvalue()
+
+
+def _normalize_turn_direction(value: str) -> str:
+    direction = str(value).strip().lower()
+    return direction if direction in {"left", "right"} else ""
+
+
+def _wrap_angle_rad(value: float) -> float:
+    return float((float(value) + np.pi) % (2.0 * np.pi) - np.pi)
+
+
+def _turn_direction_consistency(
+    *,
+    request: _GroundingRequest,
+    camera_bearing_rad: float,
+) -> bool | None:
+    direction = _normalize_turn_direction(request.expected_turn_direction)
+    if direction == "" or request.turn_start_yaw_rad is None:
+        return None
+    # TargetObservation bearing is image/right-positive. Convert it to the
+    # mathematical world yaw convention where counter-clockwise/left is positive.
+    target_world_yaw = _wrap_angle_rad(
+        float(request.robot_pose.yaw_rad) - float(camera_bearing_rad)
+    )
+    directed_delta = _wrap_angle_rad(
+        target_world_yaw - float(request.turn_start_yaw_rad)
+    )
+    if direction == "right":
+        directed_delta *= -1.0
+    tolerance_rad = float(np.deg2rad(max(0.0, request.turn_direction_tolerance_deg)))
+    return bool(directed_delta >= -tolerance_rad)
+
+
+def _turn_directed_target_delta_deg(
+    *,
+    request: _GroundingRequest,
+    camera_bearing_rad: float,
+) -> float:
+    if request.turn_start_yaw_rad is None:
+        return 0.0
+    target_world_yaw = _wrap_angle_rad(
+        float(request.robot_pose.yaw_rad) - float(camera_bearing_rad)
+    )
+    directed_delta = _wrap_angle_rad(
+        target_world_yaw - float(request.turn_start_yaw_rad)
+    )
+    if _normalize_turn_direction(request.expected_turn_direction) == "right":
+        directed_delta *= -1.0
+    return float(np.degrees(directed_delta))
+
+
 def _select_grounding_detection(
     *,
     detections: list[GroundingDinoDetection],
@@ -1215,13 +1446,57 @@ def _select_grounding_detection(
             1.0,
         ))
         depth_score = 0.0 if depth_m is None else 1.0 / (1.0 + max(0.0, float(depth_m)))
-        score = 0.55 * confidence_score + 0.45 * depth_score
+        direction_score = _detection_turn_direction_score(
+            detection=detection,
+            request=request,
+            horizontal_fov_deg=float(getattr(config, "horizontal_fov_deg", 90.0)),
+        )
+        score = (
+            0.50 * confidence_score
+            + 0.25 * depth_score
+            + 0.25 * direction_score
+        )
         ranked.append((score, int(index), detection, depth_m))
     _, best_index, best_detection, best_depth = max(ranked, key=lambda item: item[0])
     reason = "confidence_and_nearest_valid_depth"
     if best_depth is None:
         reason = "highest_confidence_without_valid_depth"
     return best_detection, best_index, reason
+
+
+def _detection_turn_direction_score(
+    *,
+    detection: GroundingDinoDetection,
+    request: _GroundingRequest,
+    horizontal_fov_deg: float,
+) -> float:
+    direction = _normalize_turn_direction(
+        getattr(request, "expected_turn_direction", "")
+    )
+    turn_start_yaw_rad = getattr(request, "turn_start_yaw_rad", None)
+    if direction == "" or turn_start_yaw_rad is None:
+        return 0.5
+    image_width = max(2, int(request.rgb_shape[1]))
+    center_u = float(_bbox_center(detection.bbox)[0])
+    cx = (float(image_width) - 1.0) * 0.5
+    half_fov_rad = float(np.deg2rad(horizontal_fov_deg) * 0.5)
+    camera_bearing_rad = float(
+        np.arctan(
+            ((center_u - cx) / max(cx, 1.0))
+            * np.tan(half_fov_rad)
+        )
+    )
+    directed_deg = _turn_directed_target_delta_deg(
+        request=request,
+        camera_bearing_rad=camera_bearing_rad,
+    )
+    tolerance = max(
+        1.0,
+        float(getattr(request, "turn_direction_tolerance_deg", 10.0)),
+    )
+    if directed_deg >= -tolerance:
+        return 1.0
+    return float(np.clip(1.0 + directed_deg / 90.0, 0.0, 0.5))
 
 
 def _rough_bbox_depth_m(

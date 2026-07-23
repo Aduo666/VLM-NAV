@@ -120,7 +120,9 @@ def _estimate_with_camera_calibration(
     sin_world = float(np.sin(robot_world_yaw))
     robot_forward_m = float(cos_world * delta_world_xy[0] + sin_world * delta_world_xy[1])
     robot_left_m = float(-sin_world * delta_world_xy[0] + cos_world * delta_world_xy[1])
-    bearing_rad = float(np.arctan2(robot_left_m, max(1.0e-9, robot_forward_m)))
+    # TargetObservation uses image/right-positive bearing throughout the policy.
+    # Robot-frame lateral position remains +Y/left, so the signs are opposite.
+    bearing_rad = float(np.arctan2(-robot_left_m, max(1.0e-9, robot_forward_m)))
 
     cos_odom = float(np.cos(robot_pose.yaw_rad))
     sin_odom = float(np.sin(robot_pose.yaw_rad))

@@ -29,8 +29,17 @@ opennav:
   semantic_turn_max_primitives: 7
   semantic_turn_min_forward_clearance_m: 0.60
   semantic_turn_alignment_confirmations: 2
-  semantic_turn_corridor_center_tolerance_deg: 12.0
-  semantic_turn_same_corridor_tolerance_deg: 20.0
+  semantic_turn_corridor_center_tolerance_deg: 10.0
+  semantic_turn_same_corridor_tolerance_deg: 15.0
+  semantic_turn_target_high_confidence: 0.75
+  semantic_turn_target_medium_confidence: 0.50
+  semantic_turn_direction_tolerance_deg: 10.0
+  semantic_turn_corridor_half_fov_deg: 60.0
+  semantic_turn_corridor_step_deg: 5.0
+  semantic_turn_lidar_bin_half_width_deg: 3.0
+  semantic_turn_min_corridor_width_deg: 15.0
+  semantic_turn_corridor_max_clearance_m: 4.0
+  semantic_turn_max_recovery_attempts: 2
   local_detour_max_turn_primitives: 2
   visual_target_center_deadband_deg: 15.0
   candidate_slot_bearings_deg: [35.0, 18.0, 0.0, -18.0, -35.0]
@@ -139,7 +148,7 @@ camera:
   height: 480
   follow_front_camera_in_gui: false
   follow_observer_camera_in_gui: true
-  observer_video_enabled: false
+  observer_video_enabled: true
   observer_video_path: "debug/local/observevideos/observer.mp4"
   observer_video_fps: 10.0
   camera_horizontal_fov_deg: 90.0
@@ -211,7 +220,7 @@ occupancy_grid:
   occupied_min_neighbors: 3
   unknown_is_traversable: false
   unknown_cell_cost: 0.80
-  debug_enabled: false
+  debug_enabled: true
   debug_image_path: "debug/local/local_map.png"
   debug_update_period_sec: 0.5
   debug_width: 900

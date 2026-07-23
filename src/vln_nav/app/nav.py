@@ -820,6 +820,33 @@ def run_navigation(
             semantic_turn_same_corridor_tolerance_deg=float(
                 config.semantic_turn_same_corridor_tolerance_deg
             ),
+            semantic_turn_target_high_confidence=float(
+                config.semantic_turn_target_high_confidence
+            ),
+            semantic_turn_target_medium_confidence=float(
+                config.semantic_turn_target_medium_confidence
+            ),
+            semantic_turn_direction_tolerance_deg=float(
+                config.semantic_turn_direction_tolerance_deg
+            ),
+            semantic_turn_corridor_half_fov_deg=float(
+                config.semantic_turn_corridor_half_fov_deg
+            ),
+            semantic_turn_corridor_step_deg=float(
+                config.semantic_turn_corridor_step_deg
+            ),
+            semantic_turn_lidar_bin_half_width_deg=float(
+                config.semantic_turn_lidar_bin_half_width_deg
+            ),
+            semantic_turn_min_corridor_width_deg=float(
+                config.semantic_turn_min_corridor_width_deg
+            ),
+            semantic_turn_corridor_max_clearance_m=float(
+                config.semantic_turn_corridor_max_clearance_m
+            ),
+            semantic_turn_max_recovery_attempts=int(
+                config.semantic_turn_max_recovery_attempts
+            ),
             local_detour_max_turn_primitives=int(config.local_detour_max_turn_primitives),
             confirm_min_observations=int(config.landmark_tracker_confirm_min_observations),
             confirm_confidence_threshold=float(config.landmark_tracker_confirm_confidence_threshold),
@@ -1523,6 +1550,33 @@ def run_navigation(
         # --- Fast path during active primitive execution ---
         is_motion_active = _is_executing_motion_step(active_step_result)
         if is_motion_active:
+            motion_target = policy.active_perception_target
+            if motion_target and target_tracker.lifecycle in {"TRACKING", "LOST_TEMP"}:
+                target_tracker.set_target_label(motion_target)
+                try:
+                    motion_camera_view_matrix_ros = np.asarray(
+                        camera.get_view_matrix_ros(), dtype=np.float64
+                    ).reshape(4, 4)
+                except Exception:
+                    motion_camera_view_matrix_ros = None
+                target_tracker.update(
+                    rgb=front_rgb,
+                    depth=last_depth_image,
+                    robot_pose=observation.pose,
+                    timestamp_sec=sim_time_sec,
+                    frame_index=frame_index,
+                    camera_intrinsics=front_camera_intrinsics,
+                    camera_view_matrix_ros=motion_camera_view_matrix_ros,
+                    robot_world_position_xyz=position,
+                    robot_world_orientation_wxyz=orientation,
+                )
+                if frame_index % 30 == 0:
+                    logger.info(
+                        "[PerceptionScheduler] target=%s grounding=paused "
+                        "tracker=%s phase=active_primitive",
+                        motion_target,
+                        target_tracker.lifecycle,
+                    )
             proposed_step_result = policy.step(observation, execution_feedback=last_policy_feedback)
             active_step_result = proposed_step_result
             step_result = active_step_result
@@ -1585,7 +1639,25 @@ def run_navigation(
                 observer_video_recorder.close()
             continue
 
-        current_landmark = policy.current_perception_target
+        if policy.current_step_type == "TURN":
+            policy.update_turn_heading_context(
+                robot_pose=mapping_pose,
+                beam_endpoints_local_xy=(
+                    None
+                    if lidar_scan is None
+                    else np.asarray(
+                        lidar_scan.beam_endpoints_local_xy,
+                        dtype=np.float32,
+                    )
+                ),
+                occupancy_snapshot=(
+                    occupancy_grid.snapshot()
+                    if bool(config.occupancy_grid_enabled)
+                    else None
+                ),
+            )
+
+        current_landmark = policy.active_perception_target
         target_observation: TargetObservation | None = None
         landmark_map_entry = None
         grounding_waiting_for_keyframe = False
@@ -1631,6 +1703,22 @@ def run_navigation(
                 camera_view_matrix_ros=front_camera_view_matrix_ros,
                 robot_world_position_xyz=position,
                 robot_world_orientation_wxyz=orientation,
+                force_semantic_verification=(
+                    policy.current_grounding_behavior_type == "turn_lookahead"
+                ),
+                expected_turn_direction=(
+                    policy.current_turn_direction
+                    if policy.current_grounding_behavior_type == "turn_lookahead"
+                    else ""
+                ),
+                turn_start_yaw_rad=(
+                    policy.current_turn_start_yaw_rad
+                    if policy.current_grounding_behavior_type == "turn_lookahead"
+                    else None
+                ),
+                turn_direction_tolerance_deg=float(
+                    policy.current_turn_direction_tolerance_deg
+                ),
             )
             if skip_grounding_once:
                 skip_grounding_once = False
@@ -1798,6 +1886,11 @@ def run_navigation(
         active_step_result = proposed_step_result
         active_command_token = proposed_command_token
         step_result = active_step_result
+        if str(step_result.decision_source) == "TURN_RECOVERY_REQUEST":
+            stuck_detector.trigger_recovery(
+                now_sec=sim_time_sec,
+                reason=str(step_result.last_error or step_result.reasoning_summary),
+            )
         if str(step_result.decision_source) in {
             "APPROACH_SAFETY_HOLD",
             "VISUAL_TARGET_SAFETY_HOLD",

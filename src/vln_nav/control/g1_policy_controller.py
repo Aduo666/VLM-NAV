@@ -38,12 +38,24 @@ class G1PolicyController:
         self._robot = robot
         self._profile = controller_profile
         self._primitives = primitive_profile
+        self._available_joint_names = list(available_joint_names)
         self._decimation = max(1, int(policy_decimation))
         self._logger = logger.getChild("g1_policy")
         self._device = torch.device(controller_profile.inference_device)
         self._deploy = _load_deploy_config(controller_profile.deploy_config_path)
         self._policy = torch.jit.load(str(controller_profile.policy_path), map_location=self._device)
         self._policy.eval()
+        self._command_min, self._command_max = _velocity_command_ranges(self._deploy)
+        self._angular_command_limit = max(
+            float(self._primitives.turn_command),
+            abs(float(self._command_min[2])),
+            abs(float(self._command_max[2])),
+        )
+        self._validate_primitive_commands()
+        self._backward_command_mps = min(
+            0.5 * float(self._primitives.forward_command),
+            abs(float(self._command_min[0])),
+        )
 
         sdk_names = list(controller_profile.sdk_joint_names)
         joint_ids_map = _numeric_vector(self._deploy, "joint_ids_map", length=29, dtype=np.int64)
@@ -103,23 +115,81 @@ class G1PolicyController:
     def standup_duration_sec(self) -> float:
         return float(self._profile.standup_duration_sec)
 
+    @property
+    def command_limits(self) -> dict[str, tuple[float, float]]:
+        return {
+            "linear_x_mps": (float(self._command_min[0]), float(self._command_max[0])),
+            "linear_y_mps": (float(self._command_min[1]), float(self._command_max[1])),
+            "angular_z_radps": (
+                -float(self._angular_command_limit),
+                float(self._angular_command_limit),
+            ),
+        }
+
     def apply(self, action_name: str, *, speed_scale: float = 1.0) -> tuple[float, float]:
         action = str(action_name).strip().upper()
         speed = float(np.clip(speed_scale, 0.0, 1.0))
         if action == "FORWARD":
-            self._command[:] = [float(self._primitives.forward_command) * speed, 0.0, 0.0]
+            self.set_velocity_command(
+                linear_x_mps=float(self._primitives.forward_command) * speed,
+                angular_z_radps=0.0,
+            )
+        elif action == "BACKWARD":
+            self.set_velocity_command(
+                linear_x_mps=-float(self._backward_command_mps) * speed,
+                angular_z_radps=0.0,
+            )
         elif action == "TURN_LEFT":
-            self._command[:] = [0.0, 0.0, float(self._primitives.turn_command) * speed]
+            self.set_velocity_command(
+                linear_x_mps=0.0,
+                angular_z_radps=float(self._primitives.turn_command) * speed,
+            )
         elif action == "TURN_RIGHT":
-            self._command[:] = [0.0, 0.0, -float(self._primitives.turn_command) * speed]
+            self.set_velocity_command(
+                linear_x_mps=0.0,
+                angular_z_radps=-float(self._primitives.turn_command) * speed,
+            )
         elif action == "STOP":
             self._command.fill(0.0)
         else:
             raise RuntimeError(
-                f"G1 does not support action {action!r}; expected FORWARD, TURN_LEFT, TURN_RIGHT, or STOP"
+                f"G1 does not support action {action!r}; expected FORWARD, BACKWARD, "
+                "TURN_LEFT, TURN_RIGHT, or STOP"
             )
 
         return float(self._command[0]), float(self._command[2])
+
+    def set_velocity_command(
+        self,
+        *,
+        linear_x_mps: float,
+        angular_z_radps: float,
+    ) -> tuple[float, float]:
+        self._command[:] = np.asarray(
+            [
+                np.clip(float(linear_x_mps), self._command_min[0], self._command_max[0]),
+                0.0,
+                np.clip(
+                    float(angular_z_radps),
+                    -self._angular_command_limit,
+                    self._angular_command_limit,
+                ),
+            ],
+            dtype=np.float32,
+        )
+        return float(self._command[0]), float(self._command[2])
+
+    def reset(self) -> None:
+        self._command.fill(0.0)
+        self._last_action.fill(0.0)
+        self._physics_step_count = 0
+        self._policy_eval_count = 0
+        self._history_initialized = False
+        for history in self._history.values():
+            history.clear()
+        self._configure_pd_gains(self._available_joint_names)
+        self._initialize_joint_state()
+        self._apply_joint_targets(self._default_joint_pos)
 
     def advance_physics(self) -> None:
         """Evaluate/apply the locomotion policy once per actual physics step."""
@@ -253,6 +323,28 @@ class G1PolicyController:
         kds[self._joint_indices] = self._damping
         articulation_controller.set_gains(kps=kps, kds=kds, save_to_usd=False)
 
+    def _validate_primitive_commands(self) -> None:
+        forward = float(self._primitives.forward_command)
+        turn = float(self._primitives.turn_command)
+        if not 0.0 <= forward <= float(self._command_max[0]):
+            raise ValueError(
+                "G1 forward_command is outside the policy training range: "
+                f"value={forward:.3f} range=[0.000,{float(self._command_max[0]):.3f}]"
+            )
+        turn_limit = min(
+            abs(float(self._command_min[2])),
+            abs(float(self._command_max[2])),
+        )
+        if turn < 0.0:
+            raise ValueError(f"G1 turn_command must be non-negative: value={turn:.3f}")
+        if turn > turn_limit:
+            self._logger.warning(
+                "[G1Policy] configured turn_command=%.3f rad/s exceeds the exported "
+                "training range limit=%.3f rad/s; preserving the configured VLN command",
+                turn,
+                turn_limit,
+            )
+
     def _initialize_joint_state(self) -> None:
         self._robot.set_joint_positions(
             np.asarray(self._default_joint_pos, dtype=np.float32),
@@ -287,6 +379,22 @@ def _mapping(payload: dict[str, Any], key: str, context: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"{context}.{key} must be a YAML mapping")
     return value
+
+
+def _velocity_command_ranges(payload: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+    commands = _mapping(payload, "commands", "deploy")
+    base_velocity = _mapping(commands, "base_velocity", "deploy.commands")
+    ranges = _mapping(base_velocity, "ranges", "deploy.commands.base_velocity")
+    values = []
+    for key in ("lin_vel_x", "lin_vel_y", "ang_vel_z"):
+        bounds = np.asarray(ranges.get(key), dtype=np.float32).reshape(-1)
+        if bounds.size != 2 or not np.isfinite(bounds).all() or bounds[0] > bounds[1]:
+            raise ValueError(
+                f"G1 deploy commands.base_velocity.ranges.{key} must be [minimum, maximum]"
+            )
+        values.append(bounds)
+    stacked = np.stack(values, axis=0)
+    return stacked[:, 0].copy(), stacked[:, 1].copy()
 
 
 def _numeric_vector(

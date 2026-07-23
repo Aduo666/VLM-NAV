@@ -8,6 +8,10 @@ import numpy as np
 from .observation_adapter import Pose2D
 
 
+_DYNAMIC_MAP_MIN_HEIGHT_M = -0.62
+_DYNAMIC_MAP_MAX_HEIGHT_M = 1.20
+
+
 @dataclass
 class PhysXLidarConfig:
     enabled: bool
@@ -228,12 +232,23 @@ class PhysXLidarReader:
             max_range_m=float(self._config.max_range_m),
             yaw_offset_deg=float(self._config.yaw_offset_deg),
         )
+        height_rejected_count = 0
         if self._dynamic_robot_frame_path:
-            beam_endpoints = _transform_sensor_points_to_robot_3d(
+            robot_points_xyz = _transform_sensor_points_to_robot_3d(
                 sensor_points=sensor_beam_endpoints,
                 sensor_origin_robot_xyz=self._sensor_origin_robot_xyz,
                 sensor_x_axis_robot_xyz=self._sensor_x_axis_robot_xyz,
                 sensor_y_axis_robot_xyz=self._sensor_y_axis_robot_xyz,
+            )
+            (
+                beam_endpoints,
+                beam_hit_mask,
+                height_rejected_count,
+            ) = _filter_level_frame_beams_by_height(
+                points_robot_xyz=robot_points_xyz,
+                beam_hit_mask=sensor_beam_hit_mask,
+                min_height_m=_DYNAMIC_MAP_MIN_HEIGHT_M,
+                max_height_m=_DYNAMIC_MAP_MAX_HEIGHT_M,
             )
         else:
             beam_endpoints = _transform_sensor_points_to_robot(
@@ -242,7 +257,7 @@ class PhysXLidarReader:
                 sensor_x_axis_robot_xy=self._sensor_x_axis_robot_xy,
                 sensor_y_axis_robot_xy=self._sensor_y_axis_robot_xy,
             )
-        beam_hit_mask = np.asarray(sensor_beam_hit_mask, dtype=bool)
+            beam_hit_mask = np.asarray(sensor_beam_hit_mask, dtype=bool)
         if beam_endpoints.shape[0] != beam_hit_mask.shape[0]:
             beam_hit_mask = np.zeros((beam_endpoints.shape[0],), dtype=bool)
         points = beam_endpoints[beam_hit_mask] if beam_endpoints.size else np.zeros((0, 2), dtype=np.float32)
@@ -293,9 +308,11 @@ class PhysXLidarReader:
             self._diagnostic_logged = True
         if float(timestamp_sec) - self._last_coverage_log_time_sec >= 2.0:
             self._logger.info(
-                "[LidarCoverage] raw_beams=%s valid_beams=%s sector_deg=[%.1f,%.1f] effective_fov_deg=%.1f merged_beams=%s merged_hits=%s",
+                "[LidarCoverage] raw_beams=%s valid_beams=%s height_rejected=%s "
+                "sector_deg=[%.1f,%.1f] effective_fov_deg=%.1f merged_beams=%s merged_hits=%s",
                 int(projection_debug["raw_beam_count"]),
                 int(projection_debug["valid_beam_count"]),
+                int(height_rejected_count),
                 current_angle_min_deg,
                 current_angle_max_deg,
                 float(coverage_debug["effective_fov_deg"]),
@@ -481,7 +498,7 @@ class PhysXLidarReader:
                 yaw_offset,
                 float(self._config.sector_merge_keep_sec),
                 effective_merge_keep_sec,
-                "dynamic_pelvis" if self._dynamic_robot_frame_path else "static_robot_root",
+                "dynamic_level_pelvis" if self._dynamic_robot_frame_path else "static_robot_root",
             )
         except Exception as exc:
             self._logger.warning("[LidarConfig] read_failed path=%s error=%s", self._sensor_path, exc)
@@ -577,19 +594,58 @@ class PhysXLidarReader:
             time_code = Usd.TimeCode.Default()
             robot_world = UsdGeom.Xformable(robot_prim).ComputeLocalToWorldTransform(time_code)
             sensor_world = UsdGeom.Xformable(sensor_prim).ComputeLocalToWorldTransform(time_code)
-            robot_inv = robot_world.GetInverse()
-            origin_robot = robot_inv.Transform(sensor_world.Transform(Gf.Vec3d(0.0, 0.0, 0.0)))
-            x_robot = (
-                robot_inv.Transform(sensor_world.Transform(Gf.Vec3d(1.0, 0.0, 0.0)))
-                - origin_robot
+            robot_origin_world = robot_world.Transform(Gf.Vec3d(0.0, 0.0, 0.0))
+            robot_x_world = (
+                robot_world.Transform(Gf.Vec3d(1.0, 0.0, 0.0)) - robot_origin_world
             )
-            y_robot = (
-                robot_inv.Transform(sensor_world.Transform(Gf.Vec3d(0.0, 1.0, 0.0)))
-                - origin_robot
+            heading_xy = np.asarray(
+                [float(robot_x_world[0]), float(robot_x_world[1])],
+                dtype=np.float64,
             )
-            origin_xyz = np.asarray([float(origin_robot[i]) for i in range(3)], dtype=np.float32)
-            x_axis_xyz = np.asarray([float(x_robot[i]) for i in range(3)], dtype=np.float32)
-            y_axis_xyz = np.asarray([float(y_robot[i]) for i in range(3)], dtype=np.float32)
+            heading_norm = float(np.linalg.norm(heading_xy))
+            if heading_norm <= 1.0e-6:
+                raise RuntimeError("pelvis forward axis has a degenerate horizontal projection")
+            heading_xy /= heading_norm
+            left_xy = np.asarray([-heading_xy[1], heading_xy[0]], dtype=np.float64)
+
+            sensor_origin_world = sensor_world.Transform(Gf.Vec3d(0.0, 0.0, 0.0))
+            sensor_x_world = (
+                sensor_world.Transform(Gf.Vec3d(1.0, 0.0, 0.0)) - sensor_origin_world
+            )
+            sensor_y_world = (
+                sensor_world.Transform(Gf.Vec3d(0.0, 1.0, 0.0)) - sensor_origin_world
+            )
+            origin_delta_world = np.asarray(
+                [
+                    float(sensor_origin_world[0] - robot_origin_world[0]),
+                    float(sensor_origin_world[1] - robot_origin_world[1]),
+                    float(sensor_origin_world[2] - robot_origin_world[2]),
+                ],
+                dtype=np.float64,
+            )
+            sensor_x_world_np = np.asarray(
+                [float(sensor_x_world[i]) for i in range(3)],
+                dtype=np.float64,
+            )
+            sensor_y_world_np = np.asarray(
+                [float(sensor_y_world[i]) for i in range(3)],
+                dtype=np.float64,
+            )
+            origin_xyz = _world_vector_to_level_robot_frame(
+                vector_world=origin_delta_world,
+                heading_world_xy=heading_xy,
+                left_world_xy=left_xy,
+            )
+            x_axis_xyz = _world_vector_to_level_robot_frame(
+                vector_world=sensor_x_world_np,
+                heading_world_xy=heading_xy,
+                left_world_xy=left_xy,
+            )
+            y_axis_xyz = _world_vector_to_level_robot_frame(
+                vector_world=sensor_y_world_np,
+                heading_world_xy=heading_xy,
+                left_world_xy=left_xy,
+            )
             if not (
                 np.isfinite(origin_xyz).all()
                 and np.isfinite(x_axis_xyz).all()
@@ -1106,17 +1162,73 @@ def _transform_sensor_points_to_robot_3d(
     sensor_x_axis_robot_xyz: np.ndarray,
     sensor_y_axis_robot_xyz: np.ndarray,
 ) -> np.ndarray:
-    """Transform the LiDAR scan plane into the robot frame, then project to XY."""
+    """Transform the LiDAR scan plane into the yaw-level robot frame."""
     points = np.asarray(sensor_points, dtype=np.float32)
     if points.size == 0:
-        return np.zeros((0, 2), dtype=np.float32)
+        return np.zeros((0, 3), dtype=np.float32)
     transformed_xyz = (
         np.asarray(sensor_origin_robot_xyz, dtype=np.float32)[None, :]
         + points[:, 0:1] * np.asarray(sensor_x_axis_robot_xyz, dtype=np.float32)[None, :]
         + points[:, 1:2] * np.asarray(sensor_y_axis_robot_xyz, dtype=np.float32)[None, :]
     )
-    finite = np.isfinite(transformed_xyz).all(axis=1)
-    return transformed_xyz[finite, :2].astype(np.float32)
+    return transformed_xyz.astype(np.float32)
+
+
+def _filter_level_frame_beams_by_height(
+    *,
+    points_robot_xyz: np.ndarray,
+    beam_hit_mask: np.ndarray,
+    min_height_m: float,
+    max_height_m: float,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """Keep only beams whose endpoints can represent 2D navigation obstacles.
+
+    A pelvis-mounted LiDAR tilts with G1. Downward rays then hit the floor and
+    upward rays can hit the ceiling; projecting either endpoint directly to XY
+    creates permanent radial obstacles. Beams outside the configured height
+    band are discarded rather than converted to free rays.
+    """
+    points = np.asarray(points_robot_xyz, dtype=np.float32)
+    hits = np.asarray(beam_hit_mask, dtype=bool).reshape(-1)
+    if points.ndim != 2 or points.shape[1] < 3 or points.shape[0] == 0:
+        return (
+            np.zeros((0, 2), dtype=np.float32),
+            np.zeros((0,), dtype=bool),
+            int(max(points.shape[0] if points.ndim >= 1 else 0, hits.size)),
+        )
+    if hits.shape[0] != points.shape[0]:
+        hits = np.zeros((points.shape[0],), dtype=bool)
+    finite = np.isfinite(points[:, :3]).all(axis=1)
+    height_valid = (
+        finite
+        & (points[:, 2] >= float(min_height_m))
+        & (points[:, 2] <= float(max_height_m))
+    )
+    rejected_count = int(points.shape[0] - np.count_nonzero(height_valid))
+    return (
+        points[height_valid, :2].astype(np.float32),
+        hits[height_valid],
+        rejected_count,
+    )
+
+
+def _world_vector_to_level_robot_frame(
+    *,
+    vector_world: np.ndarray,
+    heading_world_xy: np.ndarray,
+    left_world_xy: np.ndarray,
+) -> np.ndarray:
+    vector = np.asarray(vector_world, dtype=np.float64).reshape(3)
+    heading = np.asarray(heading_world_xy, dtype=np.float64).reshape(2)
+    left = np.asarray(left_world_xy, dtype=np.float64).reshape(2)
+    return np.asarray(
+        [
+            float(np.dot(vector[:2], heading)),
+            float(np.dot(vector[:2], left)),
+            float(vector[2]),
+        ],
+        dtype=np.float32,
+    )
 
 
 def _sector_history_keep_sec(

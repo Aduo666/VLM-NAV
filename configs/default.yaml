@@ -132,13 +132,16 @@ landmark_tracker:
   low_confidence_min_yaw_deg: 10.0
 
 robot:
-  #profile: "unitree_g1_29dof"
-  profile: "agx"
+  profile: "unitree_g1_29dof"
+  #profile: "agx"
 camera:
   width: 640
   height: 480
   follow_front_camera_in_gui: false
   follow_observer_camera_in_gui: true
+  observer_video_enabled: false
+  observer_video_path: "debug/local/observevideos/observer.mp4"
+  observer_video_fps: 10.0
   camera_horizontal_fov_deg: 90.0
   interactive_confirmation_enabled: false
   roi_vertical_range: [0.45, 0.85]

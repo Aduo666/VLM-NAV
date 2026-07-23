@@ -16,6 +16,11 @@ from .observation_adapter import Pose2D, VLNObservation
 from ..runtime.config import PROJECT_ROOT
 
 
+_STATIC_CONFIRM_REQUIRED_FRAMES = 3
+_STATIC_CONFIRM_MAX_GAP_UPDATES = 3
+_STATIC_CLEAR_REQUIRED_FRAMES = 8
+
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -133,6 +138,23 @@ class GlobalOccupancyMap:
         self._origin_y: float = -half
 
         self._log_odds = np.zeros((self._cell_count, self._cell_count), dtype=np.float32)
+        self._hit_evidence = np.zeros((self._cell_count, self._cell_count), dtype=np.uint16)
+        self._last_hit_update_index = np.full(
+            (self._cell_count, self._cell_count),
+            -1,
+            dtype=np.int32,
+        )
+        self._free_evidence = np.zeros((self._cell_count, self._cell_count), dtype=np.uint16)
+        self._last_free_update_index = np.full(
+            (self._cell_count, self._cell_count),
+            -1,
+            dtype=np.int32,
+        )
+        self._confirmed_static_occupied = np.zeros(
+            (self._cell_count, self._cell_count),
+            dtype=bool,
+        )
+        self._static_update_index = 0
         self._last_update_time_sec = -float("inf")
         self._last_debug_save_time_sec = -float("inf")
         self._last_filter_signature: tuple[int, int, tuple[str, ...]] | None = None
@@ -200,13 +222,38 @@ class GlobalOccupancyMap:
         old_count = self._cell_count
         new_count = old_count * 2
         new_grid = np.zeros((new_count, new_count), dtype=np.float32)
+        new_hit_evidence = np.zeros((new_count, new_count), dtype=np.uint16)
+        new_last_hit_update = np.full((new_count, new_count), -1, dtype=np.int32)
+        new_free_evidence = np.zeros((new_count, new_count), dtype=np.uint16)
+        new_last_free_update = np.full((new_count, new_count), -1, dtype=np.int32)
+        new_confirmed_static = np.zeros((new_count, new_count), dtype=bool)
         # Place old data in the centre of the new grid.
         offset = old_count // 2
         new_grid[offset : offset + old_count, offset : offset + old_count] = self._log_odds
+        new_hit_evidence[offset : offset + old_count, offset : offset + old_count] = (
+            self._hit_evidence
+        )
+        new_last_hit_update[offset : offset + old_count, offset : offset + old_count] = (
+            self._last_hit_update_index
+        )
+        new_free_evidence[offset : offset + old_count, offset : offset + old_count] = (
+            self._free_evidence
+        )
+        new_last_free_update[offset : offset + old_count, offset : offset + old_count] = (
+            self._last_free_update_index
+        )
+        new_confirmed_static[offset : offset + old_count, offset : offset + old_count] = (
+            self._confirmed_static_occupied
+        )
         self._origin_x -= float(offset) * self._resolution_m
         self._origin_y -= float(offset) * self._resolution_m
         self._cell_count = new_count
         self._log_odds = new_grid
+        self._hit_evidence = new_hit_evidence
+        self._last_hit_update_index = new_last_hit_update
+        self._free_evidence = new_free_evidence
+        self._last_free_update_index = new_last_free_update
+        self._confirmed_static_occupied = new_confirmed_static
         self._logger.info(
             "[OccupancyGrid] expanded %d->%d cells  origin=(%.1f, %.1f)",
             old_count,
@@ -295,6 +342,7 @@ class GlobalOccupancyMap:
         beam_hit_mask: np.ndarray | None = None,
         sensor_origin_local_xy: np.ndarray | tuple[float, float] | list[float] | None = None,
         timestamp_sec: float,
+        static_obstacle_confirmation: bool = False,
     ) -> None:
         if not bool(self._config.enabled):
             return
@@ -374,6 +422,7 @@ class GlobalOccupancyMap:
             end_xy_arr=end_xy_arr,
             endpoint_distances=endpoint_distances,
             endpoint_hit_mask=endpoint_hit_mask,
+            static_obstacle_confirmation=bool(static_obstacle_confirmation),
         )
 
         self._last_update_time_sec = float(timestamp_sec)
@@ -394,6 +443,7 @@ class GlobalOccupancyMap:
         end_xy_arr: np.ndarray,
         endpoint_distances: np.ndarray,
         endpoint_hit_mask: np.ndarray,
+        static_obstacle_confirmation: bool = False,
     ) -> tuple[int, int]:
         """Bresenham-style batch ray marking via numpy.
 
@@ -407,6 +457,8 @@ class GlobalOccupancyMap:
         n = end_xy_arr.shape[0]
         if n == 0:
             return 0, 0
+        if bool(static_obstacle_confirmation):
+            self._static_update_index += 1
         sx, sy = float(start_xy[0]), float(start_xy[1])
         dx = end_xy_arr[:, 0] - sx
         dy = end_xy_arr[:, 1] - sy
@@ -445,33 +497,90 @@ class GlobalOccupancyMap:
         in_grid = (rows >= 0) & (rows < self._cell_count) & (cols >= 0) & (cols < self._cell_count)
         valid_mask = in_grid & in_range
 
+        hits_v = endpoint_hit_mask[vb]
+        hit_mask = hits_v & (dist_v > 0.0)
+        hit_rows = np.zeros((0,), dtype=np.intp)
+        hit_cols = np.zeros((0,), dtype=np.intp)
+        hit_flat = np.zeros((0,), dtype=np.intp)
+        if np.any(hit_mask):
+            hx = end_xy_arr[vb[hit_mask], 0]
+            hy = end_xy_arr[vb[hit_mask], 1]
+            h_rows, h_cols = self._world_to_cell_xy(hx, hy)
+            h_valid = (
+                (h_rows >= 0)
+                & (h_rows < self._cell_count)
+                & (h_cols >= 0)
+                & (h_cols < self._cell_count)
+            )
+            if np.any(h_valid):
+                raw_hit_rows = h_rows[h_valid].ravel()
+                raw_hit_cols = h_cols[h_valid].ravel()
+                if bool(static_obstacle_confirmation):
+                    hit_flat = np.unique(
+                        np.ravel_multi_index(
+                            (raw_hit_rows, raw_hit_cols),
+                            self._log_odds.shape,
+                        )
+                    )
+                    hit_rows, hit_cols = np.unravel_index(
+                        hit_flat,
+                        self._log_odds.shape,
+                    )
+                else:
+                    hit_rows = raw_hit_rows
+                    hit_cols = raw_hit_cols
+
+        n_free = 0
         if np.any(valid_mask):
             r = rows[valid_mask].ravel()
             c = cols[valid_mask].ravel()
+            if bool(static_obstacle_confirmation):
+                flat = np.ravel_multi_index((r, c), self._log_odds.shape)
+                unique_flat = np.unique(flat)
+                if hit_flat.size:
+                    unique_flat = np.setdiff1d(unique_flat, hit_flat, assume_unique=True)
+                r, c = np.unravel_index(unique_flat, self._log_odds.shape)
+                self._update_static_free_confirmation(free_rows=r, free_cols=c)
+                clearable = ~self._confirmed_static_occupied[r, c]
+                r = r[clearable]
+                c = c[clearable]
             np.add.at(
                 self._log_odds,
                 (r, c),
                 np.float32(float(self._config.free_log_odds)),
             )
-        n_free = int(np.count_nonzero(valid_mask))
+            n_free = int(r.size)
 
         # Mark occupied endpoint cells (only for hit beams).
-        hits_v = endpoint_hit_mask[vb]
-        hit_mask = hits_v & (dist_v > 0.0)
-        if np.any(hit_mask):
-            hx = end_xy_arr[vb[hit_mask], 0]
-            hy = end_xy_arr[vb[hit_mask], 1]
-            h_rows, h_cols = self._world_to_cell_xy(hx, hy)
-            h_valid = (h_rows >= 0) & (h_rows < self._cell_count) & (h_cols >= 0) & (h_cols < self._cell_count)
-            if np.any(h_valid):
-                hr = h_rows[h_valid].ravel()
-                hc = h_cols[h_valid].ravel()
-                np.add.at(
-                    self._log_odds,
-                    (hr, hc),
-                    np.float32(float(self._config.occupied_log_odds)),
+        n_occupied = (
+            int(hit_rows.size)
+            if hit_rows.size and not bool(static_obstacle_confirmation)
+            else 0
+        )
+        if hit_rows.size:
+            np.add.at(
+                self._log_odds,
+                (hit_rows, hit_cols),
+                np.float32(float(self._config.occupied_log_odds)),
+            )
+            if bool(static_obstacle_confirmation):
+                self._update_static_hit_confirmation(
+                    hit_rows=hit_rows,
+                    hit_cols=hit_cols,
                 )
-        n_occupied = int(np.sum(hit_mask)) if np.any(hit_mask) else 0
+                n_occupied = int(hit_rows.size)
+
+        if bool(static_obstacle_confirmation) and np.any(self._confirmed_static_occupied):
+            confirmed_occupied_floor = np.float32(
+                min(
+                    float(self._config.log_odds_max),
+                    float(self._config.occupied_threshold) + 1.0e-3,
+                )
+            )
+            self._log_odds[self._confirmed_static_occupied] = np.maximum(
+                self._log_odds[self._confirmed_static_occupied],
+                confirmed_occupied_floor,
+            )
 
         # Clamp to configured bounds.
         np.clip(
@@ -481,6 +590,101 @@ class GlobalOccupancyMap:
             out=self._log_odds,
         )
         return n_free, n_occupied
+
+    def _update_static_hit_confirmation(
+        self,
+        *,
+        hit_rows: np.ndarray,
+        hit_cols: np.ndarray,
+    ) -> None:
+        rows = np.asarray(hit_rows, dtype=np.intp).reshape(-1)
+        cols = np.asarray(hit_cols, dtype=np.intp).reshape(-1)
+        if rows.size == 0:
+            return
+        update_index = int(self._static_update_index)
+        previous_support = np.zeros((rows.size,), dtype=np.uint16)
+        for row_offset in (-1, 0, 1):
+            neighbor_rows = rows + row_offset
+            for col_offset in (-1, 0, 1):
+                neighbor_cols = cols + col_offset
+                valid = (
+                    (neighbor_rows >= 0)
+                    & (neighbor_rows < self._cell_count)
+                    & (neighbor_cols >= 0)
+                    & (neighbor_cols < self._cell_count)
+                )
+                if np.any(valid):
+                    neighbor_last_update = self._last_hit_update_index[
+                        neighbor_rows[valid],
+                        neighbor_cols[valid],
+                    ]
+                    recent_prior_frame = (
+                        (neighbor_last_update >= update_index - _STATIC_CONFIRM_MAX_GAP_UPDATES)
+                        & (neighbor_last_update < update_index)
+                    )
+                    neighbor_evidence = np.where(
+                        recent_prior_frame,
+                        self._hit_evidence[
+                            neighbor_rows[valid],
+                            neighbor_cols[valid],
+                        ],
+                        0,
+                    ).astype(np.uint16)
+                    previous_support[valid] = np.maximum(
+                        previous_support[valid],
+                        neighbor_evidence,
+                    )
+        evidence = np.minimum(
+            previous_support.astype(np.uint32) + 1,
+            np.iinfo(np.uint16).max,
+        ).astype(np.uint16)
+        self._hit_evidence[rows, cols] = evidence
+        self._last_hit_update_index[rows, cols] = update_index
+        self._free_evidence[rows, cols] = 0
+        self._last_free_update_index[rows, cols] = -1
+        confirmed = evidence >= _STATIC_CONFIRM_REQUIRED_FRAMES
+        if np.any(confirmed):
+            self._confirmed_static_occupied[rows[confirmed], cols[confirmed]] = True
+
+    def _update_static_free_confirmation(
+        self,
+        *,
+        free_rows: np.ndarray,
+        free_cols: np.ndarray,
+    ) -> None:
+        rows = np.asarray(free_rows, dtype=np.intp).reshape(-1)
+        cols = np.asarray(free_cols, dtype=np.intp).reshape(-1)
+        if rows.size == 0:
+            return
+        confirmed = self._confirmed_static_occupied[rows, cols]
+        if not np.any(confirmed):
+            return
+        rows = rows[confirmed]
+        cols = cols[confirmed]
+        update_index = int(self._static_update_index)
+        consecutive = self._last_free_update_index[rows, cols] == update_index - 1
+        evidence = np.where(
+            consecutive,
+            self._free_evidence[rows, cols].astype(np.uint32) + 1,
+            1,
+        )
+        evidence = np.minimum(evidence, np.iinfo(np.uint16).max).astype(np.uint16)
+        self._free_evidence[rows, cols] = evidence
+        self._last_free_update_index[rows, cols] = update_index
+        released = evidence >= _STATIC_CLEAR_REQUIRED_FRAMES
+        if not np.any(released):
+            return
+        released_rows = rows[released]
+        released_cols = cols[released]
+        self._confirmed_static_occupied[released_rows, released_cols] = False
+        self._hit_evidence[released_rows, released_cols] = 0
+        self._last_hit_update_index[released_rows, released_cols] = -1
+        self._free_evidence[released_rows, released_cols] = 0
+        self._last_free_update_index[released_rows, released_cols] = -1
+        self._log_odds[released_rows, released_cols] = np.minimum(
+            self._log_odds[released_rows, released_cols],
+            np.float32(float(self._config.occupied_threshold) - 1.0e-3),
+        )
 
     # -- candidate filtering -------------------------------------------------
 
@@ -1044,7 +1248,8 @@ class GlobalOccupancyMap:
         min_neighbors = max(1, int(self._config.occupied_min_neighbors))
         if min_neighbors <= 1 or not np.any(raw):
             return raw
-        return raw & (_neighbor_count(raw) >= min_neighbors)
+        filtered = raw & (_neighbor_count(raw) >= min_neighbors)
+        return filtered | self._confirmed_static_occupied
 
     def _cell_free(self, cell: tuple[int, int]) -> bool:
         row, col = cell

@@ -1080,6 +1080,12 @@ def run_navigation(
         fps=float(config.debug_video_fps),
         logger=logger,
     )
+    observer_video_recorder = DebugVideoRecorder(
+        enabled=bool(config.observer_video_enabled) and observer_camera is not None,
+        output_path=_resolve_output_path(config.observer_video_path),
+        fps=float(config.observer_video_fps),
+        logger=logger,
+    )
     logger.info("VLM request image output: %s", _resolve_output_path(config.candidate_debug_image_path))
     if config.target_debug_enabled:
         logger.info("Runtime debug image output: %s", target_debug_output_path)
@@ -1087,6 +1093,12 @@ def run_navigation(
         logger.info("Occupancy map is rendered in runtime debug only; VLM receives structured map text.")
     if config.debug_video_enabled and config.target_debug_enabled:
         logger.info("Runtime debug video output: %s", debug_video_recorder.output_path)
+    if config.observer_video_enabled and observer_camera is not None:
+        logger.info(
+            "Observer camera video output: %s fps=%.1f",
+            observer_video_recorder.output_path,
+            float(config.observer_video_fps),
+        )
     if config.depth_debug_enabled:
         logger.info("Depth debug output: %s", depth_debug_output_path)
     if config.navigation_map_enabled:
@@ -1174,6 +1186,7 @@ def run_navigation(
     global_pose_trace: list[tuple[float, float]] = []
     latest_global_map_image: Image.Image | None = None
     skip_grounding_once = False
+    last_observer_video_frame_sim_time = float("-inf")
 
     warmup_steps = int(config.warmup_steps)
     g1_render_stride = 1
@@ -1268,6 +1281,7 @@ def run_navigation(
                     drive_controller.apply("STOP", speed_scale=0.0)
                     target_grounder.close()
                     debug_video_recorder.close()
+                    observer_video_recorder.close()
                     logger.error(
                         "[NAVIGATION_FAILED] reason=robot_fall roll_deg=%.1f pitch_deg=%.1f "
                         "base_z_m=%.3f confirmation_sec=%.2f; simulation remains open with active standing",
@@ -1283,6 +1297,17 @@ def run_navigation(
             drive_controller.apply("STOP", speed_scale=0.0)
             last_action_name = "STOP"
             continue
+
+        observer_video_period_sec = 1.0 / max(0.5, float(config.observer_video_fps))
+        if (
+            bool(config.observer_video_enabled)
+            and observer_camera is not None
+            and (sim_time_sec - last_observer_video_frame_sim_time) >= observer_video_period_sec
+        ):
+            observer_rgb = _get_rgb_image(camera=observer_camera)
+            if observer_rgb is not None:
+                observer_video_recorder.append(observer_rgb)
+                last_observer_video_frame_sim_time = sim_time_sec
 
         if last_depth_image is None or (loop_now - last_depth_eval_time) >= float(config.depth_eval_period_sec):
             last_depth_image = _get_depth_image(camera=camera, logger=logger)
@@ -1345,6 +1370,7 @@ def run_navigation(
                 beam_hit_mask=map_beam_hits,
                 sensor_origin_local_xy=getattr(lidar_scan, "sensor_origin_local_xy", None),
                 timestamp_sec=sim_time_sec,
+                static_obstacle_confirmation=bool(config.robot_profile.is_g1),
             )
             lidar_sector_depths = _lidar_sector_depths(
                 beam_endpoints_local_xy=np.asarray(lidar_scan.beam_endpoints_local_xy, dtype=np.float32),
@@ -1556,6 +1582,7 @@ def run_navigation(
                 drive_controller.apply("STOP", speed_scale=0.0)
                 target_grounder.close()
                 debug_video_recorder.close()
+                observer_video_recorder.close()
             continue
 
         current_landmark = policy.current_perception_target
@@ -1969,6 +1996,7 @@ def run_navigation(
             last_action_name = "STOP"
             target_grounder.close()
             debug_video_recorder.close()
+            observer_video_recorder.close()
             logger.info("Route complete — navigation stopped; Isaac Sim scene remains open. Debug video saved: %s", debug_video_recorder.output_path)
             continue
 
@@ -2045,6 +2073,7 @@ def run_navigation(
 
     target_grounder.close()
     debug_video_recorder.close()
+    observer_video_recorder.close()
 
 
 def _collect_detection_entries(

@@ -169,6 +169,9 @@ class AppConfig:
     front_camera_prim_path: str = "link6/Camera"
     observer_camera_enabled: bool = True
     observer_camera_prim_path: str = "dummy_base_link/observecamera"
+    observer_video_enabled: bool = True
+    observer_video_path: str = "debug/local/observevideos/observer.mp4"
+    observer_video_fps: float = 10.0
     follow_front_camera_in_gui: bool = False
     follow_observer_camera_in_gui: bool = True
     sensor_frequency_hz: int = 15
@@ -975,6 +978,18 @@ def load_config(config_path: str | None = None) -> AppConfig:
         front_camera_prim_path=robot_profile.sensors.front_camera_prim_path,
         observer_camera_enabled=bool(robot_profile.sensors.observer_camera_enabled),
         observer_camera_prim_path=robot_profile.sensors.observer_camera_prim_path,
+        observer_video_enabled=_bool_env_or_value(
+            "OBSERVER_VIDEO_ENABLED",
+            camera.get("observer_video_enabled", True),
+        ),
+        observer_video_path=_env_or_value(
+            "OBSERVER_VIDEO_PATH",
+            camera.get("observer_video_path", "debug/local/observevideos/observer.mp4"),
+        ),
+        observer_video_fps=_float_env_or_value(
+            "OBSERVER_VIDEO_FPS",
+            camera.get("observer_video_fps", 10.0),
+        ),
         follow_front_camera_in_gui=_bool_env_or_value(
             "FOLLOW_FRONT_CAMERA_IN_GUI",
             camera.get("follow_front_camera_in_gui", False),

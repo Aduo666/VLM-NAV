@@ -68,7 +68,7 @@ primitives:
   turn_tolerance_deg: 1.5
   forward_timeout_sec: 4.0
   turn_timeout_sec: 6.0
-  forward_command: 0.35
+  forward_command: 0.5
   turn_command: 1.0
   settle_max_wait_sec: 0.60
   settle_linear_speed_threshold_mps: 0.08

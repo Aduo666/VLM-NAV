@@ -158,20 +158,24 @@ Its resolved sensor prims are strict: missing paths terminate startup instead of
 
 ```text
 /World/Robot/g1_29dof_rev_1_0/torso_link/d435_link/Camera
-/World/Robot/g1_29dof_rev_1_0/observeCamera
-/World/Robot/g1_29dof_rev_1_0/torso_link/mid360_link/Lidar
+/World/Robot/g1_29dof_rev_1_0/pelvis/observeCamera
+/World/Robot/g1_29dof_rev_1_0/pelvis/Lidar
 ```
 
 Task files continue to provide `x`, `y`, and yaw. Spawn height is owned by the robot profile (`0.0 m` for AGX and `0.8 m` for G1), so tasks do not need robot-specific z values. G1 uses active zero-command balance for STOP and terminates navigation on a confirmed fall while keeping the simulator open.
 
-Before running VLN with a newly edited robot asset, run the profile smoke test:
+Before running VLN with G1, validate the locomotion policy in the isolated interactive test:
 
 ```bash
-# Uses the profile currently selected in configs/default.yaml.
-bash scripts/run_robot_smoke_test.sh --headless
+conda activate vlmnav
+bash scripts/run_g1_policy_test.sh
 ```
 
-The acceptance sequence is stand, FORWARD, STOP, TURN_LEFT, STOP, TURN_RIGHT, STOP. It fails on missing assets, articulation/joint mismatches, missing sensors, invalid policy observations/actions, or primitive timeout.
+The test always loads `unitree_g1_29dof`, regardless of the profile selected for navigation. It creates only a flat ground plane, light, G1, and the existing TorchScript policy. Use the arrow keys or panel buttons for FORWARD, BACKWARD, TURN_LEFT, and TURN_RIGHT; releasing every direction commands active STOP. Its fixed turn speed is the same `turn_command * waypoint_turn_speed_scale` used by VLN. The panel reports actual body velocity, pelvis height and attitude, policy action magnitude, and joint tracking error.
+
+Forward and backward commands are clamped to the policy ranges exported in `deploy.yaml`. Turning uses the robot profile's `turn_command`, so the test and VLN send the same configured angular velocity. A confirmed fall triggers a full simulation and policy-state reset after 0.5 seconds. Three automatic resets are allowed; after a fourth fall, use the panel's manual reset button.
+
+For G1 mapping, LiDAR points are projected through the live sensor pose into a yaw-level pelvis frame before entering the global map. Floor and ceiling returns caused by body tilt are rejected, static cells require evidence from multiple frames, and isolated free-space rays cannot erase a wall. Consistent contradictory free-space observations can still remove a false obstacle. This G1-only stabilization does not change the AGX mapping branch or visualization scale.
 
 ### Task Authoring Panel
 
@@ -297,6 +301,7 @@ debug/
   local/
     vln_debug.png
     llm_request.png
+    observevideos/observer_YYYYMMDD_HHMMSS.mp4
     videos/vln_debug_YYYYMMDD_HHMMSS.mp4
   eval/
     vln_debug.png
@@ -308,6 +313,8 @@ logs/
 ```
 
 The console intentionally shows only navigation milestones: `[PLAN]`, `[NAV_STATE]`, `[LANDMARK_CONFIRMED]`, `[STEP_COMPLETE]`, `[SAFETY_HOLD]`, `[RECOVERY]`, `[ERROR]`, and `[ROUTE_COMPLETE]`. Full component logs are overwritten in `logs/vln.log` on each run. The human debug frame keeps its status bar outside the imagery: north-up global map on the left and uncropped first-person RGB on the right.
+
+The observer-camera recording is captured automatically at 10 FPS from the configured robot observer camera. Its output is independent of the combined debug video and is saved under `debug/local/observevideos/`.
 
 ## Known Limitations
 

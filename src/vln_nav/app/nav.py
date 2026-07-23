@@ -690,6 +690,14 @@ def run_navigation(
         logger=logger,
     )
     _lidar_mode = str(config.lidar_mode).strip().lower()
+    _g1_lidar_robot_frame_path = None
+    if config.robot_profile is not None and config.robot_profile.is_g1:
+        if _lidar_mode != "single":
+            raise ValueError("G1 requires lidar.mode=single for dynamic torso-to-pelvis compensation")
+        _g1_lidar_robot_frame_path = _resolve_robot_relative_prim_path(
+            robot_root_path=str(config.robot_prim_path),
+            prim_path=str(config.robot_articulation_path),
+        )
     if _lidar_mode == "multi" and bool(config.lidar_enabled):
         _sector_count = min(
             int(config.lidar_multi_sector_count),
@@ -742,6 +750,7 @@ def run_navigation(
             ),
             robot_root_path=str(config.robot_prim_path),
             logger=logger,
+            dynamic_robot_frame_path=_g1_lidar_robot_frame_path,
         )
     map_candidate_generator = MapCandidateGenerator(
         config=MapCandidateGeneratorConfig(
@@ -1305,7 +1314,12 @@ def run_navigation(
                 "total_distance_m": float(odom_state.total_distance_m),
             },
         )
-        lidar_scan = lidar_reader.read(pose=observation.pose, timestamp_sec=sim_time_sec) if bool(config.lidar_enabled) else None
+        mapping_pose = odom_state.raw_pose if config.robot_profile.is_g1 else observation.pose
+        lidar_scan = (
+            lidar_reader.read(pose=mapping_pose, timestamp_sec=sim_time_sec)
+            if bool(config.lidar_enabled)
+            else None
+        )
         if bool(config.lidar_enabled) and lidar_scan is not None:
             current_beam_endpoints = getattr(lidar_scan, "current_beam_endpoints_local_xy", lidar_scan.beam_endpoints_local_xy)
             current_beam_hits = getattr(lidar_scan, "current_beam_hit_mask", lidar_scan.beam_hit_mask)
@@ -1325,7 +1339,7 @@ def run_navigation(
                 map_beam_hits = np.zeros((0,), dtype=bool)
                 map_points = np.zeros((0, 2), dtype=np.float32)
             occupancy_grid.update_from_lidar(
-                robot_pose=observation.pose,
+                robot_pose=mapping_pose,
                 points_local_xy=map_points,
                 beam_endpoints_local_xy=map_beam_endpoints,
                 beam_hit_mask=map_beam_hits,
@@ -1915,7 +1929,7 @@ def run_navigation(
             occupancy_snapshot=occupancy_grid.snapshot() if bool(config.occupancy_grid_enabled) else None,
         )
         if bool(config.occupancy_grid_enabled):
-            global_pose_trace.append((float(observation.pose.x), float(observation.pose.y)))
+            global_pose_trace.append((float(mapping_pose.x), float(mapping_pose.y)))
             if len(global_pose_trace) > 8000:
                 del global_pose_trace[: len(global_pose_trace) - 8000]
 
@@ -1929,7 +1943,7 @@ def run_navigation(
             if bool(config.occupancy_grid_enabled):
                 latest_global_map_image = _save_global_occupancy_debug(
                     occupancy_snapshot=occupancy_grid.snapshot(),
-                    robot_pose=observation.pose,
+                    robot_pose=mapping_pose,
                     trajectory_xy=global_pose_trace,
                     landmark_entries=landmark_map.entries(),
                     step_result=step_result,

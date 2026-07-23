@@ -10,6 +10,7 @@ from .observation_adapter import Pose2D
 @dataclass
 class OdomState:
     pose: Pose2D
+    raw_pose: Pose2D
     source: str
     timestamp_sec: float
     linear_velocity_mps: float
@@ -107,6 +108,7 @@ class SimOdometrySensor:
 
         return OdomState(
             pose=pose,
+            raw_pose=raw_pose,
             source=self._source,
             timestamp_sec=float(timestamp_sec),
             linear_velocity_mps=float(linear_velocity_mps),

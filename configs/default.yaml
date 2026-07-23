@@ -45,7 +45,7 @@ opennav:
   candidate_debug_image_path: "debug/local/llm_request.png"
   target_debug_enabled: true
   target_debug_image_path: "debug/local/vln_debug.png"
-  debug_video_enabled: true
+  debug_video_enabled: false
   debug_video_path: "debug/local/videos/vln_debug.mp4"
   debug_video_fps: 4.0
   debug_image_update_period_sec: 1.0
@@ -132,8 +132,8 @@ landmark_tracker:
   low_confidence_min_yaw_deg: 10.0
 
 robot:
-  profile: "unitree_g1_29dof"
-  #profile: "agx"
+  #profile: "unitree_g1_29dof"
+  profile: "agx"
 camera:
   width: 640
   height: 480

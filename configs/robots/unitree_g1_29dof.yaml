@@ -20,9 +20,9 @@ simulation:
 sensors:
   front_camera_prim_path: "torso_link/d435_link/Camera"
   observer_camera_enabled: true
-  observer_camera_prim_path: "torso_link/observeCamera"
+  observer_camera_prim_path: "pelvis/observeCamera"
   camera_frequency_hz: 10
-  lidar_prim_path: "torso_link/Lidar"
+  lidar_prim_path: "pelvis/Lidar"
 
 controller:
   policy_path: "src/unitree_model/g1_29dof/policy/policy.pt"
@@ -62,11 +62,11 @@ controller:
     - "right_wrist_yaw_joint"
 
 primitives:
-  forward_distance_m: 0.40
+  forward_distance_m: 0.55
   turn_angle_deg: 15.0
   distance_tolerance_m: 0.04
   turn_tolerance_deg: 1.5
-  forward_timeout_sec: 3.0
+  forward_timeout_sec: 4.0
   turn_timeout_sec: 6.0
   forward_command: 0.35
   turn_command: 1.0
@@ -77,7 +77,7 @@ primitives:
 
 geometry:
   footprint_radius_m: 0.32
-  obstacle_stop_distance_m: 0.55
+  obstacle_stop_distance_m: 0.40
   map_inflation_radius_m: 0.40
   path_corridor_radius_m: 0.38
   turn_clearance_radius_m: 0.42

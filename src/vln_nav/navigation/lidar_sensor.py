@@ -75,10 +75,21 @@ class MultiLidarConfig:
 class PhysXLidarReader:
     """Read a PhysX RangeSensor Lidar as robot-local 2D scan points."""
 
-    def __init__(self, *, config: PhysXLidarConfig, robot_root_path: str, logger) -> None:
+    def __init__(
+        self,
+        *,
+        config: PhysXLidarConfig,
+        robot_root_path: str,
+        logger,
+        dynamic_robot_frame_path: str | None = None,
+    ) -> None:
         self._config = config
         self._robot_root_path = str(robot_root_path).rstrip("/")
+        self._dynamic_robot_frame_path = (
+            str(dynamic_robot_frame_path).rstrip("/") if dynamic_robot_frame_path else ""
+        )
         self._logger = logger.getChild("lidar")
+        self._stage = None
         self._sensor_path = ""
         self._interface = None
         self._initialized = False
@@ -87,6 +98,11 @@ class PhysXLidarReader:
         self._sensor_origin_robot_xy = np.zeros((2,), dtype=np.float32)
         self._sensor_x_axis_robot_xy = np.asarray([1.0, 0.0], dtype=np.float32)
         self._sensor_y_axis_robot_xy = np.asarray([0.0, 1.0], dtype=np.float32)
+        self._sensor_origin_robot_xyz = np.zeros((3,), dtype=np.float32)
+        self._sensor_x_axis_robot_xyz = np.asarray([1.0, 0.0, 0.0], dtype=np.float32)
+        self._sensor_y_axis_robot_xyz = np.asarray([0.0, 1.0, 0.0], dtype=np.float32)
+        self._actual_horizontal_fov_deg = float(config.horizontal_fov_deg)
+        self._actual_rotation_rate_hz = float(config.rotation_rate_hz)
         self._recent_sector_history: deque[dict[str, object]] = deque(maxlen=96)
         self._last_coverage_log_time_sec = -float("inf")
 
@@ -101,6 +117,7 @@ class PhysXLidarReader:
     def initialize(self, *, stage) -> bool:
         if not bool(self._config.enabled):
             return False
+        self._stage = stage
         try:
             import omni.kit.commands
             from isaacsim.sensors.physx import _range_sensor
@@ -193,6 +210,8 @@ class PhysXLidarReader:
     def read(self, *, pose: Pose2D, timestamp_sec: float) -> LidarScan | None:
         if not self._initialized or self._interface is None or not self._sensor_path:
             return None
+        if self._dynamic_robot_frame_path:
+            self._refresh_dynamic_sensor_to_robot_transform()
         try:
             depth_raw = np.asarray(self._interface.get_depth_data(self._sensor_path))
             azimuth = np.asarray(self._interface.get_azimuth_data(self._sensor_path), dtype=np.float32).reshape(-1)
@@ -209,20 +228,37 @@ class PhysXLidarReader:
             max_range_m=float(self._config.max_range_m),
             yaw_offset_deg=float(self._config.yaw_offset_deg),
         )
-        beam_endpoints = _transform_sensor_points_to_robot(
-            sensor_points=sensor_beam_endpoints,
-            sensor_origin_robot_xy=self._sensor_origin_robot_xy,
-            sensor_x_axis_robot_xy=self._sensor_x_axis_robot_xy,
-            sensor_y_axis_robot_xy=self._sensor_y_axis_robot_xy,
-        )
+        if self._dynamic_robot_frame_path:
+            beam_endpoints = _transform_sensor_points_to_robot_3d(
+                sensor_points=sensor_beam_endpoints,
+                sensor_origin_robot_xyz=self._sensor_origin_robot_xyz,
+                sensor_x_axis_robot_xyz=self._sensor_x_axis_robot_xyz,
+                sensor_y_axis_robot_xyz=self._sensor_y_axis_robot_xyz,
+            )
+        else:
+            beam_endpoints = _transform_sensor_points_to_robot(
+                sensor_points=sensor_beam_endpoints,
+                sensor_origin_robot_xy=self._sensor_origin_robot_xy,
+                sensor_x_axis_robot_xy=self._sensor_x_axis_robot_xy,
+                sensor_y_axis_robot_xy=self._sensor_y_axis_robot_xy,
+            )
         beam_hit_mask = np.asarray(sensor_beam_hit_mask, dtype=bool)
         if beam_endpoints.shape[0] != beam_hit_mask.shape[0]:
             beam_hit_mask = np.zeros((beam_endpoints.shape[0],), dtype=bool)
         points = beam_endpoints[beam_hit_mask] if beam_endpoints.size else np.zeros((0, 2), dtype=np.float32)
         projection_debug = _with_point_extents(projection_debug, points)
+        if self._dynamic_robot_frame_path:
+            current_angle_min_deg, current_angle_max_deg = _scan_angle_bounds(
+                beam_endpoints_local_xy=beam_endpoints,
+                fallback_min_deg=float(projection_debug["normalized_min_deg"]),
+                fallback_max_deg=float(projection_debug["normalized_max_deg"]),
+            )
+        else:
+            current_angle_min_deg = float(projection_debug["normalized_min_deg"])
+            current_angle_max_deg = float(projection_debug["normalized_max_deg"])
         self._update_sector_history(
-            angle_min_deg=float(projection_debug["normalized_min_deg"]),
-            angle_max_deg=float(projection_debug["normalized_max_deg"]),
+            angle_min_deg=current_angle_min_deg,
+            angle_max_deg=current_angle_max_deg,
             beam_endpoints_local_xy=beam_endpoints,
             beam_hit_mask=beam_hit_mask,
             pose=pose,
@@ -260,8 +296,8 @@ class PhysXLidarReader:
                 "[LidarCoverage] raw_beams=%s valid_beams=%s sector_deg=[%.1f,%.1f] effective_fov_deg=%.1f merged_beams=%s merged_hits=%s",
                 int(projection_debug["raw_beam_count"]),
                 int(projection_debug["valid_beam_count"]),
-                float(projection_debug["normalized_min_deg"]),
-                float(projection_debug["normalized_max_deg"]),
+                current_angle_min_deg,
+                current_angle_max_deg,
                 float(coverage_debug["effective_fov_deg"]),
                 int(merged_beam_endpoints.shape[0]),
                 int(np.count_nonzero(merged_beam_hit_mask)),
@@ -336,10 +372,14 @@ class PhysXLidarReader:
                 },
             )
         latest_time = float(self._recent_sector_history[-1]["timestamp_sec"])
-        keep_sec = max(
-            0.10,
-            float(self._config.sector_merge_keep_sec),
-            2.5 / max(1.0, float(self._config.rotation_rate_hz)),
+        keep_sec = _sector_history_keep_sec(
+            configured_keep_sec=float(self._config.sector_merge_keep_sec),
+            rotation_rate_hz=float(
+                self._actual_rotation_rate_hz
+                if self._dynamic_robot_frame_path
+                else self._config.rotation_rate_hz
+            ),
+            dynamic_mount=bool(self._dynamic_robot_frame_path),
         )
         # The PhysX lidar can return a rotating sector instead of a full 180 deg
         # scan in one frame.  We merge recent sectors, but every stored sector is
@@ -368,6 +408,12 @@ class PhysXLidarReader:
         hit_arrays = [np.asarray(sector["beam_hit_mask"], dtype=bool) for sector in selected]
         merged_beams = np.concatenate(beam_arrays, axis=0) if beam_arrays else np.zeros((0, 2), dtype=np.float32)
         merged_hits = np.concatenate(hit_arrays, axis=0) if hit_arrays else np.zeros((0,), dtype=bool)
+        if self._dynamic_robot_frame_path:
+            merged_beams, merged_hits = _clip_scan_to_forward_fov(
+                beam_endpoints_local_xy=merged_beams,
+                beam_hit_mask=merged_hits,
+                horizontal_fov_deg=float(self._actual_horizontal_fov_deg),
+            )
         merged_beams, merged_hits = _bin_scan_by_angle(
             beam_endpoints_local_xy=merged_beams,
             beam_hit_mask=merged_hits,
@@ -403,8 +449,27 @@ class PhysXLidarReader:
             yaw_offset = _attr_value("yawOffset")
             min_range = _attr_value("minRange")
             max_range = _attr_value("maxRange")
+            self._actual_horizontal_fov_deg = _positive_float_or_default(
+                horizontal_fov,
+                default=float(self._config.horizontal_fov_deg),
+            )
+            self._actual_rotation_rate_hz = _positive_float_or_default(
+                rotation_rate,
+                default=float(self._config.rotation_rate_hz),
+            )
+            effective_merge_keep_sec = _sector_history_keep_sec(
+                configured_keep_sec=float(self._config.sector_merge_keep_sec),
+                rotation_rate_hz=float(
+                    self._actual_rotation_rate_hz
+                    if self._dynamic_robot_frame_path
+                    else self._config.rotation_rate_hz
+                ),
+                dynamic_mount=bool(self._dynamic_robot_frame_path),
+            )
             self._logger.info(
-                "[LidarConfig] path=%s horizontal_fov=%s vertical_fov=%s horizontal_resolution=%s vertical_resolution=%s rotation_rate=%s min_range=%s max_range=%s yaw_offset=%s merge_keep_sec=%.2f",
+                "[LidarConfig] path=%s horizontal_fov=%s vertical_fov=%s horizontal_resolution=%s "
+                "vertical_resolution=%s rotation_rate=%s min_range=%s max_range=%s yaw_offset=%s "
+                "configured_merge_keep_sec=%.2f effective_merge_keep_sec=%.3f frame_mode=%s",
                 self._sensor_path,
                 horizontal_fov,
                 vertical_fov,
@@ -415,11 +480,37 @@ class PhysXLidarReader:
                 max_range,
                 yaw_offset,
                 float(self._config.sector_merge_keep_sec),
+                effective_merge_keep_sec,
+                "dynamic_pelvis" if self._dynamic_robot_frame_path else "static_robot_root",
             )
         except Exception as exc:
             self._logger.warning("[LidarConfig] read_failed path=%s error=%s", self._sensor_path, exc)
 
     def _configure_sensor_to_robot_transform(self, *, stage) -> None:
+        if self._dynamic_robot_frame_path:
+            self._refresh_dynamic_sensor_to_robot_transform()
+            yaw_deg = float(
+                np.rad2deg(
+                    np.arctan2(
+                        float(self._sensor_x_axis_robot_xyz[1]),
+                        float(self._sensor_x_axis_robot_xyz[0]),
+                    )
+                )
+            )
+            self._logger.info(
+                "[Lidar] dynamic_sensor_frame robot_frame=%s sensor=%s origin_xyz=[%.3f,%.3f,%.3f] "
+                "sensor_forward_xyz=[%.3f,%.3f,%.3f] sensor_forward_yaw_deg=%.1f",
+                self._dynamic_robot_frame_path,
+                self._sensor_path,
+                float(self._sensor_origin_robot_xyz[0]),
+                float(self._sensor_origin_robot_xyz[1]),
+                float(self._sensor_origin_robot_xyz[2]),
+                float(self._sensor_x_axis_robot_xyz[0]),
+                float(self._sensor_x_axis_robot_xyz[1]),
+                float(self._sensor_x_axis_robot_xyz[2]),
+                yaw_deg,
+            )
+            return
         try:
             from pxr import Gf, Usd, UsdGeom
 
@@ -470,6 +561,52 @@ class PhysXLidarReader:
             )
         except Exception as exc:
             self._logger.warning("[Lidar] sensor_to_robot_transform_failed error=%s", exc)
+
+    def _refresh_dynamic_sensor_to_robot_transform(self) -> None:
+        if self._stage is None:
+            raise RuntimeError("G1 LiDAR dynamic transform requested before stage initialization")
+        try:
+            from pxr import Gf, Usd, UsdGeom
+
+            robot_prim = self._stage.GetPrimAtPath(self._dynamic_robot_frame_path)
+            sensor_prim = self._stage.GetPrimAtPath(self._sensor_path)
+            if not robot_prim.IsValid() or not sensor_prim.IsValid():
+                raise RuntimeError(
+                    f"invalid prim robot_frame={self._dynamic_robot_frame_path} sensor={self._sensor_path}"
+                )
+            time_code = Usd.TimeCode.Default()
+            robot_world = UsdGeom.Xformable(robot_prim).ComputeLocalToWorldTransform(time_code)
+            sensor_world = UsdGeom.Xformable(sensor_prim).ComputeLocalToWorldTransform(time_code)
+            robot_inv = robot_world.GetInverse()
+            origin_robot = robot_inv.Transform(sensor_world.Transform(Gf.Vec3d(0.0, 0.0, 0.0)))
+            x_robot = (
+                robot_inv.Transform(sensor_world.Transform(Gf.Vec3d(1.0, 0.0, 0.0)))
+                - origin_robot
+            )
+            y_robot = (
+                robot_inv.Transform(sensor_world.Transform(Gf.Vec3d(0.0, 1.0, 0.0)))
+                - origin_robot
+            )
+            origin_xyz = np.asarray([float(origin_robot[i]) for i in range(3)], dtype=np.float32)
+            x_axis_xyz = np.asarray([float(x_robot[i]) for i in range(3)], dtype=np.float32)
+            y_axis_xyz = np.asarray([float(y_robot[i]) for i in range(3)], dtype=np.float32)
+            if not (
+                np.isfinite(origin_xyz).all()
+                and np.isfinite(x_axis_xyz).all()
+                and np.isfinite(y_axis_xyz).all()
+                and float(np.linalg.norm(x_axis_xyz)) > 1.0e-6
+                and float(np.linalg.norm(y_axis_xyz)) > 1.0e-6
+            ):
+                raise RuntimeError("non-finite or degenerate LiDAR transform")
+            self._sensor_origin_robot_xyz = origin_xyz
+            self._sensor_x_axis_robot_xyz = x_axis_xyz
+            self._sensor_y_axis_robot_xyz = y_axis_xyz
+            self._sensor_origin_robot_xy = origin_xyz[:2].copy()
+        except Exception as exc:
+            raise RuntimeError(
+                "G1 LiDAR dynamic transform failed; no static fallback is allowed: "
+                f"robot_frame={self._dynamic_robot_frame_path} sensor={self._sensor_path} error={exc}"
+            ) from exc
 
 
 class MultiLidarReader:
@@ -960,6 +1097,80 @@ def _transform_sensor_points_to_robot(
     )
     finite = np.isfinite(transformed).all(axis=1)
     return transformed[finite].astype(np.float32)
+
+
+def _transform_sensor_points_to_robot_3d(
+    *,
+    sensor_points: np.ndarray,
+    sensor_origin_robot_xyz: np.ndarray,
+    sensor_x_axis_robot_xyz: np.ndarray,
+    sensor_y_axis_robot_xyz: np.ndarray,
+) -> np.ndarray:
+    """Transform the LiDAR scan plane into the robot frame, then project to XY."""
+    points = np.asarray(sensor_points, dtype=np.float32)
+    if points.size == 0:
+        return np.zeros((0, 2), dtype=np.float32)
+    transformed_xyz = (
+        np.asarray(sensor_origin_robot_xyz, dtype=np.float32)[None, :]
+        + points[:, 0:1] * np.asarray(sensor_x_axis_robot_xyz, dtype=np.float32)[None, :]
+        + points[:, 1:2] * np.asarray(sensor_y_axis_robot_xyz, dtype=np.float32)[None, :]
+    )
+    finite = np.isfinite(transformed_xyz).all(axis=1)
+    return transformed_xyz[finite, :2].astype(np.float32)
+
+
+def _sector_history_keep_sec(
+    *,
+    configured_keep_sec: float,
+    rotation_rate_hz: float,
+    dynamic_mount: bool,
+) -> float:
+    if not dynamic_mount:
+        return max(0.10, float(configured_keep_sec), 2.5 / max(1.0, float(rotation_rate_hz)))
+    scan_window_sec = 2.5 / max(1.0, float(rotation_rate_hz))
+    return float(np.clip(scan_window_sec, 0.10, 0.15))
+
+
+def _clip_scan_to_forward_fov(
+    *,
+    beam_endpoints_local_xy: np.ndarray,
+    beam_hit_mask: np.ndarray,
+    horizontal_fov_deg: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    beams = np.asarray(beam_endpoints_local_xy, dtype=np.float32)
+    hits = np.asarray(beam_hit_mask, dtype=bool).reshape(-1)
+    if beams.ndim != 2 or beams.shape[0] == 0:
+        return np.zeros((0, 2), dtype=np.float32), np.zeros((0,), dtype=bool)
+    if hits.shape[0] != beams.shape[0]:
+        hits = np.zeros((beams.shape[0],), dtype=bool)
+    half_fov_deg = 0.5 * float(np.clip(horizontal_fov_deg, 1.0, 180.0))
+    bearings_deg = np.rad2deg(np.arctan2(beams[:, 1], beams[:, 0]))
+    keep = np.isfinite(beams).all(axis=1) & (np.abs(bearings_deg) <= half_fov_deg + 1.0e-4)
+    return beams[keep].astype(np.float32), hits[keep]
+
+
+def _scan_angle_bounds(
+    *,
+    beam_endpoints_local_xy: np.ndarray,
+    fallback_min_deg: float,
+    fallback_max_deg: float,
+) -> tuple[float, float]:
+    beams = np.asarray(beam_endpoints_local_xy, dtype=np.float32)
+    if beams.ndim != 2 or beams.shape[0] == 0:
+        return float(fallback_min_deg), float(fallback_max_deg)
+    angles_deg = np.rad2deg(np.arctan2(beams[:, 1], beams[:, 0]))
+    finite = angles_deg[np.isfinite(angles_deg)]
+    if finite.size == 0:
+        return float(fallback_min_deg), float(fallback_max_deg)
+    return float(np.min(finite)), float(np.max(finite))
+
+
+def _positive_float_or_default(value, *, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    return parsed if np.isfinite(parsed) and parsed > 0.0 else float(default)
 
 
 def _with_point_extents(debug: dict[str, object], points: np.ndarray) -> dict[str, object]:

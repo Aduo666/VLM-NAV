@@ -281,7 +281,7 @@ landmark_tracker:
   confirm_max_anchor_jump_m: 0.75
 
 opennav:
-  instruction_parse_max_tokens: 2048
+  instruction_parse_max_tokens: 768
   instruction_parse_timeout_sec: 90
   instruction_cache_enabled: true
   instruction_cache_path: ".cache/instruction_plans.json"

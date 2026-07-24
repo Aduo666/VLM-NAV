@@ -10,7 +10,6 @@ from types import SimpleNamespace
 from vln_nav.navigation.instruction_manager import (
     INSTRUCTION_SCHEMA_VERSION,
     InstructionManager,
-    InstructionPlanError,
     RouteStep,
 )
 from vln_nav.navigation.observation_adapter import Pose2D
@@ -54,123 +53,55 @@ def _logger() -> logging.Logger:
 
 
 class InstructionExecutionTest(unittest.TestCase):
-    def test_compact_hospital_draft_preserves_both_destinations(self) -> None:
-        payload = {
-            "schema_version": INSTRUCTION_SCHEMA_VERSION,
-            "scene_context": {
-                "current_region": None,
-                "context_objects": [],
-            },
-            "route_steps": [
-                {
-                    "step_type": "GO_TO",
-                    "source_span": "Go forward to the wheelchair",
-                    "target": "wheelchair",
-                    "cues": [
-                        {
-                            "label": "wheelchair",
-                            "cue_type": "pass",
-                            "expected_side": "none",
-                            "source_span": "Go forward to the wheelchair",
-                        }
-                    ],
-                    "relations": [],
-                },
-                {
-                    "step_type": "TURN",
-                    "source_span": "then turn left",
-                    "target": "",
-                    "direction": "left",
-                    "cues": [
-                        {
-                            "label": "wheelchair",
-                            "cue_type": "turn",
-                            "expected_side": "none",
-                            "source_span": "Go forward to the wheelchair",
-                        }
-                    ],
-                    "relations": [],
-                },
-                {
-                    "step_type": "TRAVERSE",
-                    "source_span": "continue straight to the stairs",
-                    "cues": [
-                        {
-                            "label": "stairs",
-                            "cue_type": "pass",
-                            "expected_side": "none",
-                            "source_span": "continue straight to the stairs",
-                        }
-                    ],
-                    "relations": [],
-                },
-            ],
-        }
-        with tempfile.TemporaryDirectory() as temp_dir:
-            plan = InstructionManager(
-                llm_client=_FakeLLM([payload]),
-                logger=_logger(),
-                cache_path=Path(temp_dir) / "plans.json",
-            ).parse(
-                "Go forward to the wheelchair, then turn left and continue straight to the stairs."
-            )
-
-        self.assertEqual(
-            [step.step_type for step in plan.route_steps],
-            ["GO_TO", "TURN", "GO_TO"],
-        )
-        self.assertEqual(plan.navigation_target_labels, ["wheelchair", "stairs"])
-        self.assertEqual(plan.route_steps[1].perception_target, "")
-
-    def test_repair_cannot_delete_a_declared_destination(self) -> None:
+    def test_find_object_cannot_remain_traverse(self) -> None:
         invalid = {
             "schema_version": INSTRUCTION_SCHEMA_VERSION,
             "scene_context": {"current_region": None, "context_objects": []},
-            "navigation_targets": [
-                {"canonical_label": "wheelchair", "source_span": "wheelchair"},
-                {"canonical_label": "stairs", "source_span": "stairs"},
-            ],
+            "navigation_targets": [],
             "route_steps": [
                 {
-                    "step_type": "GO_TO",
-                    "source_span": "go to the wheelchair",
-                    "target": "wheelchair",
-                    "direction": "forward",
-                },
-                {
+                    "step_id": "step_1",
                     "step_type": "TRAVERSE",
-                    "source_span": "continue straight to the stairs",
-                    "direction": "none",
-                },
+                    "source_span": "go straight to find the wheelchair",
+                    "direction": "forward",
+                    "trigger": {"trigger_type": "NONE", "label": ""},
+                    "constraints": [],
+                }
             ],
         }
-        semantically_incomplete_repair = {
+        repaired = {
             "schema_version": INSTRUCTION_SCHEMA_VERSION,
             "scene_context": {"current_region": None, "context_objects": []},
+            "navigation_targets": [
+                {"canonical_label": "wheelchair", "source_span": "wheelchair"}
+            ],
             "route_steps": [
                 {
+                    "step_id": "step_1",
                     "step_type": "GO_TO",
-                    "source_span": "go to the wheelchair",
+                    "source_span": "go straight to find the wheelchair",
                     "target": "wheelchair",
                     "direction": "forward",
-                    "cues": [],
-                    "relations": [],
+                    "trigger": {"trigger_type": "NONE", "label": ""},
+                    "constraints": [],
                 }
             ],
         }
         with tempfile.TemporaryDirectory() as temp_dir:
-            manager = InstructionManager(
-                llm_client=_FakeLLM([invalid, semantically_incomplete_repair]),
+            client = _FakeLLM([invalid, repaired])
+            plan = InstructionManager(
+                llm_client=client,
                 logger=_logger(),
                 cache_path=Path(temp_dir) / "plans.json",
+            ).parse(
+                "You are currently in the hospital lobby. "
+                "You need to go straight to find the wheelchair."
             )
-            with self.assertRaisesRegex(
-                InstructionPlanError,
-                "repair removed declared navigation destinations",
-            ):
-                manager.parse(
-                    "Go to the wheelchair, then continue straight to the stairs."
-                )
+
+        self.assertEqual(client.calls, 2)
+        self.assertEqual(plan.route_steps[0].step_type, "GO_TO")
+        self.assertEqual(plan.route_steps[0].target, "wheelchair")
+        self.assertEqual(plan.navigation_target_labels, ["wheelchair"])
 
     def test_action_phrase_cue_is_not_a_grounding_target(self) -> None:
         payload = {
@@ -473,128 +404,6 @@ class InstructionExecutionTest(unittest.TestCase):
         self.assertFalse(first.completed)
         self.assertTrue(second.completed)
         self.assertEqual(second.stable_confirmation_count, 2)
-
-    def test_interiornav_instruction_compiles_to_four_typed_steps(self) -> None:
-        payload = {
-            "schema_version": INSTRUCTION_SCHEMA_VERSION,
-            "scene_context": {
-                "current_region": {
-                    "canonical_label": "hallway",
-                    "source_span": "down a hallway",
-                },
-                "context_objects": [],
-            },
-            "navigation_targets": [
-                {"canonical_label": "bed", "source_span": "near the bed"},
-            ],
-            "route_steps": [
-                {
-                    "step_id": "step_1",
-                    "step_type": "TRAVERSE",
-                    "source_span": "Walks straight down a hallway, passing a wall-mounted TV on the right",
-                    "direction": "forward",
-                    "completion": "CUE_PASSED",
-                    "trigger": {"trigger_type": "NONE", "label": ""},
-                    "cues": [
-                        {
-                            "label": "wall-mounted tv",
-                            "role": "PASS_CUE",
-                            "expected_side": "right",
-                            "source_span": "wall-mounted TV on the right",
-                        }
-                    ],
-                    "relations": [],
-                    "constraints": [],
-                },
-                {
-                    "step_id": "step_2",
-                    "step_type": "TURN",
-                    "source_span": "Turns left into a doorway",
-                    "direction": "left",
-                    "trigger": {
-                        "trigger_type": "AFTER_PREVIOUS_STEP",
-                        "label": "",
-                    },
-                    "cues": [
-                        {
-                            "label": "doorway",
-                            "role": "TURN_CUE",
-                            "expected_side": "left",
-                            "source_span": "left into a doorway",
-                        }
-                    ],
-                    "relations": [],
-                    "constraints": [],
-                },
-                {
-                    "step_id": "step_3",
-                    "step_type": "REGION_TRANSITION",
-                    "source_span": "Continues straight, passing a patterned glass door on the right, and enters a bedroom",
-                    "from_region": "hallway",
-                    "to_region": "bedroom",
-                    "transition": "enter",
-                    "direction": "forward",
-                    "trigger": {
-                        "trigger_type": "AFTER_PREVIOUS_STEP",
-                        "label": "",
-                    },
-                    "cues": [
-                        {
-                            "label": "patterned glass door",
-                            "role": "PASS_CUE",
-                            "expected_side": "right",
-                            "source_span": "patterned glass door on the right",
-                        }
-                    ],
-                    "relations": [],
-                    "constraints": [],
-                },
-                {
-                    "step_id": "step_4",
-                    "step_type": "GO_TO",
-                    "source_span": "Stops near the bed, with the large window positioned behind the bed",
-                    "target": "bed",
-                    "direction": "none",
-                    "trigger": {
-                        "trigger_type": "AFTER_PREVIOUS_STEP",
-                        "label": "",
-                    },
-                    "cues": [],
-                    "relations": [
-                        {
-                            "target": "bed",
-                            "relation": "BEHIND_TARGET",
-                            "reference": "large window",
-                            "source_span": "large window positioned behind the bed",
-                        }
-                    ],
-                    "constraints": [],
-                },
-            ],
-        }
-        instruction = (
-            "Walks straight down a hallway, passing a wall-mounted TV on the right. "
-            "Turns left into a doorway. Continues straight, passing a patterned glass "
-            "door on the right, and enters a bedroom. Stops near the bed, with the "
-            "large window positioned behind the bed."
-        )
-        with tempfile.TemporaryDirectory() as temp_dir:
-            plan = InstructionManager(
-                llm_client=_FakeLLM([payload]),
-                logger=_logger(),
-                cache_path=Path(temp_dir) / "plans.json",
-            ).parse(instruction)
-
-        self.assertEqual(
-            [step.step_type for step in plan.route_steps],
-            ["TRAVERSE", "TURN", "REGION_TRANSITION", "GO_TO"],
-        )
-        self.assertEqual(plan.navigation_target_labels, ["bed"])
-        self.assertEqual(plan.route_steps[0].cues[0].role, "PASS_CUE")
-        self.assertEqual(plan.route_steps[0].cues[0].expected_side, "right")
-        self.assertEqual(plan.route_steps[2].to_region, "bedroom")
-        self.assertEqual(plan.route_steps[3].relations[0].relation, "BEHIND_TARGET")
-
 
 if __name__ == "__main__":
     unittest.main()

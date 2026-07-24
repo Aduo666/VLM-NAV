@@ -24,7 +24,7 @@ class AppConfig:
     llm_upload_max_edge_px: int = 512
     camera_image_detail: str = "low"
     instruction: str = ""
-    instruction_parse_max_tokens: int = 2048
+    instruction_parse_max_tokens: int = 768
     instruction_parse_timeout_sec: int = 90
     instruction_cache_enabled: bool = True
     instruction_cache_path: str = str(PROJECT_ROOT / ".cache" / "instruction_plans.json")
@@ -475,7 +475,7 @@ def load_config(config_path: str | None = None) -> AppConfig:
         instruction=_env_or_value("INSTRUCTION", opennav.get("instruction", "")),
         instruction_parse_max_tokens=_int_env_or_value(
             "INSTRUCTION_PARSE_MAX_TOKENS",
-            opennav.get("instruction_parse_max_tokens", 2048),
+            opennav.get("instruction_parse_max_tokens", 768),
         ),
         instruction_parse_timeout_sec=_int_env_or_value(
             "INSTRUCTION_PARSE_TIMEOUT_SEC",

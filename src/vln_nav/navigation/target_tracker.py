@@ -11,7 +11,6 @@ from .target_grounding import TargetObservation
 
 @dataclass
 class TargetTrackerConfig:
-    enabled: bool = True
     tracker_type: str = "CSRT"
     max_lost_frames: int = 8
     lost_confirmed_sec: float = 2.0
@@ -99,8 +98,6 @@ class TargetTracker:
         rgb: np.ndarray | None,
         timestamp_sec: float,
     ) -> bool:
-        if not bool(self._config.enabled):
-            return False
         if rgb is None or np.asarray(rgb).ndim != 3:
             return False
         if not _is_confirmable_grounding(observation):
@@ -163,8 +160,6 @@ class TargetTracker:
         robot_world_orientation_wxyz: np.ndarray | None = None,
     ) -> TargetObservation:
         label = self._label or "target"
-        if not bool(self._config.enabled):
-            return _empty_track_observation(label=label, timestamp_sec=timestamp_sec, reason="tracker_disabled")
         if self._tracker is None:
             return _empty_track_observation(label=label, timestamp_sec=timestamp_sec, reason="tracker_uninitialized")
         if rgb is None or np.asarray(rgb).ndim != 3:
@@ -493,7 +488,7 @@ def _empty_track_observation(*, label: str, timestamp_sec: float, reason: str) -
         source="opencv_tracker",
         reason=str(reason),
         timestamp_sec=float(timestamp_sec),
-        segmentation_source="none",
+        depth_region_source="none",
         evidence_level="none",
         semantic_source="opencv_tracker",
         can_confirm=False,

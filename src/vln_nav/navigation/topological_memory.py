@@ -10,7 +10,6 @@ from .observation_adapter import Pose2D
 
 @dataclass
 class TopologicalMemoryConfig:
-    enabled: bool = True
     node_spacing_m: float = 1.0
     turn_threshold_deg: float = 40.0
     merge_radius_m: float = 0.75
@@ -60,8 +59,6 @@ class TopologicalMemory:
         landmark_entry: LandmarkMapEntry | None,
         progress_signal: str,
     ) -> None:
-        if not bool(self._config.enabled):
-            return
         label = str(current_landmark).strip().lower()
         landmark_labels: list[str] = []
         if label:
@@ -113,8 +110,6 @@ class TopologicalMemory:
         self._last_robot_pose = Pose2D(float(robot_pose.x), float(robot_pose.y), float(robot_pose.yaw_rad))
 
     def summary(self, *, current_target: str, robot_pose: Pose2D) -> str:
-        if not bool(self._config.enabled):
-            return "topology=disabled"
         current_node_id = self.current_node_id(robot_pose=robot_pose)
         if current_node_id is None:
             return "topology=node_count=0"
@@ -151,7 +146,7 @@ class TopologicalMemory:
         return int(sum(len(neighbors) for neighbors in self._adjacency.values()) // 2)
 
     def suggest_revisit_world_xy(self, *, current_target: str, robot_pose: Pose2D) -> list[float] | None:
-        if not bool(self._config.enabled) or not self._nodes:
+        if not self._nodes:
             return None
         target_key = str(current_target).strip().lower()
         if target_key and target_key in self._last_anchor_node_id_by_label:

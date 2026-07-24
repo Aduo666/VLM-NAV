@@ -121,7 +121,7 @@ class _G1ControlPanel:
                 ui.Label(
                     "VLN turn speed: "
                     f"{self._vln_turn_radps:.3f} rad/s "
-                    "(robot turn_command x waypoint_turn_speed_scale)"
+                    "(robot profile turn_command)"
                 )
                 ui.Separator()
                 self._status_label = ui.Label("Status: INITIALIZING")
@@ -280,7 +280,7 @@ class _G1ControlPanel:
 def main() -> int:
     config = load_config(DEFAULT_CONFIG_PATH)
     profile = load_robot_profile(profile_name=_PROFILE_NAME, project_root=PROJECT_ROOT)
-    logger = _create_logger(config.log_level)
+    logger = _create_logger(config.logging.level)
     sys.argv = [sys.argv[0]]
 
     from isaacsim import SimulationApp
@@ -288,11 +288,11 @@ def main() -> int:
     simulation_app = SimulationApp(
         {
             "headless": False,
-            "width": int(config.sim_width),
-            "height": int(config.sim_height),
-            "active_gpu": config.active_gpu,
-            "physics_gpu": config.physics_gpu,
-            "multi_gpu": bool(config.multi_gpu),
+            "width": int(config.simulation.width),
+            "height": int(config.simulation.height),
+            "active_gpu": config.simulation.active_gpu,
+            "physics_gpu": config.simulation.physics_gpu,
+            "multi_gpu": bool(config.simulation.multi_gpu),
         }
     )
     try:
@@ -325,7 +325,7 @@ def _run(*, simulation_app, config, profile: RobotProfile, logger: logging.Logge
     _wait_for_stage_assets(
         simulation_app=simulation_app,
         is_stage_loading=is_stage_loading,
-        timeout_sec=float(config.stage_load_timeout_sec),
+        timeout_sec=float(config.scene.stage_load_timeout_sec),
         logger=logger,
         label="G1 policy-test robot",
     )
@@ -376,10 +376,7 @@ def _run(*, simulation_app, config, profile: RobotProfile, logger: logging.Logge
             0.5 * float(profile.primitives.forward_command),
             abs(float(command_limits["linear_x_mps"][0])),
         ),
-        vln_turn_radps=(
-            float(profile.primitives.turn_command)
-            * float(config.waypoint_turn_speed_scale)
-        ),
+        vln_turn_radps=float(profile.primitives.turn_command),
         command_limits=command_limits,
     )
     print(

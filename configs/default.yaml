@@ -1,279 +1,200 @@
-sim:
+simulation:
   headless: false
   width: 1280
   height: 720
-  active_gpu: auto
+  active_gpu: null
   physics_gpu: 0
   multi_gpu: false
   warmup_steps: 30
 
 robot:
   profile: "unitree_g1_29dof"
-  #profile: "agx"
-
-llm:
-  api_key: "sk-bduqejichuzwbbzuesgwfvwswcetzfagmfkyadbpkzykfjjh"
-  api_base_url: "https://api.siliconflow.cn/v1"
-  model_name: "Qwen/Qwen3-VL-30B-A3B-Instruct"
-  timeout_sec: 30
-  retry_cooldown_sec: 0
-  upload_max_edge_px: 1024
-  camera_image_detail: "high"
-
-opennav:
-  instruction_parse_max_tokens: 768
-  instruction_parse_timeout_sec: 90
-  instruction_cache_enabled: true
-  instruction_cache_path: ".cache/instruction_plans.json"
-  region_transition_min_displacement_m: 1.0
-  region_transition_confirmations: 2
-  region_transition_min_confidence: 0.55
-  semantic_turn_min_yaw_deg: 45.0
-  semantic_turn_max_yaw_deg: 105.0
-  semantic_turn_max_primitives: 7
-  semantic_turn_min_forward_clearance_m: 0.60
-  semantic_turn_alignment_confirmations: 2
-  semantic_turn_corridor_center_tolerance_deg: 10.0
-  semantic_turn_same_corridor_tolerance_deg: 15.0
-  semantic_turn_target_high_confidence: 0.75
-  semantic_turn_target_medium_confidence: 0.50
-  semantic_turn_direction_tolerance_deg: 10.0
-  semantic_turn_corridor_half_fov_deg: 60.0
-  semantic_turn_corridor_step_deg: 5.0
-  semantic_turn_lidar_bin_half_width_deg: 3.0
-  semantic_turn_min_corridor_width_deg: 15.0
-  semantic_turn_corridor_max_clearance_m: 4.0
-  semantic_turn_max_recovery_attempts: 2
-  local_detour_max_turn_primitives: 2
-  traverse_heading_correction_limit_deg: 30.0
-  traverse_candidate_heading_tolerance_deg: 22.0
-  traverse_min_progress_m: 0.50
-  traverse_pass_margin_m: 0.20
-  traverse_review_min_progress_m: 1.00
-  traverse_review_min_translation_m: 0.20
-  traverse_max_recovery_attempts: 2
-  visual_target_center_deadband_deg: 15.0
-  candidate_slot_bearings_deg: [35.0, 18.0, 0.0, -18.0, -35.0]
-  candidate_adaptive_enabled: true
-  candidate_adaptive_count: 5
-  candidate_adaptive_min_spacing_deg: 18.0
-  candidate_adaptive_smoothing_px: 15
-  candidate_min_travel_distance_m: 0.55
-  candidate_max_travel_distance_m: 1.35
-  candidate_min_free_ratio: 0.28
-  candidate_column_half_width_px: 26
-  target_debug_enabled: true
-  target_debug_image_path: "debug/local/vln_debug.png"
-  debug_video_enabled: false
-  debug_video_path: "debug/local/videos/vln_debug.mp4"
-  debug_video_fps: 4.0
-  debug_image_update_period_sec: 1.0
-  progress_history_length: 6
-  progress_stall_distance_m: 0.08
-  progress_spin_yaw_deg: 85.0
-  policy_execution_steps: 24
-  arrival_distance_m: 2.0
-  success_distance_m: 3.0
-  landmark_arrival_confirmations: 2
-
-target_grounding:
-  enabled: true
-  backend: "grounding_dino"
-  call_period_sec: 0.10
-  reuse_last_observation_sec: 0.0
-  upload_max_edge_px: 768
-  min_bbox_area_ratio: 0.002
-  max_bbox_area_ratio: 0.60
-  min_bbox_width_px: 4
-  min_bbox_height_px: 4
-  max_bbox_aspect_ratio: 8.0
-  min_depth_valid_ratio: 0.12
-  depth_statistic: "median"
-  center_patch_ratio: 0.25
-  min_depth_m: 0.20
-  max_depth_m: 10.0
-  min_confidence: 0.50
-  coordinate_mode: "auto"
-  allow_normalized_bbox: true
-  normalized_bbox_scale: 1000.0
-  depth_region: "bbox_depth_mask"
-  depth_mask_tolerance_ratio: 0.35
-  depth_mask_min_pixels: 16
-  grounding_dino_repo_path: "third_party/GroundingDINO"
-  grounding_dino_config_path: "weights/grounded_sam/GroundingDINO_SwinT_OGC.py"
-  grounding_dino_checkpoint_path: "weights/grounded_sam/groundingdino_swint_ogc.pth"
-  grounding_dino_device: "cuda:0"
-  grounding_dino_box_threshold: 0.45
-  grounding_dino_text_threshold: 0.25
-  grounding_dino_max_detections: 5
-  grounding_dino_nms_iou_threshold: 0.50
-  grounding_dino_text_encoder_path: "weights/grounded_sam/bert-base-uncased"
-  sam_checkpoint_path: "weights/grounded_sam/sam_vit_h_4b8939.pth"
-  sam_model_type: "vit_h"
-  sam_device: "cuda:0"
-  sam_enabled: false
-  sam_min_mask_area_ratio: 0.0005
-  max_result_age_sec: 30.0
-  max_result_pose_delta_m: 0.05
-  max_result_yaw_delta_deg: 3.0
-  semantic_verification_enabled: true
-  semantic_verification_min_confidence: 0.50
-  semantic_verification_max_edge_px: 768
-  semantic_verification_auto_accept_confidence: 0.75
-  pause_during_active_primitive: true
-  tracker_enabled: true
-  tracker_type: "CSRT"
-  tracker_max_lost_frames: 8
-  tracker_lost_confirmed_sec: 2.0
-  tracker_min_depth_valid_ratio: 0.08
-  tracker_center_patch_ratio: 0.35
-  tracker_confidence_decay_per_lost_frame: 0.06
-  tracker_min_tracking_confidence: 0.35
-
-landmark_tracker:
-  min_visible_count: 2
-  arrival_confirmations: 1
-  arrival_window_size: 5
-  arrival_recent_visible_sec: 3.0
-  max_lost_count: 6
-  anchor_update_min_consistent_observations: 2
-  anchor_update_max_jump_m: 1.5
-  landmark_map_enabled: true
-  landmark_map_anchor_ttl_sec: 120.0
-  landmark_map_min_confidence: 0.20
-  landmark_map_log_period_sec: 2.0
-  confirm_confidence_threshold: 0.75
-  potential_confidence_threshold: 0.50
-  confirm_min_observations: 2
-  confirm_max_anchor_jump_m: 0.75
-  confirm_max_depth_jump_m: 3.0
-  low_confidence_min_translation_m: 0.20
-  low_confidence_min_yaw_deg: 10.0
-
-camera:
-  width: 1280
-  height: 960
-  follow_front_camera_in_gui: false
-  follow_observer_camera_in_gui: true
-  observer_video_enabled: true
-  observer_video_path: "debug/local/observevideos/observer.mp4"
-  observer_video_fps: 10.0
-  camera_horizontal_fov_deg: 90.0
-  interactive_confirmation_enabled: false
-  roi_vertical_range: [0.45, 0.85]
-  clearance_threshold_m: 1.2
-  valid_depth_range_m: [0.2, 10.0]
-  candidate_preferred_distance_m: 1.0
-  depth_eval_period_sec: 0.12
-  depth_debug_enabled: false
-  depth_debug_image_path: "debug/local/depth_debug.png"
-  obstacle_avoidance_enabled: true
-  obstacle_roi_vertical_range: [0.50, 0.95]
-  obstacle_center_width_ratio: 0.34
-  obstacle_side_width_ratio: 0.30
-  near_field_memory_enabled: true
-  near_field_memory_sec: 2.0
-  waypoint_heading_threshold_rad: 0.3
-  waypoint_stop_distance_m: 0.45
-  waypoint_turn_speed_scale: 1.0
-  waypoint_forward_speed_scale: 1.0
-  replanning_cooldown_sec: 0.5
-
-control:
-  use_discrete_action_primitives: true
-  stuck_detection_enabled: true
-  stuck_window_sec: 2.0
-  stuck_displacement_threshold_m: 0.05
-  stuck_yaw_threshold_deg: 5.0
-  stuck_recovery_pause_sec: 0.5
-  stuck_recovery_reverse_sec: 0.65
-  stuck_recovery_turn_sec: 0.35
-  stuck_recovery_turn_action: "TURN_RIGHT"
-  action_odom_completion_enabled: true
-  active_track_max_yaw_deg: 10.0
-  active_track_min_duration_sec: 0.45
-
-odom:
-  enabled: true
-  source: "isaac_world_pose"
-
-navigation_map:
-  enabled: false
-  image_path: "assets/navigation_map.png"
-  update_period_sec: 0.5
-  width: 900
-  height: 900
-  depth_sample_stride_px: 16
-  max_depth_obstacle_points: 2500
-
-topology:
-  enabled: true
-  node_spacing_m: 1.0
-  turn_threshold_deg: 40.0
-  merge_radius_m: 0.75
-  landmark_bind_radius_m: 1.5
-  max_nodes: 128
-  recent_node_count: 8
-
-occupancy_grid:
-  enabled: true
-  resolution_m: 0.08
-  size_m: 80.0
-  update_period_sec: 0.12
-  depth_sample_stride_px: 10
-  depth_roi_vertical_range: [0.38, 0.72]
-  min_depth_m: 0.40
-  max_depth_m: 10.0
-  occupied_min_neighbors: 3
-  unknown_is_traversable: false
-  unknown_cell_cost: 0.80
-  lidar_bootstrap_sec: 0.8
-  lidar_bootstrap_min_fov_deg: 165.0
-  lidar_bootstrap_max_wait_sec: 3.0
-  semantic_planner_enabled: true
-  semantic_goal_step_m: 0.9
-  semantic_goal_min_step_m: 0.45
-  semantic_goal_lateral_search_m: 0.8
-
-map_candidates:
-  enabled: true
-  max_candidates: 3
-  min_distance_m: 0.55
-  max_distance_m: 1.35
-  semantic_enabled: true
-  frontier_enabled: true
-  escape_enabled: true
-  min_clearance_m: 0.34
-  unknown_gain_weight: 0.35
-  semantic_weight: 0.45
-
-lidar:
-  enabled: true
-  child_name: "Lidar"
-  horizontal_fov_deg: 180.0
-  vertical_fov_deg: 10.0
-  horizontal_resolution_deg: 0.4
-  vertical_resolution_deg: 4.0
-  rotation_rate_hz: 30.0
-  min_range_m: 0.40
-  max_range_m: 10.0
-  yaw_offset_deg: 0.0
-  sector_merge_keep_sec: 1.5
-  draw_points: false
-  draw_lines: false
-  mode: "single"
-  multi_sector_count: 3
-  multi_sector_fov_deg: 60.0
-  multi_sector_yaw_offsets_deg: [60.0, 0.0, -60.0]
-  multi_child_names: ["LidarLeft", "LidarCenter", "LidarRight"]
 
 scene:
+  usd_path: "usd/hospital.usd"
   prim_path: "/World/Environment"
   add_default_ground_plane: false
   add_dome_light: false
   stage_load_timeout_sec: 120.0
   viewport_eye: [7.0, -2.0, 4.0]
   viewport_target: [1.5, 4.0, 1.0]
+  robot_start_xy_m: [1.5, 4.0]
+  robot_start_orientation_deg: [0.0, 0.0, 0.0]
+
+llm:
+  api_key: "sk-bduqejichuzwbbzuesgwfvwswcetzfagmfkyadbpkzykfjjh"
+  api_base_url: "https://api.siliconflow.cn/v1"
+  model_name: "Qwen/Qwen3-VL-30B-A3B-Instruct"
+  timeout_sec: 30
+  retry_cooldown_sec: 0.0
+  upload_max_edge_px: 1024
+  camera_image_detail: "high"
+
+instruction:
+  text: ""
+  parse_max_tokens: 768
+  parse_timeout_sec: 90
+  cache_enabled: true
+  cache_path: ".cache/instruction_plans.json"
+
+perception:
+  grounding:
+    call_period_sec: 0.10
+    reuse_last_observation_sec: 0.0
+    upload_max_edge_px: 768
+    min_bbox_area_ratio: 0.002
+    max_bbox_area_ratio: 0.60
+    min_bbox_width_px: 4
+    min_bbox_height_px: 4
+    max_bbox_aspect_ratio: 8.0
+    min_depth_valid_ratio: 0.12
+    depth_statistic: "median"
+    center_patch_ratio: 0.25
+    min_depth_m: 0.20
+    max_depth_m: 10.0
+    min_confidence: 0.50
+    coordinate_mode: "auto"
+    allow_normalized_bbox: true
+    normalized_bbox_scale: 1000.0
+    depth_region: "bbox_depth_cluster"
+    depth_cluster_tolerance_ratio: 0.35
+    depth_cluster_min_pixels: 16
+    max_result_age_sec: 30.0
+    max_result_pose_delta_m: 0.05
+    max_result_yaw_delta_deg: 3.0
+    detector:
+      repo_path: "third_party/GroundingDINO"
+      config_path: "weights/grounded_sam/GroundingDINO_SwinT_OGC.py"
+      checkpoint_path: "weights/grounded_sam/groundingdino_swint_ogc.pth"
+      device: "cuda:0"
+      box_threshold: 0.45
+      text_threshold: 0.25
+      max_detections: 5
+      nms_iou_threshold: 0.50
+      text_encoder_path: "weights/grounded_sam/bert-base-uncased"
+    semantic_verification:
+      min_confidence: 0.50
+      max_edge_px: 768
+      auto_accept_confidence: 0.75
+    tracker:
+      tracker_type: "CSRT"
+      max_lost_frames: 8
+      lost_confirmed_sec: 2.0
+      min_depth_valid_ratio: 0.08
+      center_patch_ratio: 0.35
+      confidence_decay_per_lost_frame: 0.06
+      min_tracking_confidence: 0.35
+  landmark_tracking:
+    min_visible_count: 2
+    arrival_confirmations: 1
+    arrival_window_size: 5
+    arrival_recent_visible_sec: 3.0
+    max_lost_count: 6
+    anchor_update_min_consistent_observations: 2
+    anchor_update_max_jump_m: 1.5
+    confirm_confidence_threshold: 0.75
+    potential_confidence_threshold: 0.50
+    confirm_min_observations: 2
+    confirm_max_anchor_jump_m: 0.75
+    confirm_max_depth_jump_m: 3.0
+    low_confidence_min_translation_m: 0.20
+    low_confidence_min_yaw_deg: 10.0
+  landmark_map:
+    anchor_ttl_sec: 120.0
+    min_confidence: 0.20
+    log_period_sec: 2.0
+
+mapping:
+  occupancy:
+    resolution_m: 0.08
+    size_m: 80.0
+    update_period_sec: 0.12
+    occupied_min_neighbors: 3
+    unknown_is_traversable: false
+    unknown_cell_cost: 0.80
+    lidar_bootstrap_sec: 0.8
+    lidar_bootstrap_min_fov_deg: 165.0
+    lidar_bootstrap_max_wait_sec: 3.0
+    semantic_goal_step_m: 0.9
+    semantic_goal_min_step_m: 0.45
+    semantic_goal_lateral_search_m: 0.8
+  topology:
+    node_spacing_m: 1.0
+    turn_threshold_deg: 40.0
+    merge_radius_m: 0.75
+    landmark_bind_radius_m: 1.5
+    max_nodes: 128
+    recent_node_count: 8
+
+navigation:
+  candidates:
+    max_candidates: 3
+    min_distance_m: 0.55
+    max_distance_m: 1.35
+    slot_bearings_deg: [35.0, 18.0, 0.0, -18.0, -35.0]
+    adaptive_count: 5
+    adaptive_min_spacing_deg: 18.0
+    adaptive_smoothing_px: 15
+    min_free_ratio: 0.28
+    column_half_width_px: 26
+    unknown_gain_weight: 0.35
+    semantic_weight: 0.45
+  policy:
+    replanning_cooldown_sec: 0.50
+    visual_target_center_deadband_deg: 15.0
+    local_detour_max_turn_primitives: 2
+    region_transition:
+      min_displacement_m: 1.0
+      confirmations: 2
+      min_confidence: 0.55
+    semantic_turn:
+      min_yaw_deg: 45.0
+      max_yaw_deg: 105.0
+      max_primitives: 7
+      min_forward_clearance_m: 0.60
+      alignment_confirmations: 2
+      corridor_center_tolerance_deg: 10.0
+      same_corridor_tolerance_deg: 15.0
+      target_high_confidence: 0.75
+      target_medium_confidence: 0.50
+      direction_tolerance_deg: 10.0
+      corridor_half_fov_deg: 60.0
+      corridor_step_deg: 5.0
+      lidar_bin_half_width_deg: 3.0
+      min_corridor_width_deg: 15.0
+      corridor_max_clearance_m: 4.0
+      max_recovery_attempts: 2
+  progress:
+    history_length: 6
+    stall_distance_m: 0.08
+    spin_yaw_deg: 85.0
+    landmark_clearance_m: 1.0
+    final_success_clearance_m: 2.0
+    landmark_arrival_confirmations: 2
+  recovery:
+    stuck_window_sec: 2.0
+    stuck_displacement_threshold_m: 0.05
+    stuck_yaw_threshold_deg: 5.0
+    pause_sec: 0.5
+    reverse_sec: 0.65
+    turn_sec: 0.35
+    turn_action: "TURN_RIGHT"
+
+debug:
+  image:
+    enabled: true
+    path: "debug/local/vln_debug.png"
+    update_period_sec: 1.0
+    depth_enabled: false
+    depth_path: "debug/local/depth_debug.png"
+  video:
+    enabled: false
+    path: "debug/local/videos/vln_debug.mp4"
+    fps: 4.0
+  observer_video:
+    enabled: false
+    path: "debug/local/observevideos/observer.mp4"
+    fps: 10.0
 
 logging:
   level: "INFO"

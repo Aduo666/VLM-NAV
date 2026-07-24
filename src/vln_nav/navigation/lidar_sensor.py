@@ -14,9 +14,7 @@ _DYNAMIC_MAP_MAX_HEIGHT_M = 1.20
 
 @dataclass
 class PhysXLidarConfig:
-    enabled: bool
     prim_path: str
-    child_name: str
     horizontal_fov_deg: float
     vertical_fov_deg: float
     horizontal_resolution_deg: float
@@ -26,9 +24,6 @@ class PhysXLidarConfig:
     max_range_m: float
     yaw_offset_deg: float
     sector_merge_keep_sec: float
-    draw_points: bool
-    draw_lines: bool
-    require_existing_sensor: bool = False
 
 
 @dataclass
@@ -50,30 +45,6 @@ class LidarScan:
     sensor_path: str
     source: str
     sensor_origin_local_xy: np.ndarray
-
-
-@dataclass
-class MultiLidarSectorConfig:
-    """Configuration for one sector of a multi-lidar setup."""
-    child_name: str
-    yaw_offset_deg: float
-    horizontal_fov_deg: float
-
-
-@dataclass
-class MultiLidarConfig:
-    """Configuration for multi-lidar setup (e.g. 3x60deg = 180deg forward)."""
-    enabled: bool
-    prim_path: str
-    vertical_fov_deg: float
-    horizontal_resolution_deg: float
-    vertical_resolution_deg: float
-    rotation_rate_hz: float
-    min_range_m: float
-    max_range_m: float
-    draw_points: bool
-    draw_lines: bool
-    sectors: list[MultiLidarSectorConfig]
 
 
 class PhysXLidarReader:
@@ -111,21 +82,13 @@ class PhysXLidarReader:
         self._last_coverage_log_time_sec = -float("inf")
 
     @property
-    def enabled(self) -> bool:
-        return bool(self._config.enabled)
-
-    @property
     def sensor_path(self) -> str:
         return self._sensor_path
 
     def initialize(self, *, stage) -> bool:
-        if not bool(self._config.enabled):
-            return False
         self._stage = stage
         try:
-            import omni.kit.commands
             from isaacsim.sensors.physx import _range_sensor
-            from pxr import Gf
         except Exception as exc:
             self._logger.warning("[Lidar] unavailable reason=import_failed error=%s", exc)
             return False
@@ -135,75 +98,14 @@ class PhysXLidarReader:
             prim_path=str(self._config.prim_path),
         )
         requested_prim = stage.GetPrimAtPath(requested_path)
-        if requested_prim.IsValid() and requested_prim.GetTypeName() == "Lidar":
-            self._sensor_path = requested_path
-            self._logger.info("[Lidar] using existing PhysX Lidar prim: %s", self._sensor_path)
-        else:
-            existing_child_path = _find_child_lidar_path(stage=stage, root_path=requested_path)
-            if existing_child_path:
-                self._sensor_path = existing_child_path
-                self._logger.info(
-                    "[Lidar] using existing mounted PhysX Lidar prim=%s mount=%s",
-                    self._sensor_path,
-                    requested_path,
-                )
-                self._log_sensor_parameters(stage=stage)
-                self._configure_sensor_to_robot_transform(stage=stage)
-                self._interface = _range_sensor.acquire_lidar_sensor_interface()
-                self._initialized = True
-                return True
-            if bool(self._config.require_existing_sensor):
-                self._logger.error(
-                    "[Lidar] required USD sensor is missing or is not a PhysX Lidar prim: %s",
-                    requested_path,
-                )
-                return False
-            parent_path = requested_path if requested_prim.IsValid() else str(requested_path).rsplit("/", 1)[0]
-            child_name = str(self._config.child_name).strip() or "lidar_sensor"
-            managed_path = f"{str(parent_path).rstrip('/')}/{child_name}"
-            managed_prim = stage.GetPrimAtPath(managed_path)
-            if managed_prim.IsValid() and managed_prim.GetTypeName() == "Lidar":
-                self._sensor_path = managed_path
-                self._logger.info(
-                    "[Lidar] using managed PhysX Lidar prim=%s mount=%s",
-                    self._sensor_path,
-                    parent_path,
-                )
-                self._log_sensor_parameters(stage=stage)
-                self._configure_sensor_to_robot_transform(stage=stage)
-                self._interface = _range_sensor.acquire_lidar_sensor_interface()
-                self._initialized = True
-                return True
-            result, lidar_prim = omni.kit.commands.execute(
-                "RangeSensorCreateLidar",
-                path=f"/{child_name}",
-                parent=parent_path,
-                min_range=float(self._config.min_range_m),
-                max_range=float(self._config.max_range_m),
-                draw_points=bool(self._config.draw_points),
-                draw_lines=bool(self._config.draw_lines),
-                horizontal_fov=float(self._config.horizontal_fov_deg),
-                vertical_fov=float(self._config.vertical_fov_deg),
-                horizontal_resolution=float(self._config.horizontal_resolution_deg),
-                vertical_resolution=float(self._config.vertical_resolution_deg),
-                rotation_rate=float(self._config.rotation_rate_hz),
-                high_lod=False,
-                yaw_offset=float(self._config.yaw_offset_deg),
-            )
-            if not result or lidar_prim is None:
-                self._logger.warning("[Lidar] unavailable reason=create_failed requested=%s parent=%s", requested_path, parent_path)
-                return False
-            self._sensor_path = str(lidar_prim.GetPath())
-            try:
-                lidar_prim.GetPrim().GetAttribute("xformOp:translate").Set(Gf.Vec3d(0.0, 0.0, 0.0))
-            except Exception:
-                pass
-            self._logger.info(
-                "[Lidar] created fallback PhysX Lidar prim=%s parent=%s requested_mount=%s",
-                self._sensor_path,
-                parent_path,
+        if not requested_prim.IsValid() or requested_prim.GetTypeName() != "Lidar":
+            self._logger.error(
+                "[Lidar] required USD PhysX Lidar prim is missing or invalid: %s",
                 requested_path,
             )
+            return False
+        self._sensor_path = requested_path
+        self._logger.info("[Lidar] using required USD PhysX Lidar prim: %s", self._sensor_path)
 
         self._configure_sensor_to_robot_transform(stage=stage)
         self._log_sensor_parameters(stage=stage)
@@ -665,322 +567,6 @@ class PhysXLidarReader:
             ) from exc
 
 
-class MultiLidarReader:
-    """Read multiple fixed-FOV PhysX Lidars and merge into one wide-FOV forward scan.
-
-    Creates N PhysX Lidar prims at the same mount position, each covering a
-    fixed angular sector.  The default 3-sector layout (left -60, center 0,
-    right +60 deg yaw offsets, each 60 deg FOV) yields a full 180 deg forward
-    scan every frame without relying on temporal sector merging.
-    """
-
-    def __init__(self, *, config: MultiLidarConfig, robot_root_path: str, logger) -> None:
-        self._config = config
-        self._robot_root_path = str(robot_root_path).rstrip("/")
-        self._logger = logger.getChild("multi_lidar")
-        self._initialized = False
-        self._sector_states: list[dict[str, object]] = []
-        self._sensor_origin_robot_xy = np.zeros((2,), dtype=np.float32)
-        self._sensor_x_axis_robot_xy = np.asarray([1.0, 0.0], dtype=np.float32)
-        self._sensor_y_axis_robot_xy = np.asarray([0.0, 1.0], dtype=np.float32)
-        self._last_log_time_sec = -float("inf")
-        self._last_coverage_log_time_sec = -float("inf")
-
-    @property
-    def enabled(self) -> bool:
-        return bool(self._config.enabled)
-
-    @property
-    def sensor_path(self) -> str:
-        if self._sector_states:
-            return str(self._sector_states[0].get("sensor_path", ""))
-        return ""
-
-    def initialize(self, *, stage) -> bool:
-        if not bool(self._config.enabled):
-            return False
-        try:
-            import omni.kit.commands
-            from isaacsim.sensors.physx import _range_sensor
-            from pxr import Gf
-        except Exception as exc:
-            self._logger.warning("[MultiLidar] unavailable reason=import_failed error=%s", exc)
-            return False
-
-        mount_path = _resolve_robot_relative_prim_path(
-            robot_root_path=self._robot_root_path,
-            prim_path=str(self._config.prim_path),
-        )
-        mount_prim = stage.GetPrimAtPath(mount_path)
-        if not mount_prim.IsValid():
-            self._logger.warning("[MultiLidar] mount prim invalid: %s", mount_path)
-            return False
-
-        interface = _range_sensor.acquire_lidar_sensor_interface()
-        self._sector_states = []
-
-        for idx, sector_cfg in enumerate(self._config.sectors):
-            child_name = str(sector_cfg.child_name).strip() or f"LidarSector{idx}"
-            sector_path = f"{str(mount_path).rstrip('/')}/{child_name}"
-            sector_prim = stage.GetPrimAtPath(sector_path)
-
-            if sector_prim.IsValid() and sector_prim.GetTypeName() == "Lidar":
-                self._logger.info("[MultiLidar] sector[%s] using existing prim: %s", idx, sector_path)
-            else:
-                result, lidar_prim = omni.kit.commands.execute(
-                    "RangeSensorCreateLidar",
-                    path=f"/{child_name}",
-                    parent=str(mount_path),
-                    min_range=float(self._config.min_range_m),
-                    max_range=float(self._config.max_range_m),
-                    draw_points=bool(self._config.draw_points),
-                    draw_lines=bool(self._config.draw_lines),
-                    horizontal_fov=float(sector_cfg.horizontal_fov_deg),
-                    vertical_fov=float(self._config.vertical_fov_deg),
-                    horizontal_resolution=float(self._config.horizontal_resolution_deg),
-                    vertical_resolution=float(self._config.vertical_resolution_deg),
-                    rotation_rate=float(self._config.rotation_rate_hz),
-                    high_lod=False,
-                    yaw_offset=0.0,
-                )
-                if not result or lidar_prim is None:
-                    self._logger.warning(
-                        "[MultiLidar] sector[%s] create_failed child=%s mount=%s",
-                        idx, child_name, mount_path,
-                    )
-                    continue
-                sector_path = str(lidar_prim.GetPath())
-                try:
-                    lidar_prim.GetPrim().GetAttribute("xformOp:translate").Set(Gf.Vec3d(0.0, 0.0, 0.0))
-                except Exception:
-                    pass
-                self._logger.info(
-                    "[MultiLidar] sector[%s] created prim=%s fov=%.1f yaw_offset=%.1f",
-                    idx, sector_path, sector_cfg.horizontal_fov_deg, sector_cfg.yaw_offset_deg,
-                )
-
-            self._sector_states.append({
-                "sensor_path": sector_path,
-                "interface": interface,
-                "yaw_offset_deg": float(sector_cfg.yaw_offset_deg),
-                "horizontal_fov_deg": float(sector_cfg.horizontal_fov_deg),
-                "min_range_m": float(self._config.min_range_m),
-                "max_range_m": float(self._config.max_range_m),
-            })
-
-        if not self._sector_states:
-            self._logger.warning("[MultiLidar] no sectors initialized")
-            return False
-
-        self._configure_sensor_to_robot_transform(stage=stage)
-        self._log_all_sensor_parameters(stage=stage)
-        self._initialized = True
-        self._logger.info("[MultiLidar] initialized %d sectors", len(self._sector_states))
-        return True
-
-    def read(self, *, pose: Pose2D, timestamp_sec: float) -> LidarScan | None:
-        if not self._initialized or not self._sector_states:
-            return None
-
-        all_endpoints: list[np.ndarray] = []
-        all_hits: list[np.ndarray] = []
-        total_raw_beams = 0
-        total_valid_beams = 0
-        any_read = False
-
-        for idx, sector in enumerate(self._sector_states):
-            sensor_path = str(sector["sensor_path"])
-            try:
-                depth_raw = np.asarray(sector["interface"].get_depth_data(sensor_path))
-                azimuth = np.asarray(
-                    sector["interface"].get_azimuth_data(sensor_path), dtype=np.float32
-                ).reshape(-1)
-            except Exception as exc:
-                if float(timestamp_sec) - self._last_log_time_sec >= 2.0:
-                    self._logger.warning(
-                        "[MultiLidar] sector[%s] read_failed path=%s error=%s",
-                        idx, sensor_path, exc,
-                    )
-                continue
-
-            sensor_beams, sensor_hits, debug = _scan_to_local_beams(
-                depth_raw=depth_raw,
-                azimuth=azimuth,
-                min_range_m=float(sector["min_range_m"]),
-                max_range_m=float(sector["max_range_m"]),
-                yaw_offset_deg=float(sector["yaw_offset_deg"]),
-            )
-
-            robot_beams = _transform_sensor_points_to_robot(
-                sensor_points=sensor_beams,
-                sensor_origin_robot_xy=self._sensor_origin_robot_xy,
-                sensor_x_axis_robot_xy=self._sensor_x_axis_robot_xy,
-                sensor_y_axis_robot_xy=self._sensor_y_axis_robot_xy,
-            )
-            hit_mask = np.asarray(sensor_hits, dtype=bool)
-            if robot_beams.shape[0] != hit_mask.shape[0]:
-                hit_mask = np.zeros((robot_beams.shape[0],), dtype=bool)
-
-            if robot_beams.size > 0:
-                all_endpoints.append(robot_beams)
-                all_hits.append(hit_mask)
-                any_read = True
-            total_raw_beams += int(debug.get("raw_beam_count", 0))
-            total_valid_beams += int(debug.get("valid_beam_count", 0))
-
-        if not any_read or not all_endpoints:
-            if float(timestamp_sec) - self._last_log_time_sec >= 2.0:
-                self._logger.info("[MultiLidar] no_valid_points sectors=%d", len(self._sector_states))
-                self._last_log_time_sec = float(timestamp_sec)
-            return None
-
-        combined_endpoints = np.concatenate(all_endpoints, axis=0)
-        combined_hits = np.concatenate(all_hits, axis=0)
-
-        if combined_endpoints.size == 0:
-            return None
-
-        # Sort by angle for consistent ordering
-        angles = np.arctan2(combined_endpoints[:, 1], combined_endpoints[:, 0])
-        order = np.argsort(angles)
-        combined_endpoints = combined_endpoints[order]
-        combined_hits = combined_hits[order]
-
-        points = (
-            combined_endpoints[combined_hits]
-            if combined_hits.any()
-            else np.zeros((0, 2), dtype=np.float32)
-        )
-
-        angle_min_deg = float(np.rad2deg(np.min(angles)))
-        angle_max_deg = float(np.rad2deg(np.max(angles)))
-        effective_fov_deg = max(0.0, angle_max_deg - angle_min_deg)
-
-        if float(timestamp_sec) - self._last_coverage_log_time_sec >= 2.0:
-            self._logger.info(
-                "[MultiLidarCoverage] sectors=%d total_raw_beams=%d total_valid_beams=%d "
-                "angle_range=[%.1f,%.1f] effective_fov_deg=%.1f combined_beams=%d hits=%d",
-                len(self._sector_states),
-                total_raw_beams,
-                total_valid_beams,
-                angle_min_deg,
-                angle_max_deg,
-                effective_fov_deg,
-                int(combined_endpoints.shape[0]),
-                int(np.count_nonzero(combined_hits)),
-            )
-            self._last_coverage_log_time_sec = float(timestamp_sec)
-
-        if float(timestamp_sec) - self._last_log_time_sec >= 2.0:
-            self._logger.info(
-                "[MultiLidar] scan sectors=%d points=%d beams=%d fov_deg=%.1f",
-                len(self._sector_states),
-                int(points.shape[0]),
-                int(combined_endpoints.shape[0]),
-                effective_fov_deg,
-            )
-            self._last_log_time_sec = float(timestamp_sec)
-
-        return LidarScan(
-            points_local_xy=points,
-            beam_endpoints_local_xy=combined_endpoints,
-            beam_hit_mask=combined_hits,
-            current_points_local_xy=points,
-            current_beam_endpoints_local_xy=combined_endpoints,
-            current_beam_hit_mask=combined_hits,
-            point_count=int(points.shape[0]),
-            current_point_count=int(points.shape[0]),
-            raw_beam_count=total_raw_beams,
-            valid_beam_count=total_valid_beams,
-            angle_min_deg=angle_min_deg,
-            angle_max_deg=angle_max_deg,
-            effective_fov_deg=effective_fov_deg,
-            timestamp_sec=float(timestamp_sec),
-            sensor_path=str(self._sector_states[0].get("sensor_path", "")),
-            source="multi_lidar",
-            sensor_origin_local_xy=self._sensor_origin_robot_xy.copy(),
-        )
-
-    def _configure_sensor_to_robot_transform(self, *, stage) -> None:
-        try:
-            from pxr import Gf, Usd, UsdGeom
-
-            robot_prim = stage.GetPrimAtPath(self._robot_root_path)
-            sensor_path = str(self._sector_states[0]["sensor_path"])
-            sensor_prim = stage.GetPrimAtPath(sensor_path)
-            if not robot_prim.IsValid() or not sensor_prim.IsValid():
-                self._logger.warning(
-                    "[MultiLidar] sensor_to_robot_transform unavailable robot=%s sensor=%s",
-                    self._robot_root_path, sensor_path,
-                )
-                return
-
-            time_code = Usd.TimeCode.Default()
-            robot_world = UsdGeom.Xformable(robot_prim).ComputeLocalToWorldTransform(time_code)
-            sensor_world = UsdGeom.Xformable(sensor_prim).ComputeLocalToWorldTransform(time_code)
-            robot_inv = robot_world.GetInverse()
-
-            origin_robot = robot_inv.Transform(sensor_world.Transform(Gf.Vec3d(0.0, 0.0, 0.0)))
-            x_robot = robot_inv.Transform(sensor_world.Transform(Gf.Vec3d(1.0, 0.0, 0.0))) - origin_robot
-            y_robot = robot_inv.Transform(sensor_world.Transform(Gf.Vec3d(0.0, 1.0, 0.0))) - origin_robot
-
-            x_axis = np.asarray([float(x_robot[0]), float(x_robot[1])], dtype=np.float32)
-            y_axis = np.asarray([float(y_robot[0]), float(y_robot[1])], dtype=np.float32)
-            x_norm = float(np.linalg.norm(x_axis))
-            y_norm = float(np.linalg.norm(y_axis))
-            if x_norm > 1.0e-6:
-                x_axis = x_axis / x_norm
-            if y_norm > 1.0e-6:
-                y_axis = y_axis / y_norm
-
-            self._sensor_origin_robot_xy = np.asarray(
-                [float(origin_robot[0]), float(origin_robot[1])],
-                dtype=np.float32,
-            )
-            self._sensor_x_axis_robot_xy = x_axis
-            self._sensor_y_axis_robot_xy = y_axis
-
-            yaw_deg = float(np.rad2deg(np.arctan2(float(x_axis[1]), float(x_axis[0]))))
-            self._logger.info(
-                "[MultiLidar] sensor_to_robot origin_xy=[%.3f,%.3f] x_axis_xy=[%.3f,%.3f] "
-                "sensor_forward_yaw_deg=%.1f",
-                float(self._sensor_origin_robot_xy[0]),
-                float(self._sensor_origin_robot_xy[1]),
-                float(self._sensor_x_axis_robot_xy[0]),
-                float(self._sensor_x_axis_robot_xy[1]),
-                yaw_deg,
-            )
-        except Exception as exc:
-            self._logger.warning("[MultiLidar] sensor_to_robot_transform_failed error=%s", exc)
-
-    def _log_all_sensor_parameters(self, *, stage) -> None:
-        for idx, sector in enumerate(self._sector_states):
-            try:
-                sensor_path = str(sector["sensor_path"])
-                prim = stage.GetPrimAtPath(sensor_path)
-                if not prim.IsValid():
-                    continue
-
-                def _attr_value(name: str, _p=prim):
-                    attr = _p.GetAttribute(name)
-                    return None if attr is None or not attr.IsValid() else attr.Get()
-
-                self._logger.info(
-                    "[MultiLidarConfig] sector[%d] path=%s horizontal_fov=%s vertical_fov=%s "
-                    "horizontal_resolution=%s vertical_resolution=%s rotation_rate=%s yaw_offset=%s",
-                    idx,
-                    sensor_path,
-                    _attr_value("horizontalFov"),
-                    _attr_value("verticalFov"),
-                    _attr_value("horizontalResolution"),
-                    _attr_value("verticalResolution"),
-                    _attr_value("rotationRate"),
-                    _attr_value("yawOffset"),
-                )
-            except Exception as exc:
-                self._logger.warning("[MultiLidarConfig] sector[%d] read_failed error=%s", idx, exc)
-
-
 def _scan_to_local_beams(
     *,
     depth_raw: np.ndarray,
@@ -1392,24 +978,6 @@ def _resolve_robot_relative_prim_path(*, robot_root_path: str, prim_path: str) -
     if text.startswith("/"):
         return text
     return f"{str(robot_root_path).rstrip('/')}/{text.lstrip('/')}"
-
-
-def _find_child_lidar_path(*, stage, root_path: str) -> str:
-    root = stage.GetPrimAtPath(str(root_path))
-    if not root.IsValid():
-        return ""
-    direct_children = list(root.GetChildren())
-    for prim in direct_children:
-        if prim.GetTypeName() == "Lidar" and prim.GetName() == "Lidar":
-            return str(prim.GetPath())
-    for prim in direct_children:
-        if prim.GetTypeName() == "Lidar":
-            return str(prim.GetPath())
-    for prim in direct_children:
-        nested = _find_child_lidar_path(stage=stage, root_path=str(prim.GetPath()))
-        if nested:
-            return nested
-    return ""
 
 
 def _pose_distance_m(first: Pose2D, second: Pose2D) -> float:

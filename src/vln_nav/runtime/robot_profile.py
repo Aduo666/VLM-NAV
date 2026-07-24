@@ -7,9 +7,10 @@ from typing import Any
 import yaml
 
 
-PROFILE_SCHEMA_VERSION = "1.0"
+PROFILE_SCHEMA_VERSION = "2.0"
 SUPPORTED_PROFILES = {"agx", "unitree_g1_29dof"}
 SUPPORTED_CONTROLLER_TYPES = {"agx_4ws", "unitree_g1_policy"}
+SUPPORTED_MOTION_MODELS = {"spin_4ws", "biped_in_place"}
 
 
 @dataclass(frozen=True)
@@ -27,12 +28,62 @@ class RobotSimulationProfile:
 
 
 @dataclass(frozen=True)
+class CameraProfile:
+    front_prim_path: str
+    observer_enabled: bool
+    observer_prim_path: str
+    width: int
+    height: int
+    frequency_hz: int
+    horizontal_fov_deg: float
+    follow_front_in_gui: bool
+    follow_observer_in_gui: bool
+    depth_roi_vertical_range: tuple[float, float]
+    valid_depth_range_m: tuple[float, float]
+    obstacle_roi_vertical_range: tuple[float, float]
+    obstacle_center_width_ratio: float
+    obstacle_side_width_ratio: float
+    depth_eval_period_sec: float
+
+
+@dataclass(frozen=True)
+class LidarProfile:
+    prim_path: str
+    horizontal_fov_deg: float
+    vertical_fov_deg: float
+    horizontal_resolution_deg: float
+    vertical_resolution_deg: float
+    rotation_rate_hz: float
+    min_range_m: float
+    max_range_m: float
+    yaw_offset_deg: float
+    sector_merge_keep_sec: float
+
+
+@dataclass(frozen=True)
 class RobotSensorProfile:
-    front_camera_prim_path: str
-    observer_camera_enabled: bool
-    observer_camera_prim_path: str
-    camera_frequency_hz: int
-    lidar_prim_path: str
+    camera: CameraProfile
+    lidar: LidarProfile
+
+    @property
+    def front_camera_prim_path(self) -> str:
+        return self.camera.front_prim_path
+
+    @property
+    def observer_camera_enabled(self) -> bool:
+        return self.camera.observer_enabled
+
+    @property
+    def observer_camera_prim_path(self) -> str:
+        return self.camera.observer_prim_path
+
+    @property
+    def camera_frequency_hz(self) -> int:
+        return self.camera.frequency_hz
+
+    @property
+    def lidar_prim_path(self) -> str:
+        return self.lidar.prim_path
 
 
 @dataclass(frozen=True)
@@ -52,12 +103,33 @@ class PrimitiveProfile:
 
 
 @dataclass(frozen=True)
+class RobotMotionModelProfile:
+    model_type: str
+    turn_drift_margin_m: float
+    sweep_resolution_deg: float
+
+
+@dataclass(frozen=True)
 class RobotGeometryProfile:
-    footprint_radius_m: float
+    footprint_polygon_xy_m: tuple[tuple[float, float], ...]
+    safety_margin_m: float
     obstacle_stop_distance_m: float
-    map_inflation_radius_m: float
-    path_corridor_radius_m: float
-    turn_clearance_radius_m: float
+
+    @property
+    def front_extent_m(self) -> float:
+        return max(point[0] for point in self.footprint_polygon_xy_m)
+
+    @property
+    def rear_extent_m(self) -> float:
+        return abs(min(point[0] for point in self.footprint_polygon_xy_m))
+
+    @property
+    def half_width_m(self) -> float:
+        return max(abs(point[1]) for point in self.footprint_polygon_xy_m)
+
+    @property
+    def circumscribed_radius_m(self) -> float:
+        return max((point[0] ** 2 + point[1] ** 2) ** 0.5 for point in self.footprint_polygon_xy_m)
 
 
 @dataclass(frozen=True)
@@ -79,12 +151,6 @@ class AgxControllerProfile:
     turn_mode: str
     turn_steering_angle: float
     rear_steering_ratio: float
-    track_min_speed_scale: float
-    track_max_speed_scale: float
-    track_heading_gain: float
-    track_slow_heading_rad: float
-    track_smoothing_alpha: float
-    track_steering_sign: float
     wheel_drive_damping: float
     steering_stiffness: float
     steering_damping: float
@@ -111,6 +177,7 @@ class RobotProfile:
     simulation: RobotSimulationProfile
     sensors: RobotSensorProfile
     primitives: PrimitiveProfile
+    motion_model: RobotMotionModelProfile
     geometry: RobotGeometryProfile
     safety: RobotSafetyProfile
     agx_controller: AgxControllerProfile | None
@@ -119,6 +186,14 @@ class RobotProfile:
     @property
     def is_g1(self) -> bool:
         return self.robot_type == "unitree_g1_policy"
+
+    def capability_summary(self) -> str:
+        platform = "biped humanoid" if self.is_g1 else "four-wheel-steering wheeled robot"
+        return (
+            f"platform={platform}; motion_model={self.motion_model.model_type}; "
+            f"FORWARD={self.primitives.forward_distance_m:.2f}m; "
+            f"TURN_LEFT/RIGHT={self.primitives.turn_angle_deg:.1f}deg"
+        )
 
 
 def load_robot_profile(*, profile_name: str, project_root: Path) -> RobotProfile:
@@ -134,6 +209,7 @@ def load_robot_profile(*, profile_name: str, project_root: Path) -> RobotProfile
         payload = yaml.safe_load(handle) or {}
     if not isinstance(payload, dict):
         raise ValueError(f"Robot profile must be a YAML mapping: {profile_path}")
+
     _require_exact_keys(
         payload,
         required={
@@ -145,6 +221,7 @@ def load_robot_profile(*, profile_name: str, project_root: Path) -> RobotProfile
             "sensors",
             "controller",
             "primitives",
+            "motion_model",
             "geometry",
             "safety",
         },
@@ -164,66 +241,114 @@ def load_robot_profile(*, profile_name: str, project_root: Path) -> RobotProfile
     if robot_type not in SUPPORTED_CONTROLLER_TYPES:
         raise ValueError(f"Unsupported controller type {robot_type!r} in {profile_path}")
 
-    asset = _mapping(payload, "asset", normalized_name)
+    asset_data = _mapping(payload, "asset", normalized_name)
     _require_exact_keys(
-        asset,
+        asset_data,
         required={"usd_path", "prim_path", "articulation_path"},
         context=f"{normalized_name}.asset",
     )
-    spawn = _mapping(payload, "spawn", normalized_name)
-    _require_exact_keys(spawn, required={"z_m"}, context=f"{normalized_name}.spawn")
-    simulation = _mapping(payload, "simulation", normalized_name)
+    spawn_data = _mapping(payload, "spawn", normalized_name)
+    _require_exact_keys(spawn_data, required={"z_m"}, context=f"{normalized_name}.spawn")
+    simulation_data = _mapping(payload, "simulation", normalized_name)
     _require_exact_keys(
-        simulation,
+        simulation_data,
         required={"physics_dt", "rendering_dt", "policy_decimation"},
         context=f"{normalized_name}.simulation",
     )
-    sensors = _mapping(payload, "sensors", normalized_name)
+
+    sensors_data = _mapping(payload, "sensors", normalized_name)
     _require_exact_keys(
-        sensors,
-        required={
-            "front_camera_prim_path",
-            "observer_camera_enabled",
-            "observer_camera_prim_path",
-            "camera_frequency_hz",
-            "lidar_prim_path",
-        },
+        sensors_data,
+        required={"camera", "lidar"},
         context=f"{normalized_name}.sensors",
     )
-    primitives = _mapping(payload, "primitives", normalized_name)
+    camera_data = _mapping(sensors_data, "camera", f"{normalized_name}.sensors")
     _require_exact_keys(
-        primitives,
+        camera_data,
         required={
-            "forward_distance_m",
-            "turn_angle_deg",
-            "distance_tolerance_m",
-            "turn_tolerance_deg",
-            "forward_timeout_sec",
-            "turn_timeout_sec",
-            "forward_command",
-            "turn_command",
-            "settle_max_wait_sec",
-            "settle_linear_speed_threshold_mps",
-            "settle_angular_speed_threshold_radps",
-            "settle_stable_duration_sec",
+            "front_prim_path",
+            "observer_enabled",
+            "observer_prim_path",
+            "width",
+            "height",
+            "frequency_hz",
+            "horizontal_fov_deg",
+            "follow_front_in_gui",
+            "follow_observer_in_gui",
+            "depth_roi_vertical_range",
+            "valid_depth_range_m",
+            "obstacle_roi_vertical_range",
+            "obstacle_center_width_ratio",
+            "obstacle_side_width_ratio",
+            "depth_eval_period_sec",
         },
+        context=f"{normalized_name}.sensors.camera",
+    )
+    lidar_data = _mapping(sensors_data, "lidar", f"{normalized_name}.sensors")
+    _require_exact_keys(
+        lidar_data,
+        required={
+            "prim_path",
+            "horizontal_fov_deg",
+            "vertical_fov_deg",
+            "horizontal_resolution_deg",
+            "vertical_resolution_deg",
+            "rotation_rate_hz",
+            "min_range_m",
+            "max_range_m",
+            "yaw_offset_deg",
+            "sector_merge_keep_sec",
+        },
+        context=f"{normalized_name}.sensors.lidar",
+    )
+
+    primitives_data = _mapping(payload, "primitives", normalized_name)
+    primitive_keys = {
+        "forward_distance_m",
+        "turn_angle_deg",
+        "distance_tolerance_m",
+        "turn_tolerance_deg",
+        "forward_timeout_sec",
+        "turn_timeout_sec",
+        "forward_command",
+        "turn_command",
+        "settle_max_wait_sec",
+        "settle_linear_speed_threshold_mps",
+        "settle_angular_speed_threshold_radps",
+        "settle_stable_duration_sec",
+    }
+    _require_exact_keys(
+        primitives_data,
+        required=primitive_keys,
         context=f"{normalized_name}.primitives",
     )
-    geometry = _mapping(payload, "geometry", normalized_name)
+
+    motion_data = _mapping(payload, "motion_model", normalized_name)
     _require_exact_keys(
-        geometry,
-        required={
-            "footprint_radius_m",
-            "obstacle_stop_distance_m",
-            "map_inflation_radius_m",
-            "path_corridor_radius_m",
-            "turn_clearance_radius_m",
-        },
+        motion_data,
+        required={"type", "turn_drift_margin_m", "sweep_resolution_deg"},
+        context=f"{normalized_name}.motion_model",
+    )
+    motion_model_type = str(motion_data["type"]).strip()
+    if motion_model_type not in SUPPORTED_MOTION_MODELS:
+        raise ValueError(
+            f"{normalized_name}.motion_model.type must be one of {sorted(SUPPORTED_MOTION_MODELS)}"
+        )
+
+    geometry_data = _mapping(payload, "geometry", normalized_name)
+    _require_exact_keys(
+        geometry_data,
+        required={"footprint_polygon_xy_m", "safety_margin_m", "obstacle_stop_distance_m"},
         context=f"{normalized_name}.geometry",
     )
-    safety = _mapping(payload, "safety", normalized_name)
+    footprint_polygon = _footprint_polygon(
+        geometry_data["footprint_polygon_xy_m"],
+        context=f"{normalized_name}.geometry.footprint_polygon_xy_m",
+    )
+
+    safety_data = _mapping(payload, "safety", normalized_name)
     _require_exact_keys(
-        safety,
+        safety_data,
         required={
             "fall_detection_enabled",
             "max_roll_pitch_deg",
@@ -232,12 +357,12 @@ def load_robot_profile(*, profile_name: str, project_root: Path) -> RobotProfile
         },
         context=f"{normalized_name}.safety",
     )
-    controller = _mapping(payload, "controller", normalized_name)
 
-    agx_controller = None
-    g1_controller = None
+    controller_data = _mapping(payload, "controller", normalized_name)
+    agx_controller: AgxControllerProfile | None = None
+    g1_controller: G1ControllerProfile | None = None
     if robot_type == "agx_4ws":
-        required_controller_keys = {
+        required = {
             "left_wheel_joint_names",
             "right_wheel_joint_names",
             "steering_joint_names",
@@ -247,138 +372,148 @@ def load_robot_profile(*, profile_name: str, project_root: Path) -> RobotProfile
             "turn_mode",
             "turn_steering_angle",
             "rear_steering_ratio",
-            "track_min_speed_scale",
-            "track_max_speed_scale",
-            "track_heading_gain",
-            "track_slow_heading_rad",
-            "track_smoothing_alpha",
-            "track_steering_sign",
             "wheel_drive_damping",
             "steering_stiffness",
             "steering_damping",
             "hold_joint_stiffness",
             "hold_joint_damping",
         }
-        _require_exact_keys(
-            controller,
-            required=required_controller_keys,
-            context=f"{normalized_name}.controller",
-        )
+        _require_exact_keys(controller_data, required=required, context=f"{normalized_name}.controller")
         agx_controller = AgxControllerProfile(
-            left_wheel_joint_names=_string_tuple(controller["left_wheel_joint_names"], "left_wheel_joint_names"),
-            right_wheel_joint_names=_string_tuple(controller["right_wheel_joint_names"], "right_wheel_joint_names"),
-            steering_joint_names=_string_tuple(controller["steering_joint_names"], "steering_joint_names"),
-            wheel_drive_velocity=_positive_float(controller["wheel_drive_velocity"], "wheel_drive_velocity"),
-            turn_drive_velocity=_positive_float(controller["turn_drive_velocity"], "turn_drive_velocity"),
-            steering_angle=_positive_float(controller["steering_angle"], "steering_angle"),
-            turn_mode=str(controller["turn_mode"]),
-            turn_steering_angle=_positive_float(controller["turn_steering_angle"], "turn_steering_angle"),
-            rear_steering_ratio=float(controller["rear_steering_ratio"]),
-            track_min_speed_scale=_positive_float(controller["track_min_speed_scale"], "track_min_speed_scale"),
-            track_max_speed_scale=_positive_float(controller["track_max_speed_scale"], "track_max_speed_scale"),
-            track_heading_gain=_positive_float(controller["track_heading_gain"], "track_heading_gain"),
-            track_slow_heading_rad=_positive_float(controller["track_slow_heading_rad"], "track_slow_heading_rad"),
-            track_smoothing_alpha=float(controller["track_smoothing_alpha"]),
-            track_steering_sign=float(controller["track_steering_sign"]),
-            wheel_drive_damping=_positive_float(controller["wheel_drive_damping"], "wheel_drive_damping"),
-            steering_stiffness=_positive_float(controller["steering_stiffness"], "steering_stiffness"),
-            steering_damping=_positive_float(controller["steering_damping"], "steering_damping"),
-            hold_joint_stiffness=_positive_float(controller["hold_joint_stiffness"], "hold_joint_stiffness"),
-            hold_joint_damping=_positive_float(controller["hold_joint_damping"], "hold_joint_damping"),
+            left_wheel_joint_names=_string_tuple(controller_data["left_wheel_joint_names"]),
+            right_wheel_joint_names=_string_tuple(controller_data["right_wheel_joint_names"]),
+            steering_joint_names=_string_tuple(controller_data["steering_joint_names"]),
+            wheel_drive_velocity=_positive_float(controller_data["wheel_drive_velocity"], "wheel_drive_velocity"),
+            turn_drive_velocity=_positive_float(controller_data["turn_drive_velocity"], "turn_drive_velocity"),
+            steering_angle=float(controller_data["steering_angle"]),
+            turn_mode=str(controller_data["turn_mode"]),
+            turn_steering_angle=float(controller_data["turn_steering_angle"]),
+            rear_steering_ratio=float(controller_data["rear_steering_ratio"]),
+            wheel_drive_damping=_nonnegative_float(controller_data["wheel_drive_damping"], "wheel_drive_damping"),
+            steering_stiffness=_nonnegative_float(controller_data["steering_stiffness"], "steering_stiffness"),
+            steering_damping=_nonnegative_float(controller_data["steering_damping"], "steering_damping"),
+            hold_joint_stiffness=_nonnegative_float(controller_data["hold_joint_stiffness"], "hold_joint_stiffness"),
+            hold_joint_damping=_nonnegative_float(controller_data["hold_joint_damping"], "hold_joint_damping"),
         )
     else:
-        _require_exact_keys(
-            controller,
-            required={
-                "policy_path",
-                "deploy_config_path",
-                "inference_device",
-                "standup_duration_sec",
-                "sdk_joint_names",
-                "odom_filter_alpha",
-            },
-            context=f"{normalized_name}.controller",
-        )
-        inference_device = str(controller["inference_device"]).strip().lower()
-        if inference_device != "cpu":
-            raise ValueError("unitree_g1_29dof inference_device must be 'cpu'")
-        sdk_joint_names = _string_tuple(controller["sdk_joint_names"], "sdk_joint_names")
-        if len(sdk_joint_names) != 29 or len(set(sdk_joint_names)) != 29:
-            raise ValueError("unitree_g1_29dof sdk_joint_names must contain 29 unique names")
+        required = {
+            "policy_path",
+            "deploy_config_path",
+            "inference_device",
+            "standup_duration_sec",
+            "odom_filter_alpha",
+            "sdk_joint_names",
+        }
+        _require_exact_keys(controller_data, required=required, context=f"{normalized_name}.controller")
         g1_controller = G1ControllerProfile(
-            policy_path=_resolve_project_path(controller["policy_path"], project_root),
-            deploy_config_path=_resolve_project_path(controller["deploy_config_path"], project_root),
-            inference_device=inference_device,
-            standup_duration_sec=_positive_float(controller["standup_duration_sec"], "standup_duration_sec"),
-            sdk_joint_names=sdk_joint_names,
-            odom_filter_alpha=_unit_float(controller["odom_filter_alpha"], "odom_filter_alpha"),
+            policy_path=_project_path(project_root, controller_data["policy_path"]),
+            deploy_config_path=_project_path(project_root, controller_data["deploy_config_path"]),
+            inference_device=str(controller_data["inference_device"]),
+            standup_duration_sec=_nonnegative_float(controller_data["standup_duration_sec"], "standup_duration_sec"),
+            odom_filter_alpha=float(controller_data["odom_filter_alpha"]),
+            sdk_joint_names=_string_tuple(controller_data["sdk_joint_names"]),
         )
 
     profile = RobotProfile(
         name=normalized_name,
         robot_type=robot_type,
         asset=RobotAssetProfile(
-            usd_path=_resolve_project_path(asset["usd_path"], project_root),
-            prim_path=_absolute_prim_path(asset["prim_path"], "asset.prim_path"),
-            articulation_path=_relative_prim_path(asset["articulation_path"], "asset.articulation_path"),
+            usd_path=_project_path(project_root, asset_data["usd_path"]),
+            prim_path=_prim_path(asset_data["prim_path"], "asset.prim_path"),
+            articulation_path=str(asset_data["articulation_path"]).strip(),
         ),
-        spawn_z_m=float(spawn["z_m"]),
+        spawn_z_m=float(spawn_data["z_m"]),
         simulation=RobotSimulationProfile(
-            physics_dt=_positive_float(simulation["physics_dt"], "physics_dt"),
-            rendering_dt=_positive_float(simulation["rendering_dt"], "rendering_dt"),
-            policy_decimation=_positive_int(simulation["policy_decimation"], "policy_decimation"),
+            physics_dt=_positive_float(simulation_data["physics_dt"], "physics_dt"),
+            rendering_dt=_positive_float(simulation_data["rendering_dt"], "rendering_dt"),
+            policy_decimation=_positive_int(simulation_data["policy_decimation"], "policy_decimation"),
         ),
         sensors=RobotSensorProfile(
-            front_camera_prim_path=_relative_prim_path(
-                sensors["front_camera_prim_path"], "front_camera_prim_path"
+            camera=CameraProfile(
+                front_prim_path=str(camera_data["front_prim_path"]).strip(),
+                observer_enabled=bool(camera_data["observer_enabled"]),
+                observer_prim_path=str(camera_data["observer_prim_path"]).strip(),
+                width=_positive_int(camera_data["width"], "camera.width"),
+                height=_positive_int(camera_data["height"], "camera.height"),
+                frequency_hz=_positive_int(camera_data["frequency_hz"], "camera.frequency_hz"),
+                horizontal_fov_deg=_positive_float(camera_data["horizontal_fov_deg"], "camera.horizontal_fov_deg"),
+                follow_front_in_gui=bool(camera_data["follow_front_in_gui"]),
+                follow_observer_in_gui=bool(camera_data["follow_observer_in_gui"]),
+                depth_roi_vertical_range=_range_pair(
+                    camera_data["depth_roi_vertical_range"], "camera.depth_roi_vertical_range"
+                ),
+                valid_depth_range_m=_range_pair(
+                    camera_data["valid_depth_range_m"], "camera.valid_depth_range_m"
+                ),
+                obstacle_roi_vertical_range=_range_pair(
+                    camera_data["obstacle_roi_vertical_range"], "camera.obstacle_roi_vertical_range"
+                ),
+                obstacle_center_width_ratio=float(camera_data["obstacle_center_width_ratio"]),
+                obstacle_side_width_ratio=float(camera_data["obstacle_side_width_ratio"]),
+                depth_eval_period_sec=_positive_float(camera_data["depth_eval_period_sec"], "camera.depth_eval_period_sec"),
             ),
-            observer_camera_enabled=bool(sensors["observer_camera_enabled"]),
-            observer_camera_prim_path=_relative_prim_path(
-                sensors["observer_camera_prim_path"], "observer_camera_prim_path"
+            lidar=LidarProfile(
+                prim_path=str(lidar_data["prim_path"]).strip(),
+                horizontal_fov_deg=_positive_float(lidar_data["horizontal_fov_deg"], "lidar.horizontal_fov_deg"),
+                vertical_fov_deg=_positive_float(lidar_data["vertical_fov_deg"], "lidar.vertical_fov_deg"),
+                horizontal_resolution_deg=_positive_float(
+                    lidar_data["horizontal_resolution_deg"], "lidar.horizontal_resolution_deg"
+                ),
+                vertical_resolution_deg=_positive_float(
+                    lidar_data["vertical_resolution_deg"], "lidar.vertical_resolution_deg"
+                ),
+                rotation_rate_hz=_positive_float(lidar_data["rotation_rate_hz"], "lidar.rotation_rate_hz"),
+                min_range_m=_nonnegative_float(lidar_data["min_range_m"], "lidar.min_range_m"),
+                max_range_m=_positive_float(lidar_data["max_range_m"], "lidar.max_range_m"),
+                yaw_offset_deg=float(lidar_data["yaw_offset_deg"]),
+                sector_merge_keep_sec=_nonnegative_float(
+                    lidar_data["sector_merge_keep_sec"], "lidar.sector_merge_keep_sec"
+                ),
             ),
-            camera_frequency_hz=_positive_int(
-                sensors["camera_frequency_hz"], "camera_frequency_hz"
-            ),
-            lidar_prim_path=_relative_prim_path(sensors["lidar_prim_path"], "lidar_prim_path"),
         ),
         primitives=PrimitiveProfile(
-            forward_distance_m=_positive_float(primitives["forward_distance_m"], "forward_distance_m"),
-            turn_angle_deg=_positive_float(primitives["turn_angle_deg"], "turn_angle_deg"),
-            distance_tolerance_m=_positive_float(primitives["distance_tolerance_m"], "distance_tolerance_m"),
-            turn_tolerance_deg=_positive_float(primitives["turn_tolerance_deg"], "turn_tolerance_deg"),
-            forward_timeout_sec=_positive_float(primitives["forward_timeout_sec"], "forward_timeout_sec"),
-            turn_timeout_sec=_positive_float(primitives["turn_timeout_sec"], "turn_timeout_sec"),
-            forward_command=_positive_float(primitives["forward_command"], "forward_command"),
-            turn_command=_positive_float(primitives["turn_command"], "turn_command"),
-            settle_max_wait_sec=max(0.0, float(primitives["settle_max_wait_sec"])),
-            settle_linear_speed_threshold_mps=max(
-                0.0, float(primitives["settle_linear_speed_threshold_mps"])
+            forward_distance_m=_positive_float(primitives_data["forward_distance_m"], "forward_distance_m"),
+            turn_angle_deg=_positive_float(primitives_data["turn_angle_deg"], "turn_angle_deg"),
+            distance_tolerance_m=_positive_float(primitives_data["distance_tolerance_m"], "distance_tolerance_m"),
+            turn_tolerance_deg=_positive_float(primitives_data["turn_tolerance_deg"], "turn_tolerance_deg"),
+            forward_timeout_sec=_positive_float(primitives_data["forward_timeout_sec"], "forward_timeout_sec"),
+            turn_timeout_sec=_positive_float(primitives_data["turn_timeout_sec"], "turn_timeout_sec"),
+            forward_command=_positive_float(primitives_data["forward_command"], "forward_command"),
+            turn_command=_positive_float(primitives_data["turn_command"], "turn_command"),
+            settle_max_wait_sec=_nonnegative_float(primitives_data["settle_max_wait_sec"], "settle_max_wait_sec"),
+            settle_linear_speed_threshold_mps=_nonnegative_float(
+                primitives_data["settle_linear_speed_threshold_mps"],
+                "settle_linear_speed_threshold_mps",
             ),
-            settle_angular_speed_threshold_radps=max(
-                0.0, float(primitives["settle_angular_speed_threshold_radps"])
+            settle_angular_speed_threshold_radps=_nonnegative_float(
+                primitives_data["settle_angular_speed_threshold_radps"],
+                "settle_angular_speed_threshold_radps",
             ),
-            settle_stable_duration_sec=max(0.0, float(primitives["settle_stable_duration_sec"])),
+            settle_stable_duration_sec=_nonnegative_float(
+                primitives_data["settle_stable_duration_sec"], "settle_stable_duration_sec"
+            ),
+        ),
+        motion_model=RobotMotionModelProfile(
+            model_type=motion_model_type,
+            turn_drift_margin_m=_nonnegative_float(
+                motion_data["turn_drift_margin_m"], "motion_model.turn_drift_margin_m"
+            ),
+            sweep_resolution_deg=_positive_float(
+                motion_data["sweep_resolution_deg"], "motion_model.sweep_resolution_deg"
+            ),
         ),
         geometry=RobotGeometryProfile(
-            footprint_radius_m=_positive_float(geometry["footprint_radius_m"], "footprint_radius_m"),
+            footprint_polygon_xy_m=footprint_polygon,
+            safety_margin_m=_nonnegative_float(geometry_data["safety_margin_m"], "geometry.safety_margin_m"),
             obstacle_stop_distance_m=_positive_float(
-                geometry["obstacle_stop_distance_m"], "obstacle_stop_distance_m"
-            ),
-            map_inflation_radius_m=_positive_float(
-                geometry["map_inflation_radius_m"], "map_inflation_radius_m"
-            ),
-            path_corridor_radius_m=_positive_float(
-                geometry["path_corridor_radius_m"], "path_corridor_radius_m"
-            ),
-            turn_clearance_radius_m=_positive_float(
-                geometry["turn_clearance_radius_m"], "turn_clearance_radius_m"
+                geometry_data["obstacle_stop_distance_m"], "geometry.obstacle_stop_distance_m"
             ),
         ),
         safety=RobotSafetyProfile(
-            fall_detection_enabled=bool(safety["fall_detection_enabled"]),
-            max_roll_pitch_deg=_positive_float(safety["max_roll_pitch_deg"], "max_roll_pitch_deg"),
-            min_base_height_m=max(0.0, float(safety["min_base_height_m"])),
-            confirmation_sec=max(0.0, float(safety["confirmation_sec"])),
+            fall_detection_enabled=bool(safety_data["fall_detection_enabled"]),
+            max_roll_pitch_deg=_positive_float(safety_data["max_roll_pitch_deg"], "max_roll_pitch_deg"),
+            min_base_height_m=_nonnegative_float(safety_data["min_base_height_m"], "min_base_height_m"),
+            confirmation_sec=_nonnegative_float(safety_data["confirmation_sec"], "confirmation_sec"),
         ),
         agx_controller=agx_controller,
         g1_controller=g1_controller,
@@ -390,69 +525,87 @@ def load_robot_profile(*, profile_name: str, project_root: Path) -> RobotProfile
 def _validate_profile_files(profile: RobotProfile) -> None:
     if not profile.asset.usd_path.is_file():
         raise FileNotFoundError(f"Robot USD does not exist: {profile.asset.usd_path}")
-    if profile.g1_controller is None:
-        return
-    if profile.spawn_z_m <= profile.safety.min_base_height_m:
+    if profile.is_g1:
+        controller = profile.g1_controller
+        if controller is None:
+            raise ValueError("G1 profile must define a G1 controller")
+        if len(controller.sdk_joint_names) != 29:
+            raise ValueError(
+                f"G1 deploy contract requires 29 sdk_joint_names, got {len(controller.sdk_joint_names)}"
+            )
+        if profile.spawn_z_m < profile.safety.min_base_height_m:
+            raise ValueError(
+                "G1 spawn.z_m must not be below the configured pelvis/root height safety threshold"
+            )
+        if not controller.policy_path.is_file():
+            raise FileNotFoundError(f"G1 policy does not exist: {controller.policy_path}")
+        if not controller.deploy_config_path.is_file():
+            raise FileNotFoundError(f"G1 deploy config does not exist: {controller.deploy_config_path}")
+        if profile.motion_model.model_type != "biped_in_place":
+            raise ValueError("G1 motion_model.type must be 'biped_in_place'")
+    elif profile.motion_model.model_type != "spin_4ws":
+        raise ValueError("AGX motion_model.type must be 'spin_4ws'")
+
+
+def _footprint_polygon(value: Any, *, context: str) -> tuple[tuple[float, float], ...]:
+    if not isinstance(value, list) or len(value) < 3:
+        raise ValueError(f"{context} must contain at least three [x, y] vertices")
+    points: list[tuple[float, float]] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            raise ValueError(f"{context}[{index}] must be [x, y]")
+        points.append((float(item[0]), float(item[1])))
+    signed_twice_area = sum(
+        points[index][0] * points[(index + 1) % len(points)][1]
+        - points[(index + 1) % len(points)][0] * points[index][1]
+        for index in range(len(points))
+    )
+    if signed_twice_area <= 0.0:
         raise ValueError(
-            "G1 spawn.z_m is the pelvis/root height above the scene floor, not the floor "
-            f"elevation; expected > safety.min_base_height_m ({profile.safety.min_base_height_m:.2f} m), "
-            f"got {profile.spawn_z_m:.2f} m"
+            f"{context} vertices must be counter-clockwise in robot frame (x forward, y left)"
         )
-    if not profile.g1_controller.policy_path.is_file():
-        raise FileNotFoundError(f"G1 TorchScript policy does not exist: {profile.g1_controller.policy_path}")
-    if not profile.g1_controller.deploy_config_path.is_file():
-        raise FileNotFoundError(
-            f"G1 deployment config does not exist: {profile.g1_controller.deploy_config_path}"
-        )
+    if abs(signed_twice_area) < 1e-4:
+        raise ValueError(f"{context} area is too small")
+    return tuple(points)
 
 
 def _mapping(payload: dict[str, Any], key: str, context: str) -> dict[str, Any]:
     value = payload.get(key)
     if not isinstance(value, dict):
-        raise ValueError(f"{context}.{key} must be a YAML mapping")
+        raise ValueError(f"{context}.{key} must be a mapping")
     return value
 
 
-def _require_exact_keys(payload: dict[str, Any], *, required: set[str], context: str) -> None:
-    actual = set(payload)
-    missing = sorted(required - actual)
-    extra = sorted(actual - required)
+def _require_exact_keys(mapping: dict[str, Any], *, required: set[str], context: str) -> None:
+    missing = sorted(required - set(mapping))
+    extra = sorted(set(mapping) - required)
     if missing or extra:
-        raise ValueError(f"Invalid robot profile section {context}: missing={missing} extra={extra}")
+        raise ValueError(f"{context} keys invalid: missing={missing} extra={extra}")
 
 
-def _resolve_project_path(value: Any, project_root: Path) -> Path:
+def _project_path(project_root: Path, value: Any) -> Path:
     path = Path(str(value)).expanduser()
     return path if path.is_absolute() else project_root / path
 
 
-def _absolute_prim_path(value: Any, field_name: str) -> str:
-    text = str(value).strip().rstrip("/")
+def _prim_path(value: Any, field_name: str) -> str:
+    text = str(value).strip()
     if not text.startswith("/"):
-        raise ValueError(f"{field_name} must be an absolute USD prim path")
+        raise ValueError(f"{field_name} must be an absolute prim path")
     return text
-
-
-def _relative_prim_path(value: Any, field_name: str) -> str:
-    text = str(value).strip().strip("/")
-    if not text:
-        raise ValueError(f"{field_name} must be a non-empty robot-relative USD prim path")
-    return text
-
-
-def _string_tuple(value: Any, field_name: str) -> tuple[str, ...]:
-    if not isinstance(value, list) or not value:
-        raise ValueError(f"{field_name} must be a non-empty YAML list")
-    result = tuple(str(item).strip() for item in value)
-    if any(not item for item in result):
-        raise ValueError(f"{field_name} cannot contain empty names")
-    return result
 
 
 def _positive_float(value: Any, field_name: str) -> float:
     result = float(value)
     if result <= 0.0:
         raise ValueError(f"{field_name} must be > 0")
+    return result
+
+
+def _nonnegative_float(value: Any, field_name: str) -> float:
+    result = float(value)
+    if result < 0.0:
+        raise ValueError(f"{field_name} must be >= 0")
     return result
 
 
@@ -463,8 +616,16 @@ def _positive_int(value: Any, field_name: str) -> int:
     return result
 
 
-def _unit_float(value: Any, field_name: str) -> float:
-    result = float(value)
-    if not 0.0 < result <= 1.0:
-        raise ValueError(f"{field_name} must be in (0, 1]")
-    return result
+def _range_pair(value: Any, field_name: str) -> tuple[float, float]:
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise ValueError(f"{field_name} must contain exactly two numbers")
+    lower, upper = float(value[0]), float(value[1])
+    if lower >= upper:
+        raise ValueError(f"{field_name} lower bound must be < upper bound")
+    return lower, upper
+
+
+def _string_tuple(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("Expected a list of strings")
+    return tuple(str(item) for item in value)

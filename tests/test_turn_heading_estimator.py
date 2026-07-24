@@ -92,6 +92,7 @@ def _empty_free_snapshot() -> OccupancyGridSnapshot:
         resolution_m=resolution_m,
         size_m=cell_count * resolution_m,
         log_odds=np.full((cell_count, cell_count), -1.0, dtype=np.float32),
+        occupied_mask=np.zeros((cell_count, cell_count), dtype=bool),
         inflated_occupied=np.zeros((cell_count, cell_count), dtype=bool),
         free_mask=np.ones((cell_count, cell_count), dtype=bool),
         origin_x=-10.0,

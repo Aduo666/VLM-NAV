@@ -168,7 +168,6 @@ class SteeringDriveController:
     steering_damping: float
     hold_joint_stiffness: float
     hold_joint_damping: float
-    track_steering_sign: float
     logger: logging.Logger
 
     def __post_init__(self) -> None:
@@ -192,8 +191,6 @@ class SteeringDriveController:
         self._rear_right_steering_names = [name for name in self.passive_steering_joint_names if _joint_side(name) == "right"]
         self._steering_reset_pending = False
         self._steering_reset_threshold_rad = 0.05
-        self._last_track_wheel_velocity = 0.0
-        self._last_track_steering_angle = 0.0
 
         self._configure_joint_drives(
             joint_names=[*self.left_wheel_joint_names, *self.right_wheel_joint_names],
@@ -272,98 +269,6 @@ class SteeringDriveController:
             steering_targets[joint_name] = rear_right_angle
 
         return self._apply_targets(wheel_targets=wheel_targets, steering_targets=steering_targets)
-
-    def track_local_target(
-        self,
-        *,
-        local_forward_m: float,
-        local_left_m: float,
-        stop_distance_m: float,
-        min_speed_scale: float,
-        max_speed_scale: float,
-        heading_gain: float,
-        slow_heading_rad: float,
-        smoothing_alpha: float,
-    ) -> tuple[float, float]:
-        forward_m = float(local_forward_m)
-        left_m = float(local_left_m)
-        distance_m = float(np.hypot(forward_m, left_m))
-        if distance_m <= float(stop_distance_m) or forward_m < -0.10:
-            self._last_track_wheel_velocity = 0.0
-            self._last_track_steering_angle = 0.0
-            self._steering_reset_pending = False
-            return self.apply("STOP", speed_scale=0.0)
-
-        heading_error_rad = float(np.arctan2(left_m, max(forward_m, 1e-6)))
-        max_steering_angle = max(1e-6, float(self.steering_angle))
-        steering_command = float(
-            np.clip(float(heading_gain) * heading_error_rad, -max_steering_angle, max_steering_angle)
-        )
-        steering_command *= -1.0 if float(self.track_steering_sign) < 0.0 else 1.0
-        actual_front_steering = self._representative_front_steering_position()
-        steering_sign_conflict = (
-            abs(steering_command) > 0.08
-            and abs(actual_front_steering) > 0.16
-            and steering_command * actual_front_steering < 0.0
-        )
-        steering_centering_required = abs(steering_command) <= 0.08 and abs(actual_front_steering) > 0.22
-
-        # Continuous waypoint tracking should behave like an Ackermann arc, not a
-        # differential-drive blend. Equal wheel targets avoid fighting the steering
-        # joints and make the first local goal noticeably faster to approach.
-        heading_slowdown = max(
-            0.45,
-            1.0 - min(abs(heading_error_rad), float(slow_heading_rad)) / max(float(slow_heading_rad), 1e-6),
-        )
-        distance_scale = float(np.clip((distance_m - float(stop_distance_m)) / 0.55, 0.35, 1.0))
-        base_speed_scale = float(max_speed_scale) * heading_slowdown * distance_scale
-        base_speed_scale = float(np.clip(base_speed_scale, float(min_speed_scale), float(max_speed_scale)))
-
-        alpha = float(np.clip(smoothing_alpha, 0.0, 1.0))
-        target_velocity = self.wheel_drive_velocity * base_speed_scale
-        smoothed_steering = alpha * steering_command + (1.0 - alpha) * self._last_track_steering_angle
-        if steering_sign_conflict or steering_centering_required:
-            smoothed_velocity = 0.0
-            smoothed_steering = steering_command
-        else:
-            smoothed_velocity = alpha * target_velocity + (1.0 - alpha) * self._last_track_wheel_velocity
-        self._last_track_wheel_velocity = float(smoothed_velocity)
-        self._last_track_steering_angle = float(smoothed_steering)
-        self._steering_reset_pending = False
-
-        wheel_targets = {joint_name: 0.0 for joint_name in self._wheel_dofs}
-        steering_targets = {joint_name: 0.0 for joint_name in [*self._steering_dofs, *self._passive_steering_dofs]}
-
-        for joint_name in self.left_wheel_joint_names:
-            wheel_targets[joint_name] = float(smoothed_velocity)
-        for joint_name in self.right_wheel_joint_names:
-            wheel_targets[joint_name] = float(smoothed_velocity)
-
-        for joint_name in self._front_left_steering_names:
-            steering_targets[joint_name] = float(smoothed_steering)
-        for joint_name in self._front_right_steering_names:
-            steering_targets[joint_name] = float(-smoothed_steering)
-        for joint_name in self._rear_left_steering_names:
-            steering_targets[joint_name] = 0.0
-        for joint_name in self._rear_right_steering_names:
-            steering_targets[joint_name] = 0.0
-
-        self._apply_targets(wheel_targets=wheel_targets, steering_targets=steering_targets)
-        return float(smoothed_velocity), float(smoothed_steering)
-
-    def _representative_front_steering_position(self) -> float:
-        values: list[float] = []
-        for joint_name in self._front_left_steering_names:
-            dof = self._steering_dofs.get(joint_name)
-            if dof is not None:
-                values.append(float(self._dc.get_dof_position(dof)))
-        for joint_name in self._front_right_steering_names:
-            dof = self._steering_dofs.get(joint_name)
-            if dof is not None:
-                values.append(-float(self._dc.get_dof_position(dof)))
-        if not values:
-            return 0.0
-        return float(np.mean(values))
 
     def _zero_targets(self) -> tuple[dict[str, float], dict[str, float]]:
         wheel_targets = {joint_name: 0.0 for joint_name in self._wheel_dofs}

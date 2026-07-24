@@ -21,7 +21,7 @@ class ChatResult:
     finish_reason: str = ""
 
 
-class OpenNavLLMClient:
+class VLMClient:
     def __init__(
         self,
         *,
@@ -41,12 +41,12 @@ class OpenNavLLMClient:
         self._retry_cooldown_sec = max(0.0, float(retry_cooldown_sec))
         self._upload_max_edge_px = max(0, int(upload_max_edge_px))
         self._image_detail = str(image_detail).strip().lower() or "high"
-        self._logger = logger.getChild("open_nav_client")
+        self._logger = logger.getChild("vlm_client")
         self._cooldown_until = 0.0
         self._consecutive_failures = 0
 
         if not self._api_key:
-            self._logger.warning("SILICONFLOW_API_KEY/LLM_API_KEY is empty, Open-Nav reasoner will fail closed.")
+            self._logger.warning("SILICONFLOW_API_KEY/LLM_API_KEY is empty; VLM requests will fail closed.")
 
     @property
     def available(self) -> bool:
@@ -96,7 +96,7 @@ class OpenNavLLMClient:
             try:
                 upload_image_bytes, _, _ = self._prepare_image_upload(image_png_bytes)
             except Exception as exc:
-                self._logger.warning("Open-Nav LLM image resize failed name=%s: %s", request_name, exc)
+                self._logger.warning("VLM image resize failed name=%s: %s", request_name, exc)
             image_base64 = base64.b64encode(upload_image_bytes).decode("utf-8")
             content_items.append(
                 {
@@ -139,11 +139,11 @@ class OpenNavLLMClient:
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
             self._register_failure()
-            self._logger.warning("Open-Nav LLM HTTP name=%s code=%s: %s", request_name, exc.code, body)
+            self._logger.warning("VLM HTTP name=%s code=%s: %s", request_name, exc.code, body)
             return ChatResult(content="", failed=True, reason="llm_http_error")
         except Exception as exc:  # pragma: no cover - runtime/network dependent
             self._register_failure()
-            self._logger.warning("Open-Nav LLM request failed name=%s: %s", request_name, exc)
+            self._logger.warning("VLM request failed name=%s: %s", request_name, exc)
             return ChatResult(content="", failed=True, reason="llm_request_failed")
 
         try:
@@ -153,7 +153,7 @@ class OpenNavLLMClient:
             finish_reason = str(choice.get("finish_reason", "")).strip().lower()
         except Exception as exc:
             self._register_failure()
-            self._logger.warning("Open-Nav LLM response parse failed name=%s: %s", request_name, exc)
+            self._logger.warning("VLM response parse failed name=%s: %s", request_name, exc)
             return ChatResult(content="", failed=True, reason="llm_parse_failed")
 
         if finish_reason == "length":

@@ -23,7 +23,6 @@ class GroundingDinoDetection:
 
 @dataclass
 class GroundingDinoConfig:
-    enabled: bool
     repo_path: str
     config_path: str
     checkpoint_path: str
@@ -47,21 +46,33 @@ class GroundingDinoDetector:
 
     @property
     def available(self) -> bool:
-        if not bool(self._config.enabled):
-            return False
         if self._load_failed_reason is not None:
             return False
         return _path_exists(self._config.repo_path) and _path_exists(self._config.config_path) and _path_exists(
             self._config.checkpoint_path
         )
 
+    def require_ready(self) -> None:
+        if not self.available:
+            raise RuntimeError(
+                "GroundingDINO repository, config, or checkpoint is missing: "
+                f"repo={self._config.repo_path} config={self._config.config_path} "
+                f"checkpoint={self._config.checkpoint_path}"
+            )
+        text_encoder_path = Path(self._config.text_encoder_path).expanduser()
+        if not text_encoder_path.is_dir() or not (text_encoder_path / "config.json").is_file():
+            raise RuntimeError(
+                f"GroundingDINO text encoder is missing: {text_encoder_path}"
+            )
+        model, reason = self._load_model()
+        if model is None:
+            raise RuntimeError(f"GroundingDINO model failed to load: {reason}")
+
     def detect(self, *, rgb: np.ndarray, target_label: str) -> tuple[GroundingDinoDetection | None, str]:
         detections, reason = self.detect_all(rgb=rgb, target_label=target_label)
         return (detections[0] if detections else None), reason
 
     def detect_all(self, *, rgb: np.ndarray, target_label: str) -> tuple[list[GroundingDinoDetection], str]:
-        if not bool(self._config.enabled):
-            return [], "grounding_dino_disabled"
         if self._load_failed_reason is not None:
             return [], self._load_failed_reason
         if not self.available:
@@ -180,7 +191,11 @@ class GroundingDinoDetector:
             raise RuntimeError(
                 "GroundingDINO config does not contain the expected bert-base-uncased text_encoder_type"
             )
-        fd, path = tempfile.mkstemp(prefix="vlmnav_groundingdino_", suffix=".py", dir="/tmp")
+        fd, path = tempfile.mkstemp(
+            prefix="captainav_groundingdino_",
+            suffix=".py",
+            dir="/tmp",
+        )
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(patched)
         self._runtime_config_path = path

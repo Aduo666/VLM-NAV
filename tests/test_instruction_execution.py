@@ -53,7 +53,7 @@ def _logger() -> logging.Logger:
 
 
 class InstructionExecutionTest(unittest.TestCase):
-    def test_find_object_cannot_remain_traverse(self) -> None:
+    def test_find_object_repairs_unsupported_step_to_go_to(self) -> None:
         invalid = {
             "schema_version": INSTRUCTION_SCHEMA_VERSION,
             "scene_context": {"current_region": None, "context_objects": []},
@@ -61,7 +61,7 @@ class InstructionExecutionTest(unittest.TestCase):
             "route_steps": [
                 {
                     "step_id": "step_1",
-                    "step_type": "TRAVERSE",
+                    "step_type": "MOVE",
                     "source_span": "go straight to find the wheelchair",
                     "direction": "forward",
                     "trigger": {"trigger_type": "NONE", "label": ""},

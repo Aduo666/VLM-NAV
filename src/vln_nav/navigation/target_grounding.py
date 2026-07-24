@@ -16,8 +16,7 @@ from .grounding_dino_detector import (
     GroundingDinoDetector,
 )
 from .observation_adapter import Pose2D
-from .open_nav_client import OpenNavLLMClient
-from .sam_segmenter import SamSegmenter, SamSegmenterConfig
+from .vlm_client import VLMClient
 from .spatial_transform import estimate_target_world_xy
 
 
@@ -36,10 +35,9 @@ class TargetObservation:
     source: str
     reason: str
     timestamp_sec: float
-    mask_area_ratio: float = 0.0
+    depth_cluster_area_ratio: float = 0.0
     coordinate_mode: str = "unknown"
-    segmentation_source: str = "none"
-    mask: np.ndarray | None = None
+    depth_region_source: str = "none"
     request_frame_index: int = -1
     request_sim_time_sec: float = 0.0
     request_robot_pose: Pose2D | None = None
@@ -59,8 +57,6 @@ class TargetObservation:
 
 @dataclass
 class TargetGroundingConfig:
-    enabled: bool
-    backend: str
     call_period_sec: float
     reuse_last_observation_sec: float
     upload_max_edge_px: int
@@ -79,9 +75,9 @@ class TargetGroundingConfig:
     coordinate_mode: str = "auto"
     allow_normalized_bbox: bool = True
     normalized_bbox_scale: float = 1000.0
-    depth_region: str = "bbox_depth_mask"
-    depth_mask_tolerance_ratio: float = 0.35
-    depth_mask_min_pixels: int = 16
+    depth_region: str = "bbox_depth_cluster"
+    depth_cluster_tolerance_ratio: float = 0.35
+    depth_cluster_min_pixels: int = 16
     grounding_dino_repo_path: str = "../GroundingDINO"
     grounding_dino_config_path: str = "../GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py"
     grounding_dino_checkpoint_path: str = "../GroundingDINO/weights/groundingdino_swint_ogc.pth"
@@ -91,15 +87,9 @@ class TargetGroundingConfig:
     grounding_dino_text_encoder_path: str = "weights/grounded_sam/bert-base-uncased"
     grounding_dino_max_detections: int = 5
     grounding_dino_nms_iou_threshold: float = 0.50
-    sam_checkpoint_path: str = "weights/grounded_sam/sam_vit_h_4b8939.pth"
-    sam_model_type: str = "vit_h"
-    sam_device: str = "cuda"
-    sam_min_mask_area_ratio: float = 0.0005
-    sam_enabled: bool = True
     max_result_age_sec: float = 30.0
     max_result_pose_delta_m: float = 0.05
     max_result_yaw_delta_deg: float = 3.0
-    semantic_verification_enabled: bool = True
     semantic_verification_min_confidence: float = 0.70
     semantic_verification_max_edge_px: int = 768
     semantic_verification_auto_accept_confidence: float = 0.75
@@ -141,17 +131,12 @@ class TargetGrounder:
         self,
         *,
         config: TargetGroundingConfig,
-        llm_client: OpenNavLLMClient,
+        llm_client: VLMClient,
         logger,
     ) -> None:
         self._config = config
         self._llm = llm_client
         self._logger = logger.getChild("target_grounding")
-        backend = str(config.backend).strip().lower()
-        if backend not in {"grounding_dino", "dino"}:
-            raise ValueError(
-                f"target grounding backend must be grounding_dino, got {config.backend!r}"
-            )
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="target_grounding")
         self._future: Future | None = None
         self._future_request: _GroundingRequest | None = None
@@ -165,7 +150,6 @@ class TargetGrounder:
         self._last_verification_result: tuple[bool, float, str] | None = None
         self._grounding_dino = GroundingDinoDetector(
             config=GroundingDinoConfig(
-                enabled=True,
                 repo_path=str(config.grounding_dino_repo_path),
                 config_path=str(config.grounding_dino_config_path),
                 checkpoint_path=str(config.grounding_dino_checkpoint_path),
@@ -178,19 +162,11 @@ class TargetGrounder:
             ),
             logger=logger,
         )
-        self._sam = SamSegmenter(
-            config=SamSegmenterConfig(
-                checkpoint_path=str(config.sam_checkpoint_path),
-                model_type=str(config.sam_model_type),
-                device=str(config.sam_device),
-                min_mask_area_ratio=float(config.sam_min_mask_area_ratio),
-                enabled=bool(config.sam_enabled),
-            ),
-            logger=logger,
-        )
-
     def close(self) -> None:
         self._executor.shutdown(wait=False, cancel_futures=True)
+
+    def require_ready(self) -> None:
+        self._grounding_dino.require_ready()
 
     @property
     def request_in_flight(self) -> bool:
@@ -232,8 +208,6 @@ class TargetGrounder:
         if completed_observation is not None and completed_observation.label == target_label:
             return completed_observation
 
-        if not bool(self._config.enabled):
-            return _empty_observation(target_label=target_label, timestamp_sec=timestamp_sec, reason="disabled")
         if rgb is None or np.asarray(rgb).ndim != 3:
             return self._reuse_or_empty(target_label=target_label, timestamp_sec=timestamp_sec, reason="rgb_unavailable")
 
@@ -346,10 +320,9 @@ class TargetGrounder:
             source=f"{self._last_observation.source}_reused",
             reason="reused_last_observation",
             timestamp_sec=float(timestamp_sec),
-            mask_area_ratio=self._last_observation.mask_area_ratio,
+            depth_cluster_area_ratio=self._last_observation.depth_cluster_area_ratio,
             coordinate_mode=self._last_observation.coordinate_mode,
-            segmentation_source=self._last_observation.segmentation_source,
-            mask=None if self._last_observation.mask is None else np.asarray(self._last_observation.mask, dtype=bool).copy(),
+            depth_region_source=self._last_observation.depth_region_source,
             request_frame_index=self._last_observation.request_frame_index,
             request_sim_time_sec=self._last_observation.request_sim_time_sec,
             request_robot_pose=self._last_observation.request_robot_pose,
@@ -426,12 +399,12 @@ class TargetGrounder:
                 list(observation.bbox or ()),
                 float(observation.depth_m or 0.0),
                 float(observation.depth_valid_ratio),
-                float(observation.mask_area_ratio),
+                float(observation.depth_cluster_area_ratio),
                 float(np.degrees(observation.bearing_rad or 0.0)),
                 observation.estimated_world_xy,
                 float(observation.confidence),
                 observation.coordinate_mode,
-                observation.segmentation_source,
+                observation.depth_region_source,
                 float(observation.result_age_sec),
                 int(observation.is_current_frame),
                 int(observation.request_frame_index),
@@ -777,57 +750,17 @@ class TargetGrounder:
         aspect_ratio = max(float(bbox_width) / max(float(bbox_height), 1.0), float(bbox_height) / max(float(bbox_width), 1.0))
         if aspect_ratio > float(self._config.max_bbox_aspect_ratio):
             return _empty_observation(request.target_label, request.timestamp_sec, "bbox_aspect_invalid")
-        mask: np.ndarray | None = None
-        segmentation_source = str(self._config.depth_region)
+        depth_region_source = str(self._config.depth_region)
         depth_m = None
         valid_ratio = 0.0
-        mask_area_ratio = 0.0
+        depth_cluster_area_ratio = 0.0
         center_uv = (float(xmin + xmax) * 0.5, float(ymin + ymax) * 0.5)
         depth_available = bool(
             request.depth is not None and np.asarray(request.depth).ndim == 2
         )
 
-        segmentation = self._sam.segment(rgb=request.rgb, bbox=bbox)
-        if segmentation is not None:
-            mask = np.asarray(segmentation.mask, dtype=bool)
-            mask_area_ratio = float(
-                np.count_nonzero(mask) / max(1, image_height * image_width)
-            )
-            ys, xs = np.nonzero(mask)
-            if xs.size > 0:
-                center_uv = (float(np.mean(xs)), float(np.mean(ys)))
-            if depth_available:
-                depth_m, valid_ratio, mask_area_ratio, center_uv = _mask_depth_statistic(
-                    depth=np.asarray(request.depth, dtype=np.float32),
-                    mask=mask,
-                    min_depth_m=float(self._config.min_depth_m),
-                    max_depth_m=float(self._config.max_depth_m),
-                    statistic=str(self._config.depth_statistic),
-                )
-            segmentation_source = segmentation.source
-            self._logger.debug(
-                "[SAM] target=%s score=%.3f mask_area=%.3f depth=%s valid_ratio=%.2f",
-                request.target_label,
-                float(segmentation.score),
-                float(mask_area_ratio),
-                "none" if depth_m is None else f"{float(depth_m):.2f}",
-                float(valid_ratio),
-            )
-
-        if depth_available and (
-            depth_m is None
-            or valid_ratio < float(self._config.min_depth_valid_ratio)
-        ):
-            if segmentation is not None:
-                self._logger.debug(
-                    "[SAMFallback] target=%s reason=mask_depth_invalid depth=%s valid_ratio=%.2f fallback=%s",
-                    request.target_label,
-                    "none" if depth_m is None else f"{float(depth_m):.2f}",
-                    float(valid_ratio),
-                    self._config.depth_region,
-                )
-            mask = None
-            depth_m, valid_ratio, mask_area_ratio, center_uv = _bbox_depth_mask_statistic(
+        if depth_available:
+            depth_m, valid_ratio, depth_cluster_area_ratio, center_uv = _bbox_depth_cluster_statistic(
                 depth=np.asarray(request.depth, dtype=np.float32),
                 bbox=bbox,
                 min_depth_m=float(self._config.min_depth_m),
@@ -835,14 +768,12 @@ class TargetGrounder:
                 statistic=str(self._config.depth_statistic),
                 depth_region=str(self._config.depth_region),
                 center_patch_ratio=float(self._config.center_patch_ratio),
-                mask_tolerance_ratio=float(self._config.depth_mask_tolerance_ratio),
-                mask_min_pixels=int(self._config.depth_mask_min_pixels),
+                cluster_tolerance_ratio=float(self._config.depth_cluster_tolerance_ratio),
+                cluster_min_pixels=int(self._config.depth_cluster_min_pixels),
             )
-            segmentation_source = str(self._config.depth_region)
-        elif not depth_available:
-            segmentation_source = (
-                segmentation_source if segmentation is not None else "no_depth"
-            )
+            depth_region_source = str(self._config.depth_region)
+        else:
+            depth_region_source = "no_depth"
         # Bearing from bbox center (works with or without depth)
         cx_px = (float(image_width) - 1.0) * 0.5
         half_fov_rad = float(np.deg2rad(float(self._config.horizontal_fov_deg)) * 0.5)
@@ -885,7 +816,7 @@ class TargetGrounder:
             self._config.semantic_verification_auto_accept_confidence
         )
         requires_viewpoint_confirmation = False
-        if can_confirm and bool(self._config.semantic_verification_enabled):
+        if can_confirm:
             if high_confidence and not bool(request.force_semantic_verification):
                 vlm_verified = True
                 vlm_verification_confidence = 1.0
@@ -975,10 +906,9 @@ class TargetGrounder:
             source=f"{source_prefix}:{coordinate_mode}",
             reason="ok",
             timestamp_sec=float(request.timestamp_sec),
-            mask_area_ratio=float(mask_area_ratio),
+            depth_cluster_area_ratio=float(depth_cluster_area_ratio),
             coordinate_mode=str(coordinate_mode),
-            segmentation_source=str(segmentation_source),
-            mask=mask,
+            depth_region_source=str(depth_region_source),
             evidence_level=evidence_level,
             semantic_source=semantic_source,
             can_confirm=can_confirm,
@@ -1140,10 +1070,9 @@ def _empty_observation(target_label: str, timestamp_sec: float, reason: str) -> 
         source="grounding_dino",
         reason=str(reason),
         timestamp_sec=float(timestamp_sec),
-        mask_area_ratio=0.0,
+        depth_cluster_area_ratio=0.0,
         coordinate_mode="none",
-        segmentation_source="none",
-        mask=None,
+        depth_region_source="none",
         evidence_level="none",
         semantic_source="unknown",
         can_confirm=False,
@@ -1181,10 +1110,9 @@ def _copy_observation_with_timestamp(
         source=observation.source,
         reason=observation.reason,
         timestamp_sec=float(observation.timestamp_sec) if observation.timestamp_sec > 0.0 else float(timestamp_sec),
-        mask_area_ratio=observation.mask_area_ratio,
+        depth_cluster_area_ratio=observation.depth_cluster_area_ratio,
         coordinate_mode=observation.coordinate_mode,
-        segmentation_source=observation.segmentation_source,
-        mask=None if observation.mask is None else np.asarray(observation.mask, dtype=bool).copy(),
+        depth_region_source=observation.depth_region_source,
         request_frame_index=int(request_frame_index) if request_frame_index >= 0 else int(observation.request_frame_index),
         request_sim_time_sec=float(request_sim_time_sec) if request_sim_time_sec > 0.0 else float(observation.request_sim_time_sec),
         request_robot_pose=request_robot_pose if request_robot_pose is not None else observation.request_robot_pose,
@@ -1661,7 +1589,7 @@ def _rough_bbox_depth_m(
 ) -> float | None:
     if depth is None or np.asarray(depth).ndim != 2:
         return None
-    value, valid_ratio, _, _ = _bbox_depth_mask_statistic(
+    value, valid_ratio, _, _ = _bbox_depth_cluster_statistic(
         depth=np.asarray(depth, dtype=np.float32),
         bbox=bbox,
         min_depth_m=float(config.min_depth_m),
@@ -1669,8 +1597,8 @@ def _rough_bbox_depth_m(
         statistic=str(config.depth_statistic),
         depth_region="center_patch",
         center_patch_ratio=float(config.center_patch_ratio),
-        mask_tolerance_ratio=float(config.depth_mask_tolerance_ratio),
-        mask_min_pixels=int(config.depth_mask_min_pixels),
+        cluster_tolerance_ratio=float(config.depth_cluster_tolerance_ratio),
+        cluster_min_pixels=int(config.depth_cluster_min_pixels),
     )
     if value is None or float(valid_ratio) < float(config.min_depth_valid_ratio):
         return None
@@ -1758,7 +1686,7 @@ def _verification_signature(
     )
 
 
-def _bbox_depth_mask_statistic(
+def _bbox_depth_cluster_statistic(
     *,
     depth: np.ndarray,
     bbox: tuple[int, int, int, int],
@@ -1767,8 +1695,8 @@ def _bbox_depth_mask_statistic(
     statistic: str,
     depth_region: str,
     center_patch_ratio: float,
-    mask_tolerance_ratio: float,
-    mask_min_pixels: int,
+    cluster_tolerance_ratio: float,
+    cluster_min_pixels: int,
 ) -> tuple[float | None, float, float, tuple[float, float]]:
     height, width = depth.shape[:2]
     xmin, ymin, xmax, ymax = bbox
@@ -1800,10 +1728,10 @@ def _bbox_depth_mask_statistic(
 
     seed_depth = float(np.median(valid))
     selected_mask = valid_mask
-    if region in {"bbox_depth_mask", "mask", "pseudo_mask"} and valid.size >= max(3, int(mask_min_pixels)):
-        tolerance = max(0.15, float(seed_depth) * max(0.05, float(mask_tolerance_ratio)))
+    if region in {"bbox_depth_cluster", "depth_cluster"} and valid.size >= max(3, int(cluster_min_pixels)):
+        tolerance = max(0.15, float(seed_depth) * max(0.05, float(cluster_tolerance_ratio)))
         near_mask = valid_mask & (np.abs(patch - seed_depth) <= tolerance)
-        if int(np.count_nonzero(near_mask)) >= max(3, int(mask_min_pixels)):
+        if int(np.count_nonzero(near_mask)) >= max(3, int(cluster_min_pixels)):
             selected_mask = near_mask
 
     selected = patch[selected_mask]
@@ -1824,49 +1752,5 @@ def _bbox_depth_mask_statistic(
         if trimmed.size > 0:
             return float(np.mean(trimmed)), valid_ratio, mask_area_ratio, center_uv
     if str(statistic).strip().lower() in {"near_percentile", "p35", "percentile_35"}:
-        return float(np.percentile(selected, 35.0)), valid_ratio, mask_area_ratio, center_uv
-    return float(np.median(selected)), valid_ratio, mask_area_ratio, center_uv
-
-
-def _mask_depth_statistic(
-    *,
-    depth: np.ndarray,
-    mask: np.ndarray,
-    min_depth_m: float,
-    max_depth_m: float,
-    statistic: str,
-) -> tuple[float | None, float, float, tuple[float, float]]:
-    depth_np = np.asarray(depth, dtype=np.float32)
-    mask_np = np.asarray(mask, dtype=bool)
-    if depth_np.ndim != 2 or mask_np.shape != depth_np.shape:
-        return None, 0.0, 0.0, (0.0, 0.0)
-
-    mask_count = int(np.count_nonzero(mask_np))
-    if mask_count <= 0:
-        return None, 0.0, 0.0, (0.0, 0.0)
-
-    valid_mask = (
-        mask_np
-        & np.isfinite(depth_np)
-        & (depth_np >= float(min_depth_m))
-        & (depth_np <= float(max_depth_m))
-    )
-    selected = depth_np[valid_mask]
-    valid_ratio = float(selected.size / max(1, mask_count))
-    mask_area_ratio = float(mask_count / max(1, depth_np.shape[0] * depth_np.shape[1]))
-
-    ys, xs = np.nonzero(valid_mask if selected.size > 0 else mask_np)
-    center_uv = (float(np.mean(xs)), float(np.mean(ys))) if xs.size > 0 else (0.0, 0.0)
-    if selected.size == 0:
-        return None, valid_ratio, mask_area_ratio, center_uv
-
-    mode = str(statistic).strip().lower()
-    if mode == "trimmed_mean" and selected.size >= 5:
-        low = np.percentile(selected, 10.0)
-        high = np.percentile(selected, 90.0)
-        trimmed = selected[(selected >= low) & (selected <= high)]
-        if trimmed.size > 0:
-            return float(np.mean(trimmed)), valid_ratio, mask_area_ratio, center_uv
-    if mode in {"near_percentile", "p35", "percentile_35"}:
         return float(np.percentile(selected, 35.0)), valid_ratio, mask_area_ratio, center_uv
     return float(np.median(selected)), valid_ratio, mask_area_ratio, center_uv

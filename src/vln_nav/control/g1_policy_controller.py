@@ -199,9 +199,6 @@ class G1PolicyController:
             self._apply_joint_targets(self._action_offset + self._action_scale * self._last_action)
         self._physics_step_count += 1
 
-    def track_local_target(self, **_: Any) -> tuple[float, float]:
-        raise RuntimeError("TRACK_TARGET is not supported by the unitree_g1_29dof profile")
-
     def readback(self) -> dict[str, Any]:
         joint_positions = np.asarray(self._robot.get_joint_positions(), dtype=np.float32).reshape(-1)
         policy_joint_positions = joint_positions[self._joint_indices]

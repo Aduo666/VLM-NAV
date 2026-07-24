@@ -6,8 +6,9 @@ from dataclasses import dataclass
 
 from .candidate_waypoint_predictor import CandidateSet, WaypointCandidate
 from .instruction_manager import InstructionContext, RouteStep
-from .open_nav_client import OpenNavLLMClient
+from .policy_helpers import candidate_primitive_action_name
 from .progress_manager import ProgressState
+from .vlm_client import VLMClient
 
 
 @dataclass
@@ -23,8 +24,6 @@ class ReasonerDecision:
     current_region_label: str = "unknown"
     region_confidence: float = 0.0
     region_changed: bool = False
-    route_progress_status: str = "CONTINUE"
-    route_progress_evidence: str = ""
 
 
 @dataclass
@@ -36,9 +35,18 @@ class CandidateChoiceRequest:
     temperature: float
 
 
-class OpenNavReasoner:
-    def __init__(self, *, llm_client: OpenNavLLMClient, logger: logging.Logger) -> None:
+class VLNReasoner:
+    def __init__(
+        self,
+        *,
+        llm_client: VLMClient,
+        robot_capability_summary: str,
+        logger: logging.Logger,
+    ) -> None:
         self._llm = llm_client
+        self._robot_capability_summary = (
+            str(robot_capability_summary).strip() or "unknown"
+        )
         self._logger = logger.getChild("vln_reasoner")
 
     def estimate_progress(
@@ -163,17 +171,8 @@ class OpenNavReasoner:
         current_region_label = str(parsed.get("current_region_label", "unknown")).strip().lower() or "unknown"
         region_confidence = float(parsed.get("region_confidence", 0.0))
         region_changed = _parse_bool(parsed.get("region_changed", False))
-        route_progress_status = (
-            str(parsed.get("route_progress_status", "CONTINUE")).strip().upper()
-            or "CONTINUE"
-        )
-        if route_progress_status not in {"CONTINUE", "LIKELY_COMPLETE"}:
-            route_progress_status = "CONTINUE"
-        route_progress_evidence = str(
-            parsed.get("route_progress_evidence", "")
-        ).strip()
         selected_candidate = next(candidate for candidate in valid_candidates if candidate.slot_id == selected_candidate_id)
-        selected_action = _candidate_primitive_action(selected_candidate)
+        selected_action = candidate_primitive_action_name(selected_candidate)
 
         return ReasonerDecision(
             selected_candidate_id=selected_candidate_id,
@@ -187,8 +186,6 @@ class OpenNavReasoner:
             current_region_label=current_region_label,
             region_confidence=max(0.0, min(1.0, region_confidence)),
             region_changed=region_changed,
-            route_progress_status=route_progress_status,
-            route_progress_evidence=route_progress_evidence,
         )
 
     def build_candidate_choice_request(
@@ -225,11 +222,6 @@ class OpenNavReasoner:
         ]
         region_output_rules = ""
         output_contract = "{reason, selected_candidate_id}"
-        if current_step is not None and current_step.step_type == "TRAVERSE":
-            output_contract = (
-                "{reason, selected_candidate_id, route_progress_status, "
-                "route_progress_evidence}"
-            )
         if current_step is not None and current_step.step_type == "REGION_TRANSITION":
             output_contract = (
                 "{reason, selected_candidate_id, current_region_label, "
@@ -244,7 +236,7 @@ class OpenNavReasoner:
                 "- region_confidence is a number in [0,1].\n"
             )
         system_prompt = (
-            "You are the high-level local VLN decision module for a wheeled robot.\n"
+            "You are the high-level local VLN decision module for a navigation robot.\n"
             "Inputs are: (a) one clean first-person camera image without overlays, "
             "(b) structured text map/memory/obstacle summaries, and (c) an explicit candidate action table.\n"
             "The occupancy map is NOT shown as an image here; use the structured text map and candidate table for spatial reasoning.\n"
@@ -253,6 +245,7 @@ class OpenNavReasoner:
             "- You must choose exactly one valid candidate id from Valid IDs.\n"
             "- The runtime deterministically maps that candidate id to its primitive action.\n"
             "- Do not infer target visibility or output a motor action.\n"
+            f"- Robot capabilities: {self._robot_capability_summary}.\n"
             "\n"
             "DECISION RULES:\n"
             "1. If the current target/landmark is visible in the first-person image, choose the candidate that centers or approaches it.\n"
@@ -264,13 +257,8 @@ class OpenNavReasoner:
             "7. Treat repetition_penalty=1.0 as a strong reason not to repeat that turn unless current visual evidence requires it.\n"
             "8. Scene context objects are localization evidence, never goals unless the current typed step names them as a target.\n"
             "9. Respect the current typed step and all global instruction constraints.\n"
-            "10. For TRAVERSE, obey the locked world heading and select only a candidate "
-            "that remains inside its allowed direction corridor.\n"
-            "11. For TRAVERSE, route_progress_status may be LIKELY_COMPLETE only when "
-            "the current image clearly supports that the pass cue was passed or the "
-            "next route event has been reached; otherwise use CONTINUE.\n"
             f"{region_output_rules}"
-            "12. Output valid JSON only, no markdown."
+            "10. Output valid JSON only, no markdown."
         )
         valid_ids_text = ", ".join(str(candidate.slot_id) for candidate in candidate_set.candidates if candidate.valid)
         user_prompt = (
@@ -307,9 +295,7 @@ class OpenNavReasoner:
             "\n"
             f"Output JSON: {output_contract}\n"
             "selected_candidate_id: integer from Valid IDs\n"
-            "reason: one short sentence explaining why this candidate is best\n"
-            "For TRAVERSE also output route_progress_status=CONTINUE|LIKELY_COMPLETE "
-            "and one short route_progress_evidence string."
+            "reason: one short sentence explaining why this candidate is best"
         )
         return CandidateChoiceRequest(
             request_name="candidate_choice",
@@ -329,8 +315,6 @@ def _step_subject(step: RouteStep | None) -> str:
         return step.to_region
     if step.step_type == "TURN":
         return f"turn {step.direction}"
-    if step.step_type == "TRAVERSE":
-        return step.cues[0].label if step.cues else f"traverse {step.direction}"
     return ""
 
 
@@ -361,9 +345,15 @@ def _parse_bool(value) -> bool:
 
 def _candidate_line(candidate: WaypointCandidate) -> str:
     side = _candidate_side(candidate)
-    primitive_action = _candidate_primitive_action(candidate)
+    primitive_action = candidate_primitive_action_name(candidate)
     occupancy_reason = str(candidate.depth_support.get("occupancy_reason", "not_checked"))
     occupancy_path_length = float(candidate.depth_support.get("occupancy_path_length_m", 0.0))
+    primitive_safety_reason = str(
+        candidate.depth_support.get("primitive_safety_reason", "not_checked")
+    )
+    primitive_safety_risk = float(
+        candidate.depth_support.get("primitive_safety_risk", 0.0)
+    )
     free_ratio = float(candidate.depth_support.get("free_ratio", 0.0))
     near_depth_m = float(candidate.depth_support.get("min_depth", 0.0))
     min_clearance_m = float(candidate.depth_support.get("min_clearance_m", near_depth_m))
@@ -387,8 +377,10 @@ def _candidate_line(candidate: WaypointCandidate) -> str:
         f"repetition_penalty={repetition_penalty:.2f} "
         f"anchor_distance_delta_m={anchor_delta_m} "
         f"median_depth_m={candidate.depth_support.get('median_depth', 0.0):.2f} "
-        f"occupancy={occupancy_reason} "
-        f"planned_path_m={occupancy_path_length:.2f}"
+        f"map_reachability={occupancy_reason} "
+        f"planned_path_m={occupancy_path_length:.2f} "
+        f"primitive_safety={primitive_safety_reason} "
+        f"primitive_risk={primitive_safety_risk:.2f}"
     )
 
 
@@ -417,18 +409,6 @@ def _candidate_side(candidate: WaypointCandidate) -> str:
     if heading < -10.0:
         return "right"
     return "center"
-
-
-def _candidate_primitive_action(candidate: WaypointCandidate) -> str:
-    explicit = str(candidate.depth_support.get("primitive_action", "")).strip().upper()
-    if explicit in {"TURN_LEFT", "FORWARD", "TURN_RIGHT"}:
-        return explicit
-    side = _candidate_side(candidate)
-    if side == "left":
-        return "TURN_LEFT"
-    if side == "right":
-        return "TURN_RIGHT"
-    return "FORWARD"
 
 
 def _parse_json(content: str) -> dict:

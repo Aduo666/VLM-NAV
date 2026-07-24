@@ -16,7 +16,7 @@ from vln_nav.navigation.target_grounding import (
     TargetObservation,
     _select_grounding_detection,
 )
-from vln_nav.navigation.vln_policy import OpenNavVLNPolicy, _TurnCorridorSample
+from vln_nav.navigation.vln_policy import VLNPolicy, _TurnCorridorSample
 
 
 def _logger() -> logging.Logger:
@@ -52,8 +52,8 @@ class TargetEvidenceTest(unittest.TestCase):
             max_depth_m=10.0,
             depth_statistic="median",
             center_patch_ratio=0.25,
-            depth_mask_tolerance_ratio=0.35,
-            depth_mask_min_pixels=16,
+            depth_cluster_tolerance_ratio=0.35,
+            depth_cluster_min_pixels=16,
             min_depth_valid_ratio=0.12,
         )
         selected, index, reason = _select_grounding_detection(
@@ -85,8 +85,8 @@ class TargetEvidenceTest(unittest.TestCase):
             max_depth_m=10.0,
             depth_statistic="median",
             center_patch_ratio=0.25,
-            depth_mask_tolerance_ratio=0.35,
-            depth_mask_min_pixels=16,
+            depth_cluster_tolerance_ratio=0.35,
+            depth_cluster_min_pixels=16,
             min_depth_valid_ratio=0.12,
         )
         selected, index, _ = _select_grounding_detection(
@@ -150,7 +150,7 @@ class TargetEvidenceTest(unittest.TestCase):
         self.assertEqual(confirmed.confirmed_observation_count, 2)
 
     def test_turn_early_exit_requires_two_consistent_corridor_samples(self) -> None:
-        policy = object.__new__(OpenNavVLNPolicy)
+        policy = object.__new__(VLNPolicy)
         policy._config = SimpleNamespace(
             semantic_turn_alignment_confirmations=2,
             semantic_turn_corridor_center_tolerance_deg=12.0,

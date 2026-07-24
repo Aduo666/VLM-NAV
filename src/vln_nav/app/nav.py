@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 import os
@@ -15,37 +16,39 @@ from PIL import Image, ImageDraw, ImageFont
 
 from ..control.locomotion import create_locomotion_controller
 from ..navigation.candidate_waypoint_predictor import CandidateWaypointPredictor, CandidateWaypointPredictorConfig
-from ..navigation.depth_safety import DepthSafetyConfig, DepthSafetyMonitor
 from ..navigation.instruction_manager import InstructionContext, InstructionManager
 from ..navigation.landmark_map import LandmarkMap, LandmarkMapConfig, LandmarkMapEntry
 from ..navigation.landmark_tracker import LandmarkState, LandmarkTracker, LandmarkTrackerConfig
-from ..navigation.lidar_sensor import (
-    MultiLidarConfig,
-    MultiLidarReader,
-    MultiLidarSectorConfig,
-    PhysXLidarConfig,
-    PhysXLidarReader,
-)
+from ..navigation.lidar_sensor import PhysXLidarConfig, PhysXLidarReader
 from ..navigation.map_candidate_generator import MapCandidateGenerator, MapCandidateGeneratorConfig
-from ..navigation.navigation_map_visualizer import NavigationMapConfig, NavigationMapVisualizer
-from ..navigation.occupancy_grid import OccupancyGridConfig, OccupancyGridMapper
+from ..navigation.occupancy_grid import GlobalOccupancyMap, OccupancyGridConfig
 from ..navigation.observation_adapter import ObservationAdapter
 from ..navigation.odometry import SimOdometrySensor
-from ..navigation.open_nav_client import OpenNavLLMClient
+from ..navigation.primitive_safety import PrimitiveSafetyEvaluator
 from ..navigation.progress_manager import ProgressManager
 from ..navigation.spatial_transform import log_spatial_transform_self_check
 from ..navigation.stuck_detector import StuckDetector, StuckDetectorConfig
 from ..navigation.target_grounding import TargetGrounder, TargetGroundingConfig, TargetObservation
 from ..navigation.target_tracker import TargetTracker, TargetTrackerConfig
 from ..navigation.topological_memory import TopologicalMemory, TopologicalMemoryConfig
-from ..navigation.vln_policy import ExecutionFeedback, OpenNavPolicyConfig, OpenNavVLNPolicy, PolicyStepResult
-from ..navigation.vln_reasoner import OpenNavReasoner
+from ..navigation.vlm_client import VLMClient
+from ..navigation.vln_policy import ExecutionFeedback, PolicyStepResult, VLNPolicy, VLNPolicyConfig
+from ..navigation.vln_reasoner import VLNReasoner
 from ..runtime.config import DEFAULT_CONFIG_PATH, PROJECT_ROOT, AppConfig, load_config, setup_logging
 from ..runtime.debug_video import DebugVideoRecorder
 
 
+@dataclass(frozen=True)
+class _RuntimeSafetyDecision:
+    action_name: str
+    speed_scale: float
+    overridden: bool
+    reason: str
+    source: str
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Isaac Sim Open-Nav style VLN runtime")
+    parser = argparse.ArgumentParser(description="CAPTAINav Isaac Sim VLN runtime")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="YAML config path")
     parser.add_argument("--task", default=os.getenv("TASK_ID", ""), help="Task id from configs/instructions.json")
     parser.add_argument("--tasks-file", default=str(PROJECT_ROOT / "configs" / "instructions.json"), help="JSON task list path")
@@ -58,9 +61,9 @@ def main() -> int:
     args = parse_args()
     config = load_config(args.config)
     if args.headless:
-        config.headless = True
+        config.simulation.headless = True
 
-    logger = setup_logging(config.log_level)
+    logger = setup_logging(config.logging.level)
     if args.list_tasks:
         _print_available_tasks(tasks_file=Path(args.tasks_file), logger=logger)
         return 0
@@ -74,9 +77,14 @@ def main() -> int:
     logger.info("Loaded config from %s", Path(args.config).resolve())
     if applied_task_id:
         logger.info("Loaded task from %s: %s", Path(args.tasks_file).resolve(), applied_task_id)
-    logger.info("Robot USD path: %s", config.robot_usd_path)
-    logger.info("LLM model=%s api_base=%s key_present=%s", config.model_name, config.api_base_url, bool(config.llm_api_key))
-    if not config.llm_api_key:
+    logger.info("Robot USD path: %s", config.robot.asset.usd_path)
+    logger.info(
+        "LLM model=%s api_base=%s key_present=%s",
+        config.llm.model_name,
+        config.llm.api_base_url,
+        bool(config.llm.api_key),
+    )
+    if not config.llm.api_key:
         logger.error(
             "LLM API key is missing. Set SILICONFLOW_API_KEY or LLM_API_KEY, "
             "or put api_key under the llm section in configs/default.yaml. "
@@ -148,24 +156,24 @@ def main() -> int:
 
 
 def _parse_instruction_preflight(*, config: AppConfig, logger) -> InstructionContext:
-    parse_client = OpenNavLLMClient(
-        api_key=config.llm_api_key,
-        model_name=config.model_name,
-        base_url=config.api_base_url,
-        timeout_sec=max(1, int(config.instruction_parse_timeout_sec)),
+    parse_client = VLMClient(
+        api_key=config.llm.api_key,
+        model_name=config.llm.model_name,
+        base_url=config.llm.api_base_url,
+        timeout_sec=max(1, int(config.instruction.parse_timeout_sec)),
         retry_cooldown_sec=0.0,
         upload_max_edge_px=0,
-        image_detail=config.camera_image_detail,
+        image_detail=config.llm.camera_image_detail,
         logger=logger,
     )
     instruction_manager = InstructionManager(
         llm_client=parse_client,
         logger=logger,
-        max_tokens=int(config.instruction_parse_max_tokens),
-        cache_enabled=bool(config.instruction_cache_enabled),
-        cache_path=str(config.instruction_cache_path),
+        max_tokens=int(config.instruction.parse_max_tokens),
+        cache_enabled=bool(config.instruction.cache_enabled),
+        cache_path=str(config.instruction.cache_path),
     )
-    return instruction_manager.parse(config.instruction)
+    return instruction_manager.parse(config.instruction.text)
 
 
 def _apply_task_overrides(*, config: AppConfig, task_id: str, tasks_file: Path, logger) -> str:
@@ -173,9 +181,9 @@ def _apply_task_overrides(*, config: AppConfig, task_id: str, tasks_file: Path, 
     if not tasks_path.exists():
         if task_id:
             raise FileNotFoundError(f"Task file does not exist: {tasks_path}")
-        if not str(config.instruction).strip():
+        if not str(config.instruction.text).strip():
             raise RuntimeError(
-                "No task selected and config has no opennav.instruction. "
+                "No task selected and config has no instruction.text. "
                 "Use --task <id> or set INSTRUCTION."
             )
         logger.info("[Task] no task file found; using instruction from config/env")
@@ -200,7 +208,7 @@ def _apply_task_overrides(*, config: AppConfig, task_id: str, tasks_file: Path, 
         if selected is None:
             available = ", ".join(str(task.get("id", "")) for task in tasks)
             raise ValueError(f"Task id not found: {requested}. Available tasks: {available}")
-    elif not str(config.instruction).strip() and tasks:
+    elif not str(config.instruction.text).strip() and tasks:
         if len(tasks) == 1:
             selected = tasks[0]
         else:
@@ -216,32 +224,34 @@ def _apply_task_overrides(*, config: AppConfig, task_id: str, tasks_file: Path, 
     instruction = str(selected.get("instruction", "")).strip()
     if not instruction:
         raise ValueError(f"Task {selected_id} has empty instruction")
-    config.instruction = instruction
+    config.instruction.text = instruction
 
     scene_usd_path = str(selected.get("scene_usd_path", "")).strip()
     if scene_usd_path:
-        config.scene_usd_path = scene_usd_path
+        config.scene.usd_path = scene_usd_path
 
     start_position = selected.get("robot_start_position", None)
     if isinstance(start_position, list) and len(start_position) >= 3:
-        spawn_z_m = 0.0 if config.robot_profile is None else float(config.robot_profile.spawn_z_m)
-        config.robot_init_position = [float(start_position[0]), float(start_position[1]), spawn_z_m]
+        config.scene.robot_start_xy_m = (
+            float(start_position[0]),
+            float(start_position[1]),
+        )
 
     start_orientation = selected.get("robot_start_orientation_deg", None)
     if isinstance(start_orientation, list) and len(start_orientation) >= 3:
-        config.robot_init_orientation_deg = [
+        config.scene.robot_start_orientation_deg = (
             float(start_orientation[0]),
             float(start_orientation[1]),
             float(start_orientation[2]),
-        ]
+        )
 
     logger.info(
         "[Task] selected=%s scene=%s start=%s rpy_deg=%s instruction=%s",
         selected_id,
-        config.scene_usd_path,
-        config.robot_init_position,
-        config.robot_init_orientation_deg,
-        config.instruction,
+        config.scene.usd_path,
+        config.robot_start_position,
+        config.scene.robot_start_orientation_deg,
+        config.instruction.text,
     )
     return selected_id
 
@@ -294,10 +304,10 @@ def _interactive_task_selection(*, tasks: list[dict]) -> dict | None:
 def _print_available_tasks(*, tasks_file: Path, logger) -> None:
     tasks_path = tasks_file if tasks_file.is_absolute() else PROJECT_ROOT / tasks_file
     tasks = _load_tasks(tasks_path)
-    logger.info("Available tasks in %s:", tasks_path)
+    logger.info("[PLAN] available_tasks file=%s count=%s", tasks_path, len(tasks))
     for task in tasks:
         logger.info(
-            "  %s | scene=%s | start=%s | instruction=%s",
+            "[PLAN] task=%s scene=%s start=%s instruction=%s",
             str(task.get("id", "")),
             str(task.get("scene_usd_path", "")),
             task.get("robot_start_position", []),
@@ -317,21 +327,21 @@ def _load_tasks(tasks_path: Path) -> list[dict]:
 def _build_simulation_app_settings(*, config: AppConfig, logger) -> dict:
     active_gpu = _resolve_active_gpu_for_display(config=config, logger=logger)
     settings = {
-        "headless": bool(config.headless),
-        "width": int(config.sim_width),
-        "height": int(config.sim_height),
-        "multi_gpu": bool(config.multi_gpu),
+        "headless": bool(config.simulation.headless),
+        "width": int(config.simulation.width),
+        "height": int(config.simulation.height),
+        "multi_gpu": bool(config.simulation.multi_gpu),
     }
     if active_gpu is not None:
         settings["active_gpu"] = int(active_gpu)
-    if config.physics_gpu is not None:
-        settings["physics_gpu"] = int(config.physics_gpu)
+    if config.simulation.physics_gpu is not None:
+        settings["physics_gpu"] = int(config.simulation.physics_gpu)
     logger.info(
         "[SimulationApp] headless=%s active_gpu=%s physics_gpu=%s multi_gpu=%s DISPLAY=%s WAYLAND_DISPLAY=%s CUDA_VISIBLE_DEVICES=%s",
-        int(bool(config.headless)),
+        int(bool(config.simulation.headless)),
         "auto" if active_gpu is None else int(active_gpu),
-        "auto" if config.physics_gpu is None else int(config.physics_gpu),
-        int(bool(config.multi_gpu)),
+        "auto" if config.simulation.physics_gpu is None else int(config.simulation.physics_gpu),
+        int(bool(config.simulation.multi_gpu)),
         os.environ.get("DISPLAY", "<unset>"),
         os.environ.get("WAYLAND_DISPLAY", "<unset>"),
         os.environ.get("CUDA_VISIBLE_DEVICES", "<unset>"),
@@ -340,8 +350,8 @@ def _build_simulation_app_settings(*, config: AppConfig, logger) -> dict:
 
 
 def _resolve_active_gpu_for_display(*, config: AppConfig, logger) -> int | None:
-    configured_gpu = config.active_gpu
-    if bool(config.headless):
+    configured_gpu = config.simulation.active_gpu
+    if bool(config.simulation.headless):
         return configured_gpu
 
     display_env = os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
@@ -397,7 +407,7 @@ def _detect_display_active_gpu(*, logger) -> int | None:
         if len(parts) < 2:
             continue
         state = parts[1].strip().lower()
-        if state in {"enabled", "active", "yes", "on", "1", "true"}:
+        if state in {"enabled", "active", "yes", "on", "1", "True"}:
             try:
                 return int(parts[0])
             except ValueError:
@@ -413,26 +423,26 @@ def run_navigation(
     task_id: str = "",
     evaluation_result_path: Path | None = None,
 ) -> None:
-    logger = setup_logging(config.log_level)
+    logger = setup_logging(config.logging.level)
 
-    llm_client = OpenNavLLMClient(
-        api_key=config.llm_api_key,
-        model_name=config.model_name,
-        base_url=config.api_base_url,
-        timeout_sec=config.llm_timeout_sec,
-        retry_cooldown_sec=config.llm_retry_cooldown_sec,
-        upload_max_edge_px=config.llm_upload_max_edge_px,
-        image_detail=config.camera_image_detail,
+    llm_client = VLMClient(
+        api_key=config.llm.api_key,
+        model_name=config.llm.model_name,
+        base_url=config.llm.api_base_url,
+        timeout_sec=config.llm.timeout_sec,
+        retry_cooldown_sec=config.llm.retry_cooldown_sec,
+        upload_max_edge_px=config.llm.upload_max_edge_px,
+        image_detail=config.llm.camera_image_detail,
         logger=logger,
     )
-    target_grounding_llm_client = OpenNavLLMClient(
-        api_key=config.llm_api_key,
-        model_name=config.model_name,
-        base_url=config.api_base_url,
-        timeout_sec=config.llm_timeout_sec,
-        retry_cooldown_sec=config.llm_retry_cooldown_sec,
-        upload_max_edge_px=config.target_grounding_upload_max_edge_px,
-        image_detail=config.camera_image_detail,
+    target_grounding_llm_client = VLMClient(
+        api_key=config.llm.api_key,
+        model_name=config.llm.model_name,
+        base_url=config.llm.api_base_url,
+        timeout_sec=config.llm.timeout_sec,
+        retry_cooldown_sec=config.llm.retry_cooldown_sec,
+        upload_max_edge_px=config.perception.grounding.upload_max_edge_px,
+        image_detail=config.llm.camera_image_detail,
         logger=logger,
     )
     logger.info("[Goal] instruction=%s", instruction_context.raw_text)
@@ -475,452 +485,346 @@ def run_navigation(
         "unknown" if instruction_context.scene_context.current_region is None else instruction_context.scene_context.current_region.canonical_label,
         [item.canonical_label for item in instruction_context.scene_context.context_objects],
         instruction_context.navigation_target_labels,
-        float(config.arrival_distance_m),
-        float(config.success_distance_m),
-        int(config.landmark_tracker_min_visible_count),
+        float(config.navigation.progress.landmark_clearance_m),
+        float(config.navigation.progress.final_success_clearance_m),
+        int(config.perception.landmark_tracking.min_visible_count),
     )
     logger.info(
-        "[GroundingConfig] enabled=%s backend=%s call_period_sec=%.2f reuse_sec=%.2f pause_active=%s min_conf=%.2f depth_range=[%.2f, %.2f] coord=%s depth_region=%s min_depth_valid_ratio=%.2f semantic_verify=%s verify_min=%.2f dino_checkpoint=%s sam_enabled=%s sam_checkpoint=%s sam_model=%s",
-        int(bool(config.target_grounding_enabled)),
-        str(config.target_grounding_backend),
-        float(config.target_grounding_call_period_sec),
-        float(config.target_grounding_reuse_last_observation_sec),
-        int(bool(config.target_grounding_pause_during_active_primitive)),
-        float(config.target_grounding_min_confidence),
-        float(config.target_grounding_min_depth_m),
-        float(config.target_grounding_max_depth_m),
-        str(config.target_grounding_coordinate_mode),
-        str(config.target_grounding_depth_region),
-        float(config.target_grounding_min_depth_valid_ratio),
-        int(bool(config.target_grounding_semantic_verification_enabled)),
-        float(config.target_grounding_semantic_verification_min_confidence),
-        str(config.target_grounding_dino_checkpoint_path),
-        int(bool(config.target_grounding_sam_enabled)),
-        str(config.target_grounding_sam_checkpoint_path),
-        str(config.target_grounding_sam_model_type),
+        "[GroundingConfig] backend=grounding_dino call_period_sec=%.2f reuse_sec=%.2f pause_active=1 min_conf=%.2f depth_range=[%.2f, %.2f] coord=%s depth_region=%s min_depth_valid_ratio=%.2f semantic_verify=1 verify_min=%.2f dino_checkpoint=%s",
+        float(config.perception.grounding.call_period_sec),
+        float(config.perception.grounding.reuse_last_observation_sec),
+        float(config.perception.grounding.min_confidence),
+        float(config.perception.grounding.min_depth_m),
+        float(config.perception.grounding.max_depth_m),
+        str(config.perception.grounding.coordinate_mode),
+        str(config.perception.grounding.depth_region),
+        float(config.perception.grounding.min_depth_valid_ratio),
+        float(config.perception.grounding.semantic_verification.min_confidence),
+        str(config.perception.grounding.detector.checkpoint_path),
     )
     logger.info(
-        "[TargetTrackerConfig] enabled=%s type=%s lost_frames=%s lost_sec=%.2f min_depth_valid_ratio=%.2f",
-        int(bool(config.target_tracker_enabled)),
-        str(config.target_tracker_type),
-        int(config.target_tracker_max_lost_frames),
-        float(config.target_tracker_lost_confirmed_sec),
-        float(config.target_tracker_min_depth_valid_ratio),
+        "[TargetTrackerConfig] required=1 type=%s lost_frames=%s lost_sec=%.2f min_depth_valid_ratio=%.2f",
+        str(config.perception.grounding.tracker.tracker_type),
+        int(config.perception.grounding.tracker.max_lost_frames),
+        float(config.perception.grounding.tracker.lost_confirmed_sec),
+        float(config.perception.grounding.tracker.min_depth_valid_ratio),
     )
     logger.info(
         "[LandmarkTrackerConfig] arrival_distance=%.2f success_distance=%.2f min_visible=%s confirmations=%s landmark_map=%s map_ttl=%.1f",
-        float(config.arrival_distance_m),
-        float(config.success_distance_m),
-        int(config.landmark_tracker_min_visible_count),
-        int(config.landmark_tracker_arrival_confirmations),
-        int(bool(config.landmark_map_enabled)),
-        float(config.landmark_map_anchor_ttl_sec),
+        float(config.navigation.progress.landmark_clearance_m),
+        float(config.navigation.progress.final_success_clearance_m),
+        int(config.perception.landmark_tracking.min_visible_count),
+        int(config.perception.landmark_tracking.arrival_confirmations),
+        1,
+        float(config.perception.landmark_map.anchor_ttl_sec),
     )
 
     observation_adapter = ObservationAdapter(
-        camera_width=int(config.camera_width),
-        camera_height=int(config.camera_height),
-        horizontal_fov_deg=float(config.camera_horizontal_fov_deg),
+        camera_width=int(config.robot.sensors.camera.width),
+        camera_height=int(config.robot.sensors.camera.height),
+        horizontal_fov_deg=float(config.robot.sensors.camera.horizontal_fov_deg),
     )
     log_spatial_transform_self_check(
         logger=logger,
-        image_width=int(config.camera_width),
-        image_height=int(config.camera_height),
-        horizontal_fov_deg=float(config.camera_horizontal_fov_deg),
+        image_width=int(config.robot.sensors.camera.width),
+        image_height=int(config.robot.sensors.camera.height),
+        horizontal_fov_deg=float(config.robot.sensors.camera.horizontal_fov_deg),
     )
     candidate_predictor = CandidateWaypointPredictor(
         CandidateWaypointPredictorConfig(
-            image_width=int(config.camera_width),
-            image_height=int(config.camera_height),
-            horizontal_fov_deg=float(config.camera_horizontal_fov_deg),
-            roi_vertical_range=(float(config.roi_vertical_range[0]), float(config.roi_vertical_range[1])),
-            valid_depth_range=(float(config.valid_depth_range_m[0]), float(config.valid_depth_range_m[1])),
-            clearance_threshold_m=float(config.clearance_threshold_m),
-            slot_bearings_deg=tuple(float(value) for value in config.candidate_slot_bearings_deg),
-            min_travel_distance_m=float(config.candidate_min_travel_distance_m),
-            preferred_distance_m=float(config.candidate_preferred_distance_m),
-            max_travel_distance_m=float(config.candidate_max_travel_distance_m),
-            min_free_ratio=float(config.candidate_min_free_ratio),
-            column_half_width_px=int(config.candidate_column_half_width_px),
-            adaptive_enabled=bool(config.candidate_adaptive_enabled),
-            adaptive_count=int(config.candidate_adaptive_count),
-            adaptive_min_spacing_deg=float(config.candidate_adaptive_min_spacing_deg),
-            adaptive_smoothing_px=int(config.candidate_adaptive_smoothing_px),
+            image_width=int(config.robot.sensors.camera.width),
+            image_height=int(config.robot.sensors.camera.height),
+            horizontal_fov_deg=float(config.robot.sensors.camera.horizontal_fov_deg),
+            roi_vertical_range=(float(config.robot.sensors.camera.depth_roi_vertical_range[0]), float(config.robot.sensors.camera.depth_roi_vertical_range[1])),
+            valid_depth_range=(float(config.robot.sensors.camera.valid_depth_range_m[0]), float(config.robot.sensors.camera.valid_depth_range_m[1])),
+            clearance_threshold_m=float(config.navigation.candidates.max_distance_m),
+            slot_bearings_deg=tuple(float(value) for value in config.navigation.candidates.slot_bearings_deg),
+            min_travel_distance_m=float(config.navigation.candidates.min_distance_m),
+            preferred_distance_m=float(
+                0.5
+                * (
+                    config.navigation.candidates.min_distance_m
+                    + config.navigation.candidates.max_distance_m
+                )
+            ),
+            max_travel_distance_m=float(config.navigation.candidates.max_distance_m),
+            min_free_ratio=float(config.navigation.candidates.min_free_ratio),
+            column_half_width_px=int(config.navigation.candidates.column_half_width_px),
+            adaptive_count=int(config.navigation.candidates.adaptive_count),
+            adaptive_min_spacing_deg=float(config.navigation.candidates.adaptive_min_spacing_deg),
+            adaptive_smoothing_px=int(config.navigation.candidates.adaptive_smoothing_px),
         ),
         logger=logger,
     )
-    depth_safety_monitor = DepthSafetyMonitor(
-        config=DepthSafetyConfig(
-            enabled=bool(config.obstacle_avoidance_enabled),
-            stop_distance_m=float(config.obstacle_stop_distance_m),
-            roi_vertical_range=(
-                float(config.obstacle_roi_vertical_range[0]),
-                float(config.obstacle_roi_vertical_range[1]),
-            ),
-            center_width_ratio=float(config.obstacle_center_width_ratio),
-            side_width_ratio=float(config.obstacle_side_width_ratio),
-            near_field_memory_enabled=bool(config.near_field_memory_enabled),
-            near_field_memory_sec=float(config.near_field_memory_sec),
-        )
-    )
     stuck_detector = StuckDetector(
         config=StuckDetectorConfig(
-            enabled=bool(config.stuck_detection_enabled),
-            window_sec=float(config.stuck_window_sec),
-            displacement_threshold_m=float(config.stuck_displacement_threshold_m),
-            yaw_threshold_deg=float(config.stuck_yaw_threshold_deg),
-            recovery_pause_sec=float(config.stuck_recovery_pause_sec),
-            recovery_reverse_sec=(
-                0.0
-                if config.robot_profile is not None and config.robot_profile.is_g1
-                else float(config.stuck_recovery_reverse_sec)
-            ),
-            recovery_turn_sec=float(config.stuck_recovery_turn_sec),
-            recovery_turn_action=str(config.stuck_recovery_turn_action),
+            window_sec=float(config.navigation.recovery.stuck_window_sec),
+            displacement_threshold_m=float(config.navigation.recovery.stuck_displacement_threshold_m),
+            yaw_threshold_deg=float(config.navigation.recovery.stuck_yaw_threshold_deg),
+            recovery_pause_sec=float(config.navigation.recovery.pause_sec),
+            recovery_reverse_sec=float(config.navigation.recovery.reverse_sec),
+            recovery_turn_sec=float(config.navigation.recovery.turn_sec),
+            recovery_turn_action=str(config.navigation.recovery.turn_action),
         ),
         logger=logger,
     )
     progress_manager = ProgressManager(
-        history_length=int(config.progress_history_length),
-        stall_distance_m=float(config.progress_stall_distance_m),
-        spin_yaw_deg=float(config.progress_spin_yaw_deg),
+        history_length=int(config.navigation.progress.history_length),
+        stall_distance_m=float(config.navigation.progress.stall_distance_m),
+        spin_yaw_deg=float(config.navigation.progress.spin_yaw_deg),
     )
     target_grounder = TargetGrounder(
         config=TargetGroundingConfig(
-            enabled=bool(config.target_grounding_enabled),
-            backend=str(config.target_grounding_backend),
-            call_period_sec=float(config.target_grounding_call_period_sec),
-            reuse_last_observation_sec=float(config.target_grounding_reuse_last_observation_sec),
-            upload_max_edge_px=int(config.target_grounding_upload_max_edge_px),
-            min_bbox_area_ratio=float(config.target_grounding_min_bbox_area_ratio),
-            max_bbox_area_ratio=float(config.target_grounding_max_bbox_area_ratio),
-            min_bbox_width_px=int(config.target_grounding_min_bbox_width_px),
-            min_bbox_height_px=int(config.target_grounding_min_bbox_height_px),
-            max_bbox_aspect_ratio=float(config.target_grounding_max_bbox_aspect_ratio),
-            min_depth_valid_ratio=float(config.target_grounding_min_depth_valid_ratio),
-            depth_statistic=str(config.target_grounding_depth_statistic),
-            center_patch_ratio=float(config.target_grounding_center_patch_ratio),
-            min_depth_m=float(config.target_grounding_min_depth_m),
-            max_depth_m=float(config.target_grounding_max_depth_m),
-            min_confidence=float(config.target_grounding_min_confidence),
-            horizontal_fov_deg=float(config.camera_horizontal_fov_deg),
-            coordinate_mode=str(config.target_grounding_coordinate_mode),
-            allow_normalized_bbox=bool(config.target_grounding_allow_normalized_bbox),
-            normalized_bbox_scale=float(config.target_grounding_normalized_bbox_scale),
-            depth_region=str(config.target_grounding_depth_region),
-            depth_mask_tolerance_ratio=float(config.target_grounding_depth_mask_tolerance_ratio),
-            depth_mask_min_pixels=int(config.target_grounding_depth_mask_min_pixels),
-            grounding_dino_repo_path=str(config.target_grounding_dino_repo_path),
-            grounding_dino_config_path=str(config.target_grounding_dino_config_path),
-            grounding_dino_checkpoint_path=str(config.target_grounding_dino_checkpoint_path),
-            grounding_dino_device=str(config.target_grounding_dino_device),
-            grounding_dino_box_threshold=float(config.target_grounding_dino_box_threshold),
-            grounding_dino_text_threshold=float(config.target_grounding_dino_text_threshold),
-            grounding_dino_text_encoder_path=str(config.target_grounding_dino_text_encoder_path),
-            grounding_dino_max_detections=int(config.target_grounding_dino_max_detections),
-            grounding_dino_nms_iou_threshold=float(
-                config.target_grounding_dino_nms_iou_threshold
+            call_period_sec=float(config.perception.grounding.call_period_sec),
+            reuse_last_observation_sec=float(config.perception.grounding.reuse_last_observation_sec),
+            upload_max_edge_px=int(config.perception.grounding.upload_max_edge_px),
+            min_bbox_area_ratio=float(config.perception.grounding.min_bbox_area_ratio),
+            max_bbox_area_ratio=float(config.perception.grounding.max_bbox_area_ratio),
+            min_bbox_width_px=int(config.perception.grounding.min_bbox_width_px),
+            min_bbox_height_px=int(config.perception.grounding.min_bbox_height_px),
+            max_bbox_aspect_ratio=float(config.perception.grounding.max_bbox_aspect_ratio),
+            min_depth_valid_ratio=float(config.perception.grounding.min_depth_valid_ratio),
+            depth_statistic=str(config.perception.grounding.depth_statistic),
+            center_patch_ratio=float(config.perception.grounding.center_patch_ratio),
+            min_depth_m=float(config.perception.grounding.min_depth_m),
+            max_depth_m=float(config.perception.grounding.max_depth_m),
+            min_confidence=float(config.perception.grounding.min_confidence),
+            horizontal_fov_deg=float(config.robot.sensors.camera.horizontal_fov_deg),
+            coordinate_mode=str(config.perception.grounding.coordinate_mode),
+            allow_normalized_bbox=bool(config.perception.grounding.allow_normalized_bbox),
+            normalized_bbox_scale=float(config.perception.grounding.normalized_bbox_scale),
+            depth_region=str(config.perception.grounding.depth_region),
+            depth_cluster_tolerance_ratio=float(
+                config.perception.grounding.depth_cluster_tolerance_ratio
             ),
-            sam_checkpoint_path=str(config.target_grounding_sam_checkpoint_path),
-            sam_model_type=str(config.target_grounding_sam_model_type),
-            sam_device=str(config.target_grounding_sam_device),
-            sam_min_mask_area_ratio=float(config.target_grounding_sam_min_mask_area_ratio),
-            sam_enabled=bool(config.target_grounding_sam_enabled),
-            max_result_age_sec=float(config.target_grounding_max_result_age_sec),
-            max_result_pose_delta_m=float(config.target_grounding_max_result_pose_delta_m),
-            max_result_yaw_delta_deg=float(config.target_grounding_max_result_yaw_delta_deg),
-            semantic_verification_enabled=bool(config.target_grounding_semantic_verification_enabled),
-            semantic_verification_min_confidence=float(config.target_grounding_semantic_verification_min_confidence),
-            semantic_verification_max_edge_px=int(config.target_grounding_semantic_verification_max_edge_px),
-            semantic_verification_auto_accept_confidence=float(config.target_grounding_semantic_verification_auto_accept_confidence),
+            depth_cluster_min_pixels=int(
+                config.perception.grounding.depth_cluster_min_pixels
+            ),
+            grounding_dino_repo_path=str(config.perception.grounding.detector.repo_path),
+            grounding_dino_config_path=str(config.perception.grounding.detector.config_path),
+            grounding_dino_checkpoint_path=str(config.perception.grounding.detector.checkpoint_path),
+            grounding_dino_device=str(config.perception.grounding.detector.device),
+            grounding_dino_box_threshold=float(config.perception.grounding.detector.box_threshold),
+            grounding_dino_text_threshold=float(config.perception.grounding.detector.text_threshold),
+            grounding_dino_text_encoder_path=str(config.perception.grounding.detector.text_encoder_path),
+            grounding_dino_max_detections=int(config.perception.grounding.detector.max_detections),
+            grounding_dino_nms_iou_threshold=float(
+                config.perception.grounding.detector.nms_iou_threshold
+            ),
+            max_result_age_sec=float(config.perception.grounding.max_result_age_sec),
+            max_result_pose_delta_m=float(config.perception.grounding.max_result_pose_delta_m),
+            max_result_yaw_delta_deg=float(config.perception.grounding.max_result_yaw_delta_deg),
+            semantic_verification_min_confidence=float(config.perception.grounding.semantic_verification.min_confidence),
+            semantic_verification_max_edge_px=int(config.perception.grounding.semantic_verification.max_edge_px),
+            semantic_verification_auto_accept_confidence=float(config.perception.grounding.semantic_verification.auto_accept_confidence),
         ),
         llm_client=target_grounding_llm_client,
         logger=logger,
     )
+    target_grounder.require_ready()
     target_tracker = TargetTracker(
         config=TargetTrackerConfig(
-            enabled=bool(config.target_tracker_enabled),
-            tracker_type=str(config.target_tracker_type),
-            max_lost_frames=int(config.target_tracker_max_lost_frames),
-            lost_confirmed_sec=float(config.target_tracker_lost_confirmed_sec),
-            min_depth_valid_ratio=float(config.target_tracker_min_depth_valid_ratio),
-            center_patch_ratio=float(config.target_tracker_center_patch_ratio),
-            min_depth_m=float(config.target_grounding_min_depth_m),
-            max_depth_m=float(config.target_grounding_max_depth_m),
-            horizontal_fov_deg=float(config.camera_horizontal_fov_deg),
-            min_bbox_area_ratio=float(config.target_grounding_min_bbox_area_ratio),
-            max_bbox_area_ratio=float(config.target_grounding_max_bbox_area_ratio),
-            confidence_decay_per_lost_frame=float(config.target_tracker_confidence_decay_per_lost_frame),
-            min_tracking_confidence=float(config.target_tracker_min_tracking_confidence),
+            tracker_type=str(config.perception.grounding.tracker.tracker_type),
+            max_lost_frames=int(config.perception.grounding.tracker.max_lost_frames),
+            lost_confirmed_sec=float(config.perception.grounding.tracker.lost_confirmed_sec),
+            min_depth_valid_ratio=float(config.perception.grounding.tracker.min_depth_valid_ratio),
+            center_patch_ratio=float(config.perception.grounding.tracker.center_patch_ratio),
+            min_depth_m=float(config.perception.grounding.min_depth_m),
+            max_depth_m=float(config.perception.grounding.max_depth_m),
+            horizontal_fov_deg=float(config.robot.sensors.camera.horizontal_fov_deg),
+            min_bbox_area_ratio=float(config.perception.grounding.min_bbox_area_ratio),
+            max_bbox_area_ratio=float(config.perception.grounding.max_bbox_area_ratio),
+            confidence_decay_per_lost_frame=float(config.perception.grounding.tracker.confidence_decay_per_lost_frame),
+            min_tracking_confidence=float(config.perception.grounding.tracker.min_tracking_confidence),
         ),
         logger=logger,
     )
     landmark_tracker = LandmarkTracker(
         config=LandmarkTrackerConfig(
-            arrival_visible_depth_m=float(config.arrival_distance_m),
-            arrival_anchor_radius_m=float(config.arrival_distance_m),
-            min_visible_count=int(config.landmark_tracker_min_visible_count),
-            arrival_confirmations=int(config.landmark_tracker_arrival_confirmations),
-            arrival_window_size=int(config.landmark_tracker_arrival_window_size),
-            arrival_recent_visible_sec=float(config.landmark_tracker_arrival_recent_visible_sec),
-            max_lost_count=int(config.landmark_tracker_max_lost_count),
+            arrival_visible_depth_m=float(config.navigation.progress.landmark_clearance_m),
+            arrival_anchor_radius_m=float(config.navigation.progress.landmark_clearance_m),
+            min_visible_count=int(config.perception.landmark_tracking.min_visible_count),
+            arrival_confirmations=int(config.perception.landmark_tracking.arrival_confirmations),
+            arrival_window_size=int(config.perception.landmark_tracking.arrival_window_size),
+            arrival_recent_visible_sec=float(config.perception.landmark_tracking.arrival_recent_visible_sec),
+            max_lost_count=int(config.perception.landmark_tracking.max_lost_count),
             anchor_update_min_consistent_observations=int(
-                config.landmark_tracker_anchor_update_min_consistent_observations
+                config.perception.landmark_tracking.anchor_update_min_consistent_observations
             ),
-            anchor_update_max_jump_m=float(config.landmark_tracker_anchor_update_max_jump_m),
-            confirm_confidence_threshold=float(config.landmark_tracker_confirm_confidence_threshold),
-            confirm_min_observations=int(config.landmark_tracker_confirm_min_observations),
-            confirm_max_anchor_jump_m=float(config.landmark_tracker_confirm_max_anchor_jump_m),
-            confirm_max_depth_jump_m=float(config.landmark_tracker_confirm_max_depth_jump_m),
-            potential_confidence_threshold=float(config.landmark_tracker_potential_confidence_threshold),
+            anchor_update_max_jump_m=float(config.perception.landmark_tracking.anchor_update_max_jump_m),
+            confirm_confidence_threshold=float(config.perception.landmark_tracking.confirm_confidence_threshold),
+            confirm_min_observations=int(config.perception.landmark_tracking.confirm_min_observations),
+            confirm_max_anchor_jump_m=float(config.perception.landmark_tracking.confirm_max_anchor_jump_m),
+            confirm_max_depth_jump_m=float(config.perception.landmark_tracking.confirm_max_depth_jump_m),
+            potential_confidence_threshold=float(config.perception.landmark_tracking.potential_confidence_threshold),
             low_confidence_min_translation_m=float(
-                config.landmark_tracker_low_confidence_min_translation_m
+                config.perception.landmark_tracking.low_confidence_min_translation_m
             ),
             low_confidence_min_yaw_deg=float(
-                config.landmark_tracker_low_confidence_min_yaw_deg
+                config.perception.landmark_tracking.low_confidence_min_yaw_deg
             ),
         ),
         logger=logger,
     )
     landmark_map = LandmarkMap(
         config=LandmarkMapConfig(
-            enabled=bool(config.landmark_map_enabled),
-            anchor_ttl_sec=float(config.landmark_map_anchor_ttl_sec),
-            min_confidence=float(config.landmark_map_min_confidence),
-            log_period_sec=float(config.landmark_map_log_period_sec),
+            anchor_ttl_sec=float(config.perception.landmark_map.anchor_ttl_sec),
+            min_confidence=float(config.perception.landmark_map.min_confidence),
+            log_period_sec=float(config.perception.landmark_map.log_period_sec),
         ),
         logger=logger,
     )
     topological_memory = TopologicalMemory(
         config=TopologicalMemoryConfig(
-            enabled=bool(config.topology_enabled),
-            node_spacing_m=float(config.topology_node_spacing_m),
-            turn_threshold_deg=float(config.topology_turn_threshold_deg),
-            merge_radius_m=float(config.topology_merge_radius_m),
-            landmark_bind_radius_m=float(config.topology_landmark_bind_radius_m),
-            max_nodes=int(config.topology_max_nodes),
-            recent_node_count=int(config.topology_recent_node_count),
+            node_spacing_m=float(config.mapping.topology.node_spacing_m),
+            turn_threshold_deg=float(config.mapping.topology.turn_threshold_deg),
+            merge_radius_m=float(config.mapping.topology.merge_radius_m),
+            landmark_bind_radius_m=float(config.mapping.topology.landmark_bind_radius_m),
+            max_nodes=int(config.mapping.topology.max_nodes),
+            recent_node_count=int(config.mapping.topology.recent_node_count),
         ),
         logger=logger,
     )
     odom_filter_alpha = 1.0
-    if config.robot_profile is not None and config.robot_profile.g1_controller is not None:
-        odom_filter_alpha = float(config.robot_profile.g1_controller.odom_filter_alpha)
+    if config.robot.g1_controller is not None:
+        odom_filter_alpha = float(config.robot.g1_controller.odom_filter_alpha)
     odom_sensor = SimOdometrySensor(
         logger=logger,
-        source=str(config.odom_source),
+        source="isaac_world_pose",
         pose_filter_alpha=odom_filter_alpha,
     )
-    occupancy_grid = OccupancyGridMapper(
+    occupancy_grid = GlobalOccupancyMap(
         config=OccupancyGridConfig(
-            enabled=bool(config.occupancy_grid_enabled),
-            resolution_m=float(config.occupancy_grid_resolution_m),
-            size_m=float(config.occupancy_grid_size_m),
-            update_period_sec=float(config.occupancy_grid_update_period_sec),
-            depth_sample_stride_px=int(config.occupancy_grid_depth_sample_stride_px),
-            depth_roi_vertical_range=(
-                float(config.occupancy_grid_depth_roi_vertical_range[0]),
-                float(config.occupancy_grid_depth_roi_vertical_range[1]),
+            resolution_m=float(config.mapping.occupancy.resolution_m),
+            size_m=float(config.mapping.occupancy.size_m),
+            update_period_sec=float(config.mapping.occupancy.update_period_sec),
+            min_range_m=float(config.robot.sensors.lidar.min_range_m),
+            max_range_m=float(config.robot.sensors.lidar.max_range_m),
+            inflation_radius_m=(
+                float(config.robot.geometry.circumscribed_radius_m)
+                + float(config.robot.geometry.safety_margin_m)
             ),
-            min_depth_m=float(config.occupancy_grid_min_depth_m),
-            max_depth_m=float(config.occupancy_grid_max_depth_m),
-            inflation_radius_m=float(config.occupancy_grid_inflation_radius_m),
-            occupied_min_neighbors=int(config.occupancy_grid_occupied_min_neighbors),
-            robot_radius_m=float(config.occupancy_grid_robot_radius_m),
-            path_corridor_radius_m=float(config.occupancy_grid_path_corridor_radius_m),
-            turn_clearance_radius_m=float(config.occupancy_grid_turn_clearance_radius_m),
-            unknown_is_traversable=bool(config.occupancy_grid_unknown_is_traversable),
-            unknown_cell_cost=float(config.occupancy_grid_unknown_cell_cost),
-            semantic_planner_enabled=bool(config.occupancy_grid_semantic_planner_enabled),
-            semantic_goal_step_m=float(config.occupancy_grid_semantic_goal_step_m),
-            semantic_goal_min_step_m=float(config.occupancy_grid_semantic_goal_min_step_m),
-            semantic_goal_lateral_search_m=float(config.occupancy_grid_semantic_goal_lateral_search_m),
+            occupied_min_neighbors=int(config.mapping.occupancy.occupied_min_neighbors),
+            unknown_is_traversable=bool(config.mapping.occupancy.unknown_is_traversable),
+            unknown_cell_cost=float(config.mapping.occupancy.unknown_cell_cost),
+            semantic_goal_step_m=float(config.mapping.occupancy.semantic_goal_step_m),
+            semantic_goal_min_step_m=float(config.mapping.occupancy.semantic_goal_min_step_m),
+            semantic_goal_lateral_search_m=float(config.mapping.occupancy.semantic_goal_lateral_search_m),
         ),
         logger=logger,
     )
-    _lidar_mode = str(config.lidar_mode).strip().lower()
+    primitive_safety = PrimitiveSafetyEvaluator(
+        profile=config.robot,
+        logger=logger,
+    )
     _g1_lidar_robot_frame_path = None
-    if config.robot_profile is not None and config.robot_profile.is_g1:
-        if _lidar_mode != "single":
-            raise ValueError("G1 requires lidar.mode=single for dynamic torso-to-pelvis compensation")
+    if config.robot.is_g1:
         _g1_lidar_robot_frame_path = _resolve_robot_relative_prim_path(
-            robot_root_path=str(config.robot_prim_path),
-            prim_path=str(config.robot_articulation_path),
+            robot_root_path=str(config.robot.asset.prim_path),
+            prim_path=str(config.robot.asset.articulation_path),
         )
-    if _lidar_mode == "multi" and bool(config.lidar_enabled):
-        _sector_count = min(
-            int(config.lidar_multi_sector_count),
-            len(config.lidar_multi_child_names),
-            len(config.lidar_multi_sector_yaw_offsets_deg),
-        )
-        multi_sectors = [
-            MultiLidarSectorConfig(
-                child_name=str(config.lidar_multi_child_names[i]),
-                yaw_offset_deg=float(config.lidar_multi_sector_yaw_offsets_deg[i]),
-                horizontal_fov_deg=float(config.lidar_multi_sector_fov_deg),
-            )
-            for i in range(_sector_count)
-        ]
-        lidar_reader: PhysXLidarReader | MultiLidarReader = MultiLidarReader(
-            config=MultiLidarConfig(
-                enabled=bool(config.lidar_enabled),
-                prim_path=str(config.lidar_prim_path),
-                vertical_fov_deg=float(config.lidar_vertical_fov_deg),
-                horizontal_resolution_deg=float(config.lidar_horizontal_resolution_deg),
-                vertical_resolution_deg=float(config.lidar_vertical_resolution_deg),
-                rotation_rate_hz=float(config.lidar_rotation_rate_hz),
-                min_range_m=float(config.lidar_min_range_m),
-                max_range_m=float(config.lidar_max_range_m),
-                draw_points=bool(config.lidar_draw_points),
-                draw_lines=bool(config.lidar_draw_lines),
-                sectors=multi_sectors,
-            ),
-            robot_root_path=str(config.robot_prim_path),
-            logger=logger,
-        )
-    else:
-        lidar_reader = PhysXLidarReader(
-            config=PhysXLidarConfig(
-                enabled=bool(config.lidar_enabled),
-                prim_path=str(config.lidar_prim_path),
-                child_name=str(config.lidar_child_name),
-                horizontal_fov_deg=float(config.lidar_horizontal_fov_deg),
-                vertical_fov_deg=float(config.lidar_vertical_fov_deg),
-                horizontal_resolution_deg=float(config.lidar_horizontal_resolution_deg),
-                vertical_resolution_deg=float(config.lidar_vertical_resolution_deg),
-                rotation_rate_hz=float(config.lidar_rotation_rate_hz),
-                min_range_m=float(config.lidar_min_range_m),
-                max_range_m=float(config.lidar_max_range_m),
-                yaw_offset_deg=float(config.lidar_yaw_offset_deg),
-                sector_merge_keep_sec=float(config.lidar_sector_merge_keep_sec),
-                draw_points=bool(config.lidar_draw_points),
-                draw_lines=bool(config.lidar_draw_lines),
-                require_existing_sensor=bool(config.robot_profile is not None and config.robot_profile.is_g1),
-            ),
-            robot_root_path=str(config.robot_prim_path),
-            logger=logger,
-            dynamic_robot_frame_path=_g1_lidar_robot_frame_path,
-        )
+    lidar_reader = PhysXLidarReader(
+        config=PhysXLidarConfig(
+            prim_path=str(config.robot.sensors.lidar.prim_path),
+            horizontal_fov_deg=float(config.robot.sensors.lidar.horizontal_fov_deg),
+            vertical_fov_deg=float(config.robot.sensors.lidar.vertical_fov_deg),
+            horizontal_resolution_deg=float(config.robot.sensors.lidar.horizontal_resolution_deg),
+            vertical_resolution_deg=float(config.robot.sensors.lidar.vertical_resolution_deg),
+            rotation_rate_hz=float(config.robot.sensors.lidar.rotation_rate_hz),
+            min_range_m=float(config.robot.sensors.lidar.min_range_m),
+            max_range_m=float(config.robot.sensors.lidar.max_range_m),
+            yaw_offset_deg=float(config.robot.sensors.lidar.yaw_offset_deg),
+            sector_merge_keep_sec=float(config.robot.sensors.lidar.sector_merge_keep_sec),
+        ),
+        robot_root_path=str(config.robot.asset.prim_path),
+        logger=logger,
+        dynamic_robot_frame_path=_g1_lidar_robot_frame_path,
+    )
     map_candidate_generator = MapCandidateGenerator(
         config=MapCandidateGeneratorConfig(
-            enabled=bool(config.map_candidates_enabled),
-            max_candidates=int(config.map_candidates_max_candidates),
-            min_distance_m=float(config.map_candidates_min_distance_m),
-            max_distance_m=float(config.map_candidates_max_distance_m),
-            semantic_enabled=bool(config.map_candidates_semantic_enabled),
-            frontier_enabled=bool(config.map_candidates_frontier_enabled),
-            escape_enabled=bool(config.map_candidates_escape_enabled),
-            min_clearance_m=float(config.map_candidates_min_clearance_m),
-            unknown_gain_weight=float(config.map_candidates_unknown_gain_weight),
-            semantic_weight=float(config.map_candidates_semantic_weight),
+            max_candidates=int(config.navigation.candidates.max_candidates),
+            min_distance_m=float(config.navigation.candidates.min_distance_m),
+            max_distance_m=float(config.navigation.candidates.max_distance_m),
+            min_clearance_m=float(config.robot.geometry.safety_margin_m),
+            unknown_gain_weight=float(config.navigation.candidates.unknown_gain_weight),
+            semantic_weight=float(config.navigation.candidates.semantic_weight),
         ),
         logger=logger,
     )
-    navigation_map_visualizer = NavigationMapVisualizer(
-        config=NavigationMapConfig(
-            enabled=bool(config.navigation_map_enabled),
-            output_path=str(config.navigation_map_image_path),
-            update_period_sec=float(config.navigation_map_update_period_sec),
-            width=int(config.navigation_map_width),
-            height=int(config.navigation_map_height),
-            depth_sample_stride_px=int(config.navigation_map_depth_sample_stride_px),
-            max_depth_obstacle_points=int(config.navigation_map_max_depth_obstacle_points),
-        ),
+    reasoner = VLNReasoner(
+        llm_client=llm_client,
+        robot_capability_summary=config.robot.capability_summary(),
         logger=logger,
     )
-    reasoner = OpenNavReasoner(llm_client=llm_client, logger=logger)
-    policy = OpenNavVLNPolicy(
+    policy = VLNPolicy(
         instruction_context=instruction_context,
         candidate_predictor=candidate_predictor,
-        occupancy_grid=occupancy_grid if bool(config.occupancy_grid_enabled) else None,
+        occupancy_grid=occupancy_grid,
         map_candidate_generator=map_candidate_generator,
+        safety_evaluator=primitive_safety,
         progress_manager=progress_manager,
         reasoner=reasoner,
-        config=OpenNavPolicyConfig(
-            execution_steps=int(config.policy_execution_steps),
-            stop_distance_m=float(config.waypoint_stop_distance_m),
-            heading_threshold_rad=float(config.waypoint_heading_threshold_rad),
-            turn_speed_scale=float(config.waypoint_turn_speed_scale),
-            forward_speed_scale=float(config.waypoint_forward_speed_scale),
-            replanning_cooldown_sec=float(config.replanning_cooldown_sec),
-            active_forward_duration_sec=float(config.action_forward_duration_sec),
-            active_turn_duration_sec=float(config.action_turn_duration_sec),
-            active_turn_angle_deg=float(config.action_turn_angle_deg),
-            active_forward_distance_m=float(config.action_forward_distance_m),
-            active_distance_tolerance_m=float(config.action_distance_tolerance_m),
-            active_turn_tolerance_deg=float(config.action_turn_tolerance_deg),
-            active_odom_completion_enabled=bool(config.action_odom_completion_enabled),
-            active_track_max_yaw_deg=float(config.active_track_max_yaw_deg),
-            active_track_min_duration_sec=float(config.active_track_min_duration_sec),
-            use_discrete_action_primitives=bool(config.use_discrete_action_primitives),
-            region_transition_min_displacement_m=float(config.region_transition_min_displacement_m),
-            region_transition_confirmations=int(config.region_transition_confirmations),
-            region_transition_min_confidence=float(config.region_transition_min_confidence),
-            semantic_turn_min_yaw_deg=float(config.semantic_turn_min_yaw_deg),
-            semantic_turn_max_yaw_deg=float(config.semantic_turn_max_yaw_deg),
-            semantic_turn_max_primitives=int(config.semantic_turn_max_primitives),
-            semantic_turn_min_forward_clearance_m=float(config.semantic_turn_min_forward_clearance_m),
+        config=VLNPolicyConfig(
+            turn_speed_scale=1.0,
+            forward_speed_scale=1.0,
+            replanning_cooldown_sec=float(config.navigation.policy.replanning_cooldown_sec),
+            active_forward_duration_sec=float(config.robot.primitives.forward_timeout_sec),
+            active_turn_duration_sec=float(config.robot.primitives.turn_timeout_sec),
+            active_turn_angle_deg=float(config.robot.primitives.turn_angle_deg),
+            active_forward_distance_m=float(config.robot.primitives.forward_distance_m),
+            active_distance_tolerance_m=float(config.robot.primitives.distance_tolerance_m),
+            active_turn_tolerance_deg=float(config.robot.primitives.turn_tolerance_deg),
+            region_transition_min_displacement_m=float(config.navigation.policy.region_transition.min_displacement_m),
+            region_transition_confirmations=int(config.navigation.policy.region_transition.confirmations),
+            region_transition_min_confidence=float(config.navigation.policy.region_transition.min_confidence),
+            semantic_turn_min_yaw_deg=float(config.navigation.policy.semantic_turn.min_yaw_deg),
+            semantic_turn_max_yaw_deg=float(config.navigation.policy.semantic_turn.max_yaw_deg),
+            semantic_turn_max_primitives=int(config.navigation.policy.semantic_turn.max_primitives),
+            semantic_turn_min_forward_clearance_m=float(config.navigation.policy.semantic_turn.min_forward_clearance_m),
             semantic_turn_alignment_confirmations=int(
-                config.semantic_turn_alignment_confirmations
+                config.navigation.policy.semantic_turn.alignment_confirmations
             ),
             semantic_turn_corridor_center_tolerance_deg=float(
-                config.semantic_turn_corridor_center_tolerance_deg
+                config.navigation.policy.semantic_turn.corridor_center_tolerance_deg
             ),
             semantic_turn_same_corridor_tolerance_deg=float(
-                config.semantic_turn_same_corridor_tolerance_deg
+                config.navigation.policy.semantic_turn.same_corridor_tolerance_deg
             ),
             semantic_turn_target_high_confidence=float(
-                config.semantic_turn_target_high_confidence
+                config.navigation.policy.semantic_turn.target_high_confidence
             ),
             semantic_turn_target_medium_confidence=float(
-                config.semantic_turn_target_medium_confidence
+                config.navigation.policy.semantic_turn.target_medium_confidence
             ),
             semantic_turn_direction_tolerance_deg=float(
-                config.semantic_turn_direction_tolerance_deg
+                config.navigation.policy.semantic_turn.direction_tolerance_deg
             ),
             semantic_turn_corridor_half_fov_deg=float(
-                config.semantic_turn_corridor_half_fov_deg
+                config.navigation.policy.semantic_turn.corridor_half_fov_deg
             ),
             semantic_turn_corridor_step_deg=float(
-                config.semantic_turn_corridor_step_deg
+                config.navigation.policy.semantic_turn.corridor_step_deg
             ),
             semantic_turn_lidar_bin_half_width_deg=float(
-                config.semantic_turn_lidar_bin_half_width_deg
+                config.navigation.policy.semantic_turn.lidar_bin_half_width_deg
             ),
             semantic_turn_min_corridor_width_deg=float(
-                config.semantic_turn_min_corridor_width_deg
+                config.navigation.policy.semantic_turn.min_corridor_width_deg
             ),
             semantic_turn_corridor_max_clearance_m=float(
-                config.semantic_turn_corridor_max_clearance_m
+                config.navigation.policy.semantic_turn.corridor_max_clearance_m
             ),
             semantic_turn_max_recovery_attempts=int(
-                config.semantic_turn_max_recovery_attempts
+                config.navigation.policy.semantic_turn.max_recovery_attempts
             ),
-            local_detour_max_turn_primitives=int(config.local_detour_max_turn_primitives),
-            traverse_heading_correction_limit_deg=float(
-                config.traverse_heading_correction_limit_deg
-            ),
-            traverse_candidate_heading_tolerance_deg=float(
-                config.traverse_candidate_heading_tolerance_deg
-            ),
-            traverse_min_progress_m=float(config.traverse_min_progress_m),
-            traverse_pass_margin_m=float(config.traverse_pass_margin_m),
-            traverse_review_min_progress_m=float(
-                config.traverse_review_min_progress_m
-            ),
-            traverse_review_min_translation_m=float(
-                config.traverse_review_min_translation_m
-            ),
-            traverse_max_recovery_attempts=int(
-                config.traverse_max_recovery_attempts
-            ),
-            confirm_min_observations=int(config.landmark_tracker_confirm_min_observations),
-            confirm_confidence_threshold=float(config.landmark_tracker_confirm_confidence_threshold),
-            visual_target_center_deadband_deg=float(config.visual_target_center_deadband_deg),
-            landmark_arrival_confirmations=int(config.landmark_arrival_confirmations),
-            landmark_arrival_window_size=int(config.landmark_tracker_arrival_window_size),
-            arrival_distance_m=float(config.arrival_distance_m),
-            success_distance_m=float(config.success_distance_m),
+            local_detour_max_turn_primitives=int(config.navigation.policy.local_detour_max_turn_primitives),
+            confirm_min_observations=int(config.perception.landmark_tracking.confirm_min_observations),
+            confirm_confidence_threshold=float(config.perception.landmark_tracking.confirm_confidence_threshold),
+            visual_target_center_deadband_deg=float(config.navigation.policy.visual_target_center_deadband_deg),
+            landmark_arrival_confirmations=int(config.navigation.progress.landmark_arrival_confirmations),
+            landmark_arrival_window_size=int(config.perception.landmark_tracking.arrival_window_size),
+            arrival_distance_m=float(config.navigation.progress.landmark_clearance_m),
+            success_distance_m=float(config.navigation.progress.final_success_clearance_m),
         ),
         logger=logger,
     )
@@ -936,8 +840,8 @@ def run_navigation(
     from isaacsim.sensors.camera import Camera
 
     world = World(
-        physics_dt=config.physics_dt,
-        rendering_dt=config.rendering_dt,
+        physics_dt=config.robot.simulation.physics_dt,
+        rendering_dt=config.robot.simulation.rendering_dt,
         stage_units_in_meters=1.0,
     )
     stage = get_current_stage()
@@ -952,15 +856,15 @@ def run_navigation(
         _wait_for_stage_assets(
             simulation_app=simulation_app,
             is_stage_loading=is_stage_loading,
-            timeout_sec=float(config.stage_load_timeout_sec),
+            timeout_sec=float(config.scene.stage_load_timeout_sec),
             logger=logger,
             label="environment",
         )
-    if config.add_default_ground_plane:
+    if config.scene.add_default_ground_plane:
         world.scene.add_default_ground_plane()
         logger.info("Added default ground plane.")
 
-    if getattr(config, "add_dome_light", False):
+    if config.scene.add_dome_light:
         try:
             from pxr import UsdLux
 
@@ -981,31 +885,31 @@ def run_navigation(
         except Exception as exc:
             logger.warning("Failed to add Dome Light: %s", exc)
 
-    add_reference_to_stage(str(config.robot_usd_path), config.robot_prim_path)
+    add_reference_to_stage(str(config.robot.asset.usd_path), config.robot.asset.prim_path)
     _wait_for_stage_assets(
         simulation_app=simulation_app,
         is_stage_loading=is_stage_loading,
-        timeout_sec=float(config.stage_load_timeout_sec),
+        timeout_sec=float(config.scene.stage_load_timeout_sec),
         logger=logger,
         label="robot",
     )
     _set_local_xform(
         stage=stage,
-        prim_path=config.robot_prim_path,
-        translation=config.robot_init_position,
-        rotation_deg=config.robot_init_orientation_deg,
+        prim_path=config.robot.asset.prim_path,
+        translation=config.robot_start_position,
+        rotation_deg=config.scene.robot_start_orientation_deg,
     )
 
     articulation_path = (
         _resolve_robot_relative_prim_path(
-            robot_root_path=config.robot_prim_path,
-            prim_path=config.robot_articulation_path,
+            robot_root_path=config.robot.asset.prim_path,
+            prim_path=config.robot.asset.articulation_path,
         )
-        if str(config.robot_articulation_path).strip()
-        else _find_articulation_root_path(stage=stage, root_path=config.robot_prim_path)
+        if str(config.robot.asset.articulation_path).strip()
+        else _find_articulation_root_path(stage=stage, root_path=config.robot.asset.prim_path)
     )
     logger.info("Using articulation prim: %s", articulation_path)
-    if config.robot_profile is not None and config.robot_profile.is_g1:
+    if config.robot is not None and config.robot.is_g1:
         articulation_prim = stage.GetPrimAtPath(articulation_path)
         if not articulation_prim or not articulation_prim.IsValid():
             raise RuntimeError(f"Required G1 articulation prim does not exist: {articulation_path}")
@@ -1014,45 +918,45 @@ def run_navigation(
         RobotArticulation(
             prim_path=articulation_path,
             name="custom_robot",
-            reset_xform_properties=not config.robot_profile.is_g1,
+            reset_xform_properties=not config.robot.is_g1,
         )
     )
     front_camera_prim_path = _resolve_robot_relative_prim_path(
-        robot_root_path=config.robot_prim_path,
-        prim_path=config.front_camera_prim_path,
+        robot_root_path=config.robot.asset.prim_path,
+        prim_path=config.robot.sensors.camera.front_prim_path,
     )
     observer_camera_prim_path = _resolve_robot_relative_prim_path(
-        robot_root_path=config.robot_prim_path,
-        prim_path=config.observer_camera_prim_path,
+        robot_root_path=config.robot.asset.prim_path,
+        prim_path=config.robot.sensors.camera.observer_prim_path,
     )
     front_camera_prim_path = _resolve_existing_prim_path(
         stage=stage,
         prim_path=front_camera_prim_path,
         kind="front camera",
-        strict=bool(config.robot_profile is not None and config.robot_profile.is_g1),
+        strict=bool(config.robot is not None and config.robot.is_g1),
     )
-    if config.observer_camera_enabled:
+    if config.robot.sensors.camera.observer_enabled:
         observer_camera_prim_path = _resolve_existing_prim_path(
             stage=stage,
             prim_path=observer_camera_prim_path,
             kind="observer camera",
-            strict=bool(config.robot_profile is not None and config.robot_profile.is_g1),
+            strict=bool(config.robot is not None and config.robot.is_g1),
         )
     logger.info("Using front camera prim: %s", front_camera_prim_path)
-    if config.observer_camera_enabled:
+    if config.robot.sensors.camera.observer_enabled:
         logger.info("Using observer camera prim: %s", observer_camera_prim_path)
 
     camera = Camera(
         prim_path=front_camera_prim_path,
-        frequency=max(1, int(config.sensor_frequency_hz)),
-        resolution=(config.camera_width, config.camera_height),
+        frequency=max(1, int(config.robot.sensors.camera.frequency_hz)),
+        resolution=(config.robot.sensors.camera.width, config.robot.sensors.camera.height),
     )
     observer_camera = None
-    if config.observer_camera_enabled:
+    if config.robot.sensors.camera.observer_enabled:
         observer_camera = Camera(
             prim_path=observer_camera_prim_path,
-            frequency=max(1, int(config.sensor_frequency_hz)),
-            resolution=(config.camera_width, config.camera_height),
+            frequency=max(1, int(config.robot.sensors.camera.frequency_hz)),
+            resolution=(config.robot.sensors.camera.width, config.robot.sensors.camera.height),
         )
 
     _set_viewport_camera(config=config, logger=logger)
@@ -1067,7 +971,7 @@ def run_navigation(
     try:
         actual_camera_hfov_deg = float(np.degrees(float(camera.get_horizontal_fov())))
     except Exception as exc:
-        actual_camera_hfov_deg = float(config.camera_horizontal_fov_deg)
+        actual_camera_hfov_deg = float(config.robot.sensors.camera.horizontal_fov_deg)
         logger.warning(
             "[CameraCalibration] unable to read USD horizontal FOV; using configured %.2fdeg error=%s",
             actual_camera_hfov_deg,
@@ -1077,11 +981,10 @@ def run_navigation(
         logger.warning(
             "[CameraCalibration] invalid USD horizontal FOV %.2fdeg; using configured %.2fdeg",
             actual_camera_hfov_deg,
-            float(config.camera_horizontal_fov_deg),
+            float(config.robot.sensors.camera.horizontal_fov_deg),
         )
-        actual_camera_hfov_deg = float(config.camera_horizontal_fov_deg)
-    configured_camera_hfov_deg = float(config.camera_horizontal_fov_deg)
-    config.camera_horizontal_fov_deg = actual_camera_hfov_deg
+        actual_camera_hfov_deg = float(config.robot.sensors.camera.horizontal_fov_deg)
+    configured_camera_hfov_deg = float(config.robot.sensors.camera.horizontal_fov_deg)
     try:
         front_camera_intrinsics = np.asarray(camera.get_intrinsics_matrix(), dtype=np.float64).reshape(3, 3)
     except Exception as exc:
@@ -1099,8 +1002,8 @@ def run_navigation(
     )
     log_spatial_transform_self_check(
         logger=logger,
-        image_width=int(config.camera_width),
-        image_height=int(config.camera_height),
+        image_width=int(config.robot.sensors.camera.width),
+        image_height=int(config.robot.sensors.camera.height),
         horizontal_fov_deg=actual_camera_hfov_deg,
     )
     _attach_camera_annotators(camera=camera, logger=logger, enable_depth=True)
@@ -1109,35 +1012,30 @@ def run_navigation(
         logger.info("observer camera initialize() complete")
         _attach_camera_annotators(camera=observer_camera, logger=logger, enable_depth=False)
     lidar_initialized = lidar_reader.initialize(stage=stage)
-    if (
-        config.robot_profile is not None
-        and config.robot_profile.is_g1
-        and bool(config.lidar_enabled)
-        and not bool(lidar_initialized)
-    ):
+    if not bool(lidar_initialized):
         raise RuntimeError(
-            "The G1 profile requires its USD LiDAR prim to exist at "
-            f"{config.robot_prim_path.rstrip('/')}/{config.lidar_prim_path.lstrip('/')}"
+            f"The {config.robot.name} profile requires its USD LiDAR prim to exist at "
+            f"{config.robot.asset.prim_path.rstrip('/')}/{config.robot.sensors.lidar.prim_path.lstrip('/')}"
         )
 
     _bind_viewport_to_camera(
         camera_prim_path=front_camera_prim_path,
         logger=logger,
-        enabled=config.follow_front_camera_in_gui,
+        enabled=config.robot.sensors.camera.follow_front_in_gui,
     )
     if observer_camera is not None:
         _bind_viewport_to_camera(
             camera_prim_path=observer_camera_prim_path,
             logger=logger,
-            enabled=config.follow_observer_camera_in_gui,
+            enabled=config.robot.sensors.camera.follow_observer_in_gui,
         )
 
     available_joint_names = _get_joint_names(robot)
     logger.info("Detected articulation DOFs: %s", available_joint_names)
-    if config.robot_profile is None:
+    if config.robot is None:
         raise RuntimeError("Robot profile was not loaded")
     drive_controller = create_locomotion_controller(
-        profile=config.robot_profile,
+        profile=config.robot,
         robot=robot,
         stage=stage,
         articulation_path=articulation_path,
@@ -1145,107 +1043,77 @@ def run_navigation(
         logger=logger,
     )
     logger.info(
-        "[RobotProfile] name=%s type=%s usd=%s physics_dt=%.4f render_dt=%.4f decimation=%s spawn_z=%.2f discrete_primitives=%s",
-        config.robot_profile.name,
-        config.robot_profile.robot_type,
-        config.robot_profile.asset.usd_path,
-        float(config.physics_dt),
-        float(config.rendering_dt),
-        int(config.robot_policy_decimation),
-        float(config.robot_profile.spawn_z_m),
-        int(bool(config.use_discrete_action_primitives)),
+        "[RobotProfile] name=%s type=%s usd=%s physics_dt=%.4f render_dt=%.4f decimation=%s spawn_z=%.2f motion_model=%s",
+        config.robot.name,
+        config.robot.robot_type,
+        config.robot.asset.usd_path,
+        float(config.robot.simulation.physics_dt),
+        float(config.robot.simulation.rendering_dt),
+        int(config.robot.simulation.policy_decimation),
+        float(config.robot.spawn_z_m),
+        config.robot.motion_model.model_type,
     )
     logger.info(
-        "[OdomConfig] enabled=%s source=%s primitive_completion=%s forward_distance=%.2fm turn_angle=%.1fdeg tolerance=%.1fdeg",
-        int(bool(config.odom_enabled)),
-        str(config.odom_source),
-        int(bool(config.action_odom_completion_enabled)),
-        float(config.action_forward_distance_m),
-        float(config.action_turn_angle_deg),
-        float(config.action_turn_tolerance_deg),
+        "[OdomConfig] source=isaac_world_pose primitive_completion=odom_or_timeout forward_distance=%.2fm turn_angle=%.1fdeg tolerance=%.1fdeg",
+        float(config.robot.primitives.forward_distance_m),
+        float(config.robot.primitives.turn_angle_deg),
+        float(config.robot.primitives.turn_tolerance_deg),
     )
-    depth_debug_output_path = _resolve_output_path(config.depth_debug_image_path)
-    target_debug_output_path = _resolve_output_path(config.target_debug_image_path)
-    target_debug_video_path = _resolve_output_path(config.debug_video_path)
+    depth_debug_output_path = _resolve_output_path(config.debug.image.depth_path)
+    target_debug_output_path = _resolve_output_path(config.debug.image.path)
+    target_debug_video_path = _resolve_output_path(config.debug.video.path)
     debug_video_recorder = DebugVideoRecorder(
-        enabled=bool(config.debug_video_enabled) and bool(config.target_debug_enabled),
+        enabled=bool(config.debug.video.enabled) and bool(config.debug.image.enabled),
         output_path=target_debug_video_path,
-        fps=float(config.debug_video_fps),
+        fps=float(config.debug.video.fps),
         logger=logger,
     )
     observer_video_recorder = DebugVideoRecorder(
-        enabled=bool(config.observer_video_enabled) and observer_camera is not None,
-        output_path=_resolve_output_path(config.observer_video_path),
-        fps=float(config.observer_video_fps),
+        enabled=bool(config.debug.observer_video.enabled) and observer_camera is not None,
+        output_path=_resolve_output_path(config.debug.observer_video.path),
+        fps=float(config.debug.observer_video.fps),
         logger=logger,
     )
-    if config.target_debug_enabled:
+    if config.debug.image.enabled:
         logger.info("Runtime debug image output: %s", target_debug_output_path)
-    if config.occupancy_grid_enabled:
-        logger.info("Occupancy map is rendered in runtime debug only; VLM receives structured map text.")
-    if config.debug_video_enabled and config.target_debug_enabled:
+    logger.info("Occupancy map is rendered in runtime debug only; VLM receives structured map text.")
+    if config.debug.video.enabled and config.debug.image.enabled:
         logger.info("Runtime debug video output: %s", debug_video_recorder.output_path)
-    if config.observer_video_enabled and observer_camera is not None:
+    if config.debug.observer_video.enabled and observer_camera is not None:
         logger.info(
             "Observer camera video output: %s fps=%.1f",
             observer_video_recorder.output_path,
-            float(config.observer_video_fps),
+            float(config.debug.observer_video.fps),
         )
-    if config.depth_debug_enabled:
+    if config.debug.image.depth_enabled:
         logger.info("Depth debug output: %s", depth_debug_output_path)
-    if config.navigation_map_enabled:
-        logger.info("Navigation map output: %s", navigation_map_visualizer.output_path)
-    if config.topology_enabled:
-        logger.info(
-            "[TopologyConfig] enabled=1 node_spacing=%.2fm turn_threshold=%.1fdeg merge_radius=%.2fm bind_radius=%.2fm max_nodes=%s recent_nodes=%s",
-            float(config.topology_node_spacing_m),
-            float(config.topology_turn_threshold_deg),
-            float(config.topology_merge_radius_m),
-            float(config.topology_landmark_bind_radius_m),
-            int(config.topology_max_nodes),
-            int(config.topology_recent_node_count),
-        )
-    if config.occupancy_grid_enabled:
-        logger.info(
-            "[OccupancyGridConfig] enabled=1 source=%s resolution=%.2fm size=%.1fm inflation=%.2fm min_neighbors=%s path_corridor=%.2fm roi=%s debug=%s",
-            "lidar" if bool(config.lidar_enabled) else "depth",
-            float(config.occupancy_grid_resolution_m),
-            float(config.occupancy_grid_size_m),
-            float(config.occupancy_grid_inflation_radius_m),
-            int(config.occupancy_grid_occupied_min_neighbors),
-            float(config.occupancy_grid_path_corridor_radius_m),
-            config.occupancy_grid_depth_roi_vertical_range,
-            occupancy_grid.output_path,
-        )
-    if config.lidar_enabled:
-        if _lidar_mode == "multi":
-            logger.info(
-                "[LidarConfig] mode=multi prim_path=%s sector_count=%s sector_fov=%.1f "
-                "total_fov=%.1f res=[%.2f,%.2f] range=[%.2f,%.2f] yaw_offsets=%s child_names=%s",
-                str(config.lidar_prim_path),
-                int(config.lidar_multi_sector_count),
-                float(config.lidar_multi_sector_fov_deg),
-                float(config.lidar_multi_sector_count) * float(config.lidar_multi_sector_fov_deg),
-                float(config.lidar_horizontal_resolution_deg),
-                float(config.lidar_vertical_resolution_deg),
-                float(config.lidar_min_range_m),
-                float(config.lidar_max_range_m),
-                config.lidar_multi_sector_yaw_offsets_deg,
-                config.lidar_multi_child_names,
-            )
-        else:
-            logger.info(
-                "[LidarConfig] mode=single prim_path=%s child=%s fov=[%.1f,%.1f] res=[%.2f,%.2f] range=[%.2f,%.2f] yaw_offset=%.1f",
-                str(config.lidar_prim_path),
-                str(config.lidar_child_name),
-                float(config.lidar_horizontal_fov_deg),
-                float(config.lidar_vertical_fov_deg),
-                float(config.lidar_horizontal_resolution_deg),
-                float(config.lidar_vertical_resolution_deg),
-                float(config.lidar_min_range_m),
-                float(config.lidar_max_range_m),
-                float(config.lidar_yaw_offset_deg),
-            )
+    logger.info(
+        "[TopologyConfig] node_spacing=%.2fm turn_threshold=%.1fdeg merge_radius=%.2fm bind_radius=%.2fm max_nodes=%s recent_nodes=%s",
+        float(config.mapping.topology.node_spacing_m),
+        float(config.mapping.topology.turn_threshold_deg),
+        float(config.mapping.topology.merge_radius_m),
+        float(config.mapping.topology.landmark_bind_radius_m),
+        int(config.mapping.topology.max_nodes),
+        int(config.mapping.topology.recent_node_count),
+    )
+    logger.info(
+        "[OccupancyGridConfig] source=lidar resolution=%.2fm size=%.1fm min_neighbors=%s debug=%s",
+        float(config.mapping.occupancy.resolution_m),
+        float(config.mapping.occupancy.size_m),
+        int(config.mapping.occupancy.occupied_min_neighbors),
+        occupancy_grid.output_path,
+    )
+    logger.info(
+        "[LidarConfig] source=required_usd prim_path=%s fov=[%.1f,%.1f] res=[%.2f,%.2f] range=[%.2f,%.2f] yaw_offset=%.1f",
+        str(config.robot.sensors.lidar.prim_path),
+        float(config.robot.sensors.lidar.horizontal_fov_deg),
+        float(config.robot.sensors.lidar.vertical_fov_deg),
+        float(config.robot.sensors.lidar.horizontal_resolution_deg),
+        float(config.robot.sensors.lidar.vertical_resolution_deg),
+        float(config.robot.sensors.lidar.min_range_m),
+        float(config.robot.sensors.lidar.max_range_m),
+        float(config.robot.sensors.lidar.yaw_offset_deg),
+    )
 
     last_depth_image: np.ndarray | None = None
     last_depth_eval_time = 0.0
@@ -1254,7 +1122,7 @@ def run_navigation(
     last_applied_wheel_velocity = 0.0
     last_applied_steering_angle = 0.0
     last_motion_log_time = 0.0
-    last_logged_position = np.asarray(config.robot_init_position, dtype=np.float32)
+    last_logged_position = np.asarray(config.robot_start_position, dtype=np.float32)
     last_logged_policy_signature: tuple | None = None
     last_policy_feedback: ExecutionFeedback | None = None
     active_step_result = None
@@ -1263,7 +1131,6 @@ def run_navigation(
     depth_warning_emitted = False
     depth_debug_save_pending = False
     last_safety_log_signature: tuple[str, str] | None = None
-    runtime_safety_hold_streak = 0
     runtime_approach_hold_streak = 0
     last_nav_debug_save_time = 0.0
     last_depth_debug_save_time = 0.0
@@ -1280,31 +1147,31 @@ def run_navigation(
     skip_grounding_once = False
     last_observer_video_frame_sim_time = float("-inf")
 
-    warmup_steps = int(config.warmup_steps)
+    warmup_steps = int(config.simulation.warmup_steps)
     g1_render_stride = 1
-    if config.robot_profile.is_g1 and config.robot_profile.g1_controller is not None:
+    if config.robot.is_g1 and config.robot.g1_controller is not None:
         warmup_steps = max(
             warmup_steps,
-            int(np.ceil(config.robot_profile.g1_controller.standup_duration_sec / config.physics_dt)),
+            int(np.ceil(config.robot.g1_controller.standup_duration_sec / config.robot.simulation.physics_dt)),
         )
-        render_ratio = float(config.rendering_dt) / float(config.physics_dt)
+        render_ratio = float(config.robot.simulation.rendering_dt) / float(config.robot.simulation.physics_dt)
         g1_render_stride = max(1, int(round(render_ratio)))
         if not np.isclose(render_ratio, float(g1_render_stride), rtol=0.0, atol=1.0e-6):
             raise RuntimeError(
                 "G1 rendering_dt must be an integer multiple of physics_dt: "
-                f"rendering_dt={config.rendering_dt} physics_dt={config.physics_dt}"
+                f"rendering_dt={config.robot.simulation.rendering_dt} physics_dt={config.robot.simulation.physics_dt}"
             )
         logger.info(
             "[G1Startup] zero-command stabilization duration=%.2fs steps=%s "
             "policy_decimation=%s render_stride=%s",
-            float(config.robot_profile.g1_controller.standup_duration_sec),
+            float(config.robot.g1_controller.standup_duration_sec),
             warmup_steps,
-            int(config.robot_profile.simulation.policy_decimation),
+            int(config.robot.simulation.policy_decimation),
             g1_render_stride,
         )
         drive_controller.apply("STOP", speed_scale=0.0)
     for warmup_index in range(warmup_steps):
-        if config.robot_profile.is_g1:
+        if config.robot.is_g1:
             drive_controller.advance_physics()
             world.step(render=False)
             if (warmup_index + 1) % g1_render_stride == 0:
@@ -1312,30 +1179,32 @@ def run_navigation(
         else:
             drive_controller.apply("STOP", speed_scale=0.0)
             world.step(render=True)
-        sim_time_sec += float(config.physics_dt)
+        sim_time_sec += float(config.robot.simulation.physics_dt)
     logger.info("Warmup complete, controller is armed.")
     occupancy_bootstrap_end_sec = sim_time_sec
     occupancy_bootstrap_deadline_sec = sim_time_sec
     occupancy_bootstrap_logged = False
     occupancy_bootstrap_done_logged = False
     occupancy_bootstrap_last_fov_bucket = -1
-    if bool(config.occupancy_grid_enabled) and bool(config.lidar_enabled):
-        occupancy_bootstrap_end_sec = sim_time_sec + max(0.0, float(config.occupancy_grid_lidar_bootstrap_sec))
-        occupancy_bootstrap_deadline_sec = occupancy_bootstrap_end_sec + max(
-            0.0,
-            float(config.occupancy_grid_lidar_bootstrap_max_wait_sec),
-        )
+    occupancy_bootstrap_end_sec = sim_time_sec + max(
+        0.0,
+        float(config.mapping.occupancy.lidar_bootstrap_sec),
+    )
+    occupancy_bootstrap_deadline_sec = occupancy_bootstrap_end_sec + max(
+        0.0,
+        float(config.mapping.occupancy.lidar_bootstrap_max_wait_sec),
+    )
 
     while simulation_app.is_running():
-        if config.robot_profile.is_g1:
+        if config.robot.is_g1:
             for _ in range(g1_render_stride):
                 drive_controller.advance_physics()
                 world.step(render=False)
-                sim_time_sec += float(config.physics_dt)
+                sim_time_sec += float(config.robot.simulation.physics_dt)
             world.render()
         else:
             world.step(render=True)
-            sim_time_sec += float(config.physics_dt)
+            sim_time_sec += float(config.robot.simulation.physics_dt)
         frame_index += 1
         loop_now = time.monotonic()
         position, orientation = _get_world_pose(robot)
@@ -1350,15 +1219,15 @@ def run_navigation(
         if initial_robot_orientation_xyzw is None:
             initial_robot_orientation_xyzw = orientation.copy()
 
-        if config.tip_stop_enabled:
+        if config.robot.safety.fall_detection_enabled:
             roll_deg, pitch_deg = _relative_roll_pitch_deg(
                 initial_quaternion_xyzw=initial_robot_orientation_xyzw,
                 current_quaternion_xyzw=orientation,
             )
             fall_condition = bool(
-                abs(float(roll_deg)) >= float(config.tip_stop_roll_pitch_deg)
-                or abs(float(pitch_deg)) >= float(config.tip_stop_roll_pitch_deg)
-                or float(position[2]) < float(config.tip_stop_min_base_height_m)
+                abs(float(roll_deg)) >= float(config.robot.safety.max_roll_pitch_deg)
+                or abs(float(pitch_deg)) >= float(config.robot.safety.max_roll_pitch_deg)
+                or float(position[2]) < float(config.robot.safety.min_base_height_m)
             )
             if fall_condition:
                 if fall_condition_started_sec is None:
@@ -1366,7 +1235,7 @@ def run_navigation(
                 fall_duration_sec = sim_time_sec - float(fall_condition_started_sec)
                 if (
                     not navigation_failed
-                    and fall_duration_sec >= float(config.tip_stop_confirmation_sec)
+                    and fall_duration_sec >= float(config.robot.safety.confirmation_sec)
                 ):
                     navigation_failed = True
                     navigation_finished = True
@@ -1404,9 +1273,9 @@ def run_navigation(
             last_action_name = "STOP"
             continue
 
-        observer_video_period_sec = 1.0 / max(0.5, float(config.observer_video_fps))
+        observer_video_period_sec = 1.0 / max(0.5, float(config.debug.observer_video.fps))
         if (
-            bool(config.observer_video_enabled)
+            bool(config.debug.observer_video.enabled)
             and observer_camera is not None
             and (sim_time_sec - last_observer_video_frame_sim_time) >= observer_video_period_sec
         ):
@@ -1415,12 +1284,15 @@ def run_navigation(
                 observer_video_recorder.append(observer_rgb)
                 last_observer_video_frame_sim_time = sim_time_sec
 
-        if last_depth_image is None or (loop_now - last_depth_eval_time) >= float(config.depth_eval_period_sec):
+        if last_depth_image is None or (loop_now - last_depth_eval_time) >= float(config.robot.sensors.camera.depth_eval_period_sec):
             last_depth_image = _get_depth_image(camera=camera, logger=logger)
             last_depth_eval_time = loop_now
             depth_debug_save_pending = last_depth_image is not None
             if last_depth_image is None and not depth_warning_emitted:
-                logger.warning("Depth frame unavailable, Open-Nav candidate predictor is waiting for the first valid frame.")
+                logger.warning(
+                    "Depth frame unavailable; CAPTAINav candidate generation is waiting "
+                    "for the first valid frame."
+                )
                 depth_warning_emitted = True
 
         front_rgb = _get_rgb_image(camera=camera)
@@ -1434,9 +1306,9 @@ def run_navigation(
             last_action=last_action_name,
             wheel_velocity=last_applied_wheel_velocity,
             steering_angle=last_applied_steering_angle,
-            odom_pose=odom_state.pose if bool(config.odom_enabled) else None,
+            odom_pose=odom_state.pose,
             odom_meta={
-                "enabled": bool(config.odom_enabled),
+                "enabled": True,
                 "source": odom_state.source,
                 "linear_velocity_mps": float(odom_state.linear_velocity_mps),
                 "angular_velocity_radps": float(odom_state.angular_velocity_radps),
@@ -1445,16 +1317,17 @@ def run_navigation(
                 "total_distance_m": float(odom_state.total_distance_m),
             },
         )
-        mapping_pose = odom_state.raw_pose if config.robot_profile.is_g1 else observation.pose
-        lidar_scan = (
-            lidar_reader.read(pose=mapping_pose, timestamp_sec=sim_time_sec)
-            if bool(config.lidar_enabled)
-            else None
+        mapping_pose = odom_state.raw_pose if config.robot.is_g1 else observation.pose
+        lidar_scan = lidar_reader.read(
+            pose=mapping_pose,
+            timestamp_sec=sim_time_sec,
         )
-        if bool(config.lidar_enabled) and lidar_scan is not None:
+        current_lidar_points = np.zeros((0, 2), dtype=np.float32)
+        if lidar_scan is not None:
             current_beam_endpoints = getattr(lidar_scan, "current_beam_endpoints_local_xy", lidar_scan.beam_endpoints_local_xy)
             current_beam_hits = getattr(lidar_scan, "current_beam_hit_mask", lidar_scan.beam_hit_mask)
             current_points = getattr(lidar_scan, "current_points_local_xy", lidar_scan.points_local_xy)
+            current_lidar_points = np.asarray(current_points, dtype=np.float32)
             current_beam_endpoints_np = np.asarray(current_beam_endpoints, dtype=np.float32)
             current_beam_hits_np = np.asarray(current_beam_hits, dtype=bool).reshape(-1)
             if (
@@ -1476,7 +1349,7 @@ def run_navigation(
                 beam_hit_mask=map_beam_hits,
                 sensor_origin_local_xy=getattr(lidar_scan, "sensor_origin_local_xy", None),
                 timestamp_sec=sim_time_sec,
-                static_obstacle_confirmation=bool(config.robot_profile.is_g1),
+                static_obstacle_confirmation=bool(config.robot.is_g1),
             )
             lidar_sector_depths = _lidar_sector_depths(
                 beam_endpoints_local_xy=np.asarray(lidar_scan.beam_endpoints_local_xy, dtype=np.float32),
@@ -1495,27 +1368,23 @@ def run_navigation(
                 "effective_fov_deg": float(lidar_scan.effective_fov_deg),
                 **lidar_sector_depths,
             }
-        elif bool(config.lidar_enabled):
+        else:
             observation.meta["lidar"] = {
                 "enabled": True,
                 "source": "unavailable",
                 "sensor_path": lidar_reader.sensor_path,
                 "point_count": 0,
             }
-        else:
-            occupancy_grid.update(observation=observation)
-            observation.meta["lidar"] = {
-                "enabled": False,
-                "source": "depth",
-                "sensor_path": lidar_reader.sensor_path,
-                "point_count": 0,
-            }
+        primitive_safety.update_environment(
+            robot_pose=mapping_pose,
+            current_lidar_points_local_xy=current_lidar_points,
+            occupancy_snapshot=occupancy_grid.snapshot(),
+        )
 
         current_lidar_fov_deg = 0.0 if lidar_scan is None else float(lidar_scan.effective_fov_deg)
-        bootstrap_min_fov_deg = max(0.0, float(config.occupancy_grid_lidar_bootstrap_min_fov_deg))
+        bootstrap_min_fov_deg = max(0.0, float(config.mapping.occupancy.lidar_bootstrap_min_fov_deg))
         bootstrap_fov_ready = (
-            not bool(config.lidar_enabled)
-            or bootstrap_min_fov_deg <= 0.0
+            bootstrap_min_fov_deg <= 0.0
             or current_lidar_fov_deg >= bootstrap_min_fov_deg
         )
         bootstrap_time_ready = sim_time_sec >= float(occupancy_bootstrap_end_sec)
@@ -1524,9 +1393,9 @@ def run_navigation(
             if not occupancy_bootstrap_logged:
                 logger.info(
                     "[OccupancyBootstrap] accumulating initial lidar map before first policy step duration_sec=%.2f min_fov_deg=%.1f max_wait_sec=%.2f",
-                    max(0.0, float(config.occupancy_grid_lidar_bootstrap_sec)),
+                    max(0.0, float(config.mapping.occupancy.lidar_bootstrap_sec)),
                     float(bootstrap_min_fov_deg),
-                    float(config.occupancy_grid_lidar_bootstrap_max_wait_sec),
+                    float(config.mapping.occupancy.lidar_bootstrap_max_wait_sec),
                 )
                 occupancy_bootstrap_logged = True
             fov_bucket = int(current_lidar_fov_deg // 10.0)
@@ -1574,7 +1443,7 @@ def run_navigation(
             active_step_result is not None
             and str(getattr(active_step_result, "decision_source", "")).strip().upper()
             == "PRIMITIVE_COMPLETE"
-            and float(config.action_settle_max_wait_sec) > 0.0
+            and float(config.robot.primitives.settle_max_wait_sec) > 0.0
         )
         if settle_required:
             if primitive_settle_started_sec is None:
@@ -1583,8 +1452,8 @@ def run_navigation(
             linear_speed = abs(float(odom_state.linear_velocity_mps))
             angular_speed = abs(float(odom_state.angular_velocity_radps))
             stable_now = bool(
-                linear_speed <= float(config.action_settle_linear_speed_threshold_mps)
-                and angular_speed <= float(config.action_settle_angular_speed_threshold_radps)
+                linear_speed <= float(config.robot.primitives.settle_linear_speed_threshold_mps)
+                and angular_speed <= float(config.robot.primitives.settle_angular_speed_threshold_radps)
             )
             if stable_now:
                 if primitive_settle_stable_started_sec is None:
@@ -1598,8 +1467,8 @@ def run_navigation(
                 else sim_time_sec - float(primitive_settle_stable_started_sec)
             )
             settle_complete = bool(
-                stable_elapsed >= float(config.action_settle_stable_duration_sec)
-                or settle_elapsed >= float(config.action_settle_max_wait_sec)
+                stable_elapsed >= float(config.robot.primitives.settle_stable_duration_sec)
+                or settle_elapsed >= float(config.robot.primitives.settle_max_wait_sec)
             )
             if not settle_complete:
                 last_applied_wheel_velocity, last_applied_steering_angle = drive_controller.apply(
@@ -1637,40 +1506,35 @@ def run_navigation(
                 if completed_key and completed_key not in landmark_map_reached_synced:
                     landmark_map.mark_reached(completed_key, timestamp_sec=sim_time_sec)
                     landmark_map_reached_synced.add(completed_key)
-            safety_decision = depth_safety_monitor.apply(
-                observation=observation,
+            safety_decision = _runtime_safety_decision(
+                evaluator=primitive_safety,
                 action_name=step_result.action_name,
                 speed_scale=step_result.speed_scale,
-                local_goal_xy=step_result.local_goal_xy,
+            )
+            policy.record_safety_result(
+                overridden=bool(safety_decision.overridden),
+                desired_action=step_result.action_name,
+                applied_action=safety_decision.action_name,
+                reason=safety_decision.reason,
             )
             if safety_decision.overridden:
-                runtime_safety_hold_streak += 1
                 policy.cancel_active_goal()
                 active_step_result = None
-                if runtime_safety_hold_streak >= 2:
-                    stuck_detector.trigger_recovery(
-                        now_sec=sim_time_sec,
-                        reason="repeated_safety_hold",
-                    )
-                    runtime_safety_hold_streak = 0
-            else:
-                runtime_safety_hold_streak = 0
-            if safety_decision.action_name == "TRACK_TARGET":
-                last_applied_wheel_velocity, last_applied_steering_angle = drive_controller.track_local_target(
-                    local_forward_m=float(step_result.local_goal_xy[0]),
-                    local_left_m=float(step_result.local_goal_xy[1]),
-                    stop_distance_m=float(config.waypoint_stop_distance_m),
-                    min_speed_scale=float(config.track_min_speed_scale),
-                    max_speed_scale=float(config.track_max_speed_scale) * float(safety_decision.speed_scale),
-                    heading_gain=float(config.track_heading_gain),
-                    slow_heading_rad=float(config.track_slow_heading_rad),
-                    smoothing_alpha=float(config.track_smoothing_alpha),
+                policy.set_safety_context(
+                    f"SAFETY_HOLD previous_desired={step_result.action_name}; "
+                    f"reason={safety_decision.reason}; source={safety_decision.source}. "
+                    "Use the fresh sensor frame and choose another valid primitive."
                 )
-            else:
-                last_applied_wheel_velocity, last_applied_steering_angle = drive_controller.apply(
-                    safety_decision.action_name,
-                    speed_scale=safety_decision.speed_scale,
+                logger.warning(
+                    "[SAFETY_HOLD] desired=%s reason=%s source=%s next=fresh_replan",
+                    step_result.action_name,
+                    safety_decision.reason,
+                    safety_decision.source,
                 )
+            last_applied_wheel_velocity, last_applied_steering_angle = drive_controller.apply(
+                safety_decision.action_name,
+                speed_scale=safety_decision.speed_scale,
+            )
             last_policy_feedback = ExecutionFeedback(
                 applied_action=safety_decision.action_name,
                 wheel_velocity=last_applied_wheel_velocity,
@@ -1713,11 +1577,7 @@ def run_navigation(
                         dtype=np.float32,
                     )
                 ),
-                occupancy_snapshot=(
-                    occupancy_grid.snapshot()
-                    if bool(config.occupancy_grid_enabled)
-                    else None
-                ),
+                occupancy_snapshot=occupancy_grid.snapshot(),
             )
 
         current_landmark = policy.active_perception_target
@@ -1735,15 +1595,8 @@ def run_navigation(
                 ) from exc
             remembered_landmark_entry = landmark_map.get(current_landmark)
             target_tracker.set_target_label(current_landmark)
-            tracker_can_cover_motion = target_tracker.lifecycle in {"TRACKING", "LOST_TEMP"}
-            perception_motion_active = (
-                bool(config.target_grounding_pause_during_active_primitive)
-                and _is_executing_motion_step(active_step_result)
-                and bool(tracker_can_cover_motion)
-            )
             allow_new_grounding = (
-                not perception_motion_active
-                and not skip_grounding_once
+                not skip_grounding_once
                 and target_tracker.should_request_grounding(
                     target_label=current_landmark,
                     timestamp_sec=sim_time_sec,
@@ -1815,14 +1668,6 @@ def run_navigation(
                 grounding_observation=grounding_observation,
                 tracker_observation=tracker_observation,
             )
-            if perception_motion_active and frame_index % 30 == 0:
-                logger.info(
-                    "[PerceptionScheduler] target=%s grounding=paused_during_active_primitive tracker=%s selected=%s reason=%s",
-                    current_landmark,
-                    target_tracker.lifecycle,
-                    target_observation.source if target_observation is not None else "none",
-                    target_observation.reason if target_observation is not None else "none",
-                )
             landmark_state = landmark_tracker.update(
                 target_label=current_landmark,
                 behavior_type=policy.current_grounding_behavior_type,
@@ -1878,15 +1723,17 @@ def run_navigation(
 
         obstacle_summary = _extract_obstacle_summary(
             depth=last_depth_image,
-            occupancy_grid=occupancy_grid if bool(config.occupancy_grid_enabled) else None,
+            occupancy_grid=occupancy_grid,
             robot_pose=observation.pose,
-            stop_distance_m=float(config.obstacle_stop_distance_m),
+            stop_distance_m=float(config.robot.geometry.obstacle_stop_distance_m),
         )
         # Layout classification
-        if bool(config.occupancy_grid_enabled):
-            policy.set_layout_description(
-                _classify_occupancy_layout(occupancy_grid=occupancy_grid, robot_pose=observation.pose)
+        policy.set_layout_description(
+            _classify_occupancy_layout(
+                occupancy_grid=occupancy_grid,
+                robot_pose=observation.pose,
             )
+        )
 
         semantic_map_summary = _build_semantic_map_summary(
             current_target=current_landmark or "",
@@ -1937,19 +1784,6 @@ def run_navigation(
         else:
             proposed_step_result = policy.step(observation, execution_feedback=last_policy_feedback)
             proposed_command_token = active_command_token + int(bool(proposed_step_result.replanned))
-            confirmation_result = _confirm_policy_step(
-                enabled=bool(config.interactive_confirmation_enabled),
-                step_result=proposed_step_result,
-                command_token=proposed_command_token,
-                logger=logger,
-            )
-            if confirmation_result == "quit":
-                logger.info("Interactive confirmation requested exit. Stopping navigation loop.")
-                drive_controller.apply("STOP", speed_scale=0.0)
-                break
-            if confirmation_result == "hold":
-                policy.cancel_active_goal()
-                proposed_step_result = _user_hold_step_result(proposed_step_result)
         active_step_result = proposed_step_result
         active_command_token = proposed_command_token
         step_result = active_step_result
@@ -1964,7 +1798,7 @@ def run_navigation(
             "LOCAL_DETOUR_SAFETY_HOLD",
             "TURN_SCAN_SAFETY_HOLD",
             "TURN_ALIGNMENT_SAFETY_HOLD",
-            "TRAVERSE_SAFETY_HOLD",
+            "PRIMITIVE_SAFETY_HOLD",
         }:
             runtime_approach_hold_streak += 1
             if runtime_approach_hold_streak >= 3:
@@ -1981,11 +1815,10 @@ def run_navigation(
                 landmark_map.mark_reached(completed_key, timestamp_sec=sim_time_sec)
                 landmark_map_reached_synced.add(completed_key)
         policy.set_all_landmark_map_entries(landmark_map.entries())
-        safety_decision = depth_safety_monitor.apply(
-            observation=observation,
+        safety_decision = _runtime_safety_decision(
+            evaluator=primitive_safety,
             action_name=step_result.action_name,
             speed_scale=step_result.speed_scale,
-            local_goal_xy=step_result.local_goal_xy,
         )
         policy.record_safety_result(
             overridden=bool(safety_decision.overridden),
@@ -1994,57 +1827,32 @@ def run_navigation(
             reason=safety_decision.reason,
         )
         if safety_decision.overridden:
-            runtime_safety_hold_streak += 1
             policy.cancel_active_goal()
             safety_context = (
-                f"SAFETY_STOP previous_desired={step_result.action_name}; "
+                f"SAFETY_HOLD previous_desired={step_result.action_name}; "
                 f"runtime_applied={safety_decision.action_name}; "
                 f"reason={safety_decision.reason}; "
-                f"depth_m front={float(safety_decision.front_depth_m):.2f}, "
-                f"left={float(safety_decision.left_depth_m):.2f}, "
-                f"right={float(safety_decision.right_depth_m):.2f}; "
-                f"stop_threshold_m={float(config.obstacle_stop_distance_m):.2f}. "
-                "The runtime overrode the unsafe action; choose a fresh safe candidate from the image."
+                f"source={safety_decision.source}. "
+                "The runtime rejected the swept footprint; use the fresh sensor frame "
+                "and choose another valid primitive."
             )
             policy.set_safety_context(safety_context)
             safety_signature = (str(step_result.action_name), str(safety_decision.reason))
             if safety_signature != last_safety_log_signature:
                 logger.warning(
-                    "!!! SAFETY_OVERRIDE !!! desired=%s applied=%s reason=%s depth_m(front=%.2f,left=%.2f,right=%.2f) threshold=%.2f next=LLM_REPLAN",
+                    "[SAFETY_HOLD] desired=%s applied=%s reason=%s source=%s next=fresh_replan",
                     step_result.action_name,
                     safety_decision.action_name,
                     safety_decision.reason,
-                    float(safety_decision.front_depth_m),
-                    float(safety_decision.left_depth_m),
-                    float(safety_decision.right_depth_m),
-                    float(config.obstacle_stop_distance_m),
+                    safety_decision.source,
                 )
                 last_safety_log_signature = safety_signature
-            if runtime_safety_hold_streak >= 2:
-                stuck_detector.trigger_recovery(
-                    now_sec=sim_time_sec,
-                    reason="repeated_safety_hold",
-                )
-                runtime_safety_hold_streak = 0
         else:
-            runtime_safety_hold_streak = 0
             last_safety_log_signature = None
-        if safety_decision.action_name == "TRACK_TARGET":
-            last_applied_wheel_velocity, last_applied_steering_angle = drive_controller.track_local_target(
-                local_forward_m=float(step_result.local_goal_xy[0]),
-                local_left_m=float(step_result.local_goal_xy[1]),
-                stop_distance_m=float(config.waypoint_stop_distance_m),
-                min_speed_scale=float(config.track_min_speed_scale),
-                max_speed_scale=float(config.track_max_speed_scale) * float(safety_decision.speed_scale),
-                heading_gain=float(config.track_heading_gain),
-                slow_heading_rad=float(config.track_slow_heading_rad),
-                smoothing_alpha=float(config.track_smoothing_alpha),
-            )
-        else:
-            last_applied_wheel_velocity, last_applied_steering_angle = drive_controller.apply(
-                safety_decision.action_name,
-                speed_scale=safety_decision.speed_scale,
-            )
+        last_applied_wheel_velocity, last_applied_steering_angle = drive_controller.apply(
+            safety_decision.action_name,
+            speed_scale=safety_decision.speed_scale,
+        )
         last_policy_feedback = ExecutionFeedback(
             applied_action=safety_decision.action_name,
             wheel_velocity=last_applied_wheel_velocity,
@@ -2102,41 +1910,31 @@ def run_navigation(
                 step_result.action_name,
                 safety_decision.action_name,
                 active_command_token,
-                "discrete_primitive" if bool(config.use_discrete_action_primitives) else "continuous_waypoint",
+                "discrete_primitive",
             )
             if step_result.debug_image_path is not None:
                 logger.info("[Debug] candidate_image=%s", step_result.debug_image_path)
             last_logged_policy_signature = policy_signature
 
-        navigation_map_visualizer.update(
-            observation=observation,
-            step_result=step_result,
-            executed_action=safety_decision.action_name,
-            landmark_entries=landmark_map.entries(),
-            timestamp_sec=sim_time_sec,
-            occupancy_snapshot=occupancy_grid.snapshot() if bool(config.occupancy_grid_enabled) else None,
-        )
-        if bool(config.occupancy_grid_enabled):
-            global_pose_trace.append((float(mapping_pose.x), float(mapping_pose.y)))
-            if len(global_pose_trace) > 8000:
-                del global_pose_trace[: len(global_pose_trace) - 8000]
+        global_pose_trace.append((float(mapping_pose.x), float(mapping_pose.y)))
+        if len(global_pose_trace) > 8000:
+            del global_pose_trace[: len(global_pose_trace) - 8000]
 
-        debug_update_period_sec = max(0.10, float(config.debug_image_update_period_sec))
+        debug_update_period_sec = max(0.10, float(config.debug.image.update_period_sec))
         force_final_debug_frame = bool(step_result.route_complete and not route_complete_handled)
         should_save_target_debug = (
-            bool(config.target_debug_enabled)
+            bool(config.debug.image.enabled)
             and (force_final_debug_frame or (loop_now - last_nav_debug_save_time) >= debug_update_period_sec)
         )
         if should_save_target_debug:
-            if bool(config.occupancy_grid_enabled):
-                latest_global_map_image = _save_global_occupancy_debug(
-                    occupancy_snapshot=occupancy_grid.snapshot(),
-                    robot_pose=mapping_pose,
-                    trajectory_xy=global_pose_trace,
-                    landmark_entries=landmark_map.entries(),
-                    step_result=step_result,
-                    output_path=None,
-                )
+            latest_global_map_image = _save_global_occupancy_debug(
+                occupancy_snapshot=occupancy_grid.snapshot(),
+                robot_pose=mapping_pose,
+                trajectory_xy=global_pose_trace,
+                landmark_entries=landmark_map.entries(),
+                step_result=step_result,
+                output_path=None,
+            )
             debug_image = _save_current_target_debug_image(
                 rgb=front_rgb,
                 step_result=step_result,
@@ -2144,8 +1942,8 @@ def run_navigation(
                 executed_action=safety_decision.action_name,
                 output_path=target_debug_output_path,
                 map_image=latest_global_map_image,
-                map_image_path=navigation_map_visualizer.output_path if bool(config.navigation_map_enabled) else None,
-                horizontal_fov_deg=float(config.camera_horizontal_fov_deg),
+                map_image_path=None,
+                horizontal_fov_deg=actual_camera_hfov_deg,
             )
             debug_video_recorder.append(debug_image)
             last_nav_debug_save_time = loop_now
@@ -2173,7 +1971,7 @@ def run_navigation(
             continue
 
         if (
-            config.depth_debug_enabled
+            config.debug.image.depth_enabled
             and last_depth_image is not None
             and depth_debug_save_pending
             and (loop_now - last_depth_debug_save_time) >= debug_update_period_sec
@@ -2183,10 +1981,10 @@ def run_navigation(
             depth_debug_save_pending = False
             last_depth_debug_save_time = loop_now
 
-        if loop_now - last_motion_log_time >= float(config.motion_log_period_sec):
+        if loop_now - last_motion_log_time >= float(config.logging.motion_log_period_sec):
             delta = position - last_logged_position
             joint_readback = drive_controller.readback()
-            if config.robot_profile.is_g1:
+            if config.robot.is_g1:
                 command_velocity = joint_readback["command_velocity"]
                 policy_action = joint_readback["policy_action"]
                 joint_tracking = joint_readback["joint_tracking"]
@@ -2223,7 +2021,7 @@ def run_navigation(
                     step_result.action_name,
                     safety_decision.action_name,
                     active_command_token,
-                    "discrete_primitive" if bool(config.use_discrete_action_primitives) else "continuous_waypoint",
+                    "discrete_primitive",
                     float(position[0]),
                     float(position[1]),
                     float(position[2]),
@@ -2333,13 +2131,13 @@ def _write_evaluation_result(
             "" if instruction_context is None else instruction_context.instruction_id
         ),
         "instruction": (
-            str(config.instruction)
+            str(config.instruction.text)
             if instruction_context is None
             else instruction_context.raw_text
         ),
-        "scene_usd_path": str(config.scene_usd_path),
+        "scene_usd_path": str(config.scene.usd_path),
         "robot_profile": (
-            "" if config.robot_profile is None else str(config.robot_profile.name)
+            "" if config.robot is None else str(config.robot.name)
         ),
         "sim_time_sec": round(float(sim_time_sec), 3),
         "current_step_index": (
@@ -2429,93 +2227,9 @@ def _load_environment(*, stage, add_reference_to_stage, config: AppConfig, logge
             f"Configured environment USD does not exist: {usd_path}. "
             "Check scene.usd_path in configs/default.yaml."
         )
-    add_reference_to_stage(usd_path, config.scene_prim_path)
+    add_reference_to_stage(usd_path, config.scene.prim_path)
     logger.info("Loaded environment USD: %s", usd_path)
     return True
-
-
-def _confirm_policy_step(
-    *,
-    enabled: bool,
-    step_result: PolicyStepResult,
-    command_token: int,
-    logger,
-) -> str:
-    if not enabled:
-        return "execute"
-    if not bool(step_result.replanned):
-        return "execute"
-    if str(step_result.action_name).strip().upper() == "STOP":
-        return "execute"
-
-    logger.info(
-        "[Confirm] token=%s action=%s source=%s candidate=%s goal_xy=%s",
-        command_token,
-        step_result.action_name,
-        step_result.decision_source,
-        step_result.selected_candidate_id,
-        step_result.world_goal_xy,
-    )
-    logger.info("[ConfirmReasoning] %s", step_result.reasoning_summary)
-
-    prompt = (
-        "\n"
-        f"[Confirm] token={command_token} action={step_result.action_name} "
-        f"source={step_result.decision_source} candidate={step_result.selected_candidate_id}\n"
-        f"[Reasoning] {step_result.reasoning_summary}\n"
-        "Execute this action? [y/N/q]: "
-    )
-    try:
-        response = _read_confirmation_from_terminal(prompt)
-    except EOFError:
-        logger.warning("Interactive confirmation stdin unavailable. Holding action by default.")
-        return "hold"
-
-    if response == "y":
-        return "execute"
-    if response == "q":
-        return "quit"
-    logger.info("[Confirm] token=%s held by user input=%r", command_token, response)
-    return "hold"
-
-
-def _read_confirmation_from_terminal(prompt: str) -> str:
-    try:
-        with open("/dev/tty", "r+", encoding="utf-8") as tty:
-            tty.write(prompt)
-            tty.flush()
-            return tty.readline().strip().lower()
-    except OSError:
-        return input(prompt).strip().lower()
-
-
-def _user_hold_step_result(step_result: PolicyStepResult) -> PolicyStepResult:
-    return PolicyStepResult(
-        action_name="STOP",
-        speed_scale=0.0,
-        decision_source=f"{step_result.decision_source}|USER_HOLD",
-        selected_candidate_id=step_result.selected_candidate_id,
-        local_goal_xy=[0.0, 0.0],
-        world_goal_xy=None,
-        execution_steps_remaining=0,
-        reasoning_summary=f"{step_result.reasoning_summary} | user_hold",
-        progress_signal=step_result.progress_signal,
-        replanned=step_result.replanned,
-        debug_image_path=step_result.debug_image_path,
-        current_landmark=step_result.current_landmark,
-        completed_landmarks=list(step_result.completed_landmarks),
-        route_complete=step_result.route_complete,
-        current_step_index=step_result.current_step_index,
-        route_step_count=step_result.route_step_count,
-        current_step_id=step_result.current_step_id,
-        current_step_type=step_result.current_step_type,
-        current_target=step_result.current_target,
-        navigation_status=step_result.navigation_status,
-        last_error=step_result.last_error,
-        traverse_locked_heading_deg=step_result.traverse_locked_heading_deg,
-        traverse_progress_m=step_result.traverse_progress_m,
-        traverse_cue_status=step_result.traverse_cue_status,
-    )
 
 
 def _runtime_recovery_step_result(*, recovery_command, previous_step_result) -> PolicyStepResult:
@@ -2540,21 +2254,6 @@ def _runtime_recovery_step_result(*, recovery_command, previous_step_result) -> 
         current_step_type="" if previous_step_result is None else str(previous_step_result.current_step_type),
         current_target="" if previous_step_result is None else str(previous_step_result.current_target),
         navigation_status="RECOVERY",
-        traverse_locked_heading_deg=(
-            None
-            if previous_step_result is None
-            else previous_step_result.traverse_locked_heading_deg
-        ),
-        traverse_progress_m=(
-            0.0
-            if previous_step_result is None
-            else float(previous_step_result.traverse_progress_m)
-        ),
-        traverse_cue_status=(
-            ""
-            if previous_step_result is None
-            else str(previous_step_result.traverse_cue_status)
-        ),
     )
 
 
@@ -2572,7 +2271,7 @@ def _wait_for_stage_assets(*, simulation_app, is_stage_loading, timeout_sec: flo
 
 
 def _set_viewport_camera(*, config: AppConfig, logger) -> None:
-    if config.headless:
+    if config.simulation.headless:
         return
     try:
         from isaacsim.core.rendering_manager import ViewportManager
@@ -2584,8 +2283,8 @@ def _set_viewport_camera(*, config: AppConfig, logger) -> None:
             return
 
         set_camera_view(
-            eye=np.asarray(config.viewport_eye, dtype=np.float32),
-            target=np.asarray(config.viewport_target, dtype=np.float32),
+            eye=np.asarray(config.scene.viewport_eye, dtype=np.float32),
+            target=np.asarray(config.scene.viewport_target, dtype=np.float32),
             camera_prim_path="/OmniverseKit_Persp",
         )
         logger.info("Set GUI viewport camera using fallback viewport utils.")
@@ -2593,10 +2292,10 @@ def _set_viewport_camera(*, config: AppConfig, logger) -> None:
 
     ViewportManager.set_camera_view(
         "/OmniverseKit_Persp",
-        eye=np.asarray(config.viewport_eye, dtype=np.float32),
-        target=np.asarray(config.viewport_target, dtype=np.float32),
+        eye=np.asarray(config.scene.viewport_eye, dtype=np.float32),
+        target=np.asarray(config.scene.viewport_target, dtype=np.float32),
     )
-    logger.info("Set GUI viewport camera to eye=%s target=%s", config.viewport_eye, config.viewport_target)
+    logger.info("Set GUI viewport camera to eye=%s target=%s", config.scene.viewport_eye, config.scene.viewport_target)
 
 
 def _bind_viewport_to_camera(*, camera_prim_path: str, logger, enabled: bool) -> bool:
@@ -2628,11 +2327,44 @@ def _resolve_output_path(path_str: str) -> Path:
     return candidate
 
 
+def _runtime_safety_decision(
+    *,
+    evaluator: PrimitiveSafetyEvaluator,
+    action_name: str,
+    speed_scale: float,
+) -> _RuntimeSafetyDecision:
+    action = str(action_name).strip().upper()
+    if action not in {"FORWARD", "TURN_LEFT", "TURN_RIGHT", "BACKWARD"}:
+        return _RuntimeSafetyDecision(
+            action_name=action,
+            speed_scale=float(speed_scale),
+            overridden=False,
+            reason="non_motion_action",
+            source="none",
+        )
+    decision = evaluator.evaluate(action_name=action)
+    if decision.valid:
+        return _RuntimeSafetyDecision(
+            action_name=action,
+            speed_scale=float(speed_scale),
+            overridden=False,
+            reason=decision.reason,
+            source=decision.source,
+        )
+    return _RuntimeSafetyDecision(
+        action_name="STOP",
+        speed_scale=0.0,
+        overridden=True,
+        reason=decision.reason,
+        source=decision.source,
+    )
+
+
 def _is_executing_motion_step(step_result) -> bool:
     if step_result is None:
         return False
     action = str(getattr(step_result, "action_name", "STOP")).strip().upper()
-    if action not in {"FORWARD", "TURN_LEFT", "TURN_RIGHT", "TRACK_TARGET"}:
+    if action not in {"FORWARD", "TURN_LEFT", "TURN_RIGHT"}:
         return False
     remaining = int(getattr(step_result, "execution_steps_remaining", 0) or 0)
     return remaining > 0
@@ -2692,7 +2424,6 @@ def _save_current_target_debug_image(
         return None
 
     fp_image = Image.fromarray(image_rgb[..., :3].copy())
-    _overlay_target_mask(image=fp_image, observation=target_observation)
     fp_draw = ImageDraw.Draw(fp_image)
     fp_width, fp_height = fp_image.size
     center_u = fp_width // 2
@@ -2754,32 +2485,11 @@ def _save_current_target_debug_image(
             f"goal=({local_forward:.2f}m forward, {local_left:.2f}m left, {heading_deg:+.1f}deg)"
         ),
     ]
-    if step_result.current_step_type == "TRAVERSE":
-        status_lines[2] = (
-            f"TRAVERSE cue={step_result.current_landmark or 'none'} "
-            f"status={step_result.traverse_cue_status or 'none'} "
-            f"progress={step_result.traverse_progress_m:.2f}m "
-            f"locked_heading={step_result.traverse_locked_heading_deg}"
-        )
     for index, line in enumerate(status_lines):
         status_draw.text((14, 8 + index * 27), line, fill=(235, 240, 245), font=status_font)
 
     _save_image_atomic(canvas, output_path)
     return canvas
-
-
-def _overlay_target_mask(*, image: Image.Image, observation: TargetObservation | None) -> None:
-    if observation is None or observation.mask is None:
-        return
-    if not observation.is_current_frame:
-        return
-    mask = np.asarray(observation.mask, dtype=bool)
-    if mask.ndim != 2 or mask.shape[0] != image.height or mask.shape[1] != image.width:
-        return
-    mask_alpha = Image.fromarray(np.asarray(mask, dtype=np.uint8) * 90, mode="L")
-    green = Image.new("RGB", image.size, (40, 255, 110))
-    blended = Image.blend(image, green, 0.35)
-    image.paste(blended, (0, 0), mask_alpha)
 
 
 def _draw_grounded_target_overlay(
@@ -2796,7 +2506,7 @@ def _draw_grounded_target_overlay(
     visible = bool(observation.visible)
     reason = str(observation.reason)
     source = str(observation.source)
-    segmentation_source = str(getattr(observation, "segmentation_source", "none"))
+    depth_region_source = str(getattr(observation, "depth_region_source", "none"))
     depth_text = "none" if observation.depth_m is None else f"{float(observation.depth_m):.2f}m"
     if visible and observation.bbox is not None:
         is_current = bool(observation.is_current_frame)
@@ -2819,7 +2529,7 @@ def _draw_grounded_target_overlay(
             )
             label = (
                 f"grounded {observation.label} depth={depth_text} conf={observation.confidence:.2f} "
-                f"can_confirm={int(can_confirm)} {verify_text} seg={segmentation_source}"
+                f"can_confirm={int(can_confirm)} {verify_text} depth_region={depth_region_source}"
             )
             draw.rectangle((xmin, max(0, ymin - 28), min(width, xmin + 620), ymin), fill=(0, 0, 0))
             draw.text((xmin + 4, max(0, ymin - 24)), label[:110], fill=color, font=label_font)
@@ -2836,7 +2546,7 @@ def _draw_grounded_target_overlay(
         return
     text = (
         f"grounding: lost/hidden label={observation.label} reason={reason} "
-        f"source={source} seg={segmentation_source} depth={depth_text}"
+        f"source={source} depth_region={depth_region_source} depth={depth_text}"
     )
     draw.rectangle((0, height - 44, width, height), fill=(0, 0, 0))
     draw.text((12, height - 32), text[:120], fill=(255, 110, 90), font=label_font)
@@ -3047,8 +2757,8 @@ def _quaternion_wxyz_to_euler_xyz_deg(quaternion_wxyz: np.ndarray) -> list[float
 
 
 def _resolve_environment_usd_path(*, config: AppConfig) -> str:
-    if config.scene_usd_path:
-        candidate = Path(str(config.scene_usd_path))
+    if config.scene.usd_path:
+        candidate = Path(str(config.scene.usd_path))
         if not candidate.is_absolute():
             candidate = PROJECT_ROOT / candidate
         return str(candidate)
@@ -3378,19 +3088,6 @@ def _save_global_occupancy_debug(
     draw.polygon([tip, rear_left, rear_right], fill=(40, 140, 255), outline=(255, 255, 255))
     rx, ry = world_to_px(robot_x, robot_y)
     draw.text((rx + 12, ry + 8), "robot", fill=(40, 140, 255), font=font_label)
-    if step_result is not None and step_result.traverse_locked_heading_deg is not None:
-        locked_rad = float(np.deg2rad(step_result.traverse_locked_heading_deg))
-        locked_tip = world_to_px(
-            robot_x + 1.2 * np.cos(locked_rad),
-            robot_y + 1.2 * np.sin(locked_rad),
-        )
-        draw.line((rx, ry, locked_tip[0], locked_tip[1]), fill=(255, 120, 20), width=4)
-        draw.text(
-            (locked_tip[0] + 6, locked_tip[1] - 10),
-            "TRAVERSE heading",
-            fill=(255, 120, 20),
-            font=font_small,
-        )
     draw.text(
         (12, height - 22),
         f"view=[{min_x:.1f},{max_x:.1f}]x[{min_y:.1f},{max_y:.1f}]m  pose=({robot_x:.2f},{robot_y:.2f}) yaw={np.degrees(yaw):+.1f}deg",

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import tempfile
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from heapq import heappop, heappush
 from pathlib import Path
 from typing import Any
@@ -10,7 +10,7 @@ from typing import Any
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-from .candidate_waypoint_predictor import CandidateSet, WaypointCandidate
+from .candidate_waypoint_predictor import CandidateSet
 from .landmark_map import LandmarkMapEntry
 from .observation_adapter import Pose2D, VLNObservation
 from ..runtime.config import PROJECT_ROOT
@@ -28,14 +28,11 @@ _STATIC_CLEAR_REQUIRED_FRAMES = 8
 
 @dataclass
 class OccupancyGridConfig:
-    enabled: bool = True
     resolution_m: float = 0.08
     size_m: float = 80.0
     update_period_sec: float = 0.12
-    depth_sample_stride_px: int = 10
-    depth_roi_vertical_range: tuple[float, float] = (0.38, 0.72)
-    min_depth_m: float = 0.20
-    max_depth_m: float = 5.0
+    min_range_m: float = 0.20
+    max_range_m: float = 10.0
     occupied_log_odds: float = 0.85
     free_log_odds: float = -0.35
     log_odds_min: float = -4.0
@@ -45,21 +42,16 @@ class OccupancyGridConfig:
     occupied_min_neighbors: int = 3
     decay_rate: float = 1.0
     inflation_radius_m: float = 0.26
-    robot_radius_m: float = 0.32
-    path_corridor_radius_m: float = 0.30
-    turn_clearance_radius_m: float = 0.36
     unknown_is_traversable: bool = True
     unknown_cell_cost: float = 0.10
     max_astar_iterations: int = 7000
     max_path_detour_ratio: float = 2.2
-    debug_enabled: bool = True
     debug_image_path: str = "debug/local_map.png"
     debug_update_period_sec: float = 0.5
     debug_width: int = 900
     debug_height: int = 900
     debug_view_size_m: float = 8.0
     debug_show_free_space: bool = False
-    semantic_planner_enabled: bool = True
     semantic_goal_step_m: float = 0.90
     semantic_goal_min_step_m: float = 0.45
     semantic_goal_lateral_search_m: float = 0.80
@@ -70,19 +62,11 @@ class OccupancyGridSnapshot:
     resolution_m: float
     size_m: float
     log_odds: np.ndarray
+    occupied_mask: np.ndarray
     inflated_occupied: np.ndarray
     free_mask: np.ndarray
     origin_x: float = 0.0
     origin_y: float = 0.0
-
-
-@dataclass
-class _CandidateEvaluation:
-    valid: bool
-    reason: str
-    path_length_m: float
-    blocked_cell_count: int
-    goal_world_xy: tuple[float, float]
 
 
 @dataclass
@@ -157,7 +141,6 @@ class GlobalOccupancyMap:
         self._static_update_index = 0
         self._last_update_time_sec = -float("inf")
         self._last_debug_save_time_sec = -float("inf")
-        self._last_filter_signature: tuple[int, int, tuple[str, ...]] | None = None
         self._last_lidar_points_local_xy = np.zeros((0, 2), dtype=np.float32)
         self._last_semantic_plan: SemanticSubgoalPlan | None = None
         self._last_semantic_entries: list[LandmarkMapEntry] = []
@@ -170,10 +153,6 @@ class GlobalOccupancyMap:
     @property
     def output_path(self) -> Path:
         return self._debug_path
-
-    @property
-    def enabled(self) -> bool:
-        return bool(self._config.enabled)
 
     # -- coordinate helpers --------------------------------------------------
 
@@ -262,75 +241,6 @@ class GlobalOccupancyMap:
             self._origin_y,
         )
 
-    # -- depth-based update (fallback) ---------------------------------------
-
-    def update(self, *, observation: VLNObservation) -> None:
-        if not bool(self._config.enabled):
-            return
-        timestamp_sec = float(observation.meta.get("timestamp_sec", 0.0))
-        if timestamp_sec - float(self._last_update_time_sec) < max(0.02, float(self._config.update_period_sec)):
-            return
-        depth = observation.depth
-        if depth is None:
-            return
-        depth_np = np.asarray(depth, dtype=np.float32)
-        if depth_np.ndim != 2 or depth_np.size == 0:
-            return
-
-        robot_x = float(observation.pose.x)
-        robot_y = float(observation.pose.y)
-        self._expand_if_needed(robot_x, robot_y)
-
-        height, width = depth_np.shape[:2]
-        v0, v1 = self._depth_roi(height)
-        stride = max(2, int(self._config.depth_sample_stride_px))
-        min_depth = max(0.02, float(self._config.min_depth_m))
-        max_depth = max(min_depth + 0.10, float(self._config.max_depth_m))
-        half_fov_rad = float(np.deg2rad(float(observation.camera.get("hfov_deg", 90.0))) * 0.5)
-        cos_yaw = float(np.cos(observation.pose.yaw_rad))
-        sin_yaw = float(np.sin(observation.pose.yaw_rad))
-
-        # Vectorised pixel -> world conversion.
-        vs = np.arange(v0, v1, stride, dtype=np.float32)
-        us = np.arange(0, width, stride, dtype=np.float32)
-        if vs.size == 0 or us.size == 0:
-            return
-        uu, vv = np.meshgrid(us, vs)
-        dists = depth_np[vv.astype(int), uu.astype(int)]
-        valid = np.isfinite(dists) & (dists >= min_depth) & (dists <= max_depth)
-        if not np.any(valid):
-            return
-        norm_u = (uu - float(width - 1) * 0.5) / max(float(width - 1) * 0.5, 1.0)
-        bearings = norm_u * half_fov_rad
-        forward_m = dists * np.cos(bearings)
-        left_m = -dists * np.sin(bearings)
-        fwd_valid = forward_m > 0.05
-        valid = valid & fwd_valid
-        if not np.any(valid):
-            return
-        world_xs = robot_x + cos_yaw * forward_m - sin_yaw * left_m
-        world_ys = robot_y + sin_yaw * forward_m + cos_yaw * left_m
-
-        start_xy = np.array([robot_x, robot_y], dtype=np.float64)
-        end_xy = np.stack([world_xs[valid], world_ys[valid]], axis=-1).astype(np.float64)
-        endpoint_dists = np.hypot(forward_m[valid], left_m[valid]).astype(np.float64)
-        hit_mask = np.ones(end_xy.shape[0], dtype=bool)
-
-        n_free, n_occ = self._batch_mark_rays(
-            start_xy=start_xy,
-            end_xy_arr=end_xy,
-            endpoint_distances=endpoint_dists,
-            endpoint_hit_mask=hit_mask,
-        )
-        self._last_update_time_sec = timestamp_sec
-        if n_occ > 0:
-            self._logger.debug(
-                "[Occupancy] update free_cells=%s occupied_cells=%s occupied_total=%s",
-                n_free,
-                n_occ,
-                int(np.count_nonzero(self._occupied_mask())),
-            )
-
     # -- LiDAR-based update --------------------------------------------------
 
     def update_from_lidar(
@@ -344,8 +254,6 @@ class GlobalOccupancyMap:
         timestamp_sec: float,
         static_obstacle_confirmation: bool = False,
     ) -> None:
-        if not bool(self._config.enabled):
-            return
         if float(timestamp_sec) - float(self._last_update_time_sec) < max(
             0.02, float(self._config.update_period_sec)
         ):
@@ -396,8 +304,8 @@ class GlobalOccupancyMap:
         sensor_left = float(sensor_origin[1]) if sensor_origin.size >= 2 else 0.0
         sensor_world_x = float(robot_x) + cos_yaw * sensor_forward - sin_yaw * sensor_left
         sensor_world_y = float(robot_y) + sin_yaw * sensor_forward + cos_yaw * sensor_left
-        min_depth = max(0.02, float(self._config.min_depth_m))
-        max_depth = max(min_depth + 0.10, float(self._config.max_depth_m))
+        min_depth = max(0.02, float(self._config.min_range_m))
+        max_depth = max(min_depth + 0.10, float(self._config.max_range_m))
 
         # Vectorised local -> world conversion.
         fwd = endpoints[:, 0].astype(np.float64)
@@ -464,7 +372,7 @@ class GlobalOccupancyMap:
         dy = end_xy_arr[:, 1] - sy
 
         beam_dists = np.sqrt(dx * dx + dy * dy)
-        min_beam = max(0.05, float(self._config.min_depth_m))
+        min_beam = max(0.05, float(self._config.min_range_m))
         valid_beam = beam_dists >= min_beam
         if not np.any(valid_beam):
             return 0, 0
@@ -477,7 +385,7 @@ class GlobalOccupancyMap:
         dir_y = dy_v / dist_v
 
         # Sample spacing and count along the free region.
-        min_sample_dist = max(self._resolution_m, float(self._config.robot_radius_m) * 0.35)
+        min_sample_dist = self._resolution_m
         max_free_dist = np.maximum(0.0, dist_v - min_sample_dist)
         n_samples = np.maximum(1, (max_free_dist / self._resolution_m).astype(np.intp))
 
@@ -686,86 +594,6 @@ class GlobalOccupancyMap:
             np.float32(float(self._config.occupied_threshold) - 1.0e-3),
         )
 
-    # -- candidate filtering -------------------------------------------------
-
-    def filter_candidates(
-        self, *, observation: VLNObservation, candidate_set: CandidateSet
-    ) -> CandidateSet:
-        if not bool(self._config.enabled):
-            return candidate_set
-        filtered: list[WaypointCandidate] = []
-        blocked_reasons: list[str] = []
-        original_valid_count = int(candidate_set.valid_count)
-        for candidate in candidate_set.candidates:
-            if not bool(candidate.valid):
-                filtered.append(candidate)
-                continue
-            evaluation = self._evaluate_candidate(observation=observation, candidate=candidate)
-            depth_support = dict(candidate.depth_support)
-            depth_support.update(
-                {
-                    "occupancy_valid": 1.0 if evaluation.valid else 0.0,
-                    "occupancy_path_length_m": float(evaluation.path_length_m),
-                    "occupancy_blocked_cells": float(evaluation.blocked_cell_count),
-                    "occupancy_reason": evaluation.reason,
-                }
-            )
-            if evaluation.valid:
-                path_penalty = min(
-                    0.25,
-                    max(0.0, evaluation.path_length_m - candidate.travel_distance_m) * 0.12,
-                )
-                filtered.append(
-                    replace(
-                        candidate,
-                        clearance_score=float(
-                            np.clip(float(candidate.clearance_score) - path_penalty, 0.0, 1.0)
-                        ),
-                        depth_support=depth_support,
-                    )
-                )
-            else:
-                blocked_reasons.append(evaluation.reason)
-                filtered.append(
-                    replace(
-                        candidate,
-                        valid=False,
-                        clearance_score=0.0,
-                        depth_support=depth_support,
-                    )
-                )
-
-        valid_count = sum(1 for candidate in filtered if candidate.valid)
-        if original_valid_count > 0 and valid_count == 0:
-            filtered = self._restore_best_turn_candidate(
-                candidate_set=CandidateSet(filtered, 0, {})
-            )
-            valid_count = sum(1 for candidate in filtered if candidate.valid)
-            if valid_count > 0:
-                blocked_reasons.append("restored_best_turn_candidate")
-
-        signature = (
-            original_valid_count,
-            int(valid_count),
-            tuple(sorted(set(blocked_reasons))[:4]),
-        )
-        if signature != self._last_filter_signature:
-            self._logger.info(
-                "[OccupancyPlanner] candidates valid=%s->%s blocked_reasons=%s",
-                original_valid_count,
-                int(valid_count),
-                ",".join(signature[2]) if signature[2] else "none",
-            )
-            self._last_filter_signature = signature
-
-        debug = dict(candidate_set.predictor_debug)
-        debug["occupancy_valid_before"] = original_valid_count
-        debug["occupancy_valid_after"] = int(valid_count)
-        debug["occupancy_blocked_reasons"] = blocked_reasons[:8]
-        return CandidateSet(
-            candidates=filtered, valid_count=int(valid_count), predictor_debug=debug
-        )
-
     # -- debug output --------------------------------------------------------
 
     def save_debug(
@@ -776,8 +604,6 @@ class GlobalOccupancyMap:
         semantic_entries: list[LandmarkMapEntry] | None = None,
         semantic_plan: SemanticSubgoalPlan | None = None,
     ) -> Path | None:
-        if not bool(self._config.enabled) or not bool(self._config.debug_enabled):
-            return None
         timestamp_sec = float(observation.meta.get("timestamp_sec", 0.0))
         if timestamp_sec - float(self._last_debug_save_time_sec) < max(
             0.05, float(self._config.debug_update_period_sec)
@@ -795,17 +621,17 @@ class GlobalOccupancyMap:
         self._last_debug_save_time_sec = timestamp_sec
         return self._debug_path
 
-    # -- snapshot (for navigation_map_visualizer) ----------------------------
+    # -- snapshot -------------------------------------------------------------
 
-    def snapshot(self) -> OccupancyGridSnapshot | None:
-        if not bool(self._config.enabled):
-            return None
+    def snapshot(self) -> OccupancyGridSnapshot:
         inflated = self._inflated_occupied_mask()
+        occupied = self._log_odds >= float(self._config.occupied_threshold)
         free = self._log_odds <= float(self._config.free_threshold)
         return OccupancyGridSnapshot(
             resolution_m=float(self._resolution_m),
             size_m=float(self._cell_count) * float(self._resolution_m),
             log_odds=self._log_odds.copy(),
+            occupied_mask=occupied.copy(),
             inflated_occupied=inflated.copy(),
             free_mask=free.copy(),
             origin_x=self._origin_x,
@@ -858,10 +684,6 @@ class GlobalOccupancyMap:
         landmark_entry: LandmarkMapEntry | None,
         stop_distance_m: float,
     ) -> SemanticSubgoalPlan:
-        if not bool(self._config.enabled) or not bool(
-            self._config.semantic_planner_enabled
-        ):
-            return SemanticSubgoalPlan(valid=False, reason="semantic_planner_disabled")
         if landmark_entry is None or not bool(landmark_entry.world_xy):
             return SemanticSubgoalPlan(valid=False, reason="no_landmark_anchor")
 
@@ -999,120 +821,7 @@ class GlobalOccupancyMap:
         self._last_semantic_plan = best_plan
         return best_plan
 
-    # -- internal helpers (unchanged logic) ----------------------------------
-
-    def _evaluate_candidate(
-        self, *, observation: VLNObservation, candidate: WaypointCandidate
-    ) -> _CandidateEvaluation:
-        goal_world_xy = _local_to_world_xy(
-            robot_pose=observation.pose, local_xy=candidate.local_goal_xy
-        )
-        if not self._inside_world(goal_world_xy[0], goal_world_xy[1]):
-            return _CandidateEvaluation(
-                False, "goal_outside_grid", 0.0, 0, goal_world_xy
-            )
-
-        if abs(float(candidate.heading_delta_deg)) <= 12.0:
-            blocked_cells = self._corridor_blocked_count(
-                start_xy=(float(observation.pose.x), float(observation.pose.y)),
-                end_xy=goal_world_xy,
-                radius_m=float(self._config.path_corridor_radius_m),
-            )
-            if blocked_cells > 0:
-                return _CandidateEvaluation(
-                    False, "corridor_occupied", 0.0, int(blocked_cells), goal_world_xy
-                )
-            if str(candidate.depth_support.get("map_candidate_type", "")) == "primitive_outcome":
-                straight = float(
-                    np.hypot(
-                        goal_world_xy[0] - observation.pose.x,
-                        goal_world_xy[1] - observation.pose.y,
-                    )
-                )
-                return _CandidateEvaluation(
-                    True, "primitive_corridor_clear", straight, 0, goal_world_xy
-                )
-            path = self._astar_path(
-                start_xy=(float(observation.pose.x), float(observation.pose.y)),
-                goal_xy=goal_world_xy,
-            )
-            if path is None:
-                return _CandidateEvaluation(
-                    False, "astar_unreachable", 0.0, 0, goal_world_xy
-                )
-            straight = max(
-                1e-3,
-                float(
-                    np.hypot(
-                        goal_world_xy[0] - observation.pose.x,
-                        goal_world_xy[1] - observation.pose.y,
-                    )
-                ),
-            )
-            path_length = self._path_length_m(path)
-            max_allowed = straight * max(1.0, float(self._config.max_path_detour_ratio)) + 0.25
-            if path_length > max_allowed:
-                return _CandidateEvaluation(
-                    False, "astar_detour_too_large", path_length, 0, goal_world_xy
-                )
-            return _CandidateEvaluation(
-                True, "reachable", path_length, 0, goal_world_xy
-            )
-
-        blocked_near_robot = self._disc_blocked_count(
-            center_xy=(float(observation.pose.x), float(observation.pose.y)),
-            radius_m=float(self._config.turn_clearance_radius_m),
-        )
-        if blocked_near_robot > 0:
-            return _CandidateEvaluation(
-                False,
-                "turn_footprint_occupied",
-                0.0,
-                int(blocked_near_robot),
-                goal_world_xy,
-            )
-        return _CandidateEvaluation(
-            True, "turn_in_place_clear", 0.0, 0, goal_world_xy
-        )
-
-    def _restore_best_turn_candidate(
-        self, *, candidate_set: CandidateSet
-    ) -> list[WaypointCandidate]:
-        candidates = list(candidate_set.candidates)
-        turn_candidates = [
-            candidate
-            for candidate in candidates
-            if abs(float(candidate.heading_delta_deg)) > 12.0
-            and str(candidate.depth_support.get("occupancy_reason", ""))
-            != "turn_footprint_occupied"
-        ]
-        if not turn_candidates:
-            return candidates
-        selected = max(
-            turn_candidates,
-            key=lambda item: (
-                float(item.clearance_score),
-                abs(float(item.heading_delta_deg)),
-            ),
-        )
-        restored: list[WaypointCandidate] = []
-        for candidate in candidates:
-            if int(candidate.slot_id) == int(selected.slot_id):
-                support = dict(candidate.depth_support)
-                support["occupancy_reason"] = "restored_best_turn_candidate"
-                support["occupancy_valid"] = 1.0
-                restored.append(
-                    replace(
-                        candidate,
-                        valid=True,
-                        clearance_score=max(0.05, float(selected.clearance_score)),
-                        travel_distance_m=max(0.45, float(selected.travel_distance_m)),
-                        depth_support=support,
-                    )
-                )
-            else:
-                restored.append(candidate)
-        return restored
+    # -- path planning helpers -----------------------------------------------
 
     def _astar_path(
         self,
@@ -1167,63 +876,6 @@ class GlobalOccupancyMap:
                 priority = tentative + _cell_distance(neighbor, goal)
                 heappush(open_heap, (priority, counter, neighbor))
         return None
-
-    def _corridor_blocked_count(
-        self,
-        *,
-        start_xy: tuple[float, float],
-        end_xy: tuple[float, float],
-        radius_m: float,
-    ) -> int:
-        blocked = self._inflated_occupied_mask()
-        distance = max(
-            1e-6,
-            float(
-                np.hypot(
-                    float(end_xy[0]) - float(start_xy[0]),
-                    float(end_xy[1]) - float(start_xy[1]),
-                )
-            ),
-        )
-        sample_step = max(self._resolution_m, float(radius_m) * 0.45)
-        sample_count = max(1, int(np.ceil(distance / sample_step)))
-        blocked_count = 0
-        for idx in range(sample_count + 1):
-            alpha = float(idx) / float(sample_count)
-            wx = float(start_xy[0]) + (float(end_xy[0]) - float(start_xy[0])) * alpha
-            wy = float(start_xy[1]) + (float(end_xy[1]) - float(start_xy[1])) * alpha
-            blocked_count += self._disc_blocked_count(
-                center_xy=(wx, wy), radius_m=radius_m, blocked_mask=blocked
-            )
-            if blocked_count > 0:
-                return blocked_count
-        return blocked_count
-
-    def _disc_blocked_count(
-        self,
-        *,
-        center_xy: tuple[float, float],
-        radius_m: float,
-        blocked_mask: np.ndarray | None = None,
-    ) -> int:
-        center = self._world_to_cell(center_xy[0], center_xy[1])
-        if center is None:
-            return 1
-        blocked = self._inflated_occupied_mask() if blocked_mask is None else blocked_mask
-        radius_cells = max(1, int(np.ceil(float(radius_m) / self._resolution_m)))
-        row, col = center
-        count = 0
-        for dr in range(-radius_cells, radius_cells + 1):
-            for dc in range(-radius_cells, radius_cells + 1):
-                if dr * dr + dc * dc > radius_cells * radius_cells:
-                    continue
-                rr = row + dr
-                cc = col + dc
-                if rr < 0 or rr >= self._cell_count or cc < 0 or cc >= self._cell_count:
-                    count += 1
-                    continue
-                count += int(blocked[rr, cc])
-        return int(count)
 
     def _inflated_occupied_mask(self) -> np.ndarray:
         occupied = self._occupied_mask()
@@ -1325,14 +977,6 @@ class GlobalOccupancyMap:
             remaining -= segment_m
             previous_xy = current_xy
         return previous_xy
-
-    def _depth_roi(self, image_height: int) -> tuple[int, int]:
-        top, bottom = self._config.depth_roi_vertical_range
-        top = float(np.clip(top, 0.0, 0.95))
-        bottom = float(np.clip(bottom, top + 0.02, 1.0))
-        v0 = int(round(top * float(image_height)))
-        v1 = int(round(bottom * float(image_height)))
-        return max(0, v0), max(v0 + 1, min(int(image_height), v1))
 
     # -- debug rendering (vectorised) ----------------------------------------
 
@@ -1583,10 +1227,6 @@ class GlobalOccupancyMap:
                 width=2,
             )
             draw.text((sx + 10, sy - 9), "subgoal", fill=(20, 120, 20), font=anchor_font)
-
-
-# Backward-compatible alias.
-OccupancyGridMapper = GlobalOccupancyMap
 
 
 # ---------------------------------------------------------------------------

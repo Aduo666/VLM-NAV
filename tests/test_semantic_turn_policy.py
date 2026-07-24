@@ -8,7 +8,7 @@ from vln_nav.navigation.instruction_manager import RouteStep
 from vln_nav.navigation.observation_adapter import Pose2D
 from vln_nav.navigation.target_grounding import TargetObservation
 from vln_nav.navigation.vln_policy import (
-    OpenNavVLNPolicy,
+    VLNPolicy,
     _TurnTargetHypothesis,
 )
 
@@ -126,8 +126,8 @@ class SemanticTurnTargetTest(unittest.TestCase):
         self.assertEqual(final["decision_source"], "TURN_FATAL_SAFETY_HOLD")
 
 
-def _policy() -> OpenNavVLNPolicy:
-    policy = OpenNavVLNPolicy.__new__(OpenNavVLNPolicy)
+def _policy() -> VLNPolicy:
+    policy = VLNPolicy.__new__(VLNPolicy)
     policy._route_steps = [
         RouteStep(
             step_id="step_1",

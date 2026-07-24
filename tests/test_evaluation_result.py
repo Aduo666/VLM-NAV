@@ -9,9 +9,9 @@ from types import SimpleNamespace
 from vln_nav.app.nav import _write_evaluation_result
 from vln_nav.navigation.instruction_manager import (
     InstructionContext,
-    RouteCue,
     RouteStep,
     SceneContext,
+    SemanticEntity,
 )
 from vln_nav.navigation.vln_policy import PolicyStepResult
 
@@ -24,22 +24,20 @@ class EvaluationResultTest(unittest.TestCase):
             instruction_id="instruction-1",
             task_type="vln",
             scene_context=SceneContext(),
-            navigation_targets=(),
+            navigation_targets=(
+                SemanticEntity(
+                    canonical_label="bed",
+                    source_span="bed",
+                ),
+            ),
             route_steps=(
                 RouteStep(
                     step_id="step_1",
-                    step_type="TRAVERSE",
-                    source_span="passing the TV on the right",
+                    step_type="GO_TO",
+                    source_span="stop near the bed",
+                    target="bed",
                     direction="forward",
-                    completion="CUE_PASSED",
-                    cues=(
-                        RouteCue(
-                            label="tv",
-                            role="PASS_CUE",
-                            expected_side="right",
-                            source_span="TV on the right",
-                        ),
-                    ),
+                    completion="SEMANTIC_AND_DISTANCE",
                 ),
             ),
             parsing_source="test",
@@ -63,9 +61,9 @@ class EvaluationResultTest(unittest.TestCase):
             navigation_status="ROUTE_COMPLETE",
         )
         config = SimpleNamespace(
-            instruction=context.raw_text,
-            scene_usd_path="scene.usd",
-            robot_profile=SimpleNamespace(name="agx"),
+            instruction=SimpleNamespace(text=context.raw_text),
+            scene=SimpleNamespace(usd_path="scene.usd"),
+            robot=SimpleNamespace(name="agx"),
         )
         with tempfile.TemporaryDirectory() as temp_dir:
             output_path = Path(temp_dir) / "episode.json"
@@ -83,9 +81,9 @@ class EvaluationResultTest(unittest.TestCase):
             payload = json.loads(output_path.read_text(encoding="utf-8"))
 
         self.assertEqual(payload["status"], "SUCCESS")
-        self.assertEqual(payload["route_steps"][0]["step_type"], "TRAVERSE")
+        self.assertEqual(payload["route_steps"][0]["step_type"], "GO_TO")
         self.assertEqual(payload["route_steps"][0]["status"], "COMPLETED")
-        self.assertEqual(payload["route_steps"][0]["cues"][0]["role"], "PASS_CUE")
+        self.assertEqual(payload["route_steps"][0]["target"], "bed")
 
 
 if __name__ == "__main__":

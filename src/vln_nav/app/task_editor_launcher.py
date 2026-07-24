@@ -10,7 +10,9 @@ from .nav import _build_simulation_app_settings
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Launch Isaac Sim with the VLM-NAV Task Editor extension enabled")
+    parser = argparse.ArgumentParser(
+        description="Launch Isaac Sim with the CAPTAINav Task Editor extension enabled"
+    )
     parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="YAML config path")
     parser.add_argument("--scene-usd", default=os.getenv("TASK_EDITOR_SCENE_USD", "usd/environment/hospital_flat.usd"), help="Scene USD to load for a new task")
     parser.add_argument("--robot-usd", default=os.getenv("TASK_EDITOR_ROBOT_USD", ""), help="Robot USD to load for a new task")
@@ -20,12 +22,14 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     config = load_config(args.config)
-    logger = setup_logging(config.log_level)
+    logger = setup_logging(config.logging.level)
 
     os.environ.setdefault("OMNI_KIT_ACCEPT_EULA", "YES")
     os.environ["VLN_TASK_EDITOR_TASK_ID"] = ""
     os.environ["VLN_TASK_EDITOR_SCENE_USD"] = str(args.scene_usd).strip()
-    os.environ["VLN_TASK_EDITOR_ROBOT_USD"] = str(args.robot_usd).strip() or str(config.robot_usd_path)
+    os.environ["VLN_TASK_EDITOR_ROBOT_USD"] = (
+        str(args.robot_usd).strip() or str(config.robot.asset.usd_path)
+    )
     os.environ["VLN_TASK_EDITOR_AUTO_LOAD"] = os.getenv("TASK_EDITOR_AUTO_LOAD", "1")
 
     from isaacsim import SimulationApp

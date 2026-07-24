@@ -1,1 +1,1 @@
-"""Open-Nav style navigation modules."""
+"""CAPTAINav navigation modules."""

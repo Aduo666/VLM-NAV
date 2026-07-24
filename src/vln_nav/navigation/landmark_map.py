@@ -10,7 +10,6 @@ from .observation_adapter import Pose2D
 
 @dataclass
 class LandmarkMapConfig:
-    enabled: bool = True
     anchor_ttl_sec: float = 120.0
     min_confidence: float = 0.20
     log_period_sec: float = 2.0
@@ -76,7 +75,7 @@ class LandmarkMap:
         robot_pose: Pose2D,
         timestamp_sec: float,
     ) -> LandmarkMapEntry | None:
-        if not bool(self._config.enabled) or state is None:
+        if state is None:
             return None
 
         label = _normalize_label(state.label)
@@ -198,8 +197,6 @@ class LandmarkMap:
         robot_pose: Pose2D,
         timestamp_sec: float,
     ) -> str:
-        if not bool(self._config.enabled):
-            return "landmark_map=disabled"
         label = _normalize_label(target_label)
         entry = self._entries.get(label)
         if entry is None:

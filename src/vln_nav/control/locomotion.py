@@ -18,8 +18,6 @@ from vln_nav.runtime.robot_profile import RobotProfile
 class LocomotionController(Protocol):
     def apply(self, action_name: str, *, speed_scale: float = 1.0) -> tuple[float, float]: ...
 
-    def track_local_target(self, **kwargs: Any) -> tuple[float, float]: ...
-
     def readback(self) -> dict[str, Any]: ...
 
 
@@ -86,7 +84,6 @@ def create_locomotion_controller(
         steering_damping=agx.steering_damping,
         hold_joint_stiffness=agx.hold_joint_stiffness,
         hold_joint_damping=agx.hold_joint_damping,
-        track_steering_sign=agx.track_steering_sign,
         logger=logger,
     )
     logger.info(

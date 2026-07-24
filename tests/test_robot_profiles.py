@@ -34,14 +34,17 @@ class RobotProfileTest(unittest.TestCase):
             handle.write('robot:\n  profile: "unitree_g1_29dof"\n')
             handle.flush()
             config = load_config(handle.name)
-        self.assertEqual(config.robot_profile_name, "unitree_g1_29dof")
-        self.assertEqual(config.robot_init_position[2], 0.8)
-        self.assertAlmostEqual(config.physics_dt, 0.005)
-        self.assertEqual(config.robot_policy_decimation, 4)
-        self.assertEqual(config.robot_prim_path, "/World/Robot/g1_29dof_rev_1_0")
-        self.assertEqual(config.front_camera_prim_path, "torso_link/d435_link/Camera")
+        self.assertEqual(config.robot.name, "unitree_g1_29dof")
+        self.assertEqual(config.robot_start_position[2], 0.8)
+        self.assertAlmostEqual(config.robot.simulation.physics_dt, 0.005)
+        self.assertEqual(config.robot.simulation.policy_decimation, 4)
+        self.assertEqual(config.robot.asset.prim_path, "/World/Robot/g1_29dof_rev_1_0")
         self.assertEqual(
-            f"{config.robot_prim_path}/{config.front_camera_prim_path}",
+            config.robot.sensors.camera.front_prim_path,
+            "torso_link/d435_link/Camera",
+        )
+        self.assertEqual(
+            f"{config.robot.asset.prim_path}/{config.robot.sensors.camera.front_prim_path}",
             "/World/Robot/g1_29dof_rev_1_0/torso_link/d435_link/Camera",
         )
 
@@ -71,16 +74,6 @@ class RobotProfileTest(unittest.TestCase):
         self.assertGreater(geometry.robot_frame_xy[1], 0.0)
         self.assertLess(geometry.bearing_rad, 0.0)
         self.assertAlmostEqual(geometry.world_xy[0], 2.0, places=5)
-
-    def test_g1_rejects_track_target_execution_mode(self) -> None:
-        with tempfile.NamedTemporaryFile("w", suffix=".yaml", encoding="utf-8") as handle:
-            handle.write(
-                'robot:\n  profile: "unitree_g1_29dof"\n'
-                "control:\n  use_discrete_action_primitives: false\n"
-            )
-            handle.flush()
-            with self.assertRaisesRegex(ValueError, "TRACK_TARGET is not supported"):
-                load_config(handle.name)
 
     def test_g1_rejects_spawn_height_below_fall_threshold(self) -> None:
         profile = load_robot_profile(profile_name="unitree_g1_29dof", project_root=PROJECT_ROOT)

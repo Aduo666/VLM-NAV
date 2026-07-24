@@ -13,13 +13,9 @@ from .occupancy_grid import OccupancyGridSnapshot
 
 @dataclass
 class MapCandidateGeneratorConfig:
-    enabled: bool = True
     max_candidates: int = 6
     min_distance_m: float = 0.55
     max_distance_m: float = 1.35
-    semantic_enabled: bool = True
-    frontier_enabled: bool = True
-    escape_enabled: bool = True
     frontier_bearings_deg: tuple[float, ...] = (35.0, 18.0, 0.0, -18.0, -35.0)
     frontier_distances_m: tuple[float, ...] = (0.75, 1.10, 1.35)
     min_clearance_m: float = 0.34
@@ -52,9 +48,6 @@ class MapCandidateGenerator:
         progress_signal: str,
         safety_context_text: str,
     ) -> CandidateSet:
-        if not bool(self._config.enabled):
-            return base_candidate_set
-
         ranked = self._primitive_candidates(
             observation=observation,
             base_candidate_set=base_candidate_set,

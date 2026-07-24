@@ -1,50 +1,122 @@
-CAPTAINav: Confidence-Gated Semantic Anchors and Primitive-Aligned Typed Instruction Navigation
-=======
+<div align="center">
 
+# CAPTAINav
 
-**A Hybrid Navigation Method Based on Confidence-Gated Semantic Anchors, Typed Instruction Execution, and Primitive-Aligned VLM Search.**
+### Confidence-Gated Semantic Anchors and Primitive-Aligned Typed Instruction Navigation
 
-CAPTAINav connects natural-language instructions, RGB-D perception, LiDAR mapping, open-vocabulary grounding, VLM reasoning, and low-level wheel/steering control into a runnable closed-loop navigation stack.
-
-| | |
-|---|---|
-| Simulator | Isaac Sim |
-| Python | python3.11 |
-| Robots | AGX 4WS / Unitree G1 29-DoF |
-| Policy | VLM-guided VLN prototype |
-| Actions | Discrete atomic primitives |
+Language-conditioned navigation in Isaac Sim with open-vocabulary grounding,
+persistent semantic anchors, map-aware VLM reasoning, and robot-specific motion primitives.
 
 ![CAPTAINav overview](docs/assets/hero.png)
 
+</div>
+
 ## Demo
 
-> **Instruction:** "You are currently in the hospital lobby. You need to go straight to find the wheelchair, then turn left, and in front of the stairs, turn right to find the yellow warning sign and stop in front of it."
+> **Instruction:** “You are currently in the hospital lobby. You need to go straight to
+> find the wheelchair, then turn left, and in front of the stairs, turn right to find
+> the yellow warning sign and stop in front of it.”
 
 [![CAPTAINav navigation demo](docs/assets/demo.gif)](https://raw.githubusercontent.com/Aduo666/VLM-NAV/main/docs/assets/display.mp4)
 
-Click it to open the full-resolution H.264 recording.
+Click the preview to open the H.264 MP4 recording.
 
-## Features
+## Overview
 
-- **Isaac Sim 5.1**: scene USD loading, robot profiles, cameras, LiDAR, viewport setup.
-- **Swappable locomotion backends**: the AGX uses the existing 4WS joint controller; Unitree G1 uses a 480-input/29-output TorchScript locomotion policy on CPU. Both expose FORWARD / TURN_LEFT / TURN_RIGHT / STOP primitives with odometry-based completion.
-- **Semantic grounding + memory**: local GroundingDINO keeps multiple proposals, preserves instance continuity, and sends only low-confidence crops to the VLM for verification; confirmed landmark anchors remain persistent.
-- **Typed instruction graph**: one startup parse separates trusted scene context from executable `TRAVERSE`, `TURN`, `REGION_TRANSITION`, and `GO_TO` steps. Route cues and target relations remain strongly typed, and validated plans are cached by instruction, schema, prompt, and model version.
-- **Aligned action representation**: at stopped decision keyframes, the VLM chooses exactly one safe candidate outcome that maps one-to-one to TURN_LEFT / FORWARD / TURN_RIGHT.
-- **Region-aware execution**: room transitions require consistent visual region evidence, odometry displacement, and a topology-node change rather than keyword matching alone.
-- **Search / approach separation**: VLM exploration is used while a landmark is unknown; fresh verified image evidence directly approaches the target, while a confirmed off-screen anchor is followed through occupancy-grid A* with bounded local detours when the direct route is blocked.
-- **Fast primitive execution**: during an atomic action, expensive decision-time perception is skipped; odometry, depth safety, drive control, and LiDAR/map updates remain active.
-- **Local and evaluation flows**: normal debugging uses `debug/local` and `logs/nav_latest.log`; dataset evaluation uses `debug/eval` and a structured per-episode result file.
+CAPTAINav is a closed-loop VLN research prototype built on Isaac Sim 5.1. It combines:
 
-![Core method](docs/assets/overview.png)
+- A validated typed instruction graph with `GO_TO`, `TURN`, and `REGION_TRANSITION`.
+- GroundingDINO proposals with confidence-gated VLM semantic verification.
+- RGB-D observations, LiDAR occupancy mapping, odometry, topology, and persistent landmark anchors.
+- A clean first-person image plus structured textual map/candidate context for VLM decisions.
+- Fixed semantic primitives shared by all robots: `FORWARD`, `TURN_LEFT`, and `TURN_RIGHT`.
+- Robot-specific primitive realization and swept-footprint safety for AGX and Unitree G1.
+- Separate local development and dataset evaluation flows.
 
-## Environment Setup
+![CAPTAINav method](docs/assets/overview.png)
 
-The project now uses only the conda / pip Isaac Sim workflow. The project environment name is `vlmnav`.
+## Method
 
-### 1. Create The Conda Environment
+```text
+English instruction
+  -> one fail-closed instruction parse
+  -> validated route graph: GO_TO / TURN / REGION_TRANSITION
+  -> stopped decision keyframe
+       RGB-D observation
+       GroundingDINO target proposals
+       VLM verification for ambiguous proposals
+       LiDAR global occupancy + topological memory
+       persistent semantic landmark anchors
+  -> primitive-aligned candidate table
+  -> VLM selects one valid candidate/action
+  -> PrimitiveSafetyEvaluator checks the robot-specific swept footprint
+  -> AGX 4WS controller or Unitree G1 locomotion policy
+  -> odometry-verified primitive completion
+  -> next decision keyframe
+```
 
-Isaac Sim 5.1 uses Python 3.11.
+### Instruction Execution
+
+The instruction parser runs before Isaac Sim starts. It returns a strict semantic graph:
+
+- `GO_TO`: find and approach one grounded landmark.
+- `TURN`: perform a bounded directional turn, optionally at a semantic trigger.
+- `REGION_TRANSITION`: leave or enter a region using semantic, odometric, and topological evidence.
+
+Objects that only describe the initial scene remain context evidence and are not silently promoted
+to navigation targets. Invalid LLM JSON receives one repair request; if the repaired graph is still
+invalid and no matching cache exists, startup fails explicitly.
+
+### Perception And Memory
+
+GroundingDINO is required by the navigation path. At decision keyframes it proposes bounding boxes
+for the current semantic target. High-confidence proposals can be accepted directly; ambiguous
+proposals are verified by the VLM using a clean crop. Bbox depth is estimated from a robust depth
+cluster inside the box, then projected through the centralized camera/robot/world transform.
+
+Confirmed anchors remain in the landmark map after leaving the camera view or completing a route
+step. A detector proposal without reliable geometry may guide visual search, but it cannot create
+a world anchor or complete a landmark by itself.
+
+### Candidate Decisions
+
+The VLM does not receive the occupancy image. Its navigation request contains:
+
+- A clean, uncropped first-person RGB frame.
+- The current typed route step and progress history.
+- Structured landmark and topology summaries.
+- Candidate heading, distance, map reachability, repetition cost, and primitive safety.
+- A concise capability description for the selected robot profile.
+
+The occupancy image remains available in `debug/local/vln_debug.png` for human inspection.
+
+### Robot-Aware Safety
+
+`PrimitiveSafetyEvaluator` is the single pre-execution safety authority. It sweeps the selected
+robot profile’s footprint polygon through the complete primitive:
+
+- Translation sweep for `FORWARD` and internal recovery `BACKWARD`.
+- Rotation sweep for `TURN_LEFT` and `TURN_RIGHT`.
+- Current LiDAR hits and raw occupied cells are both checked.
+- Unknown occupancy cells do not hard-block an in-place turn.
+- G1 adds a larger turn-drift margin than AGX.
+
+The runtime performs the same check immediately before applying a command. A rejected command is
+changed to a safety hold, the active primitive is cancelled, and the next fresh frame replans.
+
+## Requirements
+
+| Component | Version |
+|---|---|
+| OS | Linux x86_64 |
+| Python | 3.11 |
+| Isaac Sim | 5.1.0 pip distribution |
+| CUDA GPU | Required for Isaac Sim and GroundingDINO |
+| VLM API | OpenAI-compatible endpoint; SiliconFlow is configured by default |
+
+## Installation
+
+### 1. Create The Environment
 
 ```bash
 conda create -n vlmnav python=3.11 -y
@@ -58,297 +130,195 @@ python -m pip install --upgrade pip setuptools wheel
 pip install -r requirements.txt
 ```
 
-`requirements.txt` contains:
+The requirements pin Isaac Sim 5.1 and `numpy==1.26.0`, together with Pillow, PyYAML, and OpenCV.
 
-- `isaacsim[all,extscache]==5.1.0`
-- `numpy==1.26.0`
-- `PyYAML==6.0.2`
-- `Pillow==11.3.0`
-- `opencv-contrib-python-headless==4.11.0.86`
+### 3. Install GroundingDINO
 
-The NVIDIA PyPI index is already included in `requirements.txt`.
+```bash
+conda activate vlmnav
 
-### 3. Configure SiliconFlow / VLM API
+# Install a compatible PyTorch build if the environment does not already provide it.
+pip install torch==2.7.0 torchvision==0.22.0 \
+  --index-url https://download.pytorch.org/whl/cu128
+
+bash scripts/setup_grounding_dino_local.sh
+```
+
+The current local paths are:
+
+```text
+third_party/GroundingDINO/
+weights/grounded_sam/GroundingDINO_SwinT_OGC.py
+weights/grounded_sam/groundingdino_swint_ogc.pth
+weights/grounded_sam/bert-base-uncased/
+```
+
+The `weights/grounded_sam` directory name is retained only to avoid moving existing local weights;
+the active method does not install or run SAM.
+
+### 4. Configure The VLM
+
+`configs/default.yaml` contains the endpoint, model name, and API-key field. The API key can also be
+provided without editing the file:
 
 ```bash
 export SILICONFLOW_API_KEY="your_api_key"
 ```
 
-The default model and API endpoint are configured in `configs/default.yaml`.
-
-### 4. Install Local GroundingDINO
-
-GroundingDINO is required by the current main navigation method. It keeps up to five distinct open-vocabulary proposals after NMS. High-confidence detections use short temporal/geometric confirmation; lower-confidence detections are verified from a clean object crop by the VLM and require a second consistent observation from a different viewpoint. The navigation path does not fall back to VLM-generated boxes.
-
-```bash
-conda activate vlmnav
-
-# If torch / torchvision are missing in your conda environment, install a CUDA build first.
-pip install torch==2.7.0 torchvision==0.22.0 --index-url https://download.pytorch.org/whl/cu128
-
-# Clone / patch GroundingDINO and install its Python dependencies.
-bash scripts/setup_grounded_sam_local.sh
-```
-
-Required model files:
-
-- `third_party/GroundingDINO/`
-- `weights/grounded_sam/GroundingDINO_SwinT_OGC.py`
-- `weights/grounded_sam/groundingdino_swint_ogc.pth`
-- `weights/grounded_sam/bert-base-uncased/config.json` and the accompanying local BERT snapshot
-
-`scripts/setup_grounded_sam_local.sh` prints symlink commands if you already have the CA-Nav weights locally.
-
-## Run
+## Running
 
 ### Local Navigation
 
 ```bash
 conda activate vlmnav
-export SILICONFLOW_API_KEY="your_api_key"
-
-# Run the default task from configs/default.yaml / configs/instructions.json.
 bash scripts/run_nav.sh
+```
 
-# Run a named task.
-bash scripts/run_nav.sh --task hospital_001
+Common commands:
 
-# List available tasks.
+```bash
 bash scripts/run_nav.sh --list-tasks
-
-# Headless mode.
+bash scripts/run_nav.sh --task hospital_002
 bash scripts/run_nav.sh --headless
 ```
 
-The launch scripts use the currently active conda environment. If you need to launch from another shell without activating first, override the environment explicitly:
+`scripts/run_nav.sh` uses the currently active conda environment. From an inactive shell:
 
 ```bash
 CONDA_ENV_NAME=vlmnav bash scripts/run_nav.sh
 ```
 
-### Robot Profiles
+### Robot Selection
 
-Robot selection is intentionally a single configuration switch in `configs/default.yaml`:
+Change only the profile name in `configs/default.yaml`:
 
 ```yaml
 robot:
   profile: "agx"  # or "unitree_g1_29dof"
 ```
 
-Robot-specific assets, sensor prims, simulation rates, geometry, safety limits, primitive parameters, and controller settings live only in:
+Robot-specific assets, sensors, physics rates, controller settings, primitive realization,
+footprint, and safety limits live in:
 
 ```text
 configs/robots/agx.yaml
 configs/robots/unitree_g1_29dof.yaml
 ```
 
-The G1 profile expects these local files:
+The semantic meaning of a primitive is shared, while its distance, angle, command magnitude,
+timeout, and swept envelope come from the selected profile.
 
-```text
-src/unitree_model/g1_29dof/
-  policy/policy.pt
-  policy/deploy.yaml
-  usd/g1_29dof_rev_1_0.usd
-  usd/configuration/g1_29dof_rev_1_0_base.usd
-  usd/configuration/g1_29dof_rev_1_0_physics.usd
-  usd/configuration/g1_29dof_rev_1_0_sensor.usd
-```
+### G1 Policy Test
 
-Its resolved sensor prims are strict: missing paths terminate startup instead of creating fallback sensors.
-
-```text
-/World/Robot/g1_29dof_rev_1_0/torso_link/d435_link/Camera
-/World/Robot/g1_29dof_rev_1_0/pelvis/observeCamera
-/World/Robot/g1_29dof_rev_1_0/pelvis/Lidar
-```
-
-Task files continue to provide `x`, `y`, and yaw. Spawn height is owned by the robot profile (`0.0 m` for AGX and `0.8 m` for G1), so tasks do not need robot-specific z values. G1 uses active zero-command balance for STOP and terminates navigation on a confirmed fall while keeping the simulator open.
-
-Before running VLN with G1, validate the locomotion policy in the isolated interactive test:
+Validate the G1 TorchScript policy independently before running VLN:
 
 ```bash
-conda activate vlmnav
 bash scripts/run_g1_policy_test.sh
 ```
 
-The test always loads `unitree_g1_29dof`, regardless of the profile selected for navigation. It creates only a flat ground plane, light, G1, and the existing TorchScript policy. Use the arrow keys or panel buttons for FORWARD, BACKWARD, TURN_LEFT, and TURN_RIGHT; releasing every direction commands active STOP. Its fixed turn speed is the same `turn_command * waypoint_turn_speed_scale` used by VLN. The panel reports actual body velocity, pelvis height and attitude, policy action magnitude, and joint tracking error.
+Use the arrow keys or panel buttons. Releasing all directions commands active zero-velocity
+balance. The test automatically resets after a confirmed fall.
 
-Forward and backward commands are clamped to the policy ranges exported in `deploy.yaml`. Turning uses the robot profile's `turn_command`, so the test and VLN send the same configured angular velocity. A confirmed fall triggers a full simulation and policy-state reset after 0.5 seconds. Three automatic resets are allowed; after a fourth fall, use the panel's manual reset button.
-
-For G1 mapping, LiDAR points are projected through the live sensor pose into a yaw-level pelvis frame before entering the global map. Floor and ceiling returns caused by body tilt are rejected, static cells require evidence from multiple frames, and isolated free-space rays cannot erase a wall. Consistent contradictory free-space observations can still remove a false obstacle. This G1-only stabilization does not change the AGX mapping branch or visualization scale.
-
-### Task Authoring Panel
+### Task Authoring
 
 ```bash
-conda activate vlmnav
 bash scripts/run_task_editor.sh
 ```
 
-This loads the configured scene and robot, then opens the in-simulator task editor panel for adding instructions to `configs/instructions.json`.
+The Isaac Sim panel writes local tasks to `configs/instructions.json`. Task start `x`, `y`, and yaw
+come from the task; spawn height comes from the selected robot profile.
 
-## Benchmark Evaluation
+## Evaluation
 
 ### InteriorNav
 
 ```bash
-bash eval/interiornav/run.sh
 SPLIT=val_unseen EPISODE_INDEX=0 bash eval/interiornav/run.sh
 ```
 
-Data root: `/Data/qiang/interiornav_data`
-
-### VLN-PE / R2R
+### VLN-PE
 
 ```bash
-bash eval/vlnpe/run.sh
-SPLIT=val_unseen EPISODE_INDEX=5 bash eval/vlnpe/run.sh
+SPLIT=val_unseen EPISODE_INDEX=0 bash eval/vlnpe/run.sh
 ```
 
-Data root: `/Data/qiang/InternData-N1/vln_pe`
+Dataset adapters normalize source episodes into `eval/current_episode.json`. Evaluation artifacts
+are written under `debug/eval/`, including a structured result JSON for each episode.
 
-Scene root: `/Data/qiang/mp3d_pe`
+## Configuration
 
-Each dataset has an adapter under `eval/<dataset>/adapter.py` that normalizes dataset episodes into the task format consumed by `nav.py`.
-Each evaluation run also writes `debug/eval/results/<episode>_<timestamp>.json` with typed-step progress and an explicit success or failure stage.
-
-## Current Pipeline
-
-```text
-English language instruction
-  -> one validated typed semantic graph (cached)
-       scene context: localization evidence only
-       route steps: TRAVERSE / TURN / REGION_TRANSITION / GO_TO
-       route cues: PASS_CUE / TURN_CUE / TRANSITION_CUE
-       target relations: LEFT_OF / RIGHT_OF / IN_FRONT_OF / BEHIND_TARGET / NEAR
-  -> TRAVERSE: lock the measured world heading at step entry
-       hard-filter unsafe or route-inconsistent candidates
-       confirm a pass cue by GroundingDINO + VLM identity evidence
-       finish after odometry crosses the confirmed cue-anchor plane
-       if no anchor is available, require two VLM completion reviews
-       from distinct translated stopped keyframes
-  -> RGB-D + LiDAR + odometry observation
-  -> GO_TO: GroundingDINO proposal + VLM semantic verification
-       visible target -> deterministic centering/approach
-       confirmed off-screen anchor -> occupancy A*
-       unknown target -> one VLM candidate choice at a stopped keyframe
-  -> REGION_TRANSITION: candidate choice + region evidence
-       complete only after semantic + odometry + topology agreement
-  -> TURN: execute odometry-verified turn primitives in the instructed direction
-       stopped keyframes search for the next GO_TO landmark
-       high-confidence detections require VLM identity verification
-       otherwise fuse LiDAR + global occupancy into a true corridor centerline
-       exit on a stable corridor after 45 degrees, or return to the best safe
-       heading within a 105-degree scan; bounded recovery ends in SAFETY_HOLD
-  -> robot-profile locomotion backend
-       AGX: low-level 4WS joint controller
-       G1: CPU TorchScript policy -> 29 joint position targets
-```
-
-During primitive execution, the loop does not request VLM decisions, run GroundingDINO, update visual tracking, or replace the active subgoal. It continues odometry completion, LiDAR hit/miss mapping, hard safety checks, low-level control, and video recording. Semantic perception resumes at the natural stopped keyframe after the primitive. A conflicting target direction may add one explicit spatial-relation verification request; it never changes low-level control directly.
-
-The VLM input is intentionally split by role:
-
-- A clean, uncropped first-person RGB image without candidate markers or debug overlays.
-- Structured text for semantic map, landmark memory, obstacle distances, route context, and candidate action metadata.
-- No raw occupancy image is sent to the VLM by default; occupancy visualization is mainly for human debugging.
-
-Instruction parsing is fail-closed and runs before Isaac Sim starts. It uses a dedicated 90-second timeout, performs one parse request, deterministic schema validation, and at most one repair request. If neither produces a valid graph and no matching cache exists, navigation does not silently substitute a heuristic plan. Normal navigation requests continue using `llm.timeout_sec`.
-
-## Key Configuration
-
-All main configuration lives in `configs/default.yaml`.
+`configs/default.yaml` is a complete strict configuration. A custom YAML may contain only the
+fields it overrides; it is deep-merged with the default file. Unknown fields are fatal instead of
+being silently ignored.
 
 ```yaml
 robot:
-  profile: "agx"
+  profile: "unitree_g1_29dof"
+
+scene:
+  usd_path: "usd/hospital.usd"
+  robot_start_xy_m: [1.5, 4.0]
 
 llm:
   model_name: "Qwen/Qwen3-VL-30B-A3B-Instruct"
-  api_base_url: "https://api.siliconflow.cn/v1"
+  timeout_sec: 30
 
-target_grounding:
-  enabled: true
-  backend: "grounding_dino"
-  grounding_dino_text_encoder_path: "weights/grounded_sam/bert-base-uncased"
-  grounding_dino_max_detections: 5
-  semantic_verification_enabled: true
-  semantic_verification_min_confidence: 0.50
-  semantic_verification_auto_accept_confidence: 0.75
+perception:
+  grounding:
+    call_period_sec: 0.10
+    detector:
+      box_threshold: 0.45
 
-landmark_tracker:
-  confirm_confidence_threshold: 0.75
-  confirm_min_observations: 2
-  confirm_max_anchor_jump_m: 0.75
-
-opennav:
-  instruction_parse_max_tokens: 768
-  instruction_parse_timeout_sec: 90
-  instruction_cache_enabled: true
-  instruction_cache_path: ".cache/instruction_plans.json"
-  region_transition_min_displacement_m: 1.0
-  region_transition_confirmations: 2
-  region_transition_min_confidence: 0.55
-  semantic_turn_min_yaw_deg: 45.0
-  semantic_turn_max_yaw_deg: 105.0
-  semantic_turn_max_primitives: 7
-  semantic_turn_alignment_confirmations: 2
-  semantic_turn_corridor_center_tolerance_deg: 10.0
-  semantic_turn_target_high_confidence: 0.75
-  semantic_turn_target_medium_confidence: 0.50
-  semantic_turn_max_recovery_attempts: 2
-  traverse_heading_correction_limit_deg: 30.0
-  traverse_candidate_heading_tolerance_deg: 22.0
-  traverse_min_progress_m: 0.50
-  traverse_pass_margin_m: 0.20
-  traverse_review_min_progress_m: 1.0
-  traverse_review_min_translation_m: 0.20
-  traverse_max_recovery_attempts: 2
-  visual_target_center_deadband_deg: 15.0
-  arrival_distance_m: 2.0
-  success_distance_m: 3.0
-
-occupancy_grid:
-  unknown_is_traversable: false
-
-map_candidates:
-  max_candidates: 3
+navigation:
+  progress:
+    landmark_clearance_m: 1.0
+    final_success_clearance_m: 2.0
 ```
 
-Robot-specific primitive distances, turn angles, controller gains, timing, footprint, sensor paths, and physics rates are deliberately absent from `configs/default.yaml`; edit the selected file under `configs/robots/` instead.
+Physical geometry and primitive parameters must be edited in the robot profile, not duplicated in
+the global configuration.
 
-Tasks are stored in `configs/instructions.json`. Each task can specify scene path, robot start pose, instruction text, and task metadata.
-
-## Debug Outputs
+## Outputs
 
 ```text
 debug/
   local/
     vln_debug.png
-    observevideos/observer_YYYYMMDD_HHMMSS.mp4
-    videos/vln_debug_YYYYMMDD_HHMMSS.mp4
+    observevideos/observer_<timestamp>.mp4
+    videos/vln_debug_<timestamp>.mp4
   eval/
     vln_debug.png
-    videos/vln_debug_YYYYMMDD_HHMMSS.mp4
-    results/<episode>_YYYYMMDD_HHMMSS.json
+    videos/vln_debug_<timestamp>.mp4
+    results/<episode>_<timestamp>.json
 
 logs/
+  nav_latest.log
   vln.log
 ```
 
-The console intentionally shows only navigation milestones: `[PLAN]`, `[NAV_STATE]`, `[LANDMARK_CONFIRMED]`, `[STEP_COMPLETE]`, `[SAFETY_HOLD]`, `[RECOVERY]`, `[ERROR]`, and `[ROUTE_COMPLETE]`. Full component logs are overwritten in `logs/vln.log` on each run. The human debug frame keeps its status bar outside the imagery: north-up global map on the left and uncropped first-person RGB on the right.
+`nav_latest.log` is the complete launcher/Isaac console capture. `vln.log` contains the CAPTAINav
+logger stream. Both are overwritten on the next local run.
 
-The observer-camera recording is captured automatically at 10 FPS from the configured robot observer camera. Its output is independent of the combined debug video and is saved under `debug/local/observevideos/`.
+## Tests
 
-## Known Limitations
+Pure-code tests do not start Isaac Sim:
 
-- VLM API latency is still the dominant delay between atomic primitives.
-- GroundingDINO proposals can still be ambiguous; VLM verification reduces but cannot eliminate false positives.
-- Detections without usable depth cannot complete a landmark immediately; two or more translated keyframes may recover an anchor through bearing triangulation when their rays are geometrically consistent.
-- Search decisions still depend on VLM quality, while confirmed-target approach is deterministic.
-- The system is a research prototype, not a benchmark-final VLN agent.
+```bash
+PYTHONPATH=src python -m unittest discover -s tests -v
+```
+
+They cover instruction validation, robot profiles, spatial projection, landmark evidence,
+semantic turns, occupancy behavior, and robot-specific primitive safety.
+
+## Limitations
+
+- VLM latency remains the main delay between decision keyframes.
+- Open-vocabulary detections can still be ambiguous despite confidence gating and crop verification.
+- World anchors depend on camera calibration, depth quality, and odometry consistency.
+- The Unitree G1 behavior depends strongly on the quality and deployment compatibility of its policy.
+- CAPTAINav is a research prototype, not a safety-certified navigation system.
 
 ## Research Context
 
-CAPTAINav adapts ideas from VLN, ObjectNav, open-vocabulary grounding, semantic memory, and map-aware robot navigation into an Isaac Sim workflow with interchangeable wheeled and humanoid locomotion backends.
-
-Inspired by R2R, VLN-CE, DUET, NavGPT, Open-Nav, Safe-VLN, and CA-Nav.
+CAPTAINav draws on VLN, ObjectNav, open-vocabulary grounding, semantic memory, and map-aware robot
+navigation. Related systems include R2R, VLN-CE, DUET, NavGPT, Safe-VLN, CA-Nav, and Open-Nav.

@@ -1,4 +1,4 @@
-schema_version: "1.0"
+schema_version: "2.0"
 
 identity:
   name: "unitree_g1_29dof"
@@ -18,11 +18,33 @@ simulation:
   policy_decimation: 4
 
 sensors:
-  front_camera_prim_path: "torso_link/d435_link/Camera"
-  observer_camera_enabled: true
-  observer_camera_prim_path: "pelvis/observeCamera"
-  camera_frequency_hz: 10
-  lidar_prim_path: "pelvis/Lidar"
+  camera:
+    front_prim_path: "torso_link/d435_link/Camera"
+    observer_enabled: true
+    observer_prim_path: "pelvis/observeCamera"
+    width: 1280
+    height: 960
+    frequency_hz: 10
+    horizontal_fov_deg: 90.0
+    follow_front_in_gui: false
+    follow_observer_in_gui: true
+    depth_roi_vertical_range: [0.45, 0.85]
+    valid_depth_range_m: [0.20, 10.0]
+    obstacle_roi_vertical_range: [0.50, 0.95]
+    obstacle_center_width_ratio: 0.34
+    obstacle_side_width_ratio: 0.30
+    depth_eval_period_sec: 0.12
+  lidar:
+    prim_path: "pelvis/Lidar"
+    horizontal_fov_deg: 180.0
+    vertical_fov_deg: 10.0
+    horizontal_resolution_deg: 0.4
+    vertical_resolution_deg: 4.0
+    rotation_rate_hz: 30.0
+    min_range_m: 0.40
+    max_range_m: 10.0
+    yaw_offset_deg: 0.0
+    sector_merge_keep_sec: 1.5
 
 controller:
   policy_path: "src/unitree_model/g1_29dof/policy/policy.pt"
@@ -75,12 +97,20 @@ primitives:
   settle_angular_speed_threshold_radps: 0.08
   settle_stable_duration_sec: 0.15
 
+motion_model:
+  type: "biped_in_place"
+  turn_drift_margin_m: 0.08
+  sweep_resolution_deg: 2.5
+
 geometry:
-  footprint_radius_m: 0.32
+  # Conservative approximate body envelope: 0.56 m long x 0.48 m wide.
+  footprint_polygon_xy_m:
+    - [0.28, 0.24]
+    - [-0.28, 0.24]
+    - [-0.28, -0.24]
+    - [0.28, -0.24]
+  safety_margin_m: 0.05
   obstacle_stop_distance_m: 0.30
-  map_inflation_radius_m: 0.40
-  path_corridor_radius_m: 0.38
-  turn_clearance_radius_m: 0.42
 
 safety:
   fall_detection_enabled: true

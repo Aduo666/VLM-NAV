@@ -39,7 +39,6 @@ export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.9}"
 
 "${PYTHON_BIN}" -m pip install -r "${ROOT_DIR}/requirements-grounding.txt"
 "${PYTHON_BIN}" -m pip install --no-build-isolation --no-deps -e .
-"${PYTHON_BIN}" -m pip install 'git+https://github.com/facebookresearch/segment-anything.git'
 "${PYTHON_BIN}" - <<PY
 from huggingface_hub import snapshot_download
 
@@ -69,14 +68,9 @@ Put or symlink these files here:
   ${WEIGHT_DIR}/groundingdino_swint_ogc.pth
   ${WEIGHT_DIR}/bert-base-uncased/config.json
 
-SAM weights:
-  ${WEIGHT_DIR}/sam_vit_h_4b8939.pth
-  ${WEIGHT_DIR}/repvit_sam.pt
-
 If you already have CA-Nav weights, this is enough:
   ln -sf /home/Lab/qiangsibin/CA-Nav-code/data/grounded_sam/GroundingDINO_SwinT_OGC.py ${WEIGHT_DIR}/GroundingDINO_SwinT_OGC.py
   ln -sf /home/Lab/qiangsibin/CA-Nav-code/data/grounded_sam/groundingdino_swint_ogc.pth ${WEIGHT_DIR}/groundingdino_swint_ogc.pth
-  ln -sf /home/Lab/qiangsibin/CA-Nav-code/data/grounded_sam/sam_vit_h_4b8939.pth ${WEIGHT_DIR}/sam_vit_h_4b8939.pth
 
 Then run:
   bash scripts/run_nav.sh

@@ -10,7 +10,6 @@ from .observation_adapter import VLNObservation
 
 @dataclass
 class StuckDetectorConfig:
-    enabled: bool
     window_sec: float
     displacement_threshold_m: float
     yaw_threshold_deg: float
@@ -52,9 +51,6 @@ class StuckDetector:
         executed_action: str,
         speed_scale: float,
     ) -> StuckEvent:
-        if not bool(self._config.enabled):
-            self._samples.clear()
-            return StuckEvent(triggered=False)
         if self.recovery_active:
             self._samples.clear()
             return StuckEvent(triggered=False)
@@ -64,7 +60,7 @@ class StuckDetector:
             return StuckEvent(triggered=False)
 
         action = str(executed_action).strip().upper()
-        if action not in {"FORWARD", "TRACK_TARGET", "TURN_LEFT", "TURN_RIGHT"} or float(speed_scale) <= 0.05:
+        if action not in {"FORWARD", "TURN_LEFT", "TURN_RIGHT"} or float(speed_scale) <= 0.05:
             self._samples.clear()
             return StuckEvent(triggered=False)
 
@@ -89,7 +85,7 @@ class StuckDetector:
         displacement_m = float(np.hypot(float(last[1]) - float(first[1]), float(last[2]) - float(first[2])))
         yaw_delta_deg = abs(float(np.degrees(_wrap_angle_rad(float(last[3]) - float(first[3])))))
 
-        linear_commands = [sample for sample in self._samples if sample[4] in {"FORWARD", "TRACK_TARGET"}]
+        linear_commands = [sample for sample in self._samples if sample[4] == "FORWARD"]
         turn_commands = [sample for sample in self._samples if sample[4] in {"TURN_LEFT", "TURN_RIGHT"}]
         if linear_commands and displacement_m < max(0.0, float(self._config.displacement_threshold_m)):
             reason = "linear_command_no_displacement"
@@ -126,7 +122,7 @@ class StuckDetector:
         return self._recovery_started_sec is not None
 
     def trigger_recovery(self, *, now_sec: float, reason: str) -> None:
-        if not bool(self._config.enabled) or self._recovery_started_sec is not None:
+        if self._recovery_started_sec is not None:
             return
         self._samples.clear()
         self._recovery_started_sec = float(now_sec)

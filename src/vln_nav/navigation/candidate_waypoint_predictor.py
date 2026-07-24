@@ -42,7 +42,6 @@ class CandidateWaypointPredictorConfig:
     max_travel_distance_m: float
     min_free_ratio: float
     column_half_width_px: int
-    adaptive_enabled: bool = True
     adaptive_count: int = 5
     adaptive_min_spacing_deg: float = 18.0
     adaptive_smoothing_px: int = 15
@@ -79,15 +78,13 @@ class CandidateWaypointPredictor:
         v_start, v_end = roi
 
         valid_min, valid_max = [float(value) for value in self._config.valid_depth_range]
-        candidate_bearings_deg = self._base_bearings_deg()
-        if bool(self._config.adaptive_enabled):
-            candidate_bearings_deg = self._adaptive_bearings_deg(
-                depth_image=depth_np,
-                v_start=v_start,
-                v_end=v_end,
-                valid_min=valid_min,
-                valid_max=valid_max,
-            )
+        candidate_bearings_deg = self._adaptive_bearings_deg(
+            depth_image=depth_np,
+            v_start=v_start,
+            v_end=v_end,
+            valid_min=valid_min,
+            valid_max=valid_max,
+        )
         candidates: list[WaypointCandidate] = []
         valid_count = 0
         for slot_id, bearing_deg in enumerate(candidate_bearings_deg):

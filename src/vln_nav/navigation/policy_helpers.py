@@ -7,6 +7,21 @@ import numpy as np
 from .candidate_waypoint_predictor import CandidateSet, WaypointCandidate
 from .instruction_manager import InstructionContext, RouteStep
 
+PRIMITIVE_HEADING_THRESHOLD_DEG = 12.0
+
+
+def candidate_primitive_action_name(candidate: WaypointCandidate) -> str:
+    explicit = str(candidate.depth_support.get("primitive_action", "")).strip().upper()
+    if explicit in {"TURN_LEFT", "TURN_RIGHT", "FORWARD"}:
+        return explicit
+    heading_deg = float(candidate.heading_delta_deg)
+    if heading_deg > PRIMITIVE_HEADING_THRESHOLD_DEG:
+        return "TURN_LEFT"
+    if heading_deg < -PRIMITIVE_HEADING_THRESHOLD_DEG:
+        return "TURN_RIGHT"
+    return "FORWARD"
+
+
 def _find_candidate(candidate_set: CandidateSet, slot_id: int | None) -> WaypointCandidate | None:
     if slot_id is None:
         return None
@@ -99,38 +114,16 @@ def _pose_distance_m(start_pose, current_pose) -> float:
     )
 
 
-def _track_target_command(
-    *,
-    local_goal_xy: tuple[float, float] | list[float],
-    stop_distance_m: float,
-) -> tuple[str, float]:
-    forward_m = float(local_goal_xy[0])
-    left_m = float(local_goal_xy[1])
-    distance_m = float(np.hypot(forward_m, left_m))
-    if distance_m <= float(stop_distance_m) or forward_m < -0.10:
-        return "STOP", 0.0
-    return "TRACK_TARGET", 1.0
-
-
 def _candidate_to_primitive_action(
     candidate: WaypointCandidate,
     *,
     turn_speed_scale: float,
     forward_speed_scale: float,
 ) -> tuple[str, float]:
-    explicit = str(candidate.depth_support.get("primitive_action", "")).strip().upper()
-    if explicit == "TURN_LEFT":
-        return explicit, float(turn_speed_scale)
-    if explicit == "TURN_RIGHT":
-        return explicit, float(turn_speed_scale)
-    if explicit == "FORWARD":
-        return explicit, float(forward_speed_scale)
-    heading_deg = float(candidate.heading_delta_deg)
-    if heading_deg > 12.0:
-        return "TURN_LEFT", float(turn_speed_scale)
-    if heading_deg < -12.0:
-        return "TURN_RIGHT", float(turn_speed_scale)
-    return "FORWARD", float(forward_speed_scale)
+    action = candidate_primitive_action_name(candidate)
+    if action in {"TURN_LEFT", "TURN_RIGHT"}:
+        return action, float(turn_speed_scale)
+    return action, float(forward_speed_scale)
 
 
 def _local_goal_to_primitive_action(*, local_goal_xy: tuple[float, float] | list[float]) -> str:
@@ -139,9 +132,9 @@ def _local_goal_to_primitive_action(*, local_goal_xy: tuple[float, float] | list
     heading_deg = float(np.degrees(np.arctan2(left_m, max(1.0e-6, forward_m))))
     if forward_m < -0.10:
         return "TURN_LEFT" if left_m >= 0.0 else "TURN_RIGHT"
-    if heading_deg > 12.0:
+    if heading_deg > PRIMITIVE_HEADING_THRESHOLD_DEG:
         return "TURN_LEFT"
-    if heading_deg < -12.0:
+    if heading_deg < -PRIMITIVE_HEADING_THRESHOLD_DEG:
         return "TURN_RIGHT"
     return "FORWARD"
 
@@ -169,7 +162,7 @@ def _nearest_candidate_for_local_goal(
     )
 
 
-def _primitive_speed_scale(action_name: str, config) -> float:  # OpenNavPolicyConfig
+def _primitive_speed_scale(action_name: str, config) -> float:  # VLNPolicyConfig
     action = str(action_name).strip().upper()
     if action in {"TURN_LEFT", "TURN_RIGHT"}:
         return float(config.turn_speed_scale)

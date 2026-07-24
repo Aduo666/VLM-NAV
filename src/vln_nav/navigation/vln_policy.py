@@ -1728,7 +1728,7 @@ class OpenNavVLNPolicy:
         if step.step_type != "TURN":
             return step.perception_target
         if step.cues:
-            return step.cues[0].label
+            return step.perception_target
         if (
             step.trigger is not None
             and step.trigger.trigger_type == "NEAR_OBJECT"

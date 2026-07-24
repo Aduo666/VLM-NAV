@@ -10,8 +10,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 
-INSTRUCTION_SCHEMA_VERSION = "3.0"
-INSTRUCTION_PROMPT_VERSION = "2026-07-23.1"
+INSTRUCTION_SCHEMA_VERSION = "3.1"
+INSTRUCTION_PROMPT_VERSION = "2026-07-23.2"
 SUPPORTED_STEP_TYPES = {"GO_TO", "TRAVERSE", "REGION_TRANSITION", "TURN"}
 SUPPORTED_DIRECTIONS = {"none", "left", "right", "forward"}
 SUPPORTED_CUE_ROLES = {"PASS_CUE", "TURN_CUE", "TRANSITION_CUE", "CONTEXT_CUE"}
@@ -88,10 +88,14 @@ class RouteStep:
     def perception_target(self) -> str:
         if self.step_type == "GO_TO":
             return self.target
-        if self.cues:
-            return self.cues[0].label
+        for cue in self.cues:
+            if _is_groundable_label(cue.label):
+                return cue.label
         if self.step_type == "TURN" and self.trigger is not None:
-            if self.trigger.trigger_type == "NEAR_OBJECT":
+            if (
+                self.trigger.trigger_type == "NEAR_OBJECT"
+                and _is_groundable_label(self.trigger.label)
+            ):
                 return self.trigger.label
         return ""
 
@@ -177,6 +181,7 @@ class InstructionManager:
         raw_response = str(result.content)
         try:
             payload = _extract_json_object(raw_response)
+            protected_destinations = _declared_destination_labels(payload)
             context, errors = _context_from_payload(
                 raw_instruction=raw_instruction,
                 normalized=normalized,
@@ -186,6 +191,7 @@ class InstructionManager:
             )
         except InstructionPlanError as exc:
             payload = {"raw_response": raw_response}
+            protected_destinations = []
             context = None
             errors = [str(exc)]
         if errors:
@@ -194,6 +200,7 @@ class InstructionManager:
                 normalized=normalized,
                 original_payload=payload,
                 validation_errors=errors,
+                protected_destinations=protected_destinations,
             )
         if context is None:
             raise InstructionPlanError("[INSTRUCTION_FATAL] instruction plan is unavailable")
@@ -217,6 +224,7 @@ class InstructionManager:
         normalized: str,
         original_payload: dict,
         validation_errors: list[str],
+        protected_destinations: list[str],
     ) -> InstructionContext:
         self._logger.warning(
             "[INSTRUCTION_REPAIR] validation_errors=%s",
@@ -229,6 +237,7 @@ class InstructionManager:
                 normalized=normalized,
                 original_payload=original_payload,
                 validation_errors=validation_errors,
+                protected_destinations=protected_destinations,
             ),
             image_png_bytes=None,
             max_tokens=self._max_tokens,
@@ -262,6 +271,15 @@ class InstructionManager:
         if repaired_errors:
             raise InstructionPlanError(
                 f"[INSTRUCTION_FATAL] repaired instruction is invalid errors={repaired_errors}"
+            )
+        repaired_targets = set(context.navigation_target_labels)
+        missing_destinations = [
+            label for label in protected_destinations if label not in repaired_targets
+        ]
+        if missing_destinations:
+            raise InstructionPlanError(
+                "[INSTRUCTION_FATAL] repair removed declared navigation destinations "
+                f"missing={missing_destinations}"
             )
         return context
 
@@ -336,13 +354,14 @@ class InstructionManager:
 def _instruction_system_prompt() -> str:
     return (
         "You are an instruction compiler for embodied vision-language navigation.\n"
-        "Convert one English navigation instruction into a typed semantic execution graph.\n"
+        "Convert one English navigation instruction into a small ordered route draft.\n"
         "Return strict JSON only, with no markdown or commentary.\n"
-        "Never turn scene-description objects into navigation targets unless the instruction explicitly commands the robot to find, approach, or navigate to them.\n"
-        "Distinguish trusted starting context, context objects, action triggers, regions, and true navigation targets.\n"
+        "Keep scene context separate from commanded destinations.\n"
         "The only supported step types are GO_TO, TRAVERSE, REGION_TRANSITION, and TURN.\n"
-        "Use TRAVERSE for directional route segments such as walking down a hallway or passing a cue; never encode such a segment as an empty GO_TO.\n"
-        "Preserve temporal order and explicit directional relations.\n"
+        "Any phrase that commands travel to, find, approach, reach, or stop near an object is GO_TO that object.\n"
+        "TRAVERSE is only directional travel with no object destination.\n"
+        "Cue labels must be physical visible entities, never action phrases such as turn left or continue straight.\n"
+        "Preserve every commanded destination and preserve temporal order.\n"
         "Do not invent objects, regions, or actions absent from the instruction."
     )
 
@@ -350,62 +369,54 @@ def _instruction_system_prompt() -> str:
 def _instruction_user_prompt(instruction: str) -> str:
     return (
         f"Instruction:\n{instruction}\n\n"
-        "Return exactly this JSON structure:\n"
+        "Return this compact JSON draft. Python will derive step ids, triggers, "
+        "completion rules, cue roles, and the navigation-target list:\n"
         "{\n"
         f'  "schema_version": "{INSTRUCTION_SCHEMA_VERSION}",\n'
         '  "scene_context": {\n'
         '    "current_region": {"canonical_label": "", "source_span": ""},\n'
         '    "context_objects": [{"canonical_label": "", "source_span": ""}]\n'
         "  },\n"
-        '  "navigation_targets": [{"canonical_label": "", "source_span": ""}],\n'
         '  "route_steps": [\n'
         "    {\n"
-        '      "step_id": "step_1",\n'
         '      "step_type": "GO_TO|TRAVERSE|REGION_TRANSITION|TURN",\n'
         '      "source_span": "exact supporting phrase",\n'
-        '      "target": "object label or empty",\n'
+        '      "target": "commanded object destination or empty",\n'
         '      "from_region": "region label or empty",\n'
         '      "to_region": "region label, outside_current_region, adjacent_region, or empty",\n'
         '      "transition": "enter|exit|empty",\n'
         '      "direction": "none|left|right|forward",\n'
-        '      "trigger": {"trigger_type": "NONE|NEAR_OBJECT|AFTER_PREVIOUS_STEP", "label": ""},\n'
-        '      "completion": "SEMANTIC_AND_DISTANCE|CUE_PASSED|REGION_BOUNDARY|NEXT_EVENT_CONFIRMED|REGION_CHANGED|NAMED_REGION_CONFIRMED|HEADING_ALIGNED",\n'
         '      "cues": [\n'
         "        {\n"
-        '          "label": "route cue label",\n'
-        '          "role": "PASS_CUE|TURN_CUE|TRANSITION_CUE|CONTEXT_CUE",\n'
+        '          "label": "physical visible entity only",\n'
+        '          "cue_type": "pass|turn|transition|context",\n'
         '          "expected_side": "none|left|right|center",\n'
         '          "source_span": "exact supporting phrase"\n'
         "        }\n"
         "      ],\n"
         '      "relations": [\n'
         "        {\n"
-        '          "target": "GO_TO target",\n'
         '          "relation": "LEFT_OF|RIGHT_OF|IN_FRONT_OF|BEHIND_TARGET|NEAR",\n'
         '          "reference": "reference object",\n'
         '          "source_span": "exact supporting phrase"\n'
         "        }\n"
-        "      ],\n"
-        '      "constraints": ["short global semantic constraint"]\n'
+        "      ]\n"
         "    }\n"
         "  ]\n"
         "}\n\n"
         "Rules:\n"
         "1. scene_context is trusted prior information, not an execution target.\n"
-        "2. Objects merely described as nearby belong only in context_objects. Never duplicate a GO_TO target in context_objects.\n"
-        "3. find/go to/navigate to/approach an object becomes GO_TO with SEMANTIC_AND_DISTANCE.\n"
-        "4. Directional travel without an object destination becomes TRAVERSE, never GO_TO with an empty target.\n"
-        "5. A TRAVERSE must have direction and a finite completion: CUE_PASSED, REGION_BOUNDARY, or NEXT_EVENT_CONFIRMED.\n"
-        "6. 'passing X on the right/left' creates a PASS_CUE on TRAVERSE or REGION_TRANSITION; X is not a GO_TO target.\n"
-        "7. Leaving or entering a room becomes REGION_TRANSITION. Travel details inside the same entering clause are cues on that transition, not a duplicate TRAVERSE.\n"
-        "8. A directional turn becomes TURN; if it follows another step, use AFTER_PREVIOUS_STEP. 'turn left into a doorway' creates a TURN_CUE for doorway.\n"
-        "9. 'turn at/near object' uses NEAR_OBJECT and does not make that object a GO_TO target.\n"
-        "10. 'go straight to X' is GO_TO(X) with direction=forward, not an infinite forward step.\n"
-        "11. Spatial descriptions that distinguish a GO_TO instance become relations. For 'window behind the bed', target=bed, relation=BEHIND_TARGET, reference=large window.\n"
-        "12. navigation_targets contains exactly the GO_TO targets, in first-use order. Route cues and relation references are excluded.\n"
-        "13. Use concise lowercase English canonical labels.\n"
-        "14. If no current region is stated, return empty strings for current_region.\n"
-        "15. Do not emit empty objects in cues or relations; use empty lists when absent."
+        "2. Objects merely describing the initial scene belong only in context_objects.\n"
+        "3. 'find X', 'go to X', 'continue straight to X', 'approach X', and 'stop near X' are GO_TO with target=X.\n"
+        "4. TRAVERSE has no target. Use it only for travel such as 'walk down the hallway' when no destination object is commanded.\n"
+        "5. 'passing X on the right/left' adds physical cue X with cue_type=pass; it does not make X a GO_TO target.\n"
+        "6. Leaving or entering a room is REGION_TRANSITION.\n"
+        "7. A directional turn is TURN. Bare 'turn left/right' has cues=[]. "
+        "'turn left into the doorway' may use doorway as a physical turn cue.\n"
+        "8. Never use action text such as 'turn left', 'continue straight', 'go forward', left, or right as a cue label.\n"
+        "9. Relations only disambiguate a GO_TO target; the relation target is inferred from that step.\n"
+        "10. Use concise lowercase English labels and exact source spans.\n"
+        "11. Use empty lists for absent cues and relations; do not emit empty list objects."
     )
 
 
@@ -414,16 +425,236 @@ def _instruction_repair_prompt(
     normalized: str,
     original_payload: dict,
     validation_errors: list[str],
+    protected_destinations: list[str],
 ) -> str:
     return (
         _instruction_user_prompt(normalized)
-        + "\nThe previous JSON failed deterministic validation. Repair it without changing the instruction meaning.\n"
-        + "MANDATORY FINAL CHECK: collect every target from route_steps whose step_type is GO_TO, "
-        + "then remove all entities with those labels from scene_context.context_objects. "
-        + "The intersection of those two label sets must be empty.\n"
+        + "\nThe previous JSON failed deterministic validation. Repair only invalid fields "
+        + "without changing instruction meaning or route order.\n"
+        + "Never fix validation by deleting a commanded destination. "
+        + f"These previously declared destinations must remain GO_TO steps: "
+        + f"{json.dumps(protected_destinations, ensure_ascii=True)}.\n"
+        + "A phrase commanding travel to an object must remain GO_TO that object. "
+        + "Remove GO_TO targets from scene_context.context_objects instead of deleting route steps.\n"
         + f"Validation errors: {json.dumps(validation_errors, ensure_ascii=True)}\n"
         + f"Previous JSON: {json.dumps(original_payload, ensure_ascii=True)}"
     )
+
+
+def _declared_destination_labels(payload: dict) -> list[str]:
+    """Collect destination evidence before deterministic compilation or repair."""
+    if not isinstance(payload, dict):
+        return []
+    labels: list[str] = []
+    for item in payload.get("navigation_targets", []):
+        if isinstance(item, dict):
+            labels.append(_canonical_label(item.get("canonical_label")))
+    for step in payload.get("route_steps", []):
+        if not isinstance(step, dict):
+            continue
+        step_type = str(step.get("step_type", "")).strip().upper()
+        if step_type in {"GO_TO", "TRAVERSE"}:
+            labels.append(_canonical_label(step.get("target")))
+    return _dedupe_keep_order(labels)
+
+
+def _compile_instruction_payload(payload: dict) -> dict:
+    """Compile the compact model draft into the strict internal schema."""
+    if not isinstance(payload, dict):
+        return payload
+    compiled = dict(payload)
+    compiled["schema_version"] = INSTRUCTION_SCHEMA_VERSION
+    route_payload = payload.get("route_steps")
+    if not isinstance(route_payload, list):
+        return compiled
+
+    compiled_steps: list = []
+    navigation_targets: list[dict[str, str]] = []
+    seen_targets: set[str] = set()
+    for index, raw_step in enumerate(route_payload):
+        if not isinstance(raw_step, dict):
+            compiled_steps.append(raw_step)
+            continue
+        step = dict(raw_step)
+        step_type = str(step.get("step_type", "")).strip().upper()
+        target = _canonical_label(step.get("target"))
+        if step_type == "TRAVERSE" and not target:
+            target = _infer_traverse_destination(
+                source_span=str(step.get("source_span", "")),
+                cues=step.get("cues"),
+            )
+        # A directional segment with an object destination is GO_TO, not TRAVERSE.
+        if step_type == "TRAVERSE" and target:
+            step_type = "GO_TO"
+        step["step_type"] = step_type
+        step["step_id"] = _canonical_token(step.get("step_id")) or f"step_{index + 1}"
+        step["source_span"] = str(step.get("source_span", "")).strip()
+        step["target"] = target
+        step["from_region"] = _canonical_label(step.get("from_region"))
+        step["to_region"] = _canonical_label(step.get("to_region"))
+        step["transition"] = str(step.get("transition", "")).strip().lower()
+        step["direction"] = (
+            str(step.get("direction", "none")).strip().lower() or "none"
+        )
+        if (
+            step_type == "GO_TO"
+            and step["direction"] == "none"
+            and re.search(r"\b(?:forward|straight)\b", step["source_span"], re.IGNORECASE)
+        ):
+            step["direction"] = "forward"
+
+        trigger = step.get("trigger")
+        if not isinstance(trigger, dict):
+            trigger = {
+                "trigger_type": "NONE" if index == 0 else "AFTER_PREVIOUS_STEP",
+                "label": "",
+            }
+        step["trigger"] = trigger
+
+        cues = _compile_cues(
+            step.get("cues"),
+            step_type=step_type,
+            to_region=step["to_region"],
+            source_span=step["source_span"],
+        )
+        relations = _compile_relations(step.get("relations"), target=target)
+        if step_type == "GO_TO":
+            cues = []
+            step["completion"] = "SEMANTIC_AND_DISTANCE"
+            if target and target not in seen_targets:
+                navigation_targets.append(
+                    {
+                        "canonical_label": target,
+                        "source_span": step["source_span"],
+                    }
+                )
+                seen_targets.add(target)
+        elif step_type == "TRAVERSE":
+            step["completion"] = (
+                "CUE_PASSED"
+                if any(item.get("role") == "PASS_CUE" for item in cues)
+                else "NEXT_EVENT_CONFIRMED"
+            )
+            relations = []
+        elif step_type == "REGION_TRANSITION":
+            step["completion"] = (
+                "REGION_CHANGED"
+                if step["to_region"]
+                in {"", "outside_current_region", "adjacent_region", "unknown"}
+                else "NAMED_REGION_CONFIRMED"
+            )
+            relations = []
+        elif step_type == "TURN":
+            step["completion"] = "HEADING_ALIGNED"
+            relations = []
+        step["cues"] = cues
+        step["relations"] = relations
+        step["constraints"] = _clean_string_list(step.get("constraints"))
+        compiled_steps.append(step)
+
+    compiled["route_steps"] = compiled_steps
+    compiled["navigation_targets"] = navigation_targets
+    return compiled
+
+
+def _compile_cues(
+    value,
+    *,
+    step_type: str,
+    to_region: str,
+    source_span: str,
+) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    compiled: list[dict[str, str]] = []
+    role_by_type = {
+        "pass": "PASS_CUE",
+        "turn": "TURN_CUE",
+        "transition": "TRANSITION_CUE",
+        "context": "CONTEXT_CUE",
+    }
+    for item in value:
+        if not isinstance(item, dict):
+            compiled.append(item)
+            continue
+        label = _canonical_label(item.get("label"))
+        if not _is_groundable_label(label):
+            continue
+        if step_type == "TURN" and label not in _canonical_label(source_span):
+            continue
+        role = str(item.get("role", "")).strip().upper()
+        if role not in SUPPORTED_CUE_ROLES:
+            role = role_by_type.get(
+                str(item.get("cue_type", "")).strip().lower(),
+                "",
+            )
+        if step_type == "TURN":
+            role = "TURN_CUE"
+        elif step_type == "TRAVERSE" and role not in {"PASS_CUE", "CONTEXT_CUE"}:
+            role = "PASS_CUE"
+        elif step_type == "REGION_TRANSITION" and role not in {
+            "PASS_CUE",
+            "TRANSITION_CUE",
+            "CONTEXT_CUE",
+        }:
+            role = (
+                "TRANSITION_CUE"
+                if label == _canonical_label(to_region)
+                else "PASS_CUE"
+            )
+        elif role not in SUPPORTED_CUE_ROLES:
+            role = "CONTEXT_CUE"
+        compiled.append(
+            {
+                "label": label,
+                "role": role,
+                "expected_side": (
+                    str(item.get("expected_side", "none")).strip().lower()
+                    or "none"
+                ),
+                "source_span": str(item.get("source_span", "")).strip(),
+            }
+        )
+    return compiled
+
+
+def _infer_traverse_destination(*, source_span: str, cues) -> str:
+    """Recover an object destination that the model misplaced in TRAVERSE.cues."""
+    source = _canonical_label(source_span)
+    if not source or not isinstance(cues, list):
+        return ""
+    for item in cues:
+        if not isinstance(item, dict):
+            continue
+        label = _canonical_label(item.get("label"))
+        if not _is_groundable_label(label):
+            continue
+        escaped = re.escape(label)
+        if re.search(
+            rf"\b(?:to|toward|towards|near|approach|reach|find)\s+(?:the\s+)?{escaped}\b",
+            source,
+        ):
+            return label
+    return ""
+
+
+def _compile_relations(value, *, target: str) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    compiled: list[dict[str, str]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            compiled.append(item)
+            continue
+        compiled.append(
+            {
+                "target": target,
+                "relation": str(item.get("relation", "")).strip().upper(),
+                "reference": _canonical_label(item.get("reference")),
+                "source_span": str(item.get("source_span", "")).strip(),
+            }
+        )
+    return compiled
 
 
 def _canonicalize_context_target_overlap(payload: dict) -> tuple[dict, list[str]]:
@@ -477,6 +708,7 @@ def _context_from_payload(
     if not isinstance(payload, dict):
         payload = {}
         errors.append("root must be an object")
+    payload = _compile_instruction_payload(payload)
     if str(payload.get("schema_version", "")).strip() != INSTRUCTION_SCHEMA_VERSION:
         errors.append(
             f"schema_version must be {INSTRUCTION_SCHEMA_VERSION}"
@@ -846,6 +1078,23 @@ def _canonical_label(value) -> str:
     text = str(value or "").strip().lower()
     text = re.sub(r"\s+", " ", text)
     return text
+
+
+def _is_groundable_label(value) -> bool:
+    label = _canonical_label(value)
+    if not label or label in {
+        "left",
+        "right",
+        "forward",
+        "backward",
+        "straight",
+        "stop",
+    }:
+        return False
+    return re.match(
+        r"^(?:turn|go|move|walk|continue|proceed|head|rotate|stop|enter|exit)\b",
+        label,
+    ) is None
 
 
 def _canonical_token(value) -> str:

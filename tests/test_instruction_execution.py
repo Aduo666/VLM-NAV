@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from vln_nav.navigation.instruction_manager import (
     INSTRUCTION_SCHEMA_VERSION,
     InstructionManager,
+    InstructionPlanError,
     RouteStep,
 )
 from vln_nav.navigation.observation_adapter import Pose2D
@@ -53,6 +54,156 @@ def _logger() -> logging.Logger:
 
 
 class InstructionExecutionTest(unittest.TestCase):
+    def test_compact_hospital_draft_preserves_both_destinations(self) -> None:
+        payload = {
+            "schema_version": INSTRUCTION_SCHEMA_VERSION,
+            "scene_context": {
+                "current_region": None,
+                "context_objects": [],
+            },
+            "route_steps": [
+                {
+                    "step_type": "GO_TO",
+                    "source_span": "Go forward to the wheelchair",
+                    "target": "wheelchair",
+                    "cues": [
+                        {
+                            "label": "wheelchair",
+                            "cue_type": "pass",
+                            "expected_side": "none",
+                            "source_span": "Go forward to the wheelchair",
+                        }
+                    ],
+                    "relations": [],
+                },
+                {
+                    "step_type": "TURN",
+                    "source_span": "then turn left",
+                    "target": "",
+                    "direction": "left",
+                    "cues": [
+                        {
+                            "label": "wheelchair",
+                            "cue_type": "turn",
+                            "expected_side": "none",
+                            "source_span": "Go forward to the wheelchair",
+                        }
+                    ],
+                    "relations": [],
+                },
+                {
+                    "step_type": "TRAVERSE",
+                    "source_span": "continue straight to the stairs",
+                    "cues": [
+                        {
+                            "label": "stairs",
+                            "cue_type": "pass",
+                            "expected_side": "none",
+                            "source_span": "continue straight to the stairs",
+                        }
+                    ],
+                    "relations": [],
+                },
+            ],
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            plan = InstructionManager(
+                llm_client=_FakeLLM([payload]),
+                logger=_logger(),
+                cache_path=Path(temp_dir) / "plans.json",
+            ).parse(
+                "Go forward to the wheelchair, then turn left and continue straight to the stairs."
+            )
+
+        self.assertEqual(
+            [step.step_type for step in plan.route_steps],
+            ["GO_TO", "TURN", "GO_TO"],
+        )
+        self.assertEqual(plan.navigation_target_labels, ["wheelchair", "stairs"])
+        self.assertEqual(plan.route_steps[1].perception_target, "")
+
+    def test_repair_cannot_delete_a_declared_destination(self) -> None:
+        invalid = {
+            "schema_version": INSTRUCTION_SCHEMA_VERSION,
+            "scene_context": {"current_region": None, "context_objects": []},
+            "navigation_targets": [
+                {"canonical_label": "wheelchair", "source_span": "wheelchair"},
+                {"canonical_label": "stairs", "source_span": "stairs"},
+            ],
+            "route_steps": [
+                {
+                    "step_type": "GO_TO",
+                    "source_span": "go to the wheelchair",
+                    "target": "wheelchair",
+                    "direction": "forward",
+                },
+                {
+                    "step_type": "TRAVERSE",
+                    "source_span": "continue straight to the stairs",
+                    "direction": "none",
+                },
+            ],
+        }
+        semantically_incomplete_repair = {
+            "schema_version": INSTRUCTION_SCHEMA_VERSION,
+            "scene_context": {"current_region": None, "context_objects": []},
+            "route_steps": [
+                {
+                    "step_type": "GO_TO",
+                    "source_span": "go to the wheelchair",
+                    "target": "wheelchair",
+                    "direction": "forward",
+                    "cues": [],
+                    "relations": [],
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = InstructionManager(
+                llm_client=_FakeLLM([invalid, semantically_incomplete_repair]),
+                logger=_logger(),
+                cache_path=Path(temp_dir) / "plans.json",
+            )
+            with self.assertRaisesRegex(
+                InstructionPlanError,
+                "repair removed declared navigation destinations",
+            ):
+                manager.parse(
+                    "Go to the wheelchair, then continue straight to the stairs."
+                )
+
+    def test_action_phrase_cue_is_not_a_grounding_target(self) -> None:
+        payload = {
+            "schema_version": INSTRUCTION_SCHEMA_VERSION,
+            "scene_context": {"current_region": None, "context_objects": []},
+            "route_steps": [
+                {
+                    "step_type": "TURN",
+                    "source_span": "turn left",
+                    "target": "",
+                    "direction": "left",
+                    "cues": [
+                        {
+                            "label": "turn left",
+                            "cue_type": "turn",
+                            "expected_side": "left",
+                            "source_span": "turn left",
+                        }
+                    ],
+                    "relations": [],
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            plan = InstructionManager(
+                llm_client=_FakeLLM([payload]),
+                logger=_logger(),
+                cache_path=Path(temp_dir) / "plans.json",
+            ).parse("Turn left.")
+
+        self.assertEqual(plan.route_steps[0].cues, ())
+        self.assertEqual(plan.route_steps[0].perception_target, "")
+
     def test_invalid_json_uses_exactly_one_repair_call(self) -> None:
         repaired_payload = {
             "schema_version": INSTRUCTION_SCHEMA_VERSION,

@@ -3348,37 +3348,20 @@ def _save_global_occupancy_debug(
         evidence = str(getattr(entry, "evidence_level", "")).strip().lower()
         confirmed = bool(getattr(entry, "confirmed", False)) or evidence == "confirmed"
         label = str(getattr(entry, "label", "landmark"))
-        role = str(getattr(entry, "semantic_role", "GOAL"))
         if reached or passed:
             color = (40, 235, 95)
             draw.ellipse((lx - 11, ly - 11, lx + 11, ly + 11), fill=color, outline=(255, 255, 255), width=3)
             draw.line((lx - 6, ly, lx - 1, ly + 6), fill=(0, 0, 0), width=3)
             draw.line((lx - 1, ly + 6, lx + 8, ly - 7), fill=(0, 0, 0), width=3)
-            status_text = "REACHED" if reached else "PASSED"
-            draw.text(
-                (lx + 13, ly - 10),
-                f"{label} {role} {status_text}",
-                fill=color,
-                font=font_label,
-            )
+            draw.text((lx + 13, ly - 10), f"{label} DONE", fill=color, font=font_label)
         elif confirmed:
             color = (220, 60, 220)
             draw.ellipse((lx - 9, ly - 9, lx + 9, ly + 9), fill=color, outline=(255, 255, 255), width=2)
-            draw.text(
-                (lx + 11, ly - 10),
-                f"{label} {role} confirmed",
-                fill=color,
-                font=font_label,
-            )
+            draw.text((lx + 11, ly - 10), f"{label} confirmed", fill=color, font=font_label)
         else:
             color = (255, 175, 40)
             draw.ellipse((lx - 7, ly - 7, lx + 7, ly + 7), outline=color, width=3)
-            draw.text(
-                (lx + 10, ly - 10),
-                f"{label} {role} observed",
-                fill=color,
-                font=font_label,
-            )
+            draw.text((lx + 10, ly - 10), f"{label} potential", fill=color, font=font_label)
 
     yaw = float(robot_pose.yaw_rad)
     robot_x = float(robot_pose.x)

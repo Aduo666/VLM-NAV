@@ -97,20 +97,10 @@ primitives:
   settle_angular_speed_threshold_radps: 0.08
   settle_stable_duration_sec: 0.15
 
-motion_model:
-  type: "biped_in_place"
-  turn_drift_margin_m: 0.08
-  sweep_resolution_deg: 2.5
-
 geometry:
-  # Conservative approximate body envelope: 0.56 m long x 0.48 m wide.
-  footprint_polygon_xy_m:
-    - [0.28, 0.24]
-    - [-0.28, 0.24]
-    - [-0.28, -0.24]
-    - [0.28, -0.24]
-  safety_margin_m: 0.05
   obstacle_stop_distance_m: 0.30
+  map_inflation_radius_m: 0.40
+  path_corridor_radius_m: 0.38
 
 safety:
   fall_detection_enabled: true

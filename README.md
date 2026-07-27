@@ -49,7 +49,7 @@ English instruction
        persistent semantic landmark anchors
   -> primitive-aligned candidate table
   -> VLM selects one valid candidate/action
-  -> PrimitiveSafetyEvaluator checks the robot-specific swept footprint
+  -> DepthSafetyMonitor checks front/left/right RGB-D and LiDAR clearance
   -> AGX 4WS controller or Unitree G1 locomotion policy
   -> odometry-verified primitive completion
   -> next decision keyframe
@@ -85,24 +85,24 @@ The VLM does not receive the occupancy image. Its navigation request contains:
 - A clean, uncropped first-person RGB frame.
 - The current typed route step and progress history.
 - Structured landmark and topology summaries.
-- Candidate heading, distance, map reachability, repetition cost, and primitive safety.
+- Candidate heading, distance, map reachability, and repetition cost.
 - A concise capability description for the selected robot profile.
 
 The occupancy image remains available in `debug/local/vln_debug.png` for human inspection.
 
 ### Robot-Aware Safety
 
-`PrimitiveSafetyEvaluator` is the single pre-execution safety authority. It sweeps the selected
-robot profile’s footprint polygon through the complete primitive:
+`DepthSafetyMonitor` is the runtime obstacle-avoidance gate. It combines robust depth statistics
+from front/left/right image regions with the corresponding LiDAR sector distances:
 
-- Translation sweep for `FORWARD` and internal recovery `BACKWARD`.
-- Rotation sweep for `TURN_LEFT` and `TURN_RIGHT`.
-- Current LiDAR hits and raw occupied cells are both checked.
-- Unknown occupancy cells do not hard-block an in-place turn.
-- G1 adds a larger turn-drift margin than AGX.
+- `FORWARD` stops at the robot profile's obstacle threshold and slows in the near field.
+- `TURN_LEFT` checks front and left clearance.
+- `TURN_RIGHT` checks front and right clearance.
+- A short near-field memory prevents one missing sensor frame from immediately clearing an obstacle.
+- Repeated safety holds cancel the active primitive and invoke the existing recovery path.
 
-The runtime performs the same check immediately before applying a command. A rejected command is
-changed to a safety hold, the active primitive is cancelled, and the next fresh frame replans.
+Robot profiles retain scalar stop, map-inflation, and candidate-corridor radii. The experimental
+polygon footprint and full primitive sweep are not part of the active navigation path.
 
 ## Requirements
 

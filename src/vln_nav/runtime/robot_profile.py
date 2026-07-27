@@ -10,7 +10,6 @@ import yaml
 PROFILE_SCHEMA_VERSION = "2.0"
 SUPPORTED_PROFILES = {"agx", "unitree_g1_29dof"}
 SUPPORTED_CONTROLLER_TYPES = {"agx_4ws", "unitree_g1_policy"}
-SUPPORTED_MOTION_MODELS = {"spin_4ws", "biped_in_place"}
 
 
 @dataclass(frozen=True)
@@ -103,33 +102,10 @@ class PrimitiveProfile:
 
 
 @dataclass(frozen=True)
-class RobotMotionModelProfile:
-    model_type: str
-    turn_drift_margin_m: float
-    sweep_resolution_deg: float
-
-
-@dataclass(frozen=True)
 class RobotGeometryProfile:
-    footprint_polygon_xy_m: tuple[tuple[float, float], ...]
-    safety_margin_m: float
     obstacle_stop_distance_m: float
-
-    @property
-    def front_extent_m(self) -> float:
-        return max(point[0] for point in self.footprint_polygon_xy_m)
-
-    @property
-    def rear_extent_m(self) -> float:
-        return abs(min(point[0] for point in self.footprint_polygon_xy_m))
-
-    @property
-    def half_width_m(self) -> float:
-        return max(abs(point[1]) for point in self.footprint_polygon_xy_m)
-
-    @property
-    def circumscribed_radius_m(self) -> float:
-        return max((point[0] ** 2 + point[1] ** 2) ** 0.5 for point in self.footprint_polygon_xy_m)
+    map_inflation_radius_m: float
+    path_corridor_radius_m: float
 
 
 @dataclass(frozen=True)
@@ -177,7 +153,6 @@ class RobotProfile:
     simulation: RobotSimulationProfile
     sensors: RobotSensorProfile
     primitives: PrimitiveProfile
-    motion_model: RobotMotionModelProfile
     geometry: RobotGeometryProfile
     safety: RobotSafetyProfile
     agx_controller: AgxControllerProfile | None
@@ -190,7 +165,7 @@ class RobotProfile:
     def capability_summary(self) -> str:
         platform = "biped humanoid" if self.is_g1 else "four-wheel-steering wheeled robot"
         return (
-            f"platform={platform}; motion_model={self.motion_model.model_type}; "
+            f"platform={platform}; "
             f"FORWARD={self.primitives.forward_distance_m:.2f}m; "
             f"TURN_LEFT/RIGHT={self.primitives.turn_angle_deg:.1f}deg"
         )
@@ -221,7 +196,6 @@ def load_robot_profile(*, profile_name: str, project_root: Path) -> RobotProfile
             "sensors",
             "controller",
             "primitives",
-            "motion_model",
             "geometry",
             "safety",
         },
@@ -323,27 +297,15 @@ def load_robot_profile(*, profile_name: str, project_root: Path) -> RobotProfile
         context=f"{normalized_name}.primitives",
     )
 
-    motion_data = _mapping(payload, "motion_model", normalized_name)
-    _require_exact_keys(
-        motion_data,
-        required={"type", "turn_drift_margin_m", "sweep_resolution_deg"},
-        context=f"{normalized_name}.motion_model",
-    )
-    motion_model_type = str(motion_data["type"]).strip()
-    if motion_model_type not in SUPPORTED_MOTION_MODELS:
-        raise ValueError(
-            f"{normalized_name}.motion_model.type must be one of {sorted(SUPPORTED_MOTION_MODELS)}"
-        )
-
     geometry_data = _mapping(payload, "geometry", normalized_name)
     _require_exact_keys(
         geometry_data,
-        required={"footprint_polygon_xy_m", "safety_margin_m", "obstacle_stop_distance_m"},
+        required={
+            "obstacle_stop_distance_m",
+            "map_inflation_radius_m",
+            "path_corridor_radius_m",
+        },
         context=f"{normalized_name}.geometry",
-    )
-    footprint_polygon = _footprint_polygon(
-        geometry_data["footprint_polygon_xy_m"],
-        context=f"{normalized_name}.geometry.footprint_polygon_xy_m",
     )
 
     safety_data = _mapping(payload, "safety", normalized_name)
@@ -493,20 +455,17 @@ def load_robot_profile(*, profile_name: str, project_root: Path) -> RobotProfile
                 primitives_data["settle_stable_duration_sec"], "settle_stable_duration_sec"
             ),
         ),
-        motion_model=RobotMotionModelProfile(
-            model_type=motion_model_type,
-            turn_drift_margin_m=_nonnegative_float(
-                motion_data["turn_drift_margin_m"], "motion_model.turn_drift_margin_m"
-            ),
-            sweep_resolution_deg=_positive_float(
-                motion_data["sweep_resolution_deg"], "motion_model.sweep_resolution_deg"
-            ),
-        ),
         geometry=RobotGeometryProfile(
-            footprint_polygon_xy_m=footprint_polygon,
-            safety_margin_m=_nonnegative_float(geometry_data["safety_margin_m"], "geometry.safety_margin_m"),
             obstacle_stop_distance_m=_positive_float(
                 geometry_data["obstacle_stop_distance_m"], "geometry.obstacle_stop_distance_m"
+            ),
+            map_inflation_radius_m=_nonnegative_float(
+                geometry_data["map_inflation_radius_m"],
+                "geometry.map_inflation_radius_m",
+            ),
+            path_corridor_radius_m=_nonnegative_float(
+                geometry_data["path_corridor_radius_m"],
+                "geometry.path_corridor_radius_m",
             ),
         ),
         safety=RobotSafetyProfile(
@@ -541,32 +500,6 @@ def _validate_profile_files(profile: RobotProfile) -> None:
             raise FileNotFoundError(f"G1 policy does not exist: {controller.policy_path}")
         if not controller.deploy_config_path.is_file():
             raise FileNotFoundError(f"G1 deploy config does not exist: {controller.deploy_config_path}")
-        if profile.motion_model.model_type != "biped_in_place":
-            raise ValueError("G1 motion_model.type must be 'biped_in_place'")
-    elif profile.motion_model.model_type != "spin_4ws":
-        raise ValueError("AGX motion_model.type must be 'spin_4ws'")
-
-
-def _footprint_polygon(value: Any, *, context: str) -> tuple[tuple[float, float], ...]:
-    if not isinstance(value, list) or len(value) < 3:
-        raise ValueError(f"{context} must contain at least three [x, y] vertices")
-    points: list[tuple[float, float]] = []
-    for index, item in enumerate(value):
-        if not isinstance(item, (list, tuple)) or len(item) != 2:
-            raise ValueError(f"{context}[{index}] must be [x, y]")
-        points.append((float(item[0]), float(item[1])))
-    signed_twice_area = sum(
-        points[index][0] * points[(index + 1) % len(points)][1]
-        - points[(index + 1) % len(points)][0] * points[index][1]
-        for index in range(len(points))
-    )
-    if signed_twice_area <= 0.0:
-        raise ValueError(
-            f"{context} vertices must be counter-clockwise in robot frame (x forward, y left)"
-        )
-    if abs(signed_twice_area) < 1e-4:
-        raise ValueError(f"{context} area is too small")
-    return tuple(points)
 
 
 def _mapping(payload: dict[str, Any], key: str, context: str) -> dict[str, Any]:

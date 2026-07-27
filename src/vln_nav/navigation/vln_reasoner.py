@@ -348,12 +348,6 @@ def _candidate_line(candidate: WaypointCandidate) -> str:
     primitive_action = candidate_primitive_action_name(candidate)
     occupancy_reason = str(candidate.depth_support.get("occupancy_reason", "not_checked"))
     occupancy_path_length = float(candidate.depth_support.get("occupancy_path_length_m", 0.0))
-    primitive_safety_reason = str(
-        candidate.depth_support.get("primitive_safety_reason", "not_checked")
-    )
-    primitive_safety_risk = float(
-        candidate.depth_support.get("primitive_safety_risk", 0.0)
-    )
     free_ratio = float(candidate.depth_support.get("free_ratio", 0.0))
     near_depth_m = float(candidate.depth_support.get("min_depth", 0.0))
     min_clearance_m = float(candidate.depth_support.get("min_clearance_m", near_depth_m))
@@ -378,9 +372,7 @@ def _candidate_line(candidate: WaypointCandidate) -> str:
         f"anchor_distance_delta_m={anchor_delta_m} "
         f"median_depth_m={candidate.depth_support.get('median_depth', 0.0):.2f} "
         f"map_reachability={occupancy_reason} "
-        f"planned_path_m={occupancy_path_length:.2f} "
-        f"primitive_safety={primitive_safety_reason} "
-        f"primitive_risk={primitive_safety_risk:.2f}"
+        f"planned_path_m={occupancy_path_length:.2f}"
     )
 
 

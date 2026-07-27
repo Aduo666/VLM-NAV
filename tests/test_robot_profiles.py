@@ -28,6 +28,10 @@ class RobotProfileTest(unittest.TestCase):
         self.assertAlmostEqual(g1.primitives.turn_command, 1.0)
         self.assertEqual(g1.sensors.observer_camera_prim_path, "pelvis/observeCamera")
         self.assertEqual(g1.sensors.lidar_prim_path, "pelvis/Lidar")
+        self.assertAlmostEqual(agx.geometry.obstacle_stop_distance_m, 0.65)
+        self.assertAlmostEqual(g1.geometry.obstacle_stop_distance_m, 0.30)
+        self.assertGreater(agx.geometry.path_corridor_radius_m, 0.0)
+        self.assertGreater(g1.geometry.path_corridor_radius_m, 0.0)
 
     def test_minimal_config_switches_to_g1_without_robot_overrides(self) -> None:
         with tempfile.NamedTemporaryFile("w", suffix=".yaml", encoding="utf-8") as handle:

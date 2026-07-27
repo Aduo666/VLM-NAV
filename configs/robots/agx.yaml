@@ -76,20 +76,10 @@ primitives:
   settle_angular_speed_threshold_radps: 0.0
   settle_stable_duration_sec: 0.0
 
-motion_model:
-  type: "spin_4ws"
-  turn_drift_margin_m: 0.02
-  sweep_resolution_deg: 2.5
-
 geometry:
-  # Conservative approximate chassis envelope: 1.00 m long x 0.70 m wide.
-  footprint_polygon_xy_m:
-    - [0.55, 0.35]
-    - [-0.45, 0.35]
-    - [-0.45, -0.35]
-    - [0.55, -0.35]
-  safety_margin_m: 0.06
   obstacle_stop_distance_m: 0.65
+  map_inflation_radius_m: 0.26
+  path_corridor_radius_m: 0.30
 
 safety:
   fall_detection_enabled: false

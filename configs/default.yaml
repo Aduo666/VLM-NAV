@@ -127,6 +127,10 @@ mapping:
     recent_node_count: 8
 
 navigation:
+  safety:
+    obstacle_avoidance_enabled: true
+    near_field_memory_enabled: true
+    near_field_memory_sec: 2.0
   candidates:
     max_candidates: 3
     min_distance_m: 0.55

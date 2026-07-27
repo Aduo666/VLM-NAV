@@ -260,7 +260,15 @@ class RecoveryRuntimeConfig:
 
 
 @dataclass
+class NavigationSafetyConfig:
+    obstacle_avoidance_enabled: bool
+    near_field_memory_enabled: bool
+    near_field_memory_sec: float
+
+
+@dataclass
 class NavigationConfig:
+    safety: NavigationSafetyConfig
     candidates: CandidateGenerationConfig
     policy: NavigationPolicyRuntimeConfig
     progress: ProgressRuntimeConfig

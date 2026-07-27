@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 import os
@@ -16,6 +15,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 from ..control.locomotion import create_locomotion_controller
 from ..navigation.candidate_waypoint_predictor import CandidateWaypointPredictor, CandidateWaypointPredictorConfig
+from ..navigation.depth_safety import DepthSafetyConfig, DepthSafetyMonitor
 from ..navigation.instruction_manager import InstructionContext, InstructionManager
 from ..navigation.landmark_map import LandmarkMap, LandmarkMapConfig, LandmarkMapEntry
 from ..navigation.landmark_tracker import LandmarkState, LandmarkTracker, LandmarkTrackerConfig
@@ -24,7 +24,6 @@ from ..navigation.map_candidate_generator import MapCandidateGenerator, MapCandi
 from ..navigation.occupancy_grid import GlobalOccupancyMap, OccupancyGridConfig
 from ..navigation.observation_adapter import ObservationAdapter
 from ..navigation.odometry import SimOdometrySensor
-from ..navigation.primitive_safety import PrimitiveSafetyEvaluator
 from ..navigation.progress_manager import ProgressManager
 from ..navigation.spatial_transform import log_spatial_transform_self_check
 from ..navigation.stuck_detector import StuckDetector, StuckDetectorConfig
@@ -36,16 +35,6 @@ from ..navigation.vln_policy import ExecutionFeedback, PolicyStepResult, VLNPoli
 from ..navigation.vln_reasoner import VLNReasoner
 from ..runtime.config import DEFAULT_CONFIG_PATH, PROJECT_ROOT, AppConfig, load_config, setup_logging
 from ..runtime.debug_video import DebugVideoRecorder
-
-
-@dataclass(frozen=True)
-class _RuntimeSafetyDecision:
-    action_name: str
-    speed_scale: float
-    overridden: bool
-    reason: str
-    source: str
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="CAPTAINav Isaac Sim VLN runtime")
@@ -556,6 +545,28 @@ def run_navigation(
         ),
         logger=logger,
     )
+    depth_safety_monitor = DepthSafetyMonitor(
+        config=DepthSafetyConfig(
+            enabled=bool(config.navigation.safety.obstacle_avoidance_enabled),
+            stop_distance_m=float(config.robot.geometry.obstacle_stop_distance_m),
+            roi_vertical_range=(
+                float(config.robot.sensors.camera.obstacle_roi_vertical_range[0]),
+                float(config.robot.sensors.camera.obstacle_roi_vertical_range[1]),
+            ),
+            center_width_ratio=float(
+                config.robot.sensors.camera.obstacle_center_width_ratio
+            ),
+            side_width_ratio=float(
+                config.robot.sensors.camera.obstacle_side_width_ratio
+            ),
+            near_field_memory_enabled=bool(
+                config.navigation.safety.near_field_memory_enabled
+            ),
+            near_field_memory_sec=float(
+                config.navigation.safety.near_field_memory_sec
+            ),
+        )
+    )
     stuck_detector = StuckDetector(
         config=StuckDetectorConfig(
             window_sec=float(config.navigation.recovery.stuck_window_sec),
@@ -700,10 +711,7 @@ def run_navigation(
             update_period_sec=float(config.mapping.occupancy.update_period_sec),
             min_range_m=float(config.robot.sensors.lidar.min_range_m),
             max_range_m=float(config.robot.sensors.lidar.max_range_m),
-            inflation_radius_m=(
-                float(config.robot.geometry.circumscribed_radius_m)
-                + float(config.robot.geometry.safety_margin_m)
-            ),
+            inflation_radius_m=float(config.robot.geometry.map_inflation_radius_m),
             occupied_min_neighbors=int(config.mapping.occupancy.occupied_min_neighbors),
             unknown_is_traversable=bool(config.mapping.occupancy.unknown_is_traversable),
             unknown_cell_cost=float(config.mapping.occupancy.unknown_cell_cost),
@@ -711,10 +719,6 @@ def run_navigation(
             semantic_goal_min_step_m=float(config.mapping.occupancy.semantic_goal_min_step_m),
             semantic_goal_lateral_search_m=float(config.mapping.occupancy.semantic_goal_lateral_search_m),
         ),
-        logger=logger,
-    )
-    primitive_safety = PrimitiveSafetyEvaluator(
-        profile=config.robot,
         logger=logger,
     )
     _g1_lidar_robot_frame_path = None
@@ -745,7 +749,7 @@ def run_navigation(
             max_candidates=int(config.navigation.candidates.max_candidates),
             min_distance_m=float(config.navigation.candidates.min_distance_m),
             max_distance_m=float(config.navigation.candidates.max_distance_m),
-            min_clearance_m=float(config.robot.geometry.safety_margin_m),
+            min_clearance_m=float(config.robot.geometry.path_corridor_radius_m),
             unknown_gain_weight=float(config.navigation.candidates.unknown_gain_weight),
             semantic_weight=float(config.navigation.candidates.semantic_weight),
         ),
@@ -761,7 +765,6 @@ def run_navigation(
         candidate_predictor=candidate_predictor,
         occupancy_grid=occupancy_grid,
         map_candidate_generator=map_candidate_generator,
-        safety_evaluator=primitive_safety,
         progress_manager=progress_manager,
         reasoner=reasoner,
         config=VLNPolicyConfig(
@@ -1043,7 +1046,7 @@ def run_navigation(
         logger=logger,
     )
     logger.info(
-        "[RobotProfile] name=%s type=%s usd=%s physics_dt=%.4f render_dt=%.4f decimation=%s spawn_z=%.2f motion_model=%s",
+        "[RobotProfile] name=%s type=%s usd=%s physics_dt=%.4f render_dt=%.4f decimation=%s spawn_z=%.2f",
         config.robot.name,
         config.robot.robot_type,
         config.robot.asset.usd_path,
@@ -1051,7 +1054,6 @@ def run_navigation(
         float(config.robot.simulation.rendering_dt),
         int(config.robot.simulation.policy_decimation),
         float(config.robot.spawn_z_m),
-        config.robot.motion_model.model_type,
     )
     logger.info(
         "[OdomConfig] source=isaac_world_pose primitive_completion=odom_or_timeout forward_distance=%.2fm turn_angle=%.1fdeg tolerance=%.1fdeg",
@@ -1131,6 +1133,7 @@ def run_navigation(
     depth_warning_emitted = False
     depth_debug_save_pending = False
     last_safety_log_signature: tuple[str, str] | None = None
+    runtime_safety_hold_streak = 0
     runtime_approach_hold_streak = 0
     last_nav_debug_save_time = 0.0
     last_depth_debug_save_time = 0.0
@@ -1322,12 +1325,9 @@ def run_navigation(
             pose=mapping_pose,
             timestamp_sec=sim_time_sec,
         )
-        current_lidar_points = np.zeros((0, 2), dtype=np.float32)
         if lidar_scan is not None:
             current_beam_endpoints = getattr(lidar_scan, "current_beam_endpoints_local_xy", lidar_scan.beam_endpoints_local_xy)
             current_beam_hits = getattr(lidar_scan, "current_beam_hit_mask", lidar_scan.beam_hit_mask)
-            current_points = getattr(lidar_scan, "current_points_local_xy", lidar_scan.points_local_xy)
-            current_lidar_points = np.asarray(current_points, dtype=np.float32)
             current_beam_endpoints_np = np.asarray(current_beam_endpoints, dtype=np.float32)
             current_beam_hits_np = np.asarray(current_beam_hits, dtype=bool).reshape(-1)
             if (
@@ -1375,12 +1375,6 @@ def run_navigation(
                 "sensor_path": lidar_reader.sensor_path,
                 "point_count": 0,
             }
-        primitive_safety.update_environment(
-            robot_pose=mapping_pose,
-            current_lidar_points_local_xy=current_lidar_points,
-            occupancy_snapshot=occupancy_grid.snapshot(),
-        )
-
         current_lidar_fov_deg = 0.0 if lidar_scan is None else float(lidar_scan.effective_fov_deg)
         bootstrap_min_fov_deg = max(0.0, float(config.mapping.occupancy.lidar_bootstrap_min_fov_deg))
         bootstrap_fov_ready = (
@@ -1506,31 +1500,40 @@ def run_navigation(
                 if completed_key and completed_key not in landmark_map_reached_synced:
                     landmark_map.mark_reached(completed_key, timestamp_sec=sim_time_sec)
                     landmark_map_reached_synced.add(completed_key)
-            safety_decision = _runtime_safety_decision(
-                evaluator=primitive_safety,
+            safety_decision = depth_safety_monitor.apply(
+                observation=observation,
                 action_name=step_result.action_name,
                 speed_scale=step_result.speed_scale,
-            )
-            policy.record_safety_result(
-                overridden=bool(safety_decision.overridden),
-                desired_action=step_result.action_name,
-                applied_action=safety_decision.action_name,
-                reason=safety_decision.reason,
+                local_goal_xy=step_result.local_goal_xy,
             )
             if safety_decision.overridden:
+                runtime_safety_hold_streak += 1
                 policy.cancel_active_goal()
                 active_step_result = None
                 policy.set_safety_context(
-                    f"SAFETY_HOLD previous_desired={step_result.action_name}; "
-                    f"reason={safety_decision.reason}; source={safety_decision.source}. "
-                    "Use the fresh sensor frame and choose another valid primitive."
+                    f"SAFETY_STOP previous_desired={step_result.action_name}; "
+                    f"reason={safety_decision.reason}; "
+                    f"depth_m front={safety_decision.front_depth_m:.2f}, "
+                    f"left={safety_decision.left_depth_m:.2f}, "
+                    f"right={safety_decision.right_depth_m:.2f}. "
+                    "Use the fresh sensor frame and choose another primitive."
                 )
                 logger.warning(
-                    "[SAFETY_HOLD] desired=%s reason=%s source=%s next=fresh_replan",
+                    "[SAFETY_HOLD] desired=%s reason=%s depth_m(front=%.2f,left=%.2f,right=%.2f) next=fresh_replan",
                     step_result.action_name,
                     safety_decision.reason,
-                    safety_decision.source,
+                    float(safety_decision.front_depth_m),
+                    float(safety_decision.left_depth_m),
+                    float(safety_decision.right_depth_m),
                 )
+                if runtime_safety_hold_streak >= 2:
+                    stuck_detector.trigger_recovery(
+                        now_sec=sim_time_sec,
+                        reason="repeated_safety_hold",
+                    )
+                    runtime_safety_hold_streak = 0
+            else:
+                runtime_safety_hold_streak = 0
             last_applied_wheel_velocity, last_applied_steering_angle = drive_controller.apply(
                 safety_decision.action_name,
                 speed_scale=safety_decision.speed_scale,
@@ -1798,7 +1801,6 @@ def run_navigation(
             "LOCAL_DETOUR_SAFETY_HOLD",
             "TURN_SCAN_SAFETY_HOLD",
             "TURN_ALIGNMENT_SAFETY_HOLD",
-            "PRIMITIVE_SAFETY_HOLD",
         }:
             runtime_approach_hold_streak += 1
             if runtime_approach_hold_streak >= 3:
@@ -1815,10 +1817,11 @@ def run_navigation(
                 landmark_map.mark_reached(completed_key, timestamp_sec=sim_time_sec)
                 landmark_map_reached_synced.add(completed_key)
         policy.set_all_landmark_map_entries(landmark_map.entries())
-        safety_decision = _runtime_safety_decision(
-            evaluator=primitive_safety,
+        safety_decision = depth_safety_monitor.apply(
+            observation=observation,
             action_name=step_result.action_name,
             speed_scale=step_result.speed_scale,
+            local_goal_xy=step_result.local_goal_xy,
         )
         policy.record_safety_result(
             overridden=bool(safety_decision.overridden),
@@ -1827,27 +1830,39 @@ def run_navigation(
             reason=safety_decision.reason,
         )
         if safety_decision.overridden:
+            runtime_safety_hold_streak += 1
             policy.cancel_active_goal()
             safety_context = (
-                f"SAFETY_HOLD previous_desired={step_result.action_name}; "
+                f"SAFETY_STOP previous_desired={step_result.action_name}; "
                 f"runtime_applied={safety_decision.action_name}; "
                 f"reason={safety_decision.reason}; "
-                f"source={safety_decision.source}. "
-                "The runtime rejected the swept footprint; use the fresh sensor frame "
-                "and choose another valid primitive."
+                f"depth_m front={safety_decision.front_depth_m:.2f}, "
+                f"left={safety_decision.left_depth_m:.2f}, "
+                f"right={safety_decision.right_depth_m:.2f}; "
+                f"stop_threshold_m={config.robot.geometry.obstacle_stop_distance_m:.2f}. "
+                "The runtime stopped the unsafe action; choose another primitive."
             )
             policy.set_safety_context(safety_context)
             safety_signature = (str(step_result.action_name), str(safety_decision.reason))
             if safety_signature != last_safety_log_signature:
                 logger.warning(
-                    "[SAFETY_HOLD] desired=%s applied=%s reason=%s source=%s next=fresh_replan",
+                    "[SAFETY_HOLD] desired=%s applied=%s reason=%s depth_m(front=%.2f,left=%.2f,right=%.2f) next=fresh_replan",
                     step_result.action_name,
                     safety_decision.action_name,
                     safety_decision.reason,
-                    safety_decision.source,
+                    float(safety_decision.front_depth_m),
+                    float(safety_decision.left_depth_m),
+                    float(safety_decision.right_depth_m),
                 )
                 last_safety_log_signature = safety_signature
+            if runtime_safety_hold_streak >= 2:
+                stuck_detector.trigger_recovery(
+                    now_sec=sim_time_sec,
+                    reason="repeated_safety_hold",
+                )
+                runtime_safety_hold_streak = 0
         else:
+            runtime_safety_hold_streak = 0
             last_safety_log_signature = None
         last_applied_wheel_velocity, last_applied_steering_angle = drive_controller.apply(
             safety_decision.action_name,
@@ -2325,39 +2340,6 @@ def _resolve_output_path(path_str: str) -> Path:
         candidate = PROJECT_ROOT / candidate
     candidate.parent.mkdir(parents=True, exist_ok=True)
     return candidate
-
-
-def _runtime_safety_decision(
-    *,
-    evaluator: PrimitiveSafetyEvaluator,
-    action_name: str,
-    speed_scale: float,
-) -> _RuntimeSafetyDecision:
-    action = str(action_name).strip().upper()
-    if action not in {"FORWARD", "TURN_LEFT", "TURN_RIGHT", "BACKWARD"}:
-        return _RuntimeSafetyDecision(
-            action_name=action,
-            speed_scale=float(speed_scale),
-            overridden=False,
-            reason="non_motion_action",
-            source="none",
-        )
-    decision = evaluator.evaluate(action_name=action)
-    if decision.valid:
-        return _RuntimeSafetyDecision(
-            action_name=action,
-            speed_scale=float(speed_scale),
-            overridden=False,
-            reason=decision.reason,
-            source=decision.source,
-        )
-    return _RuntimeSafetyDecision(
-        action_name="STOP",
-        speed_scale=0.0,
-        overridden=True,
-        reason=decision.reason,
-        source=decision.source,
-    )
 
 
 def _is_executing_motion_step(step_result) -> bool:

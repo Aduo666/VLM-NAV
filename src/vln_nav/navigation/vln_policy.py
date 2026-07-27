@@ -15,7 +15,6 @@ from .landmark_map import LandmarkMapEntry
 from .landmark_tracker import LandmarkState
 from .map_candidate_generator import MapCandidateGenerator
 from .observation_adapter import VLNObservation
-from .primitive_safety import PrimitiveSafetyEvaluator
 from .progress_manager import ProgressManager
 from .region_transition import RegionTransitionConfig, RegionTransitionManager
 from .target_memory import TargetMemory
@@ -199,7 +198,6 @@ class VLNPolicy:
         candidate_predictor: CandidateWaypointPredictor,
         occupancy_grid: Any | None = None,
         map_candidate_generator: MapCandidateGenerator | None = None,
-        safety_evaluator: PrimitiveSafetyEvaluator,
         progress_manager: ProgressManager,
         reasoner: VLNReasoner,
         config: VLNPolicyConfig,
@@ -209,7 +207,6 @@ class VLNPolicy:
         self._candidate_predictor = candidate_predictor
         self._occupancy_grid = occupancy_grid
         self._map_candidate_generator = map_candidate_generator
-        self._safety_evaluator = safety_evaluator
         self._progress_manager = progress_manager
         self._reasoner = reasoner
         self._config = config
@@ -418,10 +415,6 @@ class VLNPolicy:
                 safety_context_text=self._safety_context_text,
             )
         self._annotate_candidate_context(candidate_set=candidate_set)
-        candidate_set = self._safety_evaluator.filter_candidates(
-            observation=observation,
-            candidate_set=candidate_set,
-        )
         self._last_candidate_set = candidate_set
 
         semantic_plan = None
@@ -891,23 +884,6 @@ class VLNPolicy:
         reasoning_summary: str,
         debug_image_path: str | Path | None,
     ) -> PolicyStepResult:
-        safety = self._safety_evaluator.evaluate(
-            action_name=action_name,
-        )
-        if not safety.valid:
-            self._next_replan_time = float(now) + float(
-                self._config.replanning_cooldown_sec
-            )
-            return self._hold_result(
-                decision_source="PRIMITIVE_SAFETY_HOLD",
-                reasoning_summary=(
-                    f"{action_name} rejected before execution: {safety.reason}"
-                ),
-                progress_signal=progress_signal,
-                debug_image_path=debug_image_path,
-                replanned=True,
-                last_error=safety.reason,
-            )
         is_turn = str(action_name) in {"TURN_LEFT", "TURN_RIGHT"}
         world_goal_xy = (
             [float(observation.pose.x), float(observation.pose.y)]
@@ -1014,28 +990,6 @@ class VLNPolicy:
                     )
                 ),
                 reason="subgoal_too_short_for_primitive",
-                action_name=action_name,
-                distance_to_target_m=float(
-                    getattr(semantic_plan, "distance_to_target_m", 0.0)
-                ),
-                path_length_m=path_length_m,
-                local_goal=local_goal,
-                min_executable_m=min_executable_forward_m,
-            )
-            return None
-        primitive_safety = self._safety_evaluator.evaluate(
-            action_name=action_name,
-        )
-        if not primitive_safety.valid:
-            self._log_semantic_skip(
-                target_label=str(
-                    getattr(
-                        semantic_plan,
-                        "target_label",
-                        self._current_target_text(),
-                    )
-                ),
-                reason=primitive_safety.reason,
                 action_name=action_name,
                 distance_to_target_m=float(
                     getattr(semantic_plan, "distance_to_target_m", 0.0)
@@ -2114,10 +2068,6 @@ class VLNPolicy:
                 safety_context_text=self._safety_context_text,
             )
         self._annotate_candidate_context(candidate_set=candidate_set)
-        candidate_set = self._safety_evaluator.filter_candidates(
-            observation=observation,
-            candidate_set=candidate_set,
-        )
         self._last_candidate_set = candidate_set
         debug_image_path = None
         image_bytes = _clean_rgb_png_bytes(observation.rgb)

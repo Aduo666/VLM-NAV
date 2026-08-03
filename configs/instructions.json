@@ -29,7 +29,7 @@
         0.0,
         0.0
       ],
-      "instruction": "You are currently in the hospital lobby. You need to go straight to find the wheelchair, then turn left, and in front of the stairs, turn right to find the yellow warning sign and stop in front of it."
+      "instruction": "You are currently in the hospital lobby. You need to go straight to find the wheelchair, then turn left, and stop in front of the stairs, turn right to find the yellow warning sign and stop in front of it."
     },
     {
       "id": "hospital_003",

@@ -8,7 +8,8 @@ simulation:
   warmup_steps: 30
 
 robot:
-  profile: "unitree_g1_29dof"
+  #profile: "unitree_g1_29dof"
+  profile: "agx"
 
 scene:
   usd_path: "usd/hospital.usd"
@@ -172,8 +173,8 @@ navigation:
     history_length: 6
     stall_distance_m: 0.08
     spin_yaw_deg: 85.0
-    landmark_clearance_m: 1.0
-    final_success_clearance_m: 2.0
+    landmark_clearance_m: 2.0
+    final_success_clearance_m: 3.0
     landmark_arrival_confirmations: 2
   recovery:
     stuck_window_sec: 2.0
@@ -192,11 +193,11 @@ debug:
     depth_enabled: false
     depth_path: "debug/local/depth_debug.png"
   video:
-    enabled: false
+    enabled: true
     path: "debug/local/videos/vln_debug.mp4"
     fps: 4.0
   observer_video:
-    enabled: false
+    enabled: true
     path: "debug/local/observevideos/observer.mp4"
     fps: 10.0
 

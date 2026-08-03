@@ -17,10 +17,14 @@ persistent semantic anchors, map-aware VLM reasoning, and robot-specific motion 
 > find the wheelchair, then turn left, and in front of the stairs, turn right to find
 > the yellow warning sign and stop in front of it.”
 
-[![CAPTAINav navigation demo](docs/assets/demo.gif)](https://raw.githubusercontent.com/Aduo666/VLM-NAV/main/docs/assets/display.mp4)
-
-Click the preview to open the H.264 MP4 recording.
-
+AGX first-view
+<video src="docs/assets/agx_fv.mp4" controls="controls" width="500" height="300"></video>
+AGX third-view
+<video src="docs/assets/agx_tv.mp4" controls="controls" width="500" height="300"></video>
+G1 first-view
+<video src="docs/assets/g1_fv.mp4" controls="controls" width="500" height="300"></video>
+G1 third-view
+<video src="docs/assets/g1_tv.mp4" controls="controls" width="500" height="300"></video>
 ## Overview
 
 CAPTAINav is a closed-loop VLN research prototype built on Isaac Sim 5.1. It combines:

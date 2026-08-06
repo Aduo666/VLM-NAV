@@ -28,7 +28,7 @@ class TargetTrackerConfig:
 class TargetTracker:
     """Persistent bbox tracker for a semantically initialized landmark.
 
-    GroundingDINO/Qwen establish identity at low frequency. This tracker only
+    YOLOE/VLM verification establishes identity at low frequency. This tracker only
     propagates the same bbox geometrically between semantic detections.
     """
 

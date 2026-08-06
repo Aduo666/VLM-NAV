@@ -6,6 +6,7 @@ debug/
 weights/
 .codex
 third_party/
+tests/
 流程.txt
 .agents
 .claude

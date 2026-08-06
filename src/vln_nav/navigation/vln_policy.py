@@ -1706,7 +1706,7 @@ class VLNPolicy:
             getattr(observation, "source", "")
         ).strip().lower()
         if (
-            not observation_source.startswith("grounding_dino")
+            not observation_source.startswith("yoloe")
             or "reused" in observation_source
         ):
             return bool(hypothesis.ready)

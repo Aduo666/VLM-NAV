@@ -4,8 +4,8 @@
 
 ### Confidence-Gated Semantic Anchors and Primitive-Aligned Typed Instruction Navigation
 
-Language-conditioned navigation in Isaac Sim with open-vocabulary grounding,
-persistent semantic anchors, map-aware VLM reasoning, and robot-specific motion primitives.
+Language-conditioned navigation in Isaac Sim with open-vocabulary instance segmentation,
+multi-view semantic memory, map-aware VLM reasoning, and robot-specific motion primitives.
 
 ![CAPTAINav overview](docs/assets/hero.png)
 
@@ -30,11 +30,11 @@ G1 third-view
 CAPTAINav is a closed-loop VLN research prototype built on Isaac Sim 5.1. It combines:
 
 - A validated typed instruction graph with `GO_TO`, `TURN`, and `REGION_TRANSITION`.
-- GroundingDINO proposals with confidence-gated VLM semantic verification.
-- RGB-D observations, LiDAR occupancy mapping, odometry, topology, and persistent landmark anchors.
+- Task-conditioned YOLOE masks with confidence-gated VLM semantic verification.
+- RGB-D semantic instances, LiDAR occupancy mapping, odometry, topology, and persistent landmark anchors.
 - A clean first-person image plus structured textual map/candidate context for VLM decisions.
 - Fixed semantic primitives shared by all robots: `FORWARD`, `TURN_LEFT`, and `TURN_RIGHT`.
-- Robot-specific primitive realization and swept-footprint safety for AGX and Unitree G1.
+- Robot-specific primitive realization and near-field safety for AGX and Unitree G1.
 - Separate local development and dataset evaluation flows.
 
 ![CAPTAINav method](docs/assets/overview.png)
@@ -47,8 +47,10 @@ English instruction
   -> validated route graph: GO_TO / TURN / REGION_TRANSITION
   -> stopped decision keyframe
        RGB-D observation
-       GroundingDINO target proposals
+       task-conditioned YOLOE instance masks
+       mask-aware depth and world projection
        VLM verification for ambiguous proposals
+       multi-view semantic instances
        LiDAR global occupancy + topological memory
        persistent semantic landmark anchors
   -> primitive-aligned candidate table
@@ -73,10 +75,16 @@ invalid and no matching cache exists, startup fails explicitly.
 
 ### Perception And Memory
 
-GroundingDINO is required by the navigation path. At decision keyframes it proposes bounding boxes
-for the current semantic target. High-confidence proposals can be accepted directly; ambiguous
-proposals are verified by the VLM using a clean crop. Bbox depth is estimated from a robust depth
-cluster inside the box, then projected through the centralized camera/robot/world transform.
+YOLOE is the single semantic detector used by the navigation path. At stopped decision keyframes it
+segments only the route targets and context objects extracted from the current instruction. The
+selected target uses its instance mask, rather than the whole bounding box, for robust depth and
+world projection. High-confidence proposals can be accepted directly; ambiguous proposals are
+verified by the VLM using a clean crop.
+
+All same-frame YOLOE masks are projected through RGB-D into a persistent world-frame semantic
+instance map. A single view remains a candidate; repeated geometrically consistent observations
+form multi-view evidence. Only the active target can become a route-completing landmark anchor
+after the existing identity and geometry gates pass.
 
 Confirmed anchors remain in the landmark map after leaving the camera view or completing a route
 step. A detector proposal without reliable geometry may guide visual search, but it cannot create
@@ -115,7 +123,7 @@ polygon footprint and full primitive sweep are not part of the active navigation
 | OS | Linux x86_64 |
 | Python | 3.11 |
 | Isaac Sim | 5.1.0 pip distribution |
-| CUDA GPU | Required for Isaac Sim and GroundingDINO |
+| CUDA GPU | Required for Isaac Sim and YOLOE |
 | VLM API | OpenAI-compatible endpoint; SiliconFlow is configured by default |
 
 ## Installation
@@ -136,29 +144,21 @@ pip install -r requirements.txt
 
 The requirements pin Isaac Sim 5.1 and `numpy==1.26.0`, together with Pillow, PyYAML, and OpenCV.
 
-### 3. Install GroundingDINO
+### 3. Download YOLOE Assets
 
 ```bash
 conda activate vlmnav
-
-# Install a compatible PyTorch build if the environment does not already provide it.
-pip install torch==2.7.0 torchvision==0.22.0 \
-  --index-url https://download.pytorch.org/whl/cu128
-
-bash scripts/setup_grounding_dino_local.sh
+bash scripts/setup_yoloe.sh
 ```
 
-The current local paths are:
+The setup script downloads the official model and text encoder into:
 
 ```text
-third_party/GroundingDINO/
-weights/grounded_sam/GroundingDINO_SwinT_OGC.py
-weights/grounded_sam/groundingdino_swint_ogc.pth
-weights/grounded_sam/bert-base-uncased/
+weights/yoloe/yoloe-26l-seg.pt
+weights/yoloe/mobileclip2_b.ts
 ```
 
-The `weights/grounded_sam` directory name is retained only to avoid moving existing local weights;
-the active method does not install or run SAM.
+Model weights are ignored by Git and must not be placed in the repository root.
 
 ### 4. Configure The VLM
 
@@ -168,6 +168,32 @@ provided without editing the file:
 ```bash
 export SILICONFLOW_API_KEY="your_api_key"
 ```
+
+## Project Layout
+
+```text
+configs/
+  default.yaml                 # Shared navigation, perception, mapping, and debug settings
+  rgbd_mapping.yaml            # Standalone RGB-D semantic-map test
+  robots/                      # Robot-specific assets, sensors, primitives, and controllers
+scripts/
+  run_nav.sh                   # Main navigation launcher
+  run_rgbd_mapping.sh          # Isolated RGB-D/YOLOE mapping validation
+  setup_yoloe.sh               # Official model asset download
+src/vln_nav/
+  app/                         # Isaac Sim entry points
+  control/                     # AGX and Unitree locomotion adapters
+  navigation/                  # Instruction, perception, maps, policy, and safety
+  runtime/                     # Strict config, robot profiles, and debug recording
+third_party/                   # External source trees only; never model checkpoints
+weights/yoloe/                 # YOLOE and MobileCLIP checkpoints, ignored by Git
+debug/local/                   # Local debug image and timestamped videos
+debug/eval/                    # Dataset evaluation artifacts
+```
+
+The main navigation path has one semantic detector, YOLOE. The standalone mapping entry point
+reuses the same segmenter, projection, and semantic-instance modules; it is not a second navigation
+implementation.
 
 ## Running
 
@@ -223,6 +249,24 @@ bash scripts/run_g1_policy_test.sh
 Use the arrow keys or panel buttons. Releasing all directions commands active zero-velocity
 balance. The test automatically resets after a confirmed fall.
 
+### RGB-D Semantic Mapping Test
+
+The standalone AGX test builds a north-up global geometry map from the front RGB-D camera and
+projects YOLOE instance masks into a persistent world-frame semantic layer. LiDAR, the VLM, and the
+navigation policy are not started, so mapping can be validated independently.
+
+```bash
+bash scripts/run_rgbd_mapping.sh
+```
+
+The standalone test and navigation runtime use the same `yoloe-26l-seg.pt` checkpoint and the
+dependencies installed by `requirements.txt`.
+Edit the open-vocabulary labels and mapping parameters in `configs/rgbd_mapping.yaml`. Hold the
+arrow keys to drive and release them to stop; YOLOE runs only on settled stopped keyframes. The
+single combined view is written to `debug/local/rgbd_semantic_map.png`: the left panel is an
+auto-cropped view of the unchanged 80 m global map, and the right panel is the matching YOLOE mask
+keyframe.
+
 ### Task Authoring
 
 ```bash
@@ -268,10 +312,12 @@ llm:
   timeout_sec: 30
 
 perception:
-  grounding:
+  target:
     call_period_sec: 0.10
     detector:
-      box_threshold: 0.45
+      model_path: "weights/yoloe/yoloe-26l-seg.pt"
+      confidence_threshold: 0.20
+      image_size_px: 960
 
 navigation:
   progress:
@@ -311,18 +357,21 @@ Pure-code tests do not start Isaac Sim:
 PYTHONPATH=src python -m unittest discover -s tests -v
 ```
 
-They cover instruction validation, robot profiles, spatial projection, landmark evidence,
+They cover instruction validation, robot profiles, mask-aware depth, spatial projection, landmark evidence,
 semantic turns, occupancy behavior, and robot-specific primitive safety.
 
 ## Limitations
 
 - VLM latency remains the main delay between decision keyframes.
-- Open-vocabulary detections can still be ambiguous despite confidence gating and crop verification.
+- Open-vocabulary instance masks can still be ambiguous despite multi-view evidence and crop verification.
 - World anchors depend on camera calibration, depth quality, and odometry consistency.
 - The Unitree G1 behavior depends strongly on the quality and deployment compatibility of its policy.
 - CAPTAINav is a research prototype, not a safety-certified navigation system.
 
 ## Research Context
 
-CAPTAINav draws on VLN, ObjectNav, open-vocabulary grounding, semantic memory, and map-aware robot
-navigation. Related systems include R2R, VLN-CE, DUET, NavGPT, Safe-VLN, CA-Nav, and Open-Nav.
+CAPTAINav draws on VLN, ObjectNav, open-vocabulary perception, semantic memory, and map-aware robot
+navigation. The RGB-D representation follows the HSGM method skeleton: separate geometric,
+semantic, and decision responsibilities. This repository adapts that decomposition to Isaac Sim
+and the existing robot controllers; it is not a copy of HSGM's Habitat runtime. Related systems
+include R2R, VLN-CE, DUET, NavGPT, Safe-VLN, CA-Nav, Open-Nav, and HSGM.

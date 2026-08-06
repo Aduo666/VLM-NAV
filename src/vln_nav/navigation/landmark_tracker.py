@@ -254,7 +254,7 @@ class LandmarkTracker:
             semantic_source = str(getattr(observation, "semantic_source", "")).strip().lower()
             can_confirm = bool(
                 getattr(observation, "can_confirm", False)
-                and semantic_source.startswith("grounding_dino")
+                and semantic_source.startswith("yoloe")
             )
             has_world = observation.estimated_world_xy is not None
 
@@ -819,7 +819,7 @@ class LandmarkTracker:
 
         semantic_arrival_observation = str(
             getattr(observation, "semantic_source", "")
-        ).strip().lower().startswith("grounding_dino")
+        ).strip().lower().startswith("yoloe")
         visible_depth_reached = (
             bool(observation.visible)
             and semantic_arrival_observation

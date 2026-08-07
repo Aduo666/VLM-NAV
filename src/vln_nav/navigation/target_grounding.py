@@ -249,20 +249,20 @@ class TargetGrounder:
             return reusable or _empty_observation(
                 target_label=target_label,
                 timestamp_sec=timestamp_sec,
-                reason="grounding_paused",
+                reason="target_detection_paused",
             )
         if self._future is not None:
             return reusable or _empty_observation(
                 target_label=target_label,
                 timestamp_sec=timestamp_sec,
-                reason="grounding_request_in_flight",
+                reason="target_detection_request_in_flight",
             )
 
         if float(wall_time_sec) - float(self._last_call_started_wall_sec) < max(0.0, float(self._config.call_period_sec)):
             return reusable or _empty_observation(
                 target_label=target_label,
                 timestamp_sec=timestamp_sec,
-                reason="grounding_call_period",
+                reason="target_detection_call_period",
             )
 
         try:
@@ -299,7 +299,7 @@ class TargetGrounder:
         return reusable or _empty_observation(
             target_label=target_label,
             timestamp_sec=timestamp_sec,
-            reason="grounding_request_started",
+            reason="target_detection_request_started",
         )
 
     def _reuse_or_empty(self, *, target_label: str, timestamp_sec: float, reason: str) -> TargetObservation:
@@ -664,7 +664,7 @@ class TargetGrounder:
         )
         if result.failed or not result.content:
             self._logger.warning(
-                "[GroundingRelation] target=%s failed=%s",
+                "[TargetRelation] target=%s failed=%s",
                 request.target_label,
                 result.reason,
             )
@@ -682,7 +682,7 @@ class TargetGrounder:
             reason = str(payload.get("reason", "")).strip() or "no_reason"
         except Exception as exc:
             self._logger.warning(
-                "[GroundingRelation] target=%s invalid_json=%s",
+                "[TargetRelation] target=%s invalid_json=%s",
                 request.target_label,
                 exc,
             )
@@ -693,7 +693,7 @@ class TargetGrounder:
             or confidence < float(self._config.semantic_verification_min_confidence)
         ):
             self._logger.info(
-                "[GroundingRelation] target=%s rejected_index=%s confidence=%.2f reason=%s",
+                "[TargetRelation] target=%s rejected_index=%s confidence=%.2f reason=%s",
                 request.target_label,
                 selected_index,
                 confidence,
@@ -701,7 +701,7 @@ class TargetGrounder:
             )
             return None
         self._logger.info(
-            "[GroundingRelation] target=%s selected=%s confidence=%.2f reason=%s",
+            "[TargetRelation] target=%s selected=%s confidence=%.2f reason=%s",
             request.target_label,
             selected_index,
             confidence,
@@ -741,13 +741,13 @@ class TargetGrounder:
             )
         if not visible_flag and bbox_upload is not None:
             self._logger.warning(
-                "[GroundingRecover] target=%s reason=visible_false_with_bbox raw_bbox=%s",
+                "[TargetDetectionRecover] target=%s reason=visible_false_with_bbox raw_bbox=%s",
                 request.target_label,
                 payload.get("bbox"),
             )
         if bbox_upload is None:
             self._logger.warning(
-                "[GroundingRejectDebug] target=%s reject_reason=bbox_missing_or_invalid raw_bbox=%s image_size=%s upload_image_size=%s mapped_bbox=None",
+                "[TargetDetectionReject] target=%s reject_reason=bbox_missing_or_invalid raw_bbox=%s image_size=%s upload_image_size=%s mapped_bbox=None",
                 request.target_label,
                 payload.get("bbox"),
                 request.original_size,
@@ -774,7 +774,7 @@ class TargetGrounder:
         )
         if mapped_bbox is None:
             self._logger.warning(
-                "[GroundingRejectDebug] target=%s reject_reason=bbox_out_of_range raw_bbox=%s image_size=%s upload_image_size=%s mapped_bbox=None requested_mode=%s normalized_scale=%.1f",
+                "[TargetDetectionReject] target=%s reject_reason=bbox_out_of_range raw_bbox=%s image_size=%s upload_image_size=%s mapped_bbox=None requested_mode=%s normalized_scale=%.1f",
                 request.target_label,
                 bbox_upload,
                 request.original_size,
@@ -789,7 +789,7 @@ class TargetGrounder:
             )
         source_prefix = str(payload.get("source", "yoloe")).strip() or "yoloe"
         self._logger.debug(
-            "[GroundingBbox] target=%s raw_bbox=%s mapped_bbox=%s image_size=%s upload_image_size=%s coord=%s source=%s",
+            "[TargetDetectionBbox] target=%s raw_bbox=%s mapped_bbox=%s image_size=%s upload_image_size=%s coord=%s source=%s",
             request.target_label,
             bbox_upload,
             mapped_bbox.bbox,
@@ -884,7 +884,7 @@ class TargetGrounder:
         depth_failed = valid_ratio < float(self._config.min_depth_valid_ratio) or depth_m is None or not np.isfinite(depth_m)
         if depth_failed:
             self._logger.info(
-                "[GroundingNoDepth] target=%s valid_ratio=%.2f depth=%s reason=depth_invalid_but_visible source=%s",
+                "[TargetDetectionNoDepth] target=%s valid_ratio=%.2f depth=%s reason=depth_invalid_but_visible source=%s",
                 request.target_label,
                 float(valid_ratio),
                 "none" if depth_m is None else f"{float(depth_m):.2f}",
@@ -927,7 +927,7 @@ class TargetGrounder:
             if not vlm_verified or vlm_verification_confidence < float(self._config.semantic_verification_min_confidence):
                 can_confirm = False
                 self._logger.info(
-                    "[GroundingVerifyReject] target=%s source=%s detector_conf=%.2f vlm_conf=%.2f reason=%s",
+                    "[TargetVerifyReject] target=%s source=%s detector_conf=%.2f vlm_conf=%.2f reason=%s",
                     request.target_label,
                     semantic_source,
                     float(confidence),
@@ -1036,7 +1036,7 @@ class TargetGrounder:
         ):
             cached = self._last_verification_result
             self._logger.info(
-                "[GroundingVerify] target=%s result=reused_same_observation verified=%s vlm_conf=%.2f",
+                "[TargetVerify] target=%s result=reused_same_observation verified=%s vlm_conf=%.2f",
                 request.target_label,
                 int(bool(cached[0])),
                 float(cached[1]),
@@ -1079,7 +1079,7 @@ class TargetGrounder:
         except Exception as exc:
             return False, 0.0, f"verification_invalid_json:{exc}"
         self._logger.info(
-            "[GroundingVerify] target=%s source=%s detector_conf=%.2f verified=%s vlm_conf=%.2f reason=%s",
+            "[TargetVerify] target=%s source=%s detector_conf=%.2f verified=%s vlm_conf=%.2f reason=%s",
             request.target_label,
             semantic_source,
             float(detector_confidence),
@@ -1264,7 +1264,7 @@ def _parse_json_object(content: str) -> dict[str, Any]:
         text = text[start : end + 1]
     payload = json.loads(text)
     if not isinstance(payload, dict):
-        raise ValueError("grounding response is not a JSON object")
+        raise ValueError("target detection response is not a JSON object")
     return payload
 
 

@@ -5,12 +5,15 @@ from dataclasses import dataclass
 import numpy as np
 
 from .observation_adapter import Pose2D
+from .spatial_transform import transform_world_xy_to_odom
 
 
 @dataclass
 class OdomState:
     pose: Pose2D
     raw_pose: Pose2D
+    origin_world_xy: tuple[float, float]
+    origin_world_yaw_rad: float
     source: str
     timestamp_sec: float
     linear_velocity_mps: float
@@ -61,9 +64,14 @@ class SimOdometrySensor:
             self._origin_position_xy = world_xy.copy()
             self._origin_yaw_rad = float(world_yaw_rad)
 
+        odom_xy = transform_world_xy_to_odom(
+            world_xy,
+            origin_world_xy=self._origin_position_xy,
+            origin_world_yaw_rad=float(self._origin_yaw_rad or 0.0),
+        )
         raw_pose = Pose2D(
-            x=float(world_xy[0] - self._origin_position_xy[0]),
-            y=float(world_xy[1] - self._origin_position_xy[1]),
+            x=float(odom_xy[0]),
+            y=float(odom_xy[1]),
             yaw_rad=float(_wrap_angle_rad(world_yaw_rad - float(self._origin_yaw_rad or 0.0))),
         )
         if self._last_pose is None or self._pose_filter_alpha >= 1.0:
@@ -109,6 +117,11 @@ class SimOdometrySensor:
         return OdomState(
             pose=pose,
             raw_pose=raw_pose,
+            origin_world_xy=(
+                float(self._origin_position_xy[0]),
+                float(self._origin_position_xy[1]),
+            ),
+            origin_world_yaw_rad=float(self._origin_yaw_rad or 0.0),
             source=self._source,
             timestamp_sec=float(timestamp_sec),
             linear_velocity_mps=float(linear_velocity_mps),

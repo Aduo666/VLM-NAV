@@ -118,6 +118,7 @@ class MapCandidateGenerator:
                         robot_pose=observation.pose,
                         local_goal_xy=local_goal,
                         min_clearance_m=float(self._config.min_clearance_m),
+                        path_start_world_xy=occupancy_snapshot.sensor_origin_world_xy,
                     )
                     free_ratio = float(evaluation["free_ratio"])
                     unknown_gain = float(evaluation["unknown_gain"])
@@ -178,6 +179,7 @@ class MapCandidateGenerator:
                 "unknown_gain": float(unknown_gain),
                 "occupancy_reason": occupancy_reason,
                 "occupancy_valid": float(bool(occupancy_valid)),
+                "depth_valid": float(bool(depth_valid)),
                 "anchor_distance_delta_m": "none" if anchor_delta_m is None else round(float(anchor_delta_m), 3),
                 "anchor_bearing_after_deg": "none" if anchor_bearing_after_deg is None else round(float(anchor_bearing_after_deg), 1),
                 "route_alignment": 0.0,
@@ -459,6 +461,24 @@ class MapCandidateGenerator:
                 for item in ranked
             ],
         )
+        forward = next(
+            (
+                item
+                for item in ranked
+                if str(item.depth_support.get("primitive_action", "")).upper()
+                == "FORWARD"
+            ),
+            None,
+        )
+        if forward is not None and not bool(forward.valid):
+            self._logger.info(
+                "[CandidateReject] action=FORWARD reason=%s free_ratio=%.2f "
+                "clearance_m=%.2f depth_valid=%s",
+                str(forward.depth_support.get("occupancy_reason", "unknown")),
+                float(forward.depth_support.get("free_ratio", 0.0)),
+                float(forward.depth_support.get("min_clearance_m", 0.0)),
+                int(float(forward.depth_support.get("depth_valid", 0.0)) > 0.0),
+            )
 
 
 def _evaluate_local_goal(
@@ -467,8 +487,18 @@ def _evaluate_local_goal(
     robot_pose: Pose2D,
     local_goal_xy: list[float],
     min_clearance_m: float,
+    path_start_world_xy: tuple[float, float] | None = None,
 ) -> dict[str, float | bool]:
-    world_goal = _local_to_world_xy(robot_pose=robot_pose, local_xy=local_goal_xy)
+    path_start = (
+        (float(robot_pose.x), float(robot_pose.y))
+        if path_start_world_xy is None
+        else (float(path_start_world_xy[0]), float(path_start_world_xy[1]))
+    )
+    world_goal = _offset_world_xy(
+        start_world_xy=path_start,
+        yaw_rad=float(robot_pose.yaw_rad),
+        local_offset_xy=local_goal_xy,
+    )
     goal_cell = _world_to_cell(snapshot=snapshot, world_xy=world_goal)
     if goal_cell is None:
         return _eval_result(False, "outside", 0.0, 0.0, 0.0, 0.0)
@@ -476,7 +506,7 @@ def _evaluate_local_goal(
     if bool(snapshot.inflated_occupied[row, col]):
         return _eval_result(False, "occupied", 0.0, 0.0, 0.0, 0.0)
     path_cells = _line_cells(
-        _world_to_cell(snapshot=snapshot, world_xy=(float(robot_pose.x), float(robot_pose.y))),
+        _world_to_cell(snapshot=snapshot, world_xy=path_start),
         goal_cell,
     )
     if not path_cells:
@@ -570,6 +600,21 @@ def _local_to_world_xy(*, robot_pose: Pose2D, local_xy: list[float] | tuple[floa
     return (
         float(robot_pose.x) + cos_yaw * forward_m - sin_yaw * left_m,
         float(robot_pose.y) + sin_yaw * forward_m + cos_yaw * left_m,
+    )
+
+
+def _offset_world_xy(
+    *,
+    start_world_xy: tuple[float, float],
+    yaw_rad: float,
+    local_offset_xy: list[float] | tuple[float, float],
+) -> tuple[float, float]:
+    forward_m, left_m = [float(value) for value in local_offset_xy[:2]]
+    cos_yaw = float(np.cos(yaw_rad))
+    sin_yaw = float(np.sin(yaw_rad))
+    return (
+        float(start_world_xy[0]) + cos_yaw * forward_m - sin_yaw * left_m,
+        float(start_world_xy[1]) + sin_yaw * forward_m + cos_yaw * left_m,
     )
 
 

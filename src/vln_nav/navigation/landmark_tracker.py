@@ -916,10 +916,10 @@ def _is_observation_transient(observation: TargetObservation) -> bool:
         or reason
         in {
             "reused_last_observation",
-            "grounding_request_started",
-            "grounding_request_in_flight",
-            "grounding_call_period",
-            "grounding_paused",
+            "target_detection_request_started",
+            "target_detection_request_in_flight",
+            "target_detection_call_period",
+            "target_detection_paused",
             "rgb_unavailable",
             "image_prepare_failed",
         }

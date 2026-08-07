@@ -174,16 +174,31 @@ class PerceptionConfig:
 class OccupancyRuntimeConfig:
     resolution_m: float
     size_m: float
-    update_period_sec: float
+    occupied_log_odds: float
+    free_log_odds: float
+    occupied_threshold: float
+    free_threshold: float
     occupied_min_neighbors: int
     unknown_is_traversable: bool
     unknown_cell_cost: float
-    lidar_bootstrap_sec: float
-    lidar_bootstrap_min_fov_deg: float
-    lidar_bootstrap_max_wait_sec: float
     semantic_goal_step_m: float
     semantic_goal_min_step_m: float
     semantic_goal_lateral_search_m: float
+
+
+@dataclass
+class RGBDMappingRuntimeConfig:
+    update_period_sec: float
+    min_depth_m: float
+    max_depth_m: float
+    pixel_stride: int
+    vertical_min_ratio: float
+    vertical_max_ratio: float
+    obstacle_min_height_m: float
+    obstacle_max_height_m: float
+    floor_tolerance_below_m: float
+    bootstrap_sec: float
+    bootstrap_max_wait_sec: float
 
 
 @dataclass
@@ -199,6 +214,7 @@ class TopologyRuntimeConfig:
 @dataclass
 class MappingConfig:
     occupancy: OccupancyRuntimeConfig
+    rgbd: RGBDMappingRuntimeConfig
     topology: TopologyRuntimeConfig
 
 
@@ -248,7 +264,6 @@ class SemanticTurnRuntimeConfig:
 class NavigationPolicyRuntimeConfig:
     replanning_cooldown_sec: float
     visual_target_center_deadband_deg: float
-    local_detour_max_turn_primitives: int
     region_transition: RegionTransitionRuntimeConfig
     semantic_turn: SemanticTurnRuntimeConfig
 
@@ -539,6 +554,12 @@ def _validate_config(config: AppConfig) -> None:
         raise ValueError("navigation.candidates.min_distance_m must not exceed max_distance_m")
     if config.mapping.occupancy.resolution_m <= 0.0:
         raise ValueError("mapping.occupancy.resolution_m must be > 0")
+    if config.mapping.rgbd.min_depth_m <= 0.0:
+        raise ValueError("mapping.rgbd.min_depth_m must be > 0")
+    if config.mapping.rgbd.max_depth_m <= config.mapping.rgbd.min_depth_m:
+        raise ValueError("mapping.rgbd.max_depth_m must be greater than min_depth_m")
+    if config.mapping.rgbd.pixel_stride < 1:
+        raise ValueError("mapping.rgbd.pixel_stride must be >= 1")
     if config.navigation.progress.landmark_clearance_m <= 0.0:
         raise ValueError("navigation.progress.landmark_clearance_m must be > 0")
     if config.navigation.progress.final_success_clearance_m <= 0.0:

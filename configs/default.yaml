@@ -120,16 +120,28 @@ mapping:
   occupancy:
     resolution_m: 0.08
     size_m: 80.0
-    update_period_sec: 0.12
+    occupied_log_odds: 0.90
+    free_log_odds: -0.25
+    occupied_threshold: 1.20
+    free_threshold: -0.45
     occupied_min_neighbors: 3
     unknown_is_traversable: false
     unknown_cell_cost: 0.80
-    lidar_bootstrap_sec: 0.8
-    lidar_bootstrap_min_fov_deg: 165.0
-    lidar_bootstrap_max_wait_sec: 3.0
     semantic_goal_step_m: 0.9
     semantic_goal_min_step_m: 0.45
     semantic_goal_lateral_search_m: 0.8
+  rgbd:
+    update_period_sec: 0.20
+    min_depth_m: 0.30
+    max_depth_m: 8.0
+    pixel_stride: 8
+    vertical_min_ratio: 0.12
+    vertical_max_ratio: 0.95
+    obstacle_min_height_m: 0.10
+    obstacle_max_height_m: 1.80
+    floor_tolerance_below_m: 0.20
+    bootstrap_sec: 0.8
+    bootstrap_max_wait_sec: 3.0
   topology:
     node_spacing_m: 1.0
     turn_threshold_deg: 40.0
@@ -158,7 +170,6 @@ navigation:
   policy:
     replanning_cooldown_sec: 0.50
     visual_target_center_deadband_deg: 15.0
-    local_detour_max_turn_primitives: 2
     region_transition:
       min_displacement_m: 1.0
       confirmations: 2
@@ -204,11 +215,11 @@ debug:
     depth_enabled: false
     depth_path: "debug/local/depth_debug.png"
   video:
-    enabled: true
+    enabled: false
     path: "debug/local/videos/vln_debug.mp4"
     fps: 4.0
   observer_video:
-    enabled: true
+    enabled: false
     path: "debug/local/observevideos/observer.mp4"
     fps: 10.0
 

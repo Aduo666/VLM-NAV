@@ -31,7 +31,7 @@ CAPTAINav is a closed-loop VLN research prototype built on Isaac Sim 5.1. It com
 
 - A validated typed instruction graph with `GO_TO`, `TURN`, and `REGION_TRANSITION`.
 - Task-conditioned YOLOE masks with confidence-gated VLM semantic verification.
-- RGB-D semantic instances, LiDAR occupancy mapping, odometry, topology, and persistent landmark anchors.
+- RGB-D global occupancy and semantic-instance mapping, odometry, topology, and persistent landmark anchors.
 - A clean first-person image plus structured textual map/candidate context for VLM decisions.
 - Fixed semantic primitives shared by all robots: `FORWARD`, `TURN_LEFT`, and `TURN_RIGHT`.
 - Robot-specific primitive realization and near-field safety for AGX and Unitree G1.
@@ -51,7 +51,7 @@ English instruction
        mask-aware depth and world projection
        VLM verification for ambiguous proposals
        multi-view semantic instances
-       LiDAR global occupancy + topological memory
+       RGB-D global occupancy + topological memory
        persistent semantic landmark anchors
   -> primitive-aligned candidate table
   -> VLM selects one valid candidate/action
@@ -101,6 +101,10 @@ The VLM does not receive the occupancy image. Its navigation request contains:
 - A concise capability description for the selected robot profile.
 
 The occupancy image remains available in `debug/local/vln_debug.png` for human inspection.
+
+The global occupancy map is built only from calibrated front-camera RGB-D rays. LiDAR readings do
+not write occupancy cells; they are retained only as an independent near-field safety signal and
+for turn-clearance estimation.
 
 ### Robot-Aware Safety
 

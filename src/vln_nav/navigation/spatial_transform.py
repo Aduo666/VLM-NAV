@@ -14,6 +14,72 @@ class TargetGeometry:
     world_xy: list[float]
 
 
+def transform_world_xy_to_odom(
+    world_xy: np.ndarray,
+    *,
+    origin_world_xy: np.ndarray | tuple[float, float] | list[float],
+    origin_world_yaw_rad: float,
+) -> np.ndarray:
+    """Transform Isaac world XY points into the navigation odom frame.
+
+    The odom origin is the robot world pose captured on the first simulation
+    frame. Odom +X follows the robot's initial heading and odom +Y points left.
+    The input may be a single ``[x, y]`` point or an array ending in dimension 2.
+    """
+    points = np.asarray(world_xy, dtype=np.float64)
+    if points.ndim == 0 or points.shape[-1] != 2:
+        raise ValueError(f"world_xy must end in dimension 2, got shape={points.shape}")
+    origin = np.asarray(origin_world_xy, dtype=np.float64).reshape(-1)
+    if origin.size < 2 or not np.all(np.isfinite(origin[:2])):
+        raise ValueError("origin_world_xy must contain two finite values")
+    if not np.all(np.isfinite(points)) or not np.isfinite(float(origin_world_yaw_rad)):
+        raise ValueError("world-to-odom transform contains non-finite values")
+
+    delta = points - origin[:2]
+    cos_yaw = float(np.cos(float(origin_world_yaw_rad)))
+    sin_yaw = float(np.sin(float(origin_world_yaw_rad)))
+    return np.stack(
+        [
+            cos_yaw * delta[..., 0] + sin_yaw * delta[..., 1],
+            -sin_yaw * delta[..., 0] + cos_yaw * delta[..., 1],
+        ],
+        axis=-1,
+    )
+
+
+def transform_camera_view_world_to_odom(
+    camera_view_matrix_ros: np.ndarray,
+    *,
+    origin_world_xy: np.ndarray | tuple[float, float] | list[float],
+    origin_world_yaw_rad: float,
+) -> np.ndarray:
+    """Express an Isaac world-to-camera ROS view matrix in the odom frame."""
+    view_world = np.asarray(camera_view_matrix_ros, dtype=np.float64).reshape(4, 4)
+    if not np.all(np.isfinite(view_world)):
+        raise ValueError("camera_view_matrix_ros contains non-finite values")
+    origin = np.asarray(origin_world_xy, dtype=np.float64).reshape(-1)
+    if origin.size < 2 or not np.all(np.isfinite(origin[:2])):
+        raise ValueError("origin_world_xy must contain two finite values")
+
+    yaw = float(origin_world_yaw_rad)
+    if not np.isfinite(yaw):
+        raise ValueError("origin_world_yaw_rad must be finite")
+    cos_yaw = float(np.cos(yaw))
+    sin_yaw = float(np.sin(yaw))
+    world_to_odom = np.asarray(
+        [
+            [cos_yaw, sin_yaw, 0.0, -(cos_yaw * origin[0] + sin_yaw * origin[1])],
+            [-sin_yaw, cos_yaw, 0.0, sin_yaw * origin[0] - cos_yaw * origin[1]],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    camera_to_world = np.linalg.inv(view_world)
+    camera_to_odom = world_to_odom @ camera_to_world
+    return np.linalg.inv(camera_to_odom)
+
+
 def estimate_target_world_xy(
     *,
     center_uv: tuple[float, float],

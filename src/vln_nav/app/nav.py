@@ -25,12 +25,20 @@ from ..navigation.occupancy_grid import GlobalOccupancyMap, OccupancyGridConfig
 from ..navigation.observation_adapter import ObservationAdapter
 from ..navigation.odometry import SimOdometrySensor
 from ..navigation.progress_manager import ProgressManager
+from ..navigation.rgbd_geometry_map import (
+    RGBDGeometryMapConfig,
+    RGBDVirtualRayProjector,
+)
 from ..navigation.semantic_instance_map import (
     SemanticInstanceMap,
     SemanticInstanceMapConfig,
     SemanticInstanceSnapshot,
 )
-from ..navigation.spatial_transform import log_spatial_transform_self_check
+from ..navigation.spatial_transform import (
+    log_spatial_transform_self_check,
+    transform_camera_view_world_to_odom,
+    transform_world_xy_to_odom,
+)
 from ..navigation.stuck_detector import StuckDetector, StuckDetectorConfig
 from ..navigation.target_grounding import TargetGrounder, TargetGroundingConfig, TargetObservation
 from ..navigation.target_tracker import TargetTracker, TargetTrackerConfig
@@ -606,7 +614,7 @@ def run_navigation(
         stall_distance_m=float(config.navigation.progress.stall_distance_m),
         spin_yaw_deg=float(config.navigation.progress.spin_yaw_deg),
     )
-    target_grounder = TargetGrounder(
+    target_perception = TargetGrounder(
         config=TargetGroundingConfig(
             call_period_sec=float(config.perception.target.call_period_sec),
             reuse_last_observation_sec=float(config.perception.target.reuse_last_observation_sec),
@@ -651,7 +659,7 @@ def run_navigation(
         logger=logger,
         semantic_labels=_instruction_semantic_labels(instruction_context),
     )
-    target_grounder.require_ready()
+    target_perception.require_ready()
     target_tracker = TargetTracker(
         config=TargetTrackerConfig(
             tracker_type=str(config.perception.target.tracker.tracker_type),
@@ -748,9 +756,13 @@ def run_navigation(
         config=OccupancyGridConfig(
             resolution_m=float(config.mapping.occupancy.resolution_m),
             size_m=float(config.mapping.occupancy.size_m),
-            update_period_sec=float(config.mapping.occupancy.update_period_sec),
-            min_range_m=float(config.robot.sensors.lidar.min_range_m),
-            max_range_m=float(config.robot.sensors.lidar.max_range_m),
+            update_period_sec=float(config.mapping.rgbd.update_period_sec),
+            min_range_m=float(config.mapping.rgbd.min_depth_m),
+            max_range_m=float(config.mapping.rgbd.max_depth_m),
+            occupied_log_odds=float(config.mapping.occupancy.occupied_log_odds),
+            free_log_odds=float(config.mapping.occupancy.free_log_odds),
+            occupied_threshold=float(config.mapping.occupancy.occupied_threshold),
+            free_threshold=float(config.mapping.occupancy.free_threshold),
             inflation_radius_m=float(config.robot.geometry.map_inflation_radius_m),
             occupied_min_neighbors=int(config.mapping.occupancy.occupied_min_neighbors),
             unknown_is_traversable=bool(config.mapping.occupancy.unknown_is_traversable),
@@ -760,6 +772,31 @@ def run_navigation(
             semantic_goal_lateral_search_m=float(config.mapping.occupancy.semantic_goal_lateral_search_m),
         ),
         logger=logger,
+    )
+    rgbd_ray_projector = RGBDVirtualRayProjector(
+        config=RGBDGeometryMapConfig(
+            resolution_m=float(config.mapping.occupancy.resolution_m),
+            size_m=float(config.mapping.occupancy.size_m),
+            update_period_sec=float(config.mapping.rgbd.update_period_sec),
+            min_depth_m=float(config.mapping.rgbd.min_depth_m),
+            max_depth_m=float(config.mapping.rgbd.max_depth_m),
+            pixel_stride=int(config.mapping.rgbd.pixel_stride),
+            vertical_min_ratio=float(config.mapping.rgbd.vertical_min_ratio),
+            vertical_max_ratio=float(config.mapping.rgbd.vertical_max_ratio),
+            obstacle_min_height_m=float(config.mapping.rgbd.obstacle_min_height_m),
+            obstacle_max_height_m=float(config.mapping.rgbd.obstacle_max_height_m),
+            floor_tolerance_below_m=float(config.mapping.rgbd.floor_tolerance_below_m),
+        ),
+        floor_z_m=float(config.robot_start_position[2]),
+    )
+    logger.info(
+        "[GeometryMapConfig] source=rgbd depth_range=[%.2f, %.2f]m stride=%s "
+        "height_band=[%.2f, %.2f]m lidar_mapping=0",
+        float(config.mapping.rgbd.min_depth_m),
+        float(config.mapping.rgbd.max_depth_m),
+        int(config.mapping.rgbd.pixel_stride),
+        float(config.mapping.rgbd.obstacle_min_height_m),
+        float(config.mapping.rgbd.obstacle_max_height_m),
     )
     _g1_lidar_robot_frame_path = None
     if config.robot.is_g1:
@@ -860,7 +897,6 @@ def run_navigation(
             semantic_turn_max_recovery_attempts=int(
                 config.navigation.policy.semantic_turn.max_recovery_attempts
             ),
-            local_detour_max_turn_primitives=int(config.navigation.policy.local_detour_max_turn_primitives),
             confirm_min_observations=int(config.perception.landmark_tracking.confirm_min_observations),
             confirm_confidence_threshold=float(config.perception.landmark_tracking.confirm_confidence_threshold),
             visual_target_center_deadband_deg=float(config.navigation.policy.visual_target_center_deadband_deg),
@@ -1036,7 +1072,7 @@ def run_navigation(
         ) from exc
     observation_adapter.set_horizontal_fov_deg(actual_camera_hfov_deg)
     candidate_predictor.set_horizontal_fov_deg(actual_camera_hfov_deg)
-    target_grounder.set_horizontal_fov_deg(actual_camera_hfov_deg)
+    target_perception.set_horizontal_fov_deg(actual_camera_hfov_deg)
     target_tracker.set_horizontal_fov_deg(actual_camera_hfov_deg)
     logger.info(
         "[CameraCalibration] configured_hfov_deg=%.2f usd_hfov_deg=%.2f source=front_camera_prim",
@@ -1139,7 +1175,7 @@ def run_navigation(
         int(config.mapping.topology.recent_node_count),
     )
     logger.info(
-        "[OccupancyGridConfig] source=lidar resolution=%.2fm size=%.1fm min_neighbors=%s debug=%s",
+        "[OccupancyGridConfig] source=rgbd resolution=%.2fm size=%.1fm min_neighbors=%s debug=%s",
         float(config.mapping.occupancy.resolution_m),
         float(config.mapping.occupancy.size_m),
         int(config.mapping.occupancy.occupied_min_neighbors),
@@ -1187,7 +1223,8 @@ def run_navigation(
     landmark_map_reached_synced: set[str] = set()
     global_pose_trace: list[tuple[float, float]] = []
     latest_global_map_image: Image.Image | None = None
-    skip_grounding_once = False
+    skip_target_detection_once = False
+    target_keyframe_wait_reason: str | None = None
     last_observer_video_frame_sim_time = float("-inf")
 
     warmup_steps = int(config.simulation.warmup_steps)
@@ -1228,14 +1265,17 @@ def run_navigation(
     occupancy_bootstrap_deadline_sec = sim_time_sec
     occupancy_bootstrap_logged = False
     occupancy_bootstrap_done_logged = False
-    occupancy_bootstrap_last_fov_bucket = -1
+    occupancy_bootstrap_last_ray_bucket = -1
+    rgbd_mapping_ready = False
+    latest_rgbd_ray_count = 0
+    rgbd_frame_check_logged = False
     occupancy_bootstrap_end_sec = sim_time_sec + max(
         0.0,
-        float(config.mapping.occupancy.lidar_bootstrap_sec),
+        float(config.mapping.rgbd.bootstrap_sec),
     )
     occupancy_bootstrap_deadline_sec = occupancy_bootstrap_end_sec + max(
         0.0,
-        float(config.mapping.occupancy.lidar_bootstrap_max_wait_sec),
+        float(config.mapping.rgbd.bootstrap_max_wait_sec),
     )
 
     while simulation_app.is_running():
@@ -1283,7 +1323,7 @@ def run_navigation(
                     navigation_failed = True
                     navigation_finished = True
                     drive_controller.apply("STOP", speed_scale=0.0)
-                    target_grounder.close()
+                    target_perception.close()
                     debug_video_recorder.close()
                     observer_video_recorder.close()
                     _write_evaluation_result(
@@ -1327,10 +1367,12 @@ def run_navigation(
                 observer_video_recorder.append(observer_rgb)
                 last_observer_video_frame_sim_time = sim_time_sec
 
+        depth_frame_updated = False
         if last_depth_image is None or (loop_now - last_depth_eval_time) >= float(config.robot.sensors.camera.depth_eval_period_sec):
             last_depth_image = _get_depth_image(camera=camera, logger=logger)
             last_depth_eval_time = loop_now
             depth_debug_save_pending = last_depth_image is not None
+            depth_frame_updated = last_depth_image is not None
             if last_depth_image is None and not depth_warning_emitted:
                 logger.warning(
                     "Depth frame unavailable; CAPTAINav candidate generation is waiting "
@@ -1361,36 +1403,70 @@ def run_navigation(
             },
         )
         mapping_pose = odom_state.raw_pose if config.robot.is_g1 else observation.pose
+        if depth_frame_updated and last_depth_image is not None:
+            try:
+                mapping_view_matrix_ros = np.asarray(
+                    camera.get_view_matrix_ros(),
+                    dtype=np.float64,
+                ).reshape(4, 4)
+                rgbd_ray_frame = rgbd_ray_projector.project(
+                    depth_image=last_depth_image,
+                    camera_intrinsics=front_camera_intrinsics,
+                    camera_view_matrix_ros=mapping_view_matrix_ros,
+                )
+                latest_rgbd_ray_count = int(rgbd_ray_frame.ray_count)
+                if rgbd_ray_frame.ray_count > 0:
+                    sensor_odom_xy = transform_world_xy_to_odom(
+                        rgbd_ray_frame.sensor_world_xy,
+                        origin_world_xy=odom_state.origin_world_xy,
+                        origin_world_yaw_rad=odom_state.origin_world_yaw_rad,
+                    )
+                    endpoints_odom_xy = transform_world_xy_to_odom(
+                        rgbd_ray_frame.endpoints_world_xy,
+                        origin_world_xy=odom_state.origin_world_xy,
+                        origin_world_yaw_rad=odom_state.origin_world_yaw_rad,
+                    )
+                    if not rgbd_frame_check_logged:
+                        camera_offset_m = float(
+                            np.linalg.norm(
+                                sensor_odom_xy
+                                - np.asarray(
+                                    [float(mapping_pose.x), float(mapping_pose.y)],
+                                    dtype=np.float64,
+                                )
+                            )
+                        )
+                        log_fn = logger.info if camera_offset_m <= 2.0 else logger.warning
+                        log_fn(
+                            "[RGBDFrameCheck] frame=odom origin_world=[%.3f,%.3f] "
+                            "origin_yaw_deg=%.1f robot_odom=[%.3f,%.3f] "
+                            "camera_odom=[%.3f,%.3f] camera_offset_m=%.3f rays=%s",
+                            float(odom_state.origin_world_xy[0]),
+                            float(odom_state.origin_world_xy[1]),
+                            float(np.degrees(odom_state.origin_world_yaw_rad)),
+                            float(mapping_pose.x),
+                            float(mapping_pose.y),
+                            float(sensor_odom_xy[0]),
+                            float(sensor_odom_xy[1]),
+                            camera_offset_m,
+                            int(rgbd_ray_frame.ray_count),
+                        )
+                        rgbd_frame_check_logged = True
+                    occupancy_grid.update_from_world_rays(
+                        robot_pose=mapping_pose,
+                        sensor_world_xy=sensor_odom_xy,
+                        beam_endpoints_world_xy=endpoints_odom_xy,
+                        beam_hit_mask=rgbd_ray_frame.hit_mask,
+                        timestamp_sec=sim_time_sec,
+                    )
+                    rgbd_mapping_ready = True
+            except Exception as exc:
+                logger.warning("[RGBDMap] frame_rejected error=%s", exc)
         lidar_scan = lidar_reader.read(
             pose=mapping_pose,
             timestamp_sec=sim_time_sec,
         )
         if lidar_scan is not None:
-            current_beam_endpoints = getattr(lidar_scan, "current_beam_endpoints_local_xy", lidar_scan.beam_endpoints_local_xy)
-            current_beam_hits = getattr(lidar_scan, "current_beam_hit_mask", lidar_scan.beam_hit_mask)
-            current_beam_endpoints_np = np.asarray(current_beam_endpoints, dtype=np.float32)
-            current_beam_hits_np = np.asarray(current_beam_hits, dtype=bool).reshape(-1)
-            if (
-                current_beam_endpoints_np.ndim == 2
-                and current_beam_endpoints_np.shape[0] == current_beam_hits_np.shape[0]
-                and current_beam_endpoints_np.shape[0] > 0
-            ):
-                map_beam_endpoints = current_beam_endpoints_np
-                map_beam_hits = current_beam_hits_np
-                map_points = current_beam_endpoints_np[current_beam_hits_np]
-            else:
-                map_beam_endpoints = np.zeros((0, 2), dtype=np.float32)
-                map_beam_hits = np.zeros((0,), dtype=bool)
-                map_points = np.zeros((0, 2), dtype=np.float32)
-            occupancy_grid.update_from_lidar(
-                robot_pose=mapping_pose,
-                points_local_xy=map_points,
-                beam_endpoints_local_xy=map_beam_endpoints,
-                beam_hit_mask=map_beam_hits,
-                sensor_origin_local_xy=getattr(lidar_scan, "sensor_origin_local_xy", None),
-                timestamp_sec=sim_time_sec,
-                static_obstacle_confirmation=bool(config.robot.is_g1),
-            )
             lidar_sector_depths = _lidar_sector_depths(
                 beam_endpoints_local_xy=np.asarray(lidar_scan.beam_endpoints_local_xy, dtype=np.float32),
                 beam_hit_mask=np.asarray(lidar_scan.beam_hit_mask, dtype=bool),
@@ -1415,41 +1491,39 @@ def run_navigation(
                 "sensor_path": lidar_reader.sensor_path,
                 "point_count": 0,
             }
-        current_lidar_fov_deg = 0.0 if lidar_scan is None else float(lidar_scan.effective_fov_deg)
-        bootstrap_min_fov_deg = max(0.0, float(config.mapping.occupancy.lidar_bootstrap_min_fov_deg))
-        bootstrap_fov_ready = (
-            bootstrap_min_fov_deg <= 0.0
-            or current_lidar_fov_deg >= bootstrap_min_fov_deg
-        )
         bootstrap_time_ready = sim_time_sec >= float(occupancy_bootstrap_end_sec)
         bootstrap_deadline_reached = sim_time_sec >= float(occupancy_bootstrap_deadline_sec)
-        if not (bootstrap_time_ready and (bootstrap_fov_ready or bootstrap_deadline_reached)):
+        if not (
+            bootstrap_time_ready
+            and (bool(rgbd_mapping_ready) or bootstrap_deadline_reached)
+        ):
             if not occupancy_bootstrap_logged:
                 logger.info(
-                    "[OccupancyBootstrap] accumulating initial lidar map before first policy step duration_sec=%.2f min_fov_deg=%.1f max_wait_sec=%.2f",
-                    max(0.0, float(config.mapping.occupancy.lidar_bootstrap_sec)),
-                    float(bootstrap_min_fov_deg),
-                    float(config.mapping.occupancy.lidar_bootstrap_max_wait_sec),
+                    "[OccupancyBootstrap] accumulating initial RGB-D map before first policy "
+                    "step duration_sec=%.2f max_wait_sec=%.2f",
+                    max(0.0, float(config.mapping.rgbd.bootstrap_sec)),
+                    float(config.mapping.rgbd.bootstrap_max_wait_sec),
                 )
                 occupancy_bootstrap_logged = True
-            fov_bucket = int(current_lidar_fov_deg // 10.0)
-            if fov_bucket != occupancy_bootstrap_last_fov_bucket:
+            ray_bucket = int(latest_rgbd_ray_count // 10)
+            if ray_bucket != occupancy_bootstrap_last_ray_bucket:
                 logger.info(
-                    "[OccupancyBootstrap] waiting time_ready=%s fov_ready=%s deadline=%s current_fov_deg=%.1f threshold_deg=%.1f",
+                    "[OccupancyBootstrap] waiting time_ready=%s rgbd_ready=%s "
+                    "deadline=%s rays=%s",
                     int(bool(bootstrap_time_ready)),
-                    int(bool(bootstrap_fov_ready)),
+                    int(bool(rgbd_mapping_ready)),
                     int(bool(bootstrap_deadline_reached)),
-                    float(current_lidar_fov_deg),
-                    float(bootstrap_min_fov_deg),
+                    int(latest_rgbd_ray_count),
                 )
-                occupancy_bootstrap_last_fov_bucket = fov_bucket
+                occupancy_bootstrap_last_ray_bucket = ray_bucket
             drive_controller.apply("STOP", speed_scale=0.0)
             last_action_name = "STOP"
             continue
         if occupancy_bootstrap_logged and not occupancy_bootstrap_done_logged:
             logger.info(
-                "[OccupancyBootstrap] complete; starting VLN policy. fov_deg=%.1f deadline_reached=%s",
-                float(current_lidar_fov_deg),
+                "[OccupancyBootstrap] complete; starting VLN policy. source=rgbd "
+                "rays=%s deadline_reached=%s",
+                int(latest_rgbd_ray_count),
                 int(bool(bootstrap_deadline_reached)),
             )
             occupancy_bootstrap_done_logged = True
@@ -1593,7 +1667,7 @@ def run_navigation(
                 route_complete_handled = True
                 navigation_finished = True
                 drive_controller.apply("STOP", speed_scale=0.0)
-                target_grounder.close()
+                target_perception.close()
                 debug_video_recorder.close()
                 observer_video_recorder.close()
                 _write_evaluation_result(
@@ -1626,7 +1700,8 @@ def run_navigation(
         current_landmark = policy.active_perception_target
         target_observation: TargetObservation | None = None
         landmark_map_entry = None
-        grounding_waiting_for_keyframe = False
+        target_detection_observation: TargetObservation | None = None
+        target_keyframe_ready = False
         if current_landmark:
             try:
                 front_camera_view_matrix_ros = np.asarray(
@@ -1638,21 +1713,21 @@ def run_navigation(
                 ) from exc
             remembered_landmark_entry = landmark_map.get(current_landmark)
             target_tracker.set_target_label(current_landmark)
-            allow_new_grounding = (
-                not skip_grounding_once
-                and target_tracker.should_request_grounding(
+            allow_new_target_detection = (
+                not skip_target_detection_once
+                and target_tracker.should_request_detection(
                     target_label=current_landmark,
                     timestamp_sec=sim_time_sec,
                 )
             )
-            grounding_observation = target_grounder.observe(
+            target_detection_observation = target_perception.observe(
                 rgb=front_rgb,
                 depth=last_depth_image,
                 target_label=current_landmark,
                 robot_pose=observation.pose,
                 timestamp_sec=sim_time_sec,
                 frame_index=frame_index,
-                allow_new_request=allow_new_grounding,
+                allow_new_request=allow_new_target_detection,
                 preferred_world_xy=(
                     None
                     if remembered_landmark_entry is None
@@ -1683,7 +1758,43 @@ def run_navigation(
                 ),
                 semantic_relation_text=policy.current_semantic_relation_text,
             )
-            semantic_batch = target_grounder.consume_semantic_batch()
+            detection_reason = str(target_detection_observation.reason).strip().lower()
+            detection_pending = bool(target_perception.request_in_flight) or detection_reason in {
+                "target_detection_request_started",
+                "target_detection_request_in_flight",
+            }
+            if detection_pending:
+                if target_keyframe_wait_reason != detection_reason:
+                    logger.info(
+                        "[PerceptionKeyframe] target=%s state=waiting reason=%s "
+                        "action=hold_current_pose",
+                        current_landmark,
+                        detection_reason,
+                    )
+                    target_keyframe_wait_reason = detection_reason
+                last_applied_wheel_velocity, last_applied_steering_angle = (
+                    drive_controller.apply("STOP", speed_scale=0.0)
+                )
+                last_action_name = "STOP"
+                last_policy_feedback = ExecutionFeedback(
+                    applied_action="STOP",
+                    wheel_velocity=last_applied_wheel_velocity,
+                    steering_angle=last_applied_steering_angle,
+                )
+                continue
+            if target_keyframe_wait_reason is not None:
+                target_keyframe_ready = True
+                logger.info(
+                    "[PerceptionKeyframe] target=%s state=ready visible=%s bbox=%s "
+                    "current=%s reason=%s",
+                    current_landmark,
+                    int(bool(target_detection_observation.visible)),
+                    list(target_detection_observation.bbox or ()),
+                    int(bool(target_detection_observation.is_current_frame)),
+                    detection_reason,
+                )
+                target_keyframe_wait_reason = None
+            semantic_batch = target_perception.consume_semantic_batch()
             if (
                 semantic_batch is not None
                 and semantic_batch.depth is not None
@@ -1694,7 +1805,11 @@ def run_navigation(
                     observations=list(semantic_batch.observations),
                     depth_image=semantic_batch.depth,
                     camera_intrinsics=semantic_batch.camera_intrinsics,
-                    camera_view_matrix_ros=semantic_batch.camera_view_matrix_ros,
+                    camera_view_matrix_ros=transform_camera_view_world_to_odom(
+                        semantic_batch.camera_view_matrix_ros,
+                        origin_world_xy=odom_state.origin_world_xy,
+                        origin_world_yaw_rad=odom_state.origin_world_yaw_rad,
+                    ),
                     timestamp_sec=semantic_batch.timestamp_sec,
                 )
                 logger.info(
@@ -1708,16 +1823,13 @@ def run_navigation(
                     int(semantic_update.total_instance_count),
                     int(semantic_update.rejected_depth_count),
                 )
-            if skip_grounding_once:
-                skip_grounding_once = False
-            grounding_waiting_for_keyframe = bool(
-                target_grounder.request_in_flight
-                and str(grounding_observation.reason).strip().lower()
-                in {"grounding_request_started", "grounding_request_in_flight"}
-            )
-            if bool(grounding_observation.visible) and bool(getattr(grounding_observation, "can_confirm", False)):
-                target_tracker.initialize_from_grounding(
-                    observation=grounding_observation,
+            if skip_target_detection_once:
+                skip_target_detection_once = False
+            if bool(target_detection_observation.visible) and bool(
+                getattr(target_detection_observation, "can_confirm", False)
+            ):
+                target_tracker.initialize_from_detection(
+                    observation=target_detection_observation,
                     rgb=front_rgb,
                     timestamp_sec=sim_time_sec,
                 )
@@ -1733,7 +1845,7 @@ def run_navigation(
                 robot_world_orientation_wxyz=orientation,
             )
             target_observation = _select_target_observation(
-                grounding_observation=grounding_observation,
+                detection_observation=target_detection_observation,
                 tracker_observation=tracker_observation,
             )
             landmark_state = landmark_tracker.update(
@@ -1816,31 +1928,22 @@ def run_navigation(
         )
         policy.set_obstacle_summary(obstacle_summary)
         policy.set_semantic_map_summary(semantic_map_summary)
-        if grounding_waiting_for_keyframe:
-            drive_controller.apply("STOP", speed_scale=0.0)
-            last_action_name = "STOP"
-            last_applied_wheel_velocity = 0.0
-            last_applied_steering_angle = 0.0
-            continue
-        grounding_vlm_was_used = bool(
+        target_verification_vlm_was_used = bool(
             current_landmark
-            and grounding_observation is not None
-            and str(getattr(grounding_observation, "vlm_verification_reason", ""))
+            and target_detection_observation is not None
+            and str(
+                getattr(target_detection_observation, "vlm_verification_reason", "")
+            )
             not in {"", "not_run", "auto_accept_high_detector_confidence"}
         )
-        if grounding_vlm_was_used and not bool(
-            getattr(grounding_observation, "can_confirm", False)
+        if target_verification_vlm_was_used and not bool(
+            getattr(target_detection_observation, "can_confirm", False)
         ):
-            skip_grounding_once = True
-            drive_controller.apply("STOP", speed_scale=0.0)
-            last_action_name = "STOP"
-            last_applied_wheel_velocity = 0.0
-            last_applied_steering_angle = 0.0
+            skip_target_detection_once = True
             logger.info(
-                "[NAV_STATE] perception_review target=%s result=rejected next=single_navigation_decision",
+                "[TargetVerify] target=%s result=rejected navigation=continue_search",
                 current_landmark,
             )
-            continue
         should_refresh_policy = True
         recovery_command = stuck_detector.recovery_command(now_sec=sim_time_sec)
         if recovery_command.active:
@@ -1864,7 +1967,6 @@ def run_navigation(
         if str(step_result.decision_source) in {
             "APPROACH_SAFETY_HOLD",
             "VISUAL_TARGET_SAFETY_HOLD",
-            "LOCAL_DETOUR_SAFETY_HOLD",
             "TURN_SCAN_SAFETY_HOLD",
             "TURN_ALIGNMENT_SAFETY_HOLD",
         }:
@@ -2005,7 +2107,11 @@ def run_navigation(
         force_final_debug_frame = bool(step_result.route_complete and not route_complete_handled)
         should_save_target_debug = (
             bool(config.debug.image.enabled)
-            and (force_final_debug_frame or (loop_now - last_nav_debug_save_time) >= debug_update_period_sec)
+            and (
+                force_final_debug_frame
+                or target_keyframe_ready
+                or (loop_now - last_nav_debug_save_time) >= debug_update_period_sec
+            )
         )
         if should_save_target_debug:
             latest_global_map_image = _save_global_occupancy_debug(
@@ -2035,7 +2141,7 @@ def run_navigation(
             navigation_finished = True
             drive_controller.apply("STOP", speed_scale=0.0)
             last_action_name = "STOP"
-            target_grounder.close()
+            target_perception.close()
             debug_video_recorder.close()
             observer_video_recorder.close()
             _write_evaluation_result(
@@ -2123,7 +2229,7 @@ def run_navigation(
 
         last_action_name = safety_decision.action_name
 
-    target_grounder.close()
+    target_perception.close()
     debug_video_recorder.close()
     observer_video_recorder.close()
     if not navigation_finished:
@@ -2421,17 +2527,21 @@ def _is_executing_motion_step(step_result) -> bool:
 
 def _select_target_observation(
     *,
-    grounding_observation: TargetObservation,
+    detection_observation: TargetObservation,
     tracker_observation: TargetObservation,
 ) -> TargetObservation:
-    if bool(grounding_observation.visible) and bool(getattr(grounding_observation, "can_confirm", False)):
-        return grounding_observation
-    if _is_transient_grounding_observation(grounding_observation):
-        return tracker_observation if bool(tracker_observation.visible) else grounding_observation
-    return grounding_observation
+    if bool(detection_observation.visible) and bool(
+        getattr(detection_observation, "can_confirm", False)
+    ):
+        return detection_observation
+    if _is_transient_target_detection_observation(detection_observation):
+        return tracker_observation if bool(tracker_observation.visible) else detection_observation
+    return detection_observation
 
 
-def _is_transient_grounding_observation(observation: TargetObservation | None) -> bool:
+def _is_transient_target_detection_observation(
+    observation: TargetObservation | None,
+) -> bool:
     if observation is None:
         return False
     reason = str(observation.reason).strip().lower()
@@ -2440,10 +2550,10 @@ def _is_transient_grounding_observation(observation: TargetObservation | None) -
         "reused" in source
         or reason
         in {
-            "grounding_request_started",
-            "grounding_request_in_flight",
-            "grounding_call_period",
-            "grounding_paused",
+            "target_detection_request_started",
+            "target_detection_request_in_flight",
+            "target_detection_call_period",
+            "target_detection_paused",
             "rgb_unavailable",
             "image_prepare_failed",
         }
@@ -3086,7 +3196,12 @@ def _save_global_occupancy_debug(
         py = int(round(map_y0 + (max_y - float(y_m)) * scale))
         return px, py
 
-    draw.text((12, 10), "NORTH-UP GLOBAL OCCUPANCY MAP", fill=(245, 245, 245), font=font_title)
+    draw.text(
+        (12, 10),
+        "NORTH-UP RGB-D GLOBAL OCCUPANCY MAP",
+        fill=(245, 245, 245),
+        font=font_title,
+    )
     draw.text(
         (12, 42),
         "black=occupied  white=free  gray=unknown  cyan=trajectory  blue=robot  green=DONE  magenta=confirmed  amber=potential  yellow=active_subgoal",

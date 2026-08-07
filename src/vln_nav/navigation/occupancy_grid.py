@@ -67,6 +67,7 @@ class OccupancyGridSnapshot:
     free_mask: np.ndarray
     origin_x: float = 0.0
     origin_y: float = 0.0
+    sensor_origin_world_xy: tuple[float, float] | None = None
 
 
 @dataclass
@@ -102,7 +103,7 @@ class GlobalOccupancyMap:
     - Grid origin is tracked in world coordinates and can be dynamically
       expanded as the robot navigates beyond the current boundaries.
     - No decay by default (``decay_rate=1.0``).
-    - LiDAR rays are processed in batch via numpy (Bresenham-style free/hit
+    - Sensor rays are processed in batch via numpy (Bresenham-style free/hit
       marking without a Python loop per sample).
     """
 
@@ -141,7 +142,8 @@ class GlobalOccupancyMap:
         self._static_update_index = 0
         self._last_update_time_sec = -float("inf")
         self._last_debug_save_time_sec = -float("inf")
-        self._last_lidar_points_local_xy = np.zeros((0, 2), dtype=np.float32)
+        self._last_sensor_points_local_xy = np.zeros((0, 2), dtype=np.float32)
+        self._last_sensor_origin_world_xy: tuple[float, float] | None = None
         self._last_semantic_plan: SemanticSubgoalPlan | None = None
         self._last_semantic_entries: list[LandmarkMapEntry] = []
         self._debug_path = Path(config.debug_image_path)
@@ -241,7 +243,73 @@ class GlobalOccupancyMap:
             self._origin_y,
         )
 
-    # -- LiDAR-based update --------------------------------------------------
+    # -- sensor updates -------------------------------------------------------
+
+    def update_from_world_rays(
+        self,
+        *,
+        robot_pose: Pose2D,
+        sensor_world_xy: np.ndarray,
+        beam_endpoints_world_xy: np.ndarray,
+        beam_hit_mask: np.ndarray,
+        timestamp_sec: float,
+    ) -> None:
+        """Fuse calibrated world-frame rays from the active geometry sensor."""
+
+        if float(timestamp_sec) - float(self._last_update_time_sec) < max(
+            0.02, float(self._config.update_period_sec)
+        ):
+            return
+        endpoints = np.asarray(beam_endpoints_world_xy, dtype=np.float64)
+        hits = np.asarray(beam_hit_mask, dtype=bool).reshape(-1)
+        sensor = np.asarray(sensor_world_xy, dtype=np.float64).reshape(-1)
+        if (
+            endpoints.ndim != 2
+            or endpoints.shape[1] < 2
+            or endpoints.shape[0] == 0
+            or hits.shape[0] != endpoints.shape[0]
+            or sensor.size < 2
+        ):
+            return
+        endpoints = endpoints[:, :2]
+        sensor = sensor[:2]
+        distances = np.linalg.norm(endpoints - sensor[None, :], axis=1)
+        min_range = max(0.02, float(self._config.min_range_m))
+        max_range = max(min_range + 0.10, float(self._config.max_range_m))
+        valid = (
+            np.all(np.isfinite(endpoints), axis=1)
+            & np.isfinite(distances)
+            & (distances >= min_range)
+            & (distances <= max_range)
+        )
+        if not np.any(valid):
+            self._last_update_time_sec = float(timestamp_sec)
+            return
+
+        endpoints = endpoints[valid]
+        distances = distances[valid]
+        hits = hits[valid]
+        self._last_sensor_origin_world_xy = (float(sensor[0]), float(sensor[1]))
+        self._expand_if_needed(float(robot_pose.x), float(robot_pose.y))
+        self._last_sensor_points_local_xy = _world_points_to_robot_local(
+            world_points_xy=endpoints,
+            robot_pose=robot_pose,
+        )
+        n_free, n_occ = self._batch_mark_rays(
+            start_xy=sensor,
+            end_xy_arr=endpoints,
+            endpoint_distances=distances,
+            endpoint_hit_mask=hits,
+            static_obstacle_confirmation=False,
+        )
+        self._last_update_time_sec = float(timestamp_sec)
+        if n_occ > 0:
+            self._logger.debug(
+                "[Occupancy] rgbd_update free_cells=%s occupied_cells=%s occupied_total=%s",
+                n_free,
+                n_occ,
+                int(np.count_nonzero(self._occupied_mask())),
+            )
 
     def update_from_lidar(
         self,
@@ -288,7 +356,7 @@ class GlobalOccupancyMap:
             hits = np.ones((endpoints.shape[0],), dtype=bool)
         if endpoints.ndim != 2 or endpoints.shape[0] == 0:
             return
-        self._last_lidar_points_local_xy = endpoints.copy()
+        self._last_sensor_points_local_xy = endpoints.copy()
 
         robot_x = float(robot_pose.x)
         robot_y = float(robot_pose.y)
@@ -304,6 +372,7 @@ class GlobalOccupancyMap:
         sensor_left = float(sensor_origin[1]) if sensor_origin.size >= 2 else 0.0
         sensor_world_x = float(robot_x) + cos_yaw * sensor_forward - sin_yaw * sensor_left
         sensor_world_y = float(robot_y) + sin_yaw * sensor_forward + cos_yaw * sensor_left
+        self._last_sensor_origin_world_xy = (sensor_world_x, sensor_world_y)
         min_depth = max(0.02, float(self._config.min_range_m))
         max_depth = max(min_depth + 0.10, float(self._config.max_range_m))
 
@@ -636,6 +705,7 @@ class GlobalOccupancyMap:
             free_mask=free.copy(),
             origin_x=self._origin_x,
             origin_y=self._origin_y,
+            sensor_origin_world_xy=self._last_sensor_origin_world_xy,
         )
 
     # -- local submap (for candidate filtering & A*) -------------------------
@@ -1033,7 +1103,7 @@ class GlobalOccupancyMap:
         legend = (
             "up=front | image-left=robot-left | "
             "black=occupied  white=free  gray=unknown  "
-            "cyan=lidar  yellow=candidate  magenta=potential  orange=confirmed  green=reached/subgoal"
+            "cyan=sensor rays  yellow=candidate  magenta=potential  orange=confirmed  green=reached/subgoal"
         )
         draw.text((12, 34), legend, fill=(30, 30, 30), font=label_font)
 
@@ -1144,12 +1214,12 @@ class GlobalOccupancyMap:
             if reason and reason != "reachable":
                 draw.text((x + 12, y - 9), reason, fill=color, font=_load_font(14))
 
-        self._draw_latest_lidar_points(draw=draw, transform=transform)
+        self._draw_latest_sensor_points(draw=draw, transform=transform)
 
-    def _draw_latest_lidar_points(
+    def _draw_latest_sensor_points(
         self, *, draw: ImageDraw.ImageDraw, transform: "_DebugTransform"
     ) -> None:
-        points = np.asarray(self._last_lidar_points_local_xy, dtype=np.float32)
+        points = np.asarray(self._last_sensor_points_local_xy, dtype=np.float32)
         if points.ndim != 2 or points.shape[1] < 2 or points.size == 0:
             return
         for forward_m, left_m in points[:: max(1, int(len(points) / 220))]:
@@ -1302,6 +1372,27 @@ def _world_to_local_xy(
     forward_m = cos_yaw * float(delta[0]) + sin_yaw * float(delta[1])
     left_m = -sin_yaw * float(delta[0]) + cos_yaw * float(delta[1])
     return float(forward_m), float(left_m)
+
+
+def _world_points_to_robot_local(
+    *,
+    world_points_xy: np.ndarray,
+    robot_pose: Pose2D,
+) -> np.ndarray:
+    points = np.asarray(world_points_xy, dtype=np.float64).reshape(-1, 2)
+    delta = points - np.asarray(
+        [float(robot_pose.x), float(robot_pose.y)],
+        dtype=np.float64,
+    )[None, :]
+    cos_yaw = float(np.cos(robot_pose.yaw_rad))
+    sin_yaw = float(np.sin(robot_pose.yaw_rad))
+    return np.stack(
+        [
+            cos_yaw * delta[:, 0] + sin_yaw * delta[:, 1],
+            -sin_yaw * delta[:, 0] + cos_yaw * delta[:, 1],
+        ],
+        axis=-1,
+    ).astype(np.float32)
 
 
 def _shift_mask(mask: np.ndarray, row_shift: int, col_shift: int) -> np.ndarray:

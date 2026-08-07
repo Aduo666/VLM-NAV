@@ -41,6 +41,18 @@ class RGBDMapUpdate:
     free_cell_count: int
 
 
+@dataclass(frozen=True)
+class RGBDVirtualRayFrame:
+    sensor_world_xy: np.ndarray
+    endpoints_world_xy: np.ndarray
+    hit_mask: np.ndarray
+    valid_depth_count: int
+
+    @property
+    def ray_count(self) -> int:
+        return int(self.endpoints_world_xy.shape[0])
+
+
 def backproject_depth_pixels_to_world(
     *,
     pixel_u: np.ndarray,
@@ -83,6 +95,127 @@ def backproject_depth_pixels_to_world(
     return points_world_h[..., :3] / scale[..., None]
 
 
+class RGBDVirtualRayProjector:
+    """Convert a calibrated RGB-D frame into one planar ray per image column."""
+
+    def __init__(self, *, config: RGBDGeometryMapConfig, floor_z_m: float) -> None:
+        self._config = config
+        self._floor_z_m = float(floor_z_m)
+
+    def project(
+        self,
+        *,
+        depth_image: np.ndarray,
+        camera_intrinsics: np.ndarray,
+        camera_view_matrix_ros: np.ndarray,
+    ) -> RGBDVirtualRayFrame:
+        depth = np.asarray(depth_image, dtype=np.float32)
+        intrinsics = np.asarray(camera_intrinsics, dtype=np.float64).reshape(3, 3)
+        view_ros = np.asarray(camera_view_matrix_ros, dtype=np.float64).reshape(4, 4)
+        if depth.ndim != 2:
+            raise ValueError(f"RGB-D projector expects HxW depth, got shape={depth.shape}")
+        if not np.all(np.isfinite(intrinsics)) or not np.all(np.isfinite(view_ros)):
+            raise ValueError("Camera calibration contains non-finite values")
+
+        camera_to_world = np.linalg.inv(view_ros)
+        camera_origin_world = camera_to_world[:3, 3].astype(np.float64)
+        endpoints_world, hit_mask, valid_depth_count = self._extract_virtual_rays(
+            depth=depth,
+            intrinsics=intrinsics,
+            camera_to_world=camera_to_world,
+            camera_origin_world=camera_origin_world,
+        )
+        return RGBDVirtualRayFrame(
+            sensor_world_xy=camera_origin_world[:2].copy(),
+            endpoints_world_xy=endpoints_world[:, :2].copy(),
+            hit_mask=hit_mask.copy(),
+            valid_depth_count=int(valid_depth_count),
+        )
+
+    def _extract_virtual_rays(
+        self,
+        *,
+        depth: np.ndarray,
+        intrinsics: np.ndarray,
+        camera_to_world: np.ndarray,
+        camera_origin_world: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, int]:
+        height, width = depth.shape
+        stride = max(1, int(self._config.pixel_stride))
+        u_values = np.arange(stride // 2, width, stride, dtype=np.intp)
+        v_start = int(np.clip(self._config.vertical_min_ratio, 0.0, 0.99) * height)
+        v_stop = int(np.clip(self._config.vertical_max_ratio, 0.01, 1.0) * height)
+        v_values = np.arange(v_start, max(v_start + 1, v_stop), stride, dtype=np.intp)
+        if u_values.size == 0 or v_values.size == 0:
+            return np.zeros((0, 3), dtype=np.float64), np.zeros((0,), dtype=bool), 0
+
+        sampled_depth = depth[np.ix_(v_values, u_values)].astype(np.float64)
+        valid_depth = (
+            np.isfinite(sampled_depth)
+            & (sampled_depth >= float(self._config.min_depth_m))
+            & (sampled_depth <= float(self._config.max_depth_m))
+        )
+        if not np.any(valid_depth):
+            return np.zeros((0, 3), dtype=np.float64), np.zeros((0,), dtype=bool), 0
+
+        uu, vv = np.meshgrid(u_values.astype(np.float64), v_values.astype(np.float64))
+        points_world = backproject_depth_pixels_to_world(
+            pixel_u=uu,
+            pixel_v=vv,
+            depth_m=sampled_depth,
+            camera_intrinsics=intrinsics,
+            camera_to_world=camera_to_world,
+        )
+        planar_distance = np.linalg.norm(
+            points_world[..., :2] - camera_origin_world[None, None, :2],
+            axis=-1,
+        )
+        valid = (
+            valid_depth
+            & np.all(np.isfinite(points_world), axis=-1)
+            & np.isfinite(planar_distance)
+            & (planar_distance >= float(self._config.min_depth_m))
+            & (planar_distance <= float(self._config.max_depth_m))
+        )
+        relative_height = points_world[..., 2] - self._floor_z_m
+        obstacle = (
+            valid
+            & (relative_height >= float(self._config.obstacle_min_height_m))
+            & (relative_height <= float(self._config.obstacle_max_height_m))
+        )
+        floor = (
+            valid
+            & (relative_height >= -float(self._config.floor_tolerance_below_m))
+            & (relative_height < float(self._config.obstacle_min_height_m))
+        )
+
+        obstacle_distances = np.where(obstacle, planar_distance, np.inf)
+        nearest_obstacle_row = np.argmin(obstacle_distances, axis=0)
+        nearest_obstacle_distance = np.min(obstacle_distances, axis=0)
+        has_obstacle = np.isfinite(nearest_obstacle_distance)
+
+        floor_distances = np.where(floor, planar_distance, -np.inf)
+        farthest_floor_row = np.argmax(floor_distances, axis=0)
+        farthest_floor_distance = np.max(floor_distances, axis=0)
+        has_floor = np.isfinite(farthest_floor_distance) & (farthest_floor_distance > 0.0)
+        keep_column = has_obstacle | has_floor
+        if not np.any(keep_column):
+            return (
+                np.zeros((0, 3), dtype=np.float64),
+                np.zeros((0,), dtype=bool),
+                int(np.count_nonzero(valid)),
+            )
+
+        column_indices = np.arange(u_values.size, dtype=np.intp)
+        selected_rows = np.where(has_obstacle, nearest_obstacle_row, farthest_floor_row)
+        selected_points = points_world[selected_rows, column_indices]
+        return (
+            selected_points[keep_column].astype(np.float64),
+            has_obstacle[keep_column].astype(bool),
+            int(np.count_nonzero(valid)),
+        )
+
+
 class RGBDGeometryMap:
     """North-up global geometry map built only from posed RGB-D observations.
 
@@ -112,6 +245,10 @@ class RGBDGeometryMap:
         self._origin_x = float(self._center_world_xy[0] - half_extent)
         self._origin_y = float(self._center_world_xy[1] - half_extent)
         self._floor_z_m = float(floor_z_m)
+        self._ray_projector = RGBDVirtualRayProjector(
+            config=config,
+            floor_z_m=self._floor_z_m,
+        )
         self._log_odds = np.zeros((self._cell_count, self._cell_count), dtype=np.float32)
         self._trajectory_world_xy: list[tuple[float, float]] = []
         self._last_update_time_sec = -float("inf")
@@ -152,19 +289,16 @@ class RGBDGeometryMap:
         if not np.all(np.isfinite(intrinsics)) or not np.all(np.isfinite(view_ros)):
             raise ValueError("Camera calibration contains non-finite values")
 
-        camera_to_world = np.linalg.inv(view_ros)
-        camera_origin_world = camera_to_world[:3, 3].astype(np.float64)
-        endpoints_world, hit_mask, valid_depth_count = self._extract_virtual_rays(
-            depth=depth,
-            intrinsics=intrinsics,
-            camera_to_world=camera_to_world,
-            camera_origin_world=camera_origin_world,
+        ray_frame = self._ray_projector.project(
+            depth_image=depth,
+            camera_intrinsics=intrinsics,
+            camera_view_matrix_ros=view_ros,
         )
-        if endpoints_world.shape[0] > 0:
+        if ray_frame.ray_count > 0:
             self._integrate_rays(
-                sensor_world_xy=camera_origin_world[:2],
-                endpoints_world_xy=endpoints_world[:, :2],
-                hit_mask=hit_mask,
+                sensor_world_xy=ray_frame.sensor_world_xy,
+                endpoints_world_xy=ray_frame.endpoints_world_xy,
+                hit_mask=ray_frame.hit_mask,
             )
 
         self._last_update_time_sec = float(timestamp_sec)
@@ -172,9 +306,9 @@ class RGBDGeometryMap:
         free_count = int(np.count_nonzero(self._log_odds <= self._config.free_threshold))
         self._last_update = RGBDMapUpdate(
             updated=True,
-            ray_count=int(endpoints_world.shape[0]),
-            hit_ray_count=int(np.count_nonzero(hit_mask)),
-            valid_depth_count=int(valid_depth_count),
+            ray_count=int(ray_frame.ray_count),
+            hit_ray_count=int(np.count_nonzero(ray_frame.hit_mask)),
+            valid_depth_count=int(ray_frame.valid_depth_count),
             occupied_cell_count=occupied_count,
             free_cell_count=free_count,
         )
@@ -381,82 +515,6 @@ class RGBDGeometryMap:
         row_min = int(np.clip(row_min, 0, self._cell_count - side))
         col_min = int(np.clip(col_min, 0, self._cell_count - side))
         return row_min, row_min + side - 1, col_min, col_min + side - 1
-
-    def _extract_virtual_rays(
-        self,
-        *,
-        depth: np.ndarray,
-        intrinsics: np.ndarray,
-        camera_to_world: np.ndarray,
-        camera_origin_world: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray, int]:
-        height, width = depth.shape
-        stride = max(1, int(self._config.pixel_stride))
-        u_values = np.arange(stride // 2, width, stride, dtype=np.intp)
-        v_start = int(np.clip(self._config.vertical_min_ratio, 0.0, 0.99) * height)
-        v_stop = int(np.clip(self._config.vertical_max_ratio, 0.01, 1.0) * height)
-        v_values = np.arange(v_start, max(v_start + 1, v_stop), stride, dtype=np.intp)
-        if u_values.size == 0 or v_values.size == 0:
-            return np.zeros((0, 3), dtype=np.float64), np.zeros((0,), dtype=bool), 0
-
-        sampled_depth = depth[np.ix_(v_values, u_values)].astype(np.float64)
-        valid_depth = (
-            np.isfinite(sampled_depth)
-            & (sampled_depth >= float(self._config.min_depth_m))
-            & (sampled_depth <= float(self._config.max_depth_m))
-        )
-        if not np.any(valid_depth):
-            return np.zeros((0, 3), dtype=np.float64), np.zeros((0,), dtype=bool), 0
-
-        uu, vv = np.meshgrid(u_values.astype(np.float64), v_values.astype(np.float64))
-        points_world = backproject_depth_pixels_to_world(
-            pixel_u=uu,
-            pixel_v=vv,
-            depth_m=sampled_depth,
-            camera_intrinsics=intrinsics,
-            camera_to_world=camera_to_world,
-        )
-        planar_distance = np.linalg.norm(points_world[..., :2] - camera_origin_world[None, None, :2], axis=-1)
-        valid = (
-            valid_depth
-            & np.all(np.isfinite(points_world), axis=-1)
-            & np.isfinite(planar_distance)
-            & (planar_distance >= float(self._config.min_depth_m))
-            & (planar_distance <= float(self._config.max_depth_m))
-        )
-        relative_height = points_world[..., 2] - self._floor_z_m
-        obstacle = (
-            valid
-            & (relative_height >= float(self._config.obstacle_min_height_m))
-            & (relative_height <= float(self._config.obstacle_max_height_m))
-        )
-        floor = (
-            valid
-            & (relative_height >= -float(self._config.floor_tolerance_below_m))
-            & (relative_height < float(self._config.obstacle_min_height_m))
-        )
-
-        obstacle_distances = np.where(obstacle, planar_distance, np.inf)
-        nearest_obstacle_row = np.argmin(obstacle_distances, axis=0)
-        nearest_obstacle_distance = np.min(obstacle_distances, axis=0)
-        has_obstacle = np.isfinite(nearest_obstacle_distance)
-
-        floor_distances = np.where(floor, planar_distance, -np.inf)
-        farthest_floor_row = np.argmax(floor_distances, axis=0)
-        farthest_floor_distance = np.max(floor_distances, axis=0)
-        has_floor = np.isfinite(farthest_floor_distance) & (farthest_floor_distance > 0.0)
-        keep_column = has_obstacle | has_floor
-        if not np.any(keep_column):
-            return np.zeros((0, 3), dtype=np.float64), np.zeros((0,), dtype=bool), int(np.count_nonzero(valid))
-
-        column_indices = np.arange(u_values.size, dtype=np.intp)
-        selected_rows = np.where(has_obstacle, nearest_obstacle_row, farthest_floor_row)
-        selected_points = points_world[selected_rows, column_indices]
-        return (
-            selected_points[keep_column].astype(np.float64),
-            has_obstacle[keep_column].astype(bool),
-            int(np.count_nonzero(valid)),
-        )
 
     def _integrate_rays(
         self,

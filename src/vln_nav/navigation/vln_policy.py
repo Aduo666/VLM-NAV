@@ -84,7 +84,6 @@ class VLNPolicyConfig:
     semantic_turn_min_corridor_width_deg: float = 15.0
     semantic_turn_corridor_max_clearance_m: float = 4.0
     semantic_turn_max_recovery_attempts: int = 2
-    local_detour_max_turn_primitives: int = 2
     confirm_min_observations: int = 3
     confirm_confidence_threshold: float = 0.50
     visual_target_center_deadband_deg: float = 15.0
@@ -136,13 +135,6 @@ class _TurnTargetHypothesis:
     confidence: float = 0.0
     ready: bool = False
     has_world_anchor: bool = False
-
-
-@dataclass
-class _LocalDetourState:
-    target_label: str
-    turn_action: str
-    turns_taken: int
 
 
 def _turn_target_observation_consistent(
@@ -285,7 +277,6 @@ class VLNPolicy:
             )
         )
         self._satisfied_turn_triggers: set[str] = set()
-        self._local_detour_state: _LocalDetourState | None = None
         self._topology_node_id: int | None = None
         self._region_transition = RegionTransitionManager(
             config=RegionTransitionConfig(
@@ -437,17 +428,6 @@ class VLNPolicy:
                 )
 
         debug_image_path = None
-        detour_result = self._continue_local_detour(
-            observation=observation,
-            candidate_set=candidate_set,
-            progress_signal=progress_state.progress_signal,
-            debug_image_path=debug_image_path,
-            now=now,
-        )
-        if detour_result is not None:
-            self._safety_context_text = ""
-            return detour_result
-
         # Fresh verified image evidence outranks a projected world anchor.
         visual_candidate = None
         visual_desired_action = None
@@ -711,11 +691,6 @@ class VLNPolicy:
             turn_speed_scale=float(self._config.turn_speed_scale),
             forward_speed_scale=float(self._config.forward_speed_scale),
         )
-        self._local_detour_state = _LocalDetourState(
-            target_label=self._current_target_text(),
-            turn_action=turn_action,
-            turns_taken=1,
-        )
         self._logger.warning(
             "[LocalDetour] target=%s direct=%s blocked=1 detour=%s bearing_deg=%+.1f",
             self._current_target_text(),
@@ -732,77 +707,10 @@ class VLNPolicy:
             progress_signal=progress_signal,
             decision_source="VISUAL_TARGET_LOCAL_DETOUR",
             reasoning_summary=(
-                f"direct visual action {desired_action} is blocked; commit {turn_action} then one safe forward primitive"
+                f"direct visual action {desired_action} is blocked; execute one "
+                f"{turn_action} primitive and re-evaluate the fresh target bearing"
             ),
             debug_image_path=debug_image_path,
-        )
-
-    def _continue_local_detour(
-        self,
-        *,
-        observation: VLNObservation,
-        candidate_set: CandidateSet,
-        progress_signal: str,
-        debug_image_path: str | Path | None,
-        now: float,
-    ) -> PolicyStepResult | None:
-        state = self._local_detour_state
-        if state is None:
-            return None
-        if state.target_label != self._current_target_text():
-            self._local_detour_state = None
-            return None
-
-        forward_candidate = self._best_candidate_for_action(
-            candidate_set=candidate_set,
-            action_name="FORWARD",
-        )
-        if forward_candidate is not None:
-            self._local_detour_state = None
-            return self._start_candidate_primitive(
-                observation=observation,
-                candidate=forward_candidate,
-                action_name="FORWARD",
-                speed_scale=float(self._config.forward_speed_scale),
-                now=now,
-                progress_signal=progress_signal,
-                decision_source="LOCAL_DETOUR_FORWARD",
-                reasoning_summary=(
-                    f"detour side={state.turn_action} established a safe corridor; advance once before target recentering"
-                ),
-                debug_image_path=debug_image_path,
-            )
-
-        max_turns = max(1, int(self._config.local_detour_max_turn_primitives))
-        turn_candidate = self._best_candidate_for_action(
-            candidate_set=candidate_set,
-            action_name=state.turn_action,
-        )
-        if turn_candidate is not None and state.turns_taken < max_turns:
-            state.turns_taken += 1
-            return self._start_candidate_primitive(
-                observation=observation,
-                candidate=turn_candidate,
-                action_name=state.turn_action,
-                speed_scale=float(self._config.turn_speed_scale),
-                now=now,
-                progress_signal=progress_signal,
-                decision_source="VISUAL_TARGET_LOCAL_DETOUR",
-                reasoning_summary=(
-                    f"continue committed detour {state.turn_action} turn {state.turns_taken}/{max_turns}"
-                ),
-                debug_image_path=debug_image_path,
-            )
-
-        self._local_detour_state = None
-        self._next_replan_time = now + float(self._config.replanning_cooldown_sec)
-        return self._hold_result(
-            decision_source="LOCAL_DETOUR_SAFETY_HOLD",
-            reasoning_summary="local detour exhausted without a safe forward corridor; request bounded runtime recovery",
-            progress_signal=progress_signal,
-            debug_image_path=debug_image_path,
-            replanned=True,
-            last_error="local_detour_exhausted",
         )
 
     def _best_detour_turn_candidate(
@@ -1124,7 +1032,6 @@ class VLNPolicy:
 
     def cancel_active_goal(self) -> None:
         self._clear_active_goal()
-        self._local_detour_state = None
         self._semantic_turn_active_counts_as_scan = False
 
     def set_safety_context(self, text: str) -> None:
@@ -2568,7 +2475,6 @@ class VLNPolicy:
         self._semantic_turn_recovery_attempts = 0
         self._semantic_turn_restart_after_recovery = False
         self._semantic_turn_active_counts_as_scan = False
-        self._local_detour_state = None
         self._region_transition.reset()
         self._landmark_tracker_state = None
         self._landmark_map_entry = None

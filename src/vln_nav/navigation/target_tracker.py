@@ -41,7 +41,7 @@ class TargetTracker:
         self._lifecycle = "SEARCHING"
         self._lost_count = 0
         self._last_seen_time_sec = -float("inf")
-        self._last_grounding_time_sec = -float("inf")
+        self._last_detection_time_sec = -float("inf")
         self._identity_confidence = 0.0
         self._identity_vlm_verified = False
         self._identity_vlm_confidence = 0.0
@@ -85,13 +85,13 @@ class TargetTracker:
         self._last_observation = None
         self._last_log_signature = None
 
-    def should_request_grounding(self, *, target_label: str, timestamp_sec: float) -> bool:
-        # This method is called only at decision keyframes. Re-ground there so
+    def should_request_detection(self, *, target_label: str, timestamp_sec: float) -> bool:
+        # This method is called only at decision keyframes. Re-detect there so
         # geometric tracker drift can never become semantic truth.
         _ = target_label, timestamp_sec
         return True
 
-    def initialize_from_grounding(
+    def initialize_from_detection(
         self,
         *,
         observation: TargetObservation,
@@ -100,7 +100,7 @@ class TargetTracker:
     ) -> bool:
         if rgb is None or np.asarray(rgb).ndim != 3:
             return False
-        if not _is_confirmable_grounding(observation):
+        if not _is_confirmable_detection(observation):
             return False
         bbox = _clip_bbox(observation.bbox, image_shape=np.asarray(rgb).shape)
         if bbox is None:
@@ -128,7 +128,7 @@ class TargetTracker:
         self._lifecycle = "TRACKING"
         self._lost_count = 0
         self._last_seen_time_sec = float(timestamp_sec)
-        self._last_grounding_time_sec = float(timestamp_sec)
+        self._last_detection_time_sec = float(timestamp_sec)
         self._identity_confidence = float(observation.confidence)
         self._identity_vlm_verified = bool(getattr(observation, "vlm_verified", False))
         self._identity_vlm_confidence = float(getattr(observation, "vlm_verification_confidence", 0.0))
@@ -408,7 +408,7 @@ class TargetTracker:
         )
 
 
-def _is_confirmable_grounding(observation: TargetObservation) -> bool:
+def _is_confirmable_detection(observation: TargetObservation) -> bool:
     if not bool(observation.visible) or observation.bbox is None:
         return False
     if str(observation.reason).strip().lower() != "ok":

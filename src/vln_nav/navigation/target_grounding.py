@@ -43,6 +43,9 @@ class TargetObservation:
     request_robot_pose: Pose2D | None = None
     result_age_sec: float = 0.0
     is_current_frame: bool = True
+    request_evidence_valid: bool = True
+    result_pose_delta_m: float = 0.0
+    result_yaw_delta_deg: float = 0.0
     evidence_level: str = "none"  # none / potential / confirmed_candidate
     semantic_source: str = "unknown"
     can_confirm: bool = False
@@ -87,9 +90,9 @@ class TargetGroundingConfig:
     grounding_dino_text_encoder_path: str = "weights/grounded_sam/bert-base-uncased"
     grounding_dino_max_detections: int = 5
     grounding_dino_nms_iou_threshold: float = 0.50
-    max_result_age_sec: float = 30.0
-    max_result_pose_delta_m: float = 0.05
-    max_result_yaw_delta_deg: float = 3.0
+    max_result_age_sec: float = 2.0
+    max_result_pose_delta_m: float = 0.20
+    max_result_yaw_delta_deg: float = 10.0
     semantic_verification_min_confidence: float = 0.70
     semantic_verification_max_edge_px: int = 768
     semantic_verification_auto_accept_confidence: float = 0.75
@@ -124,6 +127,14 @@ class _GroundingRequest:
 class _MappedBbox:
     bbox: tuple[int, int, int, int]
     coordinate_mode: str
+
+
+@dataclass(frozen=True)
+class _ResultFreshness:
+    is_current_frame: bool
+    request_evidence_valid: bool
+    pose_delta_m: float
+    yaw_delta_deg: float
 
 
 class TargetGrounder:
@@ -298,7 +309,7 @@ class TargetGrounder:
         if age_sec > max(0.0, float(self._config.reuse_last_observation_sec)):
             return None
         result_age_sec = float(timestamp_sec) - float(self._last_observation.request_sim_time_sec) if self._last_observation.request_sim_time_sec > 0.0 else age_sec
-        is_current = _is_current_frame(
+        freshness = _result_freshness(
             result_age_sec=result_age_sec,
             request_pose=self._last_observation.request_robot_pose,
             current_pose=current_robot_pose,
@@ -327,7 +338,13 @@ class TargetGrounder:
             request_sim_time_sec=self._last_observation.request_sim_time_sec,
             request_robot_pose=self._last_observation.request_robot_pose,
             result_age_sec=float(result_age_sec),
-            is_current_frame=is_current,
+            is_current_frame=False,
+            request_evidence_valid=(
+                bool(self._last_observation.request_evidence_valid)
+                and bool(freshness.request_evidence_valid)
+            ),
+            result_pose_delta_m=float(freshness.pose_delta_m),
+            result_yaw_delta_deg=float(freshness.yaw_delta_deg),
             evidence_level=str(self._last_observation.evidence_level),
             semantic_source=str(self._last_observation.semantic_source),
             can_confirm=bool(self._last_observation.can_confirm),
@@ -369,13 +386,14 @@ class TargetGrounder:
                 request_sim_time_sec=request.timestamp_sec,
                 request_robot_pose=request.robot_pose,
                 result_age_sec=float(timestamp_sec) - float(request.timestamp_sec),
-                is_current_frame=True,
+                is_current_frame=False,
+                request_evidence_valid=False,
             )
             self._last_observation = observation
             self._last_observation_wall_sec = float(wall_time_sec)
             return observation
         result_age_sec = float(timestamp_sec) - float(request.timestamp_sec)
-        is_current = _is_current_frame(
+        freshness = _result_freshness(
             result_age_sec=result_age_sec,
             request_pose=request.robot_pose,
             current_pose=current_robot_pose,
@@ -388,7 +406,10 @@ class TargetGrounder:
             request_sim_time_sec=request.timestamp_sec,
             request_robot_pose=request.robot_pose,
             result_age_sec=result_age_sec,
-            is_current_frame=is_current,
+            is_current_frame=bool(freshness.is_current_frame),
+            request_evidence_valid=bool(freshness.request_evidence_valid),
+            result_pose_delta_m=float(freshness.pose_delta_m),
+            result_yaw_delta_deg=float(freshness.yaw_delta_deg),
         )
         self._last_observation = observation
         self._last_observation_wall_sec = float(wall_time_sec)
@@ -414,6 +435,16 @@ class TargetGrounder:
                 int(observation.vlm_verified),
                 float(observation.vlm_verification_confidence),
                 observation.vlm_verification_reason[:80],
+            )
+            self._logger.info(
+                "[GroundingFreshness] target=%s age=%.2fs pose_delta=%.2fm "
+                "yaw_delta=%.1fdeg request_valid=%s current_bbox=%s",
+                observation.label,
+                float(observation.result_age_sec),
+                float(observation.result_pose_delta_m),
+                float(observation.result_yaw_delta_deg),
+                int(bool(observation.request_evidence_valid)),
+                int(bool(observation.is_current_frame)),
             )
         elif not observation.visible and self._should_log_observation(observation=observation, wall_time_sec=wall_time_sec):
             self._logger.info("[GroundingReject] target=%s reason=%s", observation.label, observation.reason)
@@ -1083,6 +1114,7 @@ def _empty_observation(target_label: str, timestamp_sec: float, reason: str) -> 
         turn_direction_consistent=None,
         turn_relation_verified=False,
         turn_relation_reason="",
+        request_evidence_valid=False,
     )
 
 
@@ -1095,6 +1127,9 @@ def _copy_observation_with_timestamp(
     request_robot_pose: Pose2D | None = None,
     result_age_sec: float = 0.0,
     is_current_frame: bool = True,
+    request_evidence_valid: bool = True,
+    result_pose_delta_m: float = 0.0,
+    result_yaw_delta_deg: float = 0.0,
 ) -> TargetObservation:
     return TargetObservation(
         label=observation.label,
@@ -1118,6 +1153,9 @@ def _copy_observation_with_timestamp(
         request_robot_pose=request_robot_pose if request_robot_pose is not None else observation.request_robot_pose,
         result_age_sec=float(result_age_sec),
         is_current_frame=bool(is_current_frame),
+        request_evidence_valid=bool(request_evidence_valid),
+        result_pose_delta_m=float(result_pose_delta_m),
+        result_yaw_delta_deg=float(result_yaw_delta_deg),
         evidence_level=str(observation.evidence_level),
         semantic_source=str(observation.semantic_source),
         can_confirm=bool(observation.can_confirm),
@@ -1138,24 +1176,45 @@ def _is_current_frame(
     current_pose: Pose2D | None,
     config: TargetGroundingConfig,
 ) -> bool:
+    return _result_freshness(
+        result_age_sec=result_age_sec,
+        request_pose=request_pose,
+        current_pose=current_pose,
+        config=config,
+    ).is_current_frame
+
+
+def _result_freshness(
+    *,
+    result_age_sec: float,
+    request_pose: Pose2D | None,
+    current_pose: Pose2D | None,
+    config: TargetGroundingConfig,
+) -> _ResultFreshness:
+    result_age_sec = max(0.0, float(result_age_sec))
     max_age = float(config.max_result_age_sec)
-    if max_age > 0.0 and result_age_sec > max_age:
-        return False
+    request_evidence_valid = max_age <= 0.0 or result_age_sec <= max_age
     max_pose_delta = float(config.max_result_pose_delta_m)
     max_yaw_delta = float(config.max_result_yaw_delta_deg)
+    pose_delta_m = 0.0
+    yaw_delta_deg = 0.0
     if request_pose is not None and current_pose is not None:
-        pos_delta = float(np.hypot(
+        pose_delta_m = float(np.hypot(
             float(current_pose.x) - float(request_pose.x),
             float(current_pose.y) - float(request_pose.y),
         ))
-        if max_pose_delta > 0.0 and pos_delta > max_pose_delta:
-            return False
-        if max_yaw_delta > 0.0:
-            yaw_delta = abs(float(np.degrees(float(current_pose.yaw_rad) - float(request_pose.yaw_rad))))
-            yaw_delta = min(yaw_delta, 360.0 - yaw_delta)
-            if yaw_delta > max_yaw_delta:
-                return False
-    return True
+        yaw_delta_rad = float(current_pose.yaw_rad) - float(request_pose.yaw_rad)
+        yaw_delta_deg = abs(
+            float(np.degrees(np.arctan2(np.sin(yaw_delta_rad), np.cos(yaw_delta_rad))))
+        )
+    pose_current = max_pose_delta <= 0.0 or pose_delta_m <= max_pose_delta
+    yaw_current = max_yaw_delta <= 0.0 or yaw_delta_deg <= max_yaw_delta
+    return _ResultFreshness(
+        is_current_frame=bool(request_evidence_valid and pose_current and yaw_current),
+        request_evidence_valid=bool(request_evidence_valid),
+        pose_delta_m=float(pose_delta_m),
+        yaw_delta_deg=float(yaw_delta_deg),
+    )
 
 
 def _parse_json_object(content: str) -> dict[str, Any]:

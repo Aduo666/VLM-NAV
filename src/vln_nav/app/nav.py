@@ -1752,8 +1752,10 @@ def run_navigation(
                 target_keyframe_wait_reason = None
             if skip_target_detection_once:
                 skip_target_detection_once = False
-            if bool(target_detection_observation.visible) and bool(
-                getattr(target_detection_observation, "can_confirm", False)
+            if (
+                bool(target_detection_observation.visible)
+                and bool(getattr(target_detection_observation, "can_confirm", False))
+                and bool(getattr(target_detection_observation, "is_current_frame", True))
             ):
                 target_tracker.initialize_from_grounding(
                     observation=target_detection_observation,
@@ -1775,10 +1777,25 @@ def run_navigation(
                 detection_observation=target_detection_observation,
                 tracker_observation=tracker_observation,
             )
+            if target_keyframe_ready:
+                logger.info(
+                    "[TargetFrame] target=%s bbox_source=%s semantic_source=%s "
+                    "request_valid=%s grounding_bbox_current=%s",
+                    current_landmark,
+                    str(target_observation.source),
+                    str(target_detection_observation.semantic_source),
+                    int(bool(getattr(target_detection_observation, "request_evidence_valid", False))),
+                    int(bool(target_detection_observation.is_current_frame)),
+                )
             landmark_state = landmark_tracker.update(
                 target_label=current_landmark,
                 behavior_type=policy.current_grounding_behavior_type,
                 observation=target_observation,
+                semantic_evidence_observation=(
+                    target_detection_observation
+                    if _is_valid_request_semantic_evidence(target_detection_observation)
+                    else None
+                ),
                 robot_pose=observation.pose,
                 timestamp_sec=sim_time_sec,
                 arrival_distance_m=float(policy.current_arrival_distance_m),
@@ -2455,13 +2472,36 @@ def _select_target_observation(
     detection_observation: TargetObservation,
     tracker_observation: TargetObservation,
 ) -> TargetObservation:
-    if bool(detection_observation.visible) and bool(
-        getattr(detection_observation, "can_confirm", False)
+    if (
+        bool(detection_observation.visible)
+        and detection_observation.bbox is not None
+        and bool(getattr(detection_observation, "is_current_frame", True))
     ):
         return detection_observation
+    if (
+        bool(tracker_observation.visible)
+        and tracker_observation.bbox is not None
+        and bool(getattr(tracker_observation, "is_current_frame", True))
+    ):
+        return tracker_observation
     if _is_transient_target_detection_observation(detection_observation):
         return tracker_observation if bool(tracker_observation.visible) else detection_observation
     return detection_observation
+
+
+def _is_valid_request_semantic_evidence(observation: TargetObservation | None) -> bool:
+    if observation is None or not bool(observation.visible):
+        return False
+    if "reused" in str(observation.source).strip().lower():
+        return False
+    return bool(
+        getattr(observation, "can_confirm", False)
+        and getattr(
+            observation,
+            "request_evidence_valid",
+            getattr(observation, "is_current_frame", True),
+        )
+    )
 
 
 def _is_transient_target_detection_observation(
@@ -2602,7 +2642,11 @@ def _draw_grounded_target_overlay(
             xmax = max(0, min(width, xmax))
             ymax = max(0, min(height, ymax))
             can_confirm = bool(getattr(observation, "can_confirm", False))
-            color = (70, 255, 120) if can_confirm else (255, 190, 55)
+            semantic_source = str(getattr(observation, "semantic_source", "unknown"))
+            is_tracker = semantic_source == "opencv_tracker"
+            color = (70, 220, 255) if is_tracker else (
+                (70, 255, 120) if can_confirm else (255, 190, 55)
+            )
             draw.rectangle((xmin, ymin, xmax, ymax), outline=color, width=4)
             if observation.center_uv is not None:
                 center_u, center_v = [int(round(float(value))) for value in observation.center_uv]
@@ -2612,8 +2656,9 @@ def _draw_grounded_target_overlay(
                 f"verify={int(bool(getattr(observation, 'vlm_verified', False)))}"
                 f"/{float(getattr(observation, 'vlm_verification_confidence', 0.0)):.2f}"
             )
+            overlay_kind = "tracked" if is_tracker else "grounded"
             label = (
-                f"detected {observation.label} depth={depth_text} conf={observation.confidence:.2f} "
+                f"{overlay_kind} {observation.label} depth={depth_text} conf={observation.confidence:.2f} "
                 f"can_confirm={int(can_confirm)} {verify_text} depth_region={depth_region_source}"
             )
             draw.rectangle((xmin, max(0, ymin - 28), min(width, xmin + 620), ymin), fill=(0, 0, 0))
@@ -2624,6 +2669,7 @@ def _draw_grounded_target_overlay(
             stale_text = (
                 f"STALE perception: {observation.label} age={age_text} "
                 f"depth={depth_text} conf={observation.confidence:.2f} "
+                f"request_valid={int(bool(getattr(observation, 'request_evidence_valid', False)))} "
                 f"frame={observation.request_frame_index}"
             )
             draw.rectangle((0, height - 44, width, height), fill=(0, 0, 0))

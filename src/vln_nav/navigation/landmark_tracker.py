@@ -129,6 +129,7 @@ class LandmarkTracker:
         target_label: str,
         behavior_type: str,
         observation: TargetObservation,
+        semantic_evidence_observation: TargetObservation | None = None,
         robot_pose: Pose2D,
         timestamp_sec: float,
         arrival_distance_m: float | None = None,
@@ -173,8 +174,26 @@ class LandmarkTracker:
         is_depth_invalid = str(observation.reason).strip().lower() == "depth_invalid"
         is_reused = "reused" in str(observation.source).strip().lower()
         fresh_visible = bool(observation.visible) and (is_ok or is_depth_invalid) and not is_reused
-        has_valid_depth = fresh_visible and is_ok and observation.depth_m is not None
-        current_fresh = has_valid_depth and bool(getattr(observation, "is_current_frame", True))
+        evidence_observation = semantic_evidence_observation or observation
+        evidence_reason = str(evidence_observation.reason).strip().lower()
+        evidence_is_ok = evidence_reason == "ok"
+        evidence_is_depth_invalid = evidence_reason == "depth_invalid"
+        evidence_is_reused = "reused" in str(evidence_observation.source).strip().lower()
+        evidence_request_valid = bool(
+            getattr(
+                evidence_observation,
+                "request_evidence_valid",
+                getattr(evidence_observation, "is_current_frame", True),
+            )
+        )
+        evidence_fresh_visible = bool(evidence_observation.visible) and (
+            evidence_is_ok or evidence_is_depth_invalid
+        ) and not evidence_is_reused and evidence_request_valid
+        evidence_has_valid_depth = (
+            evidence_fresh_visible
+            and evidence_is_ok
+            and evidence_observation.depth_m is not None
+        )
         transient_observation = _is_observation_transient(observation)
 
         if bool(observation.visible):
@@ -187,7 +206,12 @@ class LandmarkTracker:
             # --- Image-level potential (depth_invalid ok, no world_xy) ---
             has_bbox = observation.bbox is not None
             meets_potential_conf = float(observation.confidence) >= float(self._config.potential_confidence_threshold)
-            if has_bbox and meets_potential_conf and not is_reused:
+            if (
+                has_bbox
+                and meets_potential_conf
+                and not is_reused
+                and bool(getattr(observation, "is_current_frame", True))
+            ):
                 state.potential_bbox = tuple(observation.bbox) if observation.bbox is not None else None
                 state.potential_center_uv = (
                     None if observation.center_uv is None
@@ -209,62 +233,78 @@ class LandmarkTracker:
                     )
 
             # --- World-level potential (only ok + depth + world_xy + threshold) ---
+            evidence_meets_potential_conf = (
+                float(evidence_observation.confidence)
+                >= float(self._config.potential_confidence_threshold)
+            )
             can_update_world_potential = (
-                is_ok
-                and bool(getattr(observation, "is_current_frame", True))
-                and observation.depth_m is not None
-                and observation.estimated_world_xy is not None
-                and meets_potential_conf
+                evidence_is_ok
+                and evidence_request_valid
+                and evidence_observation.depth_m is not None
+                and evidence_observation.estimated_world_xy is not None
+                and evidence_meets_potential_conf
             )
             if can_update_world_potential:
-                state.potential_world_xy = list(observation.estimated_world_xy)
+                state.potential_world_xy = list(evidence_observation.estimated_world_xy)
                 if state.evidence_level == "none":
                     state.evidence_level = "potential"
-            elif fresh_visible and not is_depth_invalid and not is_reused:
+            elif evidence_fresh_visible and not evidence_is_depth_invalid:
                 # Log why world potential was not updated
                 reasons = []
-                if not is_ok:
+                if not evidence_is_ok:
                     reasons.append("reason_not_ok")
-                if not bool(getattr(observation, "is_current_frame", True)):
-                    reasons.append("stale")
-                if observation.depth_m is None:
+                if not evidence_request_valid:
+                    reasons.append("request_evidence_expired")
+                if evidence_observation.depth_m is None:
                     reasons.append("no_depth")
-                if observation.estimated_world_xy is None:
+                if evidence_observation.estimated_world_xy is None:
                     reasons.append("no_world_xy")
-                if not meets_potential_conf:
+                if not evidence_meets_potential_conf:
                     reasons.append("low_confidence")
                 if reasons:
                     self._logger.info(
                         "[LandmarkPotentialReject] target=%s reason=%s confidence=%.2f",
                         label,
                         "_".join(reasons),
-                        float(observation.confidence),
+                        float(evidence_observation.confidence),
                     )
 
             state.candidate_world_xy = (
-                None if observation.estimated_world_xy is None else list(observation.estimated_world_xy)
+                None
+                if not evidence_request_valid or evidence_observation.estimated_world_xy is None
+                else list(evidence_observation.estimated_world_xy)
             )
 
-            # Only high-confidence fresh current-frame from confirmable source enters confirmed pipeline
-            high_conf = float(observation.confidence) >= float(self._config.confirm_confidence_threshold)
-            low_confidence_vlm_verified = bool(
-                getattr(observation, "requires_viewpoint_confirmation", False)
-                and getattr(observation, "vlm_verified", False)
+            # Semantic identity and request-time world geometry are independent
+            # from whether the old bbox still aligns with the current RGB frame.
+            high_conf = float(evidence_observation.confidence) >= float(
+                self._config.confirm_confidence_threshold
             )
-            semantic_source = str(getattr(observation, "semantic_source", "")).strip().lower()
+            low_confidence_vlm_verified = bool(
+                getattr(evidence_observation, "requires_viewpoint_confirmation", False)
+                and getattr(evidence_observation, "vlm_verified", False)
+            )
+            semantic_source = str(
+                getattr(evidence_observation, "semantic_source", "")
+            ).strip().lower()
             can_confirm = bool(
-                getattr(observation, "can_confirm", False)
+                getattr(evidence_observation, "can_confirm", False)
                 and semantic_source.startswith("grounding_dino")
             )
-            has_world = observation.estimated_world_xy is not None
+            has_world = evidence_observation.estimated_world_xy is not None
 
-            if current_fresh and has_world and (high_conf or low_confidence_vlm_verified) and can_confirm:
+            if (
+                evidence_has_valid_depth
+                and has_world
+                and (high_conf or low_confidence_vlm_verified)
+                and can_confirm
+            ):
                 self._try_confirm_candidate(
                     label=label,
                     state=state,
-                    observation=observation,
+                    observation=evidence_observation,
                 )
-            elif current_fresh and has_world and semantic_source != "opencv_tracker":
+            elif evidence_has_valid_depth and has_world and semantic_source != "opencv_tracker":
                 reasons = []
                 if not high_conf and not low_confidence_vlm_verified:
                     reasons.append("low_confidence")
@@ -275,22 +315,21 @@ class LandmarkTracker:
                         "[LandmarkConfirmReject] target=%s reason=%s confidence=%.2f can_confirm=%s source=%s",
                         label,
                         "_".join(reasons),
-                        float(observation.confidence),
+                        float(evidence_observation.confidence),
                         int(can_confirm),
-                        getattr(observation, "semantic_source", "unknown"),
+                        getattr(evidence_observation, "semantic_source", "unknown"),
                     )
             elif (
-                fresh_visible
-                and is_depth_invalid
-                and bool(getattr(observation, "is_current_frame", True))
-                and observation.bearing_rad is not None
+                evidence_fresh_visible
+                and evidence_is_depth_invalid
+                and evidence_observation.bearing_rad is not None
                 and (high_conf or low_confidence_vlm_verified)
                 and can_confirm
             ):
                 self._try_confirm_from_bearings(
                     label=label,
                     state=state,
-                    observation=observation,
+                    observation=evidence_observation,
                     robot_pose=robot_pose,
                 )
 

@@ -60,9 +60,9 @@ perception:
     depth_region: "bbox_depth_cluster"
     depth_cluster_tolerance_ratio: 0.35
     depth_cluster_min_pixels: 16
-    max_result_age_sec: 30.0
-    max_result_pose_delta_m: 0.05
-    max_result_yaw_delta_deg: 3.0
+    max_result_age_sec: 2.0
+    max_result_pose_delta_m: 0.20
+    max_result_yaw_delta_deg: 10.0
     detector:
       repo_path: "third_party/GroundingDINO"
       config_path: "weights/grounded_sam/GroundingDINO_SwinT_OGC.py"

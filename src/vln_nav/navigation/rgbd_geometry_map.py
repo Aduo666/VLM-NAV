@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable
-
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
@@ -219,10 +217,9 @@ class RGBDVirtualRayProjector:
 class RGBDGeometryMap:
     """North-up global geometry map built only from posed RGB-D observations.
 
-    The map is the geometric layer of an HSGM-style representation. Each image
-    column becomes one virtual planar ray. The nearest point inside the obstacle
-    height band is treated as a hit; otherwise the farthest observed floor point
-    clears free space. No LiDAR or semantic detector is used.
+    Each image column becomes one virtual planar ray. The nearest point inside
+    the obstacle height band is treated as a hit; otherwise the farthest observed
+    floor point clears free space. No LiDAR or semantic detector is used.
     """
 
     def __init__(
@@ -319,12 +316,9 @@ class RGBDGeometryMap:
         *,
         robot_world_xy: tuple[float, float],
         robot_yaw_rad: float,
-        semantic_instances: Iterable[object] = (),
     ) -> Image.Image:
-        instances = tuple(semantic_instances)
         row_min, row_max, col_min, col_max = self._debug_crop_bounds(
             robot_world_xy=robot_world_xy,
-            semantic_instances=instances,
         )
         occupied = self._log_odds >= float(self._config.occupied_threshold)
         free = self._log_odds <= float(self._config.free_threshold)
@@ -463,20 +457,12 @@ class RGBDGeometryMap:
         self,
         *,
         robot_world_xy: tuple[float, float],
-        semantic_instances: tuple[object, ...],
     ) -> tuple[int, int, int, int]:
         observed_rows, observed_cols = np.nonzero(np.abs(self._log_odds) > 1.0e-6)
         rows = observed_rows.tolist()
         cols = observed_cols.tolist()
 
         points = [robot_world_xy, *self._trajectory_world_xy]
-        for instance in semantic_instances:
-            center = np.asarray(
-                getattr(instance, "world_xyz", ()),
-                dtype=np.float64,
-            ).reshape(-1)
-            if center.size >= 2:
-                points.append((float(center[0]), float(center[1])))
         for point in points:
             cell = self._world_to_cell(float(point[0]), float(point[1]))
             if cell is not None:

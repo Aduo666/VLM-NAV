@@ -63,14 +63,16 @@ class InstructionConfig:
 
 
 @dataclass
-class YOLOEDetectorConfig:
-    model_path: str
+class GroundingDetectorConfig:
+    repo_path: str
+    config_path: str
+    checkpoint_path: str
     device: str
-    confidence_threshold: float
-    iou_threshold: float
-    image_size_px: int
+    box_threshold: float
+    text_threshold: float
     max_detections: int
-    min_mask_pixels: int
+    nms_iou_threshold: float
+    text_encoder_path: str
 
 
 @dataclass
@@ -92,7 +94,7 @@ class TargetTrackerRuntimeConfig:
 
 
 @dataclass
-class TargetPerceptionRuntimeConfig:
+class GroundingRuntimeConfig:
     call_period_sec: float
     reuse_last_observation_sec: float
     upload_max_edge_px: int
@@ -116,7 +118,7 @@ class TargetPerceptionRuntimeConfig:
     max_result_age_sec: float
     max_result_pose_delta_m: float
     max_result_yaw_delta_deg: float
-    detector: YOLOEDetectorConfig
+    detector: GroundingDetectorConfig
     semantic_verification: SemanticVerificationConfig
     tracker: TargetTrackerRuntimeConfig
 
@@ -147,27 +149,10 @@ class LandmarkMapRuntimeConfig:
 
 
 @dataclass
-class SemanticInstanceMapRuntimeConfig:
-    min_depth_m: float
-    max_depth_m: float
-    mask_pixel_stride: int
-    min_valid_depth_pixels: int
-    min_valid_depth_ratio: float
-    point_trim_quantile: float
-    point_voxel_size_m: float
-    max_points_per_instance: int
-    merge_max_centroid_distance_m: float
-    merge_min_bev_iou: float
-    merge_max_bev_gap_m: float
-    confirmed_min_observations: int
-
-
-@dataclass
 class PerceptionConfig:
-    target: TargetPerceptionRuntimeConfig
+    grounding: GroundingRuntimeConfig
     landmark_tracking: LandmarkTrackingRuntimeConfig
     landmark_map: LandmarkMapRuntimeConfig
-    semantic_map: SemanticInstanceMapRuntimeConfig
 
 
 @dataclass
@@ -535,8 +520,11 @@ def _apply_environment_overrides(config: AppConfig) -> None:
 
 def _normalize_paths(config: AppConfig) -> None:
     config.instruction.cache_path = str(_project_path(config.instruction.cache_path))
-    target = config.perception.target
-    target.detector.model_path = str(_project_path(target.detector.model_path))
+    grounding = config.perception.grounding
+    grounding.detector.repo_path = str(_project_path(grounding.detector.repo_path))
+    grounding.detector.config_path = str(_project_path(grounding.detector.config_path))
+    grounding.detector.checkpoint_path = str(_project_path(grounding.detector.checkpoint_path))
+    grounding.detector.text_encoder_path = str(_project_path(grounding.detector.text_encoder_path))
     config.debug.image.path = str(_project_path(config.debug.image.path))
     config.debug.image.depth_path = str(_project_path(config.debug.image.depth_path))
     config.debug.video.path = str(_project_path(config.debug.video.path))
@@ -544,12 +532,11 @@ def _normalize_paths(config: AppConfig) -> None:
 
 
 def _validate_config(config: AppConfig) -> None:
-    if not 0.0 <= config.perception.target.detector.confidence_threshold <= 1.0:
-        raise ValueError("perception.target.detector.confidence_threshold must be in [0, 1]")
-    if config.perception.target.detector.image_size_px < 320:
-        raise ValueError("perception.target.detector.image_size_px must be >= 320")
-    if config.perception.semantic_map.confirmed_min_observations < 1:
-        raise ValueError("perception.semantic_map.confirmed_min_observations must be >= 1")
+    detector = config.perception.grounding.detector
+    if not 0.0 <= detector.box_threshold <= 1.0:
+        raise ValueError("perception.grounding.detector.box_threshold must be in [0, 1]")
+    if not 0.0 <= detector.text_threshold <= 1.0:
+        raise ValueError("perception.grounding.detector.text_threshold must be in [0, 1]")
     if config.navigation.candidates.min_distance_m > config.navigation.candidates.max_distance_m:
         raise ValueError("navigation.candidates.min_distance_m must not exceed max_distance_m")
     if config.mapping.occupancy.resolution_m <= 0.0:

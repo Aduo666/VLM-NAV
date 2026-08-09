@@ -29,14 +29,8 @@ from ..navigation.rgbd_geometry_map import (
     RGBDGeometryMapConfig,
     RGBDVirtualRayProjector,
 )
-from ..navigation.semantic_instance_map import (
-    SemanticInstanceMap,
-    SemanticInstanceMapConfig,
-    SemanticInstanceSnapshot,
-)
 from ..navigation.spatial_transform import (
     log_spatial_transform_self_check,
-    transform_camera_view_world_to_odom,
     transform_world_xy_to_odom,
 )
 from ..navigation.stuck_detector import StuckDetector, StuckDetectorConfig
@@ -48,24 +42,6 @@ from ..navigation.vln_policy import ExecutionFeedback, PolicyStepResult, VLNPoli
 from ..navigation.vln_reasoner import VLNReasoner
 from ..runtime.config import DEFAULT_CONFIG_PATH, PROJECT_ROOT, AppConfig, load_config, setup_logging
 from ..runtime.debug_video import DebugVideoRecorder
-
-
-def _instruction_semantic_labels(context: InstructionContext) -> tuple[str, ...]:
-    labels: list[str] = []
-    labels.extend(context.navigation_target_labels)
-    labels.extend(item.canonical_label for item in context.scene_context.context_objects)
-    for step in context.route_steps:
-        labels.extend((step.target, step.perception_target))
-        labels.extend(cue.label for cue in step.cues)
-    normalized: list[str] = []
-    seen: set[str] = set()
-    for value in labels:
-        label = " ".join(str(value).strip().lower().replace("_", " ").split())
-        if not label or label in seen:
-            continue
-        seen.add(label)
-        normalized.append(label)
-    return tuple(normalized)
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="CAPTAINav Isaac Sim VLN runtime")
@@ -461,7 +437,7 @@ def run_navigation(
         base_url=config.llm.api_base_url,
         timeout_sec=config.llm.timeout_sec,
         retry_cooldown_sec=config.llm.retry_cooldown_sec,
-        upload_max_edge_px=config.perception.target.upload_max_edge_px,
+        upload_max_edge_px=config.perception.grounding.upload_max_edge_px,
         image_detail=config.llm.camera_image_detail,
         logger=logger,
     )
@@ -510,23 +486,23 @@ def run_navigation(
         int(config.perception.landmark_tracking.min_visible_count),
     )
     logger.info(
-        "[TargetPerceptionConfig] backend=yoloe_seg call_period_sec=%.2f reuse_sec=%.2f pause_active=1 min_conf=%.2f depth_range=[%.2f, %.2f] depth_region=instance_mask min_depth_valid_ratio=%.2f semantic_verify=1 verify_min=%.2f model=%s image_size=%s",
-        float(config.perception.target.call_period_sec),
-        float(config.perception.target.reuse_last_observation_sec),
-        float(config.perception.target.min_confidence),
-        float(config.perception.target.min_depth_m),
-        float(config.perception.target.max_depth_m),
-        float(config.perception.target.min_depth_valid_ratio),
-        float(config.perception.target.semantic_verification.min_confidence),
-        str(config.perception.target.detector.model_path),
-        int(config.perception.target.detector.image_size_px),
+        "[TargetPerceptionConfig] backend=grounding_dino call_period_sec=%.2f reuse_sec=%.2f pause_active=1 min_conf=%.2f depth_range=[%.2f, %.2f] depth_region=%s min_depth_valid_ratio=%.2f semantic_verify=1 verify_min=%.2f checkpoint=%s",
+        float(config.perception.grounding.call_period_sec),
+        float(config.perception.grounding.reuse_last_observation_sec),
+        float(config.perception.grounding.min_confidence),
+        float(config.perception.grounding.min_depth_m),
+        float(config.perception.grounding.max_depth_m),
+        str(config.perception.grounding.depth_region),
+        float(config.perception.grounding.min_depth_valid_ratio),
+        float(config.perception.grounding.semantic_verification.min_confidence),
+        str(config.perception.grounding.detector.checkpoint_path),
     )
     logger.info(
         "[TargetTrackerConfig] required=1 type=%s lost_frames=%s lost_sec=%.2f min_depth_valid_ratio=%.2f",
-        str(config.perception.target.tracker.tracker_type),
-        int(config.perception.target.tracker.max_lost_frames),
-        float(config.perception.target.tracker.lost_confirmed_sec),
-        float(config.perception.target.tracker.min_depth_valid_ratio),
+        str(config.perception.grounding.tracker.tracker_type),
+        int(config.perception.grounding.tracker.max_lost_frames),
+        float(config.perception.grounding.tracker.lost_confirmed_sec),
+        float(config.perception.grounding.tracker.min_depth_valid_ratio),
     )
     logger.info(
         "[LandmarkTrackerConfig] arrival_distance=%.2f success_distance=%.2f min_visible=%s confirmations=%s landmark_map=%s map_ttl=%.1f",
@@ -616,64 +592,65 @@ def run_navigation(
     )
     target_perception = TargetGrounder(
         config=TargetGroundingConfig(
-            call_period_sec=float(config.perception.target.call_period_sec),
-            reuse_last_observation_sec=float(config.perception.target.reuse_last_observation_sec),
-            upload_max_edge_px=int(config.perception.target.upload_max_edge_px),
-            min_bbox_area_ratio=float(config.perception.target.min_bbox_area_ratio),
-            max_bbox_area_ratio=float(config.perception.target.max_bbox_area_ratio),
-            min_bbox_width_px=int(config.perception.target.min_bbox_width_px),
-            min_bbox_height_px=int(config.perception.target.min_bbox_height_px),
-            max_bbox_aspect_ratio=float(config.perception.target.max_bbox_aspect_ratio),
-            min_depth_valid_ratio=float(config.perception.target.min_depth_valid_ratio),
-            depth_statistic=str(config.perception.target.depth_statistic),
-            center_patch_ratio=float(config.perception.target.center_patch_ratio),
-            min_depth_m=float(config.perception.target.min_depth_m),
-            max_depth_m=float(config.perception.target.max_depth_m),
-            min_confidence=float(config.perception.target.min_confidence),
+            call_period_sec=float(config.perception.grounding.call_period_sec),
+            reuse_last_observation_sec=float(config.perception.grounding.reuse_last_observation_sec),
+            upload_max_edge_px=int(config.perception.grounding.upload_max_edge_px),
+            min_bbox_area_ratio=float(config.perception.grounding.min_bbox_area_ratio),
+            max_bbox_area_ratio=float(config.perception.grounding.max_bbox_area_ratio),
+            min_bbox_width_px=int(config.perception.grounding.min_bbox_width_px),
+            min_bbox_height_px=int(config.perception.grounding.min_bbox_height_px),
+            max_bbox_aspect_ratio=float(config.perception.grounding.max_bbox_aspect_ratio),
+            min_depth_valid_ratio=float(config.perception.grounding.min_depth_valid_ratio),
+            depth_statistic=str(config.perception.grounding.depth_statistic),
+            center_patch_ratio=float(config.perception.grounding.center_patch_ratio),
+            min_depth_m=float(config.perception.grounding.min_depth_m),
+            max_depth_m=float(config.perception.grounding.max_depth_m),
+            min_confidence=float(config.perception.grounding.min_confidence),
             horizontal_fov_deg=float(config.robot.sensors.camera.horizontal_fov_deg),
-            coordinate_mode=str(config.perception.target.coordinate_mode),
-            allow_normalized_bbox=bool(config.perception.target.allow_normalized_bbox),
-            normalized_bbox_scale=float(config.perception.target.normalized_bbox_scale),
-            depth_region=str(config.perception.target.depth_region),
+            coordinate_mode=str(config.perception.grounding.coordinate_mode),
+            allow_normalized_bbox=bool(config.perception.grounding.allow_normalized_bbox),
+            normalized_bbox_scale=float(config.perception.grounding.normalized_bbox_scale),
+            depth_region=str(config.perception.grounding.depth_region),
             depth_cluster_tolerance_ratio=float(
-                config.perception.target.depth_cluster_tolerance_ratio
+                config.perception.grounding.depth_cluster_tolerance_ratio
             ),
             depth_cluster_min_pixels=int(
-                config.perception.target.depth_cluster_min_pixels
+                config.perception.grounding.depth_cluster_min_pixels
             ),
-            yoloe_model_path=str(config.perception.target.detector.model_path),
-            yoloe_device=str(config.perception.target.detector.device),
-            yoloe_confidence_threshold=float(config.perception.target.detector.confidence_threshold),
-            yoloe_iou_threshold=float(config.perception.target.detector.iou_threshold),
-            yoloe_image_size_px=int(config.perception.target.detector.image_size_px),
-            yoloe_max_detections=int(config.perception.target.detector.max_detections),
-            yoloe_min_mask_pixels=int(config.perception.target.detector.min_mask_pixels),
-            max_result_age_sec=float(config.perception.target.max_result_age_sec),
-            max_result_pose_delta_m=float(config.perception.target.max_result_pose_delta_m),
-            max_result_yaw_delta_deg=float(config.perception.target.max_result_yaw_delta_deg),
-            semantic_verification_min_confidence=float(config.perception.target.semantic_verification.min_confidence),
-            semantic_verification_max_edge_px=int(config.perception.target.semantic_verification.max_edge_px),
-            semantic_verification_auto_accept_confidence=float(config.perception.target.semantic_verification.auto_accept_confidence),
+            grounding_dino_repo_path=str(config.perception.grounding.detector.repo_path),
+            grounding_dino_config_path=str(config.perception.grounding.detector.config_path),
+            grounding_dino_checkpoint_path=str(config.perception.grounding.detector.checkpoint_path),
+            grounding_dino_device=str(config.perception.grounding.detector.device),
+            grounding_dino_box_threshold=float(config.perception.grounding.detector.box_threshold),
+            grounding_dino_text_threshold=float(config.perception.grounding.detector.text_threshold),
+            grounding_dino_text_encoder_path=str(config.perception.grounding.detector.text_encoder_path),
+            grounding_dino_max_detections=int(config.perception.grounding.detector.max_detections),
+            grounding_dino_nms_iou_threshold=float(config.perception.grounding.detector.nms_iou_threshold),
+            max_result_age_sec=float(config.perception.grounding.max_result_age_sec),
+            max_result_pose_delta_m=float(config.perception.grounding.max_result_pose_delta_m),
+            max_result_yaw_delta_deg=float(config.perception.grounding.max_result_yaw_delta_deg),
+            semantic_verification_min_confidence=float(config.perception.grounding.semantic_verification.min_confidence),
+            semantic_verification_max_edge_px=int(config.perception.grounding.semantic_verification.max_edge_px),
+            semantic_verification_auto_accept_confidence=float(config.perception.grounding.semantic_verification.auto_accept_confidence),
         ),
         llm_client=target_verification_llm_client,
         logger=logger,
-        semantic_labels=_instruction_semantic_labels(instruction_context),
     )
     target_perception.require_ready()
     target_tracker = TargetTracker(
         config=TargetTrackerConfig(
-            tracker_type=str(config.perception.target.tracker.tracker_type),
-            max_lost_frames=int(config.perception.target.tracker.max_lost_frames),
-            lost_confirmed_sec=float(config.perception.target.tracker.lost_confirmed_sec),
-            min_depth_valid_ratio=float(config.perception.target.tracker.min_depth_valid_ratio),
-            center_patch_ratio=float(config.perception.target.tracker.center_patch_ratio),
-            min_depth_m=float(config.perception.target.min_depth_m),
-            max_depth_m=float(config.perception.target.max_depth_m),
+            tracker_type=str(config.perception.grounding.tracker.tracker_type),
+            max_lost_frames=int(config.perception.grounding.tracker.max_lost_frames),
+            lost_confirmed_sec=float(config.perception.grounding.tracker.lost_confirmed_sec),
+            min_depth_valid_ratio=float(config.perception.grounding.tracker.min_depth_valid_ratio),
+            center_patch_ratio=float(config.perception.grounding.tracker.center_patch_ratio),
+            min_depth_m=float(config.perception.grounding.min_depth_m),
+            max_depth_m=float(config.perception.grounding.max_depth_m),
             horizontal_fov_deg=float(config.robot.sensors.camera.horizontal_fov_deg),
-            min_bbox_area_ratio=float(config.perception.target.min_bbox_area_ratio),
-            max_bbox_area_ratio=float(config.perception.target.max_bbox_area_ratio),
-            confidence_decay_per_lost_frame=float(config.perception.target.tracker.confidence_decay_per_lost_frame),
-            min_tracking_confidence=float(config.perception.target.tracker.min_tracking_confidence),
+            min_bbox_area_ratio=float(config.perception.grounding.min_bbox_area_ratio),
+            max_bbox_area_ratio=float(config.perception.grounding.max_bbox_area_ratio),
+            confidence_decay_per_lost_frame=float(config.perception.grounding.tracker.confidence_decay_per_lost_frame),
+            min_tracking_confidence=float(config.perception.grounding.tracker.min_tracking_confidence),
         ),
         logger=logger,
     )
@@ -709,27 +686,6 @@ def run_navigation(
             anchor_ttl_sec=float(config.perception.landmark_map.anchor_ttl_sec),
             min_confidence=float(config.perception.landmark_map.min_confidence),
             log_period_sec=float(config.perception.landmark_map.log_period_sec),
-        ),
-        logger=logger,
-    )
-    semantic_instance_map = SemanticInstanceMap(
-        config=SemanticInstanceMapConfig(
-            min_depth_m=float(config.perception.semantic_map.min_depth_m),
-            max_depth_m=float(config.perception.semantic_map.max_depth_m),
-            mask_pixel_stride=int(config.perception.semantic_map.mask_pixel_stride),
-            min_valid_depth_pixels=int(config.perception.semantic_map.min_valid_depth_pixels),
-            min_valid_depth_ratio=float(config.perception.semantic_map.min_valid_depth_ratio),
-            point_trim_quantile=float(config.perception.semantic_map.point_trim_quantile),
-            point_voxel_size_m=float(config.perception.semantic_map.point_voxel_size_m),
-            max_points_per_instance=int(config.perception.semantic_map.max_points_per_instance),
-            merge_max_centroid_distance_m=float(
-                config.perception.semantic_map.merge_max_centroid_distance_m
-            ),
-            merge_min_bev_iou=float(config.perception.semantic_map.merge_min_bev_iou),
-            merge_max_bev_gap_m=float(config.perception.semantic_map.merge_max_bev_gap_m),
-            confirmed_min_observations=int(
-                config.perception.semantic_map.confirmed_min_observations
-            ),
         ),
         logger=logger,
     )
@@ -1715,7 +1671,7 @@ def run_navigation(
             target_tracker.set_target_label(current_landmark)
             allow_new_target_detection = (
                 not skip_target_detection_once
-                and target_tracker.should_request_detection(
+                and target_tracker.should_request_grounding(
                     target_label=current_landmark,
                     timestamp_sec=sim_time_sec,
                 )
@@ -1760,8 +1716,8 @@ def run_navigation(
             )
             detection_reason = str(target_detection_observation.reason).strip().lower()
             detection_pending = bool(target_perception.request_in_flight) or detection_reason in {
-                "target_detection_request_started",
-                "target_detection_request_in_flight",
+                "grounding_request_started",
+                "grounding_request_in_flight",
             }
             if detection_pending:
                 if target_keyframe_wait_reason != detection_reason:
@@ -1794,41 +1750,12 @@ def run_navigation(
                     detection_reason,
                 )
                 target_keyframe_wait_reason = None
-            semantic_batch = target_perception.consume_semantic_batch()
-            if (
-                semantic_batch is not None
-                and semantic_batch.depth is not None
-                and semantic_batch.camera_intrinsics is not None
-                and semantic_batch.camera_view_matrix_ros is not None
-            ):
-                semantic_update = semantic_instance_map.update(
-                    observations=list(semantic_batch.observations),
-                    depth_image=semantic_batch.depth,
-                    camera_intrinsics=semantic_batch.camera_intrinsics,
-                    camera_view_matrix_ros=transform_camera_view_world_to_odom(
-                        semantic_batch.camera_view_matrix_ros,
-                        origin_world_xy=odom_state.origin_world_xy,
-                        origin_world_yaw_rad=odom_state.origin_world_yaw_rad,
-                    ),
-                    timestamp_sec=semantic_batch.timestamp_sec,
-                )
-                logger.info(
-                    "[SemanticMapUpdate] frame=%s detections=%s projected=%s created=%s "
-                    "merged=%s instances=%s rejected_depth=%s",
-                    int(semantic_batch.frame_index),
-                    int(semantic_update.input_detection_count),
-                    int(semantic_update.projected_detection_count),
-                    int(semantic_update.created_instance_count),
-                    int(semantic_update.merged_instance_count),
-                    int(semantic_update.total_instance_count),
-                    int(semantic_update.rejected_depth_count),
-                )
             if skip_target_detection_once:
                 skip_target_detection_once = False
             if bool(target_detection_observation.visible) and bool(
                 getattr(target_detection_observation, "can_confirm", False)
             ):
-                target_tracker.initialize_from_detection(
+                target_tracker.initialize_from_grounding(
                     observation=target_detection_observation,
                     rgb=front_rgb,
                     timestamp_sec=sim_time_sec,
@@ -1918,7 +1845,6 @@ def run_navigation(
         semantic_map_summary = _build_semantic_map_summary(
             current_target=current_landmark or "",
             landmark_entries=list(landmark_map.entries()),
-            semantic_instances=list(semantic_instance_map.snapshots()),
             robot_pose=observation.pose,
             obstacle_summary=obstacle_summary,
             completed_anchors=policy.landmark_anchors,
@@ -2119,7 +2045,6 @@ def run_navigation(
                 robot_pose=mapping_pose,
                 trajectory_xy=global_pose_trace,
                 landmark_entries=landmark_map.entries(),
-                semantic_instances=list(semantic_instance_map.snapshots()),
                 step_result=step_result,
                 output_path=None,
             )
@@ -2550,10 +2475,10 @@ def _is_transient_target_detection_observation(
         "reused" in source
         or reason
         in {
-            "target_detection_request_started",
-            "target_detection_request_in_flight",
-            "target_detection_call_period",
-            "target_detection_paused",
+            "grounding_request_started",
+            "grounding_request_in_flight",
+            "grounding_call_period",
+            "grounding_paused",
             "rgb_unavailable",
             "image_prepare_failed",
         }
@@ -2583,18 +2508,6 @@ def _save_current_target_debug_image(
         return None
 
     fp_pixels = image_rgb[..., :3].copy()
-    if (
-        target_observation is not None
-        and bool(target_observation.visible)
-        and bool(target_observation.is_current_frame)
-        and target_observation.mask is not None
-    ):
-        mask = np.asarray(target_observation.mask, dtype=bool)
-        if mask.shape == fp_pixels.shape[:2]:
-            tint = np.asarray([35, 220, 120], dtype=np.float32)
-            blended = fp_pixels.astype(np.float32)
-            blended[mask] = 0.58 * blended[mask] + 0.42 * tint
-            fp_pixels = np.clip(blended, 0, 255).astype(np.uint8)
     fp_image = Image.fromarray(fp_pixels)
     fp_draw = ImageDraw.Draw(fp_image)
     fp_width, fp_height = fp_image.size
@@ -3113,7 +3026,6 @@ def _save_global_occupancy_debug(
     robot_pose,
     trajectory_xy: list[tuple[float, float]],
     landmark_entries,
-    semantic_instances: list[SemanticInstanceSnapshot],
     step_result: PolicyStepResult | None,
     output_path: Path | None,
 ) -> Image.Image | None:
@@ -3138,8 +3050,6 @@ def _save_global_occupancy_debug(
         world_xy = getattr(entry, "world_xy", None)
         if world_xy:
             world_points.append((float(world_xy[0]), float(world_xy[1])))
-    for instance in semantic_instances:
-        world_points.append((float(instance.world_xyz[0]), float(instance.world_xyz[1])))
 
     if np.any(known_mask):
         rows, cols = np.where(known_mask)
@@ -3252,30 +3162,6 @@ def _save_global_occupancy_debug(
             color = (255, 175, 40)
             draw.ellipse((lx - 7, ly - 7, lx + 7, ly + 7), outline=color, width=3)
             draw.text((lx + 10, ly - 10), f"{label} potential", fill=color, font=font_label)
-
-    formal_labels = {
-        str(getattr(entry, "label", "")).strip().lower()
-        for entry in landmark_entries or []
-    }
-    for instance in semantic_instances:
-        if str(instance.label).strip().lower() in formal_labels:
-            continue
-        lx, ly = world_to_px(float(instance.world_xyz[0]), float(instance.world_xyz[1]))
-        color = (220, 60, 220) if bool(instance.confirmed) else (255, 175, 40)
-        radius = 8 if bool(instance.confirmed) else 6
-        draw.ellipse(
-            (lx - radius, ly - radius, lx + radius, ly + radius),
-            fill=color if bool(instance.confirmed) else None,
-            outline=color,
-            width=2,
-        )
-        state = "multi-view" if bool(instance.confirmed) else "candidate"
-        draw.text(
-            (lx + 10, ly - 10),
-            f"{instance.label} {state}",
-            fill=color,
-            font=font_label,
-        )
 
     yaw = float(robot_pose.yaw_rad)
     robot_x = float(robot_pose.x)
@@ -3438,7 +3324,6 @@ def _build_semantic_map_summary(
     *,
     current_target: str,
     landmark_entries,
-    semantic_instances: list[SemanticInstanceSnapshot],
     robot_pose,
     obstacle_summary: str,
     completed_anchors: dict[str, list[float]] | None = None,
@@ -3449,12 +3334,10 @@ def _build_semantic_map_summary(
     """Build a clean semantic map description for VLM."""
     lines = [f"Current Goal: {current_target}"]
     object_lines = []
-    formal_labels: set[str] = set()
     for entry in landmark_entries:
         label = str(entry.label).strip().lower()
         if not label or label in {"none", "null", "unknown", "n/a"}:
             continue
-        formal_labels.add(label)
         is_goal = label == current_target.strip().lower()
         status = str(entry.evidence_level).strip()
         role = str(getattr(entry, "semantic_role", "GOAL"))
@@ -3483,30 +3366,6 @@ def _build_semantic_map_summary(
         object_lines.append(
             f"  {marker}{label}: role={role} {direction} {dist_str} "
             f"[{lifecycle}] {confidence}"
-        )
-    for instance in semantic_instances or []:
-        label = str(instance.label).strip().lower()
-        if not label or label in formal_labels:
-            continue
-        dx = float(instance.world_xyz[0]) - float(robot_pose.x)
-        dy = float(instance.world_xyz[1]) - float(robot_pose.y)
-        cos_yaw = float(np.cos(robot_pose.yaw_rad))
-        sin_yaw = float(np.sin(robot_pose.yaw_rad))
-        forward_m = cos_yaw * dx + sin_yaw * dy
-        left_m = -sin_yaw * dx + cos_yaw * dy
-        distance_m = float(np.hypot(forward_m, left_m))
-        if abs(left_m) < 0.3:
-            direction = "ahead"
-        elif left_m > 0.0:
-            direction = "left-front" if forward_m > 1.0 else "left"
-        else:
-            direction = "right-front" if forward_m > 1.0 else "right"
-        evidence = "multi_view" if bool(instance.confirmed) else "single_view_candidate"
-        marker = ">> " if label == current_target.strip().lower() else ""
-        object_lines.append(
-            f"  {marker}{label}: role=OBSERVED {direction} {distance_m:.1f}m "
-            f"[{evidence}] conf={float(instance.confidence):.2f} "
-            f"views={int(instance.observation_count)}"
         )
     if object_lines:
         lines.append("Objects:")

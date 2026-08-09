@@ -13,17 +13,6 @@ from PIL import Image, ImageDraw, ImageFont
 
 from ..control.locomotion import create_locomotion_controller
 from ..navigation.rgbd_geometry_map import RGBDGeometryMap, RGBDGeometryMapConfig
-from ..navigation.semantic_instance_map import (
-    SemanticInstanceMap,
-    SemanticInstanceMapConfig,
-    SemanticMapUpdate,
-)
-from ..navigation.yoloe_instance_segmenter import (
-    InstanceMaskObservation,
-    YOLOEInstanceSegmenter,
-    YOLOEInstanceSegmenterConfig,
-    require_yoloe_dependency,
-)
 from ..runtime.config import DEFAULT_CONFIG_PATH, PROJECT_ROOT, load_config, setup_logging
 from ..runtime.isaac_runtime_utils import (
     bind_viewport_to_camera,
@@ -40,10 +29,6 @@ from ..runtime.isaac_runtime_utils import (
 @dataclass(frozen=True)
 class _StandaloneMappingSettings:
     geometry: RGBDGeometryMapConfig
-    segmenter: YOLOEInstanceSegmenterConfig
-    semantic_map: SemanticInstanceMapConfig
-    semantic_call_period_sec: float
-    stopped_settle_sec: float
     visualization_update_period_sec: float
     visualization_panel_size_px: int
     output_path: Path
@@ -68,7 +53,7 @@ class _MappingControlPanel:
         self._press_order: list[str] = []
         self._speed_model = ui.SimpleFloatModel(0.65)
         self._window = ui.Window(
-            "AGX RGB-D Semantic Mapping Test",
+            "AGX RGB-D Geometry Mapping Test",
             width=390,
             height=410,
             visible=True,
@@ -76,7 +61,7 @@ class _MappingControlPanel:
         )
         with self._window.frame:
             with ui.VStack(spacing=8):
-                ui.Label("RGB-D + YOLOE: LiDAR, VLM and navigation are disabled")
+                ui.Label("RGB-D geometry only: LiDAR, detector, VLM and navigation are disabled")
                 ui.Label("Hold arrow keys or buttons to drive; release to STOP")
                 ui.Separator()
                 with ui.HStack(height=42):
@@ -92,7 +77,7 @@ class _MappingControlPanel:
                     self._motion_button("DOWN", "BACKWARD")
                     ui.Spacer()
                 ui.Button("STOP", height=34, clicked_fn=self.clear_motion)
-                ui.Button("CLEAR GEOMETRY + SEMANTICS", height=34, clicked_fn=clear_map_callback)
+                ui.Button("CLEAR MAP", height=34, clicked_fn=clear_map_callback)
                 with ui.HStack(height=30):
                     ui.Label("Drive speed scale", width=135)
                     ui.FloatSlider(model=self._speed_model, min=0.10, max=1.0, step=0.05)
@@ -100,7 +85,6 @@ class _MappingControlPanel:
                 self._action_label = ui.Label("Action: STOP")
                 self._pose_label = ui.Label("Pose: x=0.00 y=0.00 yaw=0.0 deg")
                 self._map_label = ui.Label("Map: waiting for depth")
-                self._semantic_label = ui.Label("Semantics: waiting for stopped keyframe")
                 self._path_label = ui.Label(f"Output: {output_path}")
 
         app_window = omni.appwindow.get_default_app_window()
@@ -129,7 +113,6 @@ class _MappingControlPanel:
         robot_position,
         robot_yaw_rad: float,
         map_update,
-        semantic_update: SemanticMapUpdate,
     ) -> None:
         self._action_label.text = f"Action: {self.action} speed_scale={self.speed_scale:.2f}"
         self._pose_label.text = (
@@ -139,11 +122,6 @@ class _MappingControlPanel:
         self._map_label.text = (
             f"Map: rays={map_update.ray_count} hits={map_update.hit_ray_count} "
             f"occupied={map_update.occupied_cell_count} free={map_update.free_cell_count}"
-        )
-        self._semantic_label.text = (
-            f"Semantics: detections={semantic_update.input_detection_count} "
-            f"projected={semantic_update.projected_detection_count} "
-            f"instances={semantic_update.total_instance_count}"
         )
 
     def clear_motion(self) -> None:
@@ -199,13 +177,13 @@ class _MappingControlPanel:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Standalone AGX RGB-D geometry and YOLOE semantic mapping test"
+        description="Standalone AGX RGB-D geometry mapping test"
     )
     parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="Base YAML config path")
     parser.add_argument(
         "--mapping-config",
         default=str(PROJECT_ROOT / "configs" / "rgbd_mapping.yaml"),
-        help="Standalone RGB-D semantic mapping YAML path",
+        help="Standalone RGB-D geometry mapping YAML path",
     )
     parser.add_argument(
         "--output",
@@ -226,7 +204,6 @@ def main() -> int:
         path=Path(args.mapping_config).expanduser().resolve(),
         output_override=str(args.output),
     )
-    require_yoloe_dependency()
     config.simulation.headless = False
     logger = setup_logging(config.logging.level)
     _validate_runtime_dependencies()
@@ -409,46 +386,19 @@ def _run(*, simulation_app, config, settings: _StandaloneMappingSettings, logger
         floor_z_m=floor_z_m,
         logger=logger,
     )
-    logger.warning("[RGBDStartup] phase=yoloe_initialize state=begin")
-    segmenter = YOLOEInstanceSegmenter(
-        config=settings.segmenter,
-        project_root=PROJECT_ROOT,
-        logger=logger,
-    )
-    segmenter.require_ready()
-    logger.warning("[RGBDStartup] phase=yoloe_initialize state=complete")
-    semantic_map = SemanticInstanceMap(config=settings.semantic_map, logger=logger)
-    latest_semantic_rgb: np.ndarray | None = None
-    latest_observations: list[InstanceMaskObservation] = []
-    latest_semantic_frame_time = -float("inf")
-    semantic_update = semantic_map.last_update
-
-    def clear_maps() -> None:
-        nonlocal latest_semantic_rgb, latest_observations, latest_semantic_frame_time
-        nonlocal semantic_update
-        geometry_map.clear()
-        semantic_map.clear()
-        latest_semantic_rgb = None
-        latest_observations = []
-        latest_semantic_frame_time = -float("inf")
-        semantic_update = semantic_map.last_update
-
     panel = _MappingControlPanel(
-        clear_map_callback=clear_maps,
+        clear_map_callback=geometry_map.clear,
         output_path=settings.output_path,
     )
     logger.warning(
-        "[RGBDMapping] READY source=front_camera_depth+isaac_world_pose lidar=disabled "
-        "semantic=yoloe stopped_keyframes=1 output=%s floor_z=%.3f labels=%s",
+        "[RGBDMapping] READY source=front_camera_depth+isaac_world_pose "
+        "lidar=disabled semantics=disabled output=%s floor_z=%.3f",
         settings.output_path,
         floor_z_m,
-        list(segmenter.labels),
     )
 
     sim_time_sec = 0.0
     last_log_time = -float("inf")
-    last_motion_time = 0.0
-    last_semantic_call_time = -float("inf")
     last_visualization_time = -float("inf")
     last_pose = (float(start_position[0]), float(start_position[1]), _yaw_wxyz(start_orientation))
     latest_rgb: np.ndarray | None = None
@@ -458,9 +408,6 @@ def _run(*, simulation_app, config, settings: _StandaloneMappingSettings, logger
             controller.apply(current_action, speed_scale=panel.speed_scale)
             world.step(render=True)
             sim_time_sec += float(config.robot.simulation.physics_dt)
-            if current_action != "STOP":
-                last_motion_time = sim_time_sec
-
             position, orientation = get_world_pose(robot)
             yaw_rad = _yaw_wxyz(orientation)
             last_pose = (float(position[0]), float(position[1]), yaw_rad)
@@ -482,37 +429,6 @@ def _run(*, simulation_app, config, settings: _StandaloneMappingSettings, logger
             else:
                 map_update = geometry_map.last_update
 
-            stopped_keyframe_ready = (
-                current_action == "STOP"
-                and rgb is not None
-                and depth is not None
-                and sim_time_sec - last_motion_time >= float(settings.stopped_settle_sec)
-                and sim_time_sec - last_semantic_call_time
-                >= float(settings.semantic_call_period_sec)
-            )
-            if stopped_keyframe_ready:
-                latest_observations = segmenter.predict(rgb)
-                latest_semantic_rgb = rgb.copy()
-                latest_semantic_frame_time = sim_time_sec
-                semantic_update = semantic_map.update(
-                    observations=latest_observations,
-                    depth_image=depth,
-                    camera_intrinsics=intrinsics,
-                    camera_view_matrix_ros=view_matrix,
-                    timestamp_sec=sim_time_sec,
-                )
-                last_semantic_call_time = sim_time_sec
-                logger.warning(
-                    "[YOLOEKeyframe] detections=%s projected=%s created=%s merged=%s "
-                    "instances=%s rejected_depth=%s",
-                    semantic_update.input_detection_count,
-                    semantic_update.projected_detection_count,
-                    semantic_update.created_instance_count,
-                    semantic_update.merged_instance_count,
-                    semantic_update.total_instance_count,
-                    semantic_update.rejected_depth_count,
-                )
-
             if (
                 latest_rgb is not None
                 and sim_time_sec - last_visualization_time
@@ -520,16 +436,7 @@ def _run(*, simulation_app, config, settings: _StandaloneMappingSettings, logger
             ):
                 _save_combined_debug(
                     geometry_map=geometry_map,
-                    segmenter=segmenter,
-                    semantic_map=semantic_map,
                     current_rgb=latest_rgb,
-                    semantic_rgb=latest_semantic_rgb,
-                    observations=latest_observations,
-                    semantic_frame_age_sec=(
-                        sim_time_sec - latest_semantic_frame_time
-                        if np.isfinite(latest_semantic_frame_time)
-                        else None
-                    ),
                     robot_world_xy=(last_pose[0], last_pose[1]),
                     robot_yaw_rad=last_pose[2],
                     panel_size_px=settings.visualization_panel_size_px,
@@ -541,12 +448,11 @@ def _run(*, simulation_app, config, settings: _StandaloneMappingSettings, logger
                 robot_position=position,
                 robot_yaw_rad=yaw_rad,
                 map_update=map_update,
-                semantic_update=semantic_update,
             )
             if sim_time_sec - last_log_time >= 2.0:
                 logger.warning(
                     "[RGBDMapping] action=%s pose=[%.2f,%.2f,%.1fdeg] rays=%s hits=%s "
-                    "occupied=%s free=%s depth_ready=%s semantic_instances=%s",
+                    "occupied=%s free=%s depth_ready=%s",
                     current_action,
                     last_pose[0],
                     last_pose[1],
@@ -556,7 +462,6 @@ def _run(*, simulation_app, config, settings: _StandaloneMappingSettings, logger
                     map_update.occupied_cell_count,
                     map_update.free_cell_count,
                     int(depth is not None),
-                    semantic_update.total_instance_count,
                 )
                 last_log_time = sim_time_sec
             time.sleep(0.001)
@@ -565,16 +470,7 @@ def _run(*, simulation_app, config, settings: _StandaloneMappingSettings, logger
         if latest_rgb is not None:
             _save_combined_debug(
                 geometry_map=geometry_map,
-                segmenter=segmenter,
-                semantic_map=semantic_map,
                 current_rgb=latest_rgb,
-                semantic_rgb=latest_semantic_rgb,
-                observations=latest_observations,
-                semantic_frame_age_sec=(
-                    sim_time_sec - latest_semantic_frame_time
-                    if np.isfinite(latest_semantic_frame_time)
-                    else None
-                ),
                 robot_world_xy=(last_pose[0], last_pose[1]),
                 robot_yaw_rad=last_pose[2],
                 panel_size_px=settings.visualization_panel_size_px,
@@ -616,13 +512,12 @@ def _load_mapping_settings(
     payload = yaml.safe_load(path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
         raise ValueError(f"RGB-D mapping config must be a YAML object: {path}")
-    allowed_top_level = {"geometry", "semantics", "visualization"}
+    allowed_top_level = {"geometry", "visualization"}
     unknown_top_level = set(payload) - allowed_top_level
     if unknown_top_level:
         raise ValueError(f"Unknown RGB-D mapping config sections: {sorted(unknown_top_level)}")
 
     geometry_values = _require_mapping(payload.get("geometry"), "geometry")
-    semantics_values = _require_mapping(payload.get("semantics"), "semantics")
     visualization_values = _require_mapping(payload.get("visualization"), "visualization")
 
     allowed_visualization = {
@@ -634,7 +529,7 @@ def _load_mapping_settings(
     }
     _reject_unknown(visualization_values, allowed_visualization, "visualization")
     output_value = str(output_override).strip() or str(
-        visualization_values.get("output_path", "debug/local/rgbd_semantic_map.png")
+        visualization_values.get("output_path", "debug/local/rgbd_geometry_map.png")
     )
     output_path = Path(output_value).expanduser()
     if not output_path.is_absolute():
@@ -655,46 +550,8 @@ def _load_mapping_settings(
         debug_output_size_px=int(visualization_values.get("panel_size_px", 720)),
     )
 
-    segmenter_field_names = {
-        field.name for field in fields(YOLOEInstanceSegmenterConfig)
-    }
-    semantic_map_field_names = {
-        field.name for field in fields(SemanticInstanceMapConfig)
-    }
-    schedule_fields = {"call_period_sec", "stopped_settle_sec"}
-    _reject_unknown(
-        semantics_values,
-        segmenter_field_names | semantic_map_field_names | schedule_fields,
-        "semantics",
-    )
-    segmenter_values = {
-        key: value for key, value in semantics_values.items() if key in segmenter_field_names
-    }
-    if "labels" in segmenter_values:
-        labels = segmenter_values["labels"]
-        if not isinstance(labels, list) or not all(isinstance(label, str) for label in labels):
-            raise ValueError("semantics.labels must be a YAML list of strings")
-        segmenter_values["labels"] = tuple(labels)
-    segmenter = YOLOEInstanceSegmenterConfig(**segmenter_values)
-    semantic_map = SemanticInstanceMapConfig(
-        **{
-            key: value
-            for key, value in semantics_values.items()
-            if key in semantic_map_field_names
-        }
-    )
     return _StandaloneMappingSettings(
         geometry=geometry,
-        segmenter=segmenter,
-        semantic_map=semantic_map,
-        semantic_call_period_sec=max(
-            0.1,
-            float(semantics_values.get("call_period_sec", 1.0)),
-        ),
-        stopped_settle_sec=max(
-            0.0,
-            float(semantics_values.get("stopped_settle_sec", 0.25)),
-        ),
         visualization_update_period_sec=max(
             0.1,
             float(visualization_values.get("update_period_sec", 0.50)),
@@ -724,31 +581,21 @@ def _reject_unknown(values: dict, allowed: set[str], section_name: str) -> None:
 def _save_combined_debug(
     *,
     geometry_map: RGBDGeometryMap,
-    segmenter: YOLOEInstanceSegmenter,
-    semantic_map: SemanticInstanceMap,
     current_rgb: np.ndarray,
-    semantic_rgb: np.ndarray | None,
-    observations: list[InstanceMaskObservation],
-    semantic_frame_age_sec: float | None,
     robot_world_xy: tuple[float, float],
     robot_yaw_rad: float,
     panel_size_px: int,
     output_path: Path,
 ) -> None:
-    snapshots = semantic_map.snapshots()
     map_image = geometry_map.render_debug(
         robot_world_xy=robot_world_xy,
         robot_yaw_rad=robot_yaw_rad,
-        semantic_instances=snapshots,
-    )
-    source_rgb = semantic_rgb if semantic_rgb is not None else current_rgb
-    overlay_observations = observations if semantic_rgb is not None else []
-    camera_image = segmenter.render_overlay(
-        rgb_image=source_rgb,
-        observations=overlay_observations,
-        output_size_px=panel_size_px,
     )
     panel_size = max(320, int(panel_size_px))
+    camera_image = Image.fromarray(np.asarray(current_rgb, dtype=np.uint8)[..., :3]).resize(
+        (panel_size, panel_size),
+        resample=Image.Resampling.BILINEAR,
+    )
     if map_image.size != (panel_size, panel_size):
         map_image = map_image.resize(
             (panel_size, panel_size),
@@ -766,19 +613,13 @@ def _save_combined_debug(
     header_font = _debug_font(18)
     draw.text(
         (16, 14),
-        "GLOBAL GEOMETRY + PERSISTENT SEMANTIC INSTANCES",
+        "RGB-D GLOBAL GEOMETRY",
         fill=(245, 245, 245),
         font=header_font,
     )
-    age_text = "waiting for first stopped keyframe"
-    if semantic_frame_age_sec is not None:
-        age_text = (
-            f"LAST YOLOE STOPPED KEYFRAME | age={max(0.0, semantic_frame_age_sec):.1f}s "
-            f"| masks={len(observations)}"
-        )
     draw.text(
         (panel_size + 16, 14),
-        age_text,
+        "CURRENT FRONT CAMERA",
         fill=(245, 245, 245),
         font=header_font,
     )
@@ -850,26 +691,6 @@ def _validate_runtime_dependencies() -> None:
             "Isaac Sim 5.1 requires numpy==1.26.0, but the active environment has "
             f"numpy=={np.__version__}. Reinstall requirements.txt before startup."
         )
-    try:
-        import filelock
-    except ImportError as exc:
-        raise RuntimeError(
-            "YOLOE requires filelock with AsyncFileLock support. "
-            "Reinstall requirements.txt before startup."
-        ) from exc
-    if not hasattr(filelock, "AsyncFileLock"):
-        raise RuntimeError(
-            "YOLOE requires filelock>=3.16.1, but the active environment has "
-            f"filelock=={filelock.__version__}. Reinstall requirements.txt "
-            "before startup."
-        )
-    try:
-        import clip  # noqa: F401
-    except ImportError as exc:
-        raise RuntimeError(
-            "YOLOE requires Ultralytics CLIP. Reinstall requirements.txt "
-            "before startup."
-        ) from exc
 
 
 def _get_rgb_image(*, camera, logger) -> np.ndarray | None:

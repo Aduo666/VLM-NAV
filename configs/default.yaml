@@ -39,7 +39,7 @@ instruction:
   cache_path: ".cache/instruction_plans.json"
 
 perception:
-  target:
+  grounding:
     call_period_sec: 0.10
     reuse_last_observation_sec: 0.0
     upload_max_edge_px: 768
@@ -64,13 +64,15 @@ perception:
     max_result_pose_delta_m: 0.05
     max_result_yaw_delta_deg: 3.0
     detector:
-      model_path: "weights/yoloe/yoloe-26l-seg.pt"
+      repo_path: "third_party/GroundingDINO"
+      config_path: "weights/grounded_sam/GroundingDINO_SwinT_OGC.py"
+      checkpoint_path: "weights/grounded_sam/groundingdino_swint_ogc.pth"
       device: "cuda:0"
-      confidence_threshold: 0.20
-      iou_threshold: 0.30
-      image_size_px: 960
-      max_detections: 20
-      min_mask_pixels: 80
+      box_threshold: 0.45
+      text_threshold: 0.25
+      max_detections: 5
+      nms_iou_threshold: 0.50
+      text_encoder_path: "weights/grounded_sam/bert-base-uncased"
     semantic_verification:
       min_confidence: 0.50
       max_edge_px: 768
@@ -102,20 +104,6 @@ perception:
     anchor_ttl_sec: 120.0
     min_confidence: 0.20
     log_period_sec: 2.0
-  semantic_map:
-    min_depth_m: 0.30
-    max_depth_m: 8.0
-    mask_pixel_stride: 4
-    min_valid_depth_pixels: 40
-    min_valid_depth_ratio: 0.12
-    point_trim_quantile: 0.05
-    point_voxel_size_m: 0.05
-    max_points_per_instance: 2000
-    merge_max_centroid_distance_m: 0.90
-    merge_min_bev_iou: 0.02
-    merge_max_bev_gap_m: 0.30
-    confirmed_min_observations: 2
-
 mapping:
   occupancy:
     resolution_m: 0.08

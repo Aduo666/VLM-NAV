@@ -254,7 +254,7 @@ class LandmarkTracker:
             semantic_source = str(getattr(observation, "semantic_source", "")).strip().lower()
             can_confirm = bool(
                 getattr(observation, "can_confirm", False)
-                and semantic_source.startswith("yoloe")
+                and semantic_source.startswith("grounding_dino")
             )
             has_world = observation.estimated_world_xy is not None
 
@@ -819,7 +819,7 @@ class LandmarkTracker:
 
         semantic_arrival_observation = str(
             getattr(observation, "semantic_source", "")
-        ).strip().lower().startswith("yoloe")
+        ).strip().lower().startswith("grounding_dino")
         visible_depth_reached = (
             bool(observation.visible)
             and semantic_arrival_observation
@@ -916,10 +916,10 @@ def _is_observation_transient(observation: TargetObservation) -> bool:
         or reason
         in {
             "reused_last_observation",
-            "target_detection_request_started",
-            "target_detection_request_in_flight",
-            "target_detection_call_period",
-            "target_detection_paused",
+            "grounding_request_started",
+            "grounding_request_in_flight",
+            "grounding_call_period",
+            "grounding_paused",
             "rgb_unavailable",
             "image_prepare_failed",
         }

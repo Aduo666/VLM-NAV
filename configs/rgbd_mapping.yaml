@@ -17,54 +17,8 @@ geometry:
   log_odds_min: -4.0
   log_odds_max: 4.0
 
-semantics:
-  model_path: "weights/yoloe/yoloe-26l-seg.pt"
-  device: "cuda:0"
-  labels:
-    - wheelchair
-    - stairs
-    - door
-    - chair
-    - bed
-    - table
-    - sofa
-    - television
-    - window
-    - refrigerator
-    - sink
-    - toilet
-    - cabinet
-    - desk
-    - lamp
-    - plant
-    - elevator
-    - warning sign
-    - fire extinguisher
-    - vending machine
-    - hospital bed
-    - stretcher
-  confidence_threshold: 0.20
-  iou_threshold: 0.30
-  image_size_px: 960
-  max_detections: 20
-  min_mask_pixels: 80
-  call_period_sec: 1.0
-  stopped_settle_sec: 0.25
-  min_depth_m: 0.30
-  max_depth_m: 8.0
-  mask_pixel_stride: 4
-  min_valid_depth_pixels: 40
-  min_valid_depth_ratio: 0.12
-  point_trim_quantile: 0.05
-  point_voxel_size_m: 0.05
-  max_points_per_instance: 2000
-  merge_max_centroid_distance_m: 0.90
-  merge_min_bev_iou: 0.02
-  merge_max_bev_gap_m: 0.30
-  confirmed_min_observations: 2
-
 visualization:
-  output_path: "debug/local/rgbd_semantic_map.png"
+  output_path: "debug/local/rgbd_geometry_map.png"
   update_period_sec: 0.50
   crop_margin_m: 2.0
   min_view_size_m: 12.0

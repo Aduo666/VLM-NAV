@@ -5,20 +5,19 @@ import json
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 import numpy as np
 from PIL import Image, ImageDraw
 
+from .grounding_dino_detector import (
+    GroundingDinoConfig,
+    GroundingDinoDetection,
+    GroundingDinoDetector,
+)
 from .observation_adapter import Pose2D
 from .vlm_client import VLMClient
 from .spatial_transform import estimate_target_world_xy
-from .yoloe_instance_segmenter import (
-    InstanceMaskObservation,
-    YOLOEInstanceSegmenter,
-    YOLOEInstanceSegmenterConfig,
-)
 
 
 @dataclass
@@ -54,7 +53,6 @@ class TargetObservation:
     turn_direction_consistent: bool | None = None
     turn_relation_verified: bool = False
     turn_relation_reason: str = ""
-    mask: np.ndarray | None = None
 
 
 @dataclass
@@ -80,13 +78,15 @@ class TargetGroundingConfig:
     depth_region: str = "bbox_depth_cluster"
     depth_cluster_tolerance_ratio: float = 0.35
     depth_cluster_min_pixels: int = 16
-    yoloe_model_path: str = "weights/yoloe/yoloe-26l-seg.pt"
-    yoloe_device: str = "cuda:0"
-    yoloe_confidence_threshold: float = 0.20
-    yoloe_iou_threshold: float = 0.30
-    yoloe_image_size_px: int = 960
-    yoloe_max_detections: int = 20
-    yoloe_min_mask_pixels: int = 80
+    grounding_dino_repo_path: str = "../GroundingDINO"
+    grounding_dino_config_path: str = "../GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py"
+    grounding_dino_checkpoint_path: str = "../GroundingDINO/weights/groundingdino_swint_ogc.pth"
+    grounding_dino_device: str = "cuda"
+    grounding_dino_box_threshold: float = 0.45
+    grounding_dino_text_threshold: float = 0.25
+    grounding_dino_text_encoder_path: str = "weights/grounded_sam/bert-base-uncased"
+    grounding_dino_max_detections: int = 5
+    grounding_dino_nms_iou_threshold: float = 0.50
     max_result_age_sec: float = 30.0
     max_result_pose_delta_m: float = 0.05
     max_result_yaw_delta_deg: float = 3.0
@@ -118,25 +118,6 @@ class _GroundingRequest:
     turn_start_yaw_rad: float | None = None
     turn_direction_tolerance_deg: float = 10.0
     semantic_relation_text: str = ""
-    semantic_labels: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True)
-class SemanticPerceptionBatch:
-    observations: tuple[InstanceMaskObservation, ...]
-    depth: np.ndarray | None
-    camera_intrinsics: np.ndarray | None
-    camera_view_matrix_ros: np.ndarray | None
-    timestamp_sec: float
-    frame_index: int
-
-
-@dataclass(frozen=True)
-class _DetectorResult:
-    content: str
-    reason: str
-    selected_mask: np.ndarray | None
-    batch: SemanticPerceptionBatch | None
 
 
 @dataclass
@@ -152,12 +133,11 @@ class TargetGrounder:
         config: TargetGroundingConfig,
         llm_client: VLMClient,
         logger,
-        semantic_labels: tuple[str, ...] = (),
     ) -> None:
         self._config = config
         self._llm = llm_client
-        self._logger = logger.getChild("target_perception")
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="target_perception")
+        self._logger = logger.getChild("target_grounding")
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="target_grounding")
         self._future: Future | None = None
         self._future_request: _GroundingRequest | None = None
         self._last_call_started_sec = -float("inf")
@@ -168,33 +148,25 @@ class TargetGrounder:
         self._last_observation_log_wall_sec = -float("inf")
         self._last_verification_signature: tuple | None = None
         self._last_verification_result: tuple[bool, float, str] | None = None
-        labels = _normalize_semantic_labels(semantic_labels) or ("object",)
-        self._semantic_labels = labels
-        self._latest_batch: SemanticPerceptionBatch | None = None
-        self._segmenter = YOLOEInstanceSegmenter(
-            config=YOLOEInstanceSegmenterConfig(
-                model_path=str(config.yoloe_model_path),
-                labels=labels,
-                device=str(config.yoloe_device),
-                confidence_threshold=float(config.yoloe_confidence_threshold),
-                iou_threshold=float(config.yoloe_iou_threshold),
-                image_size_px=int(config.yoloe_image_size_px),
-                max_detections=int(config.yoloe_max_detections),
-                min_mask_pixels=int(config.yoloe_min_mask_pixels),
+        self._grounding_dino = GroundingDinoDetector(
+            config=GroundingDinoConfig(
+                repo_path=str(config.grounding_dino_repo_path),
+                config_path=str(config.grounding_dino_config_path),
+                checkpoint_path=str(config.grounding_dino_checkpoint_path),
+                device=str(config.grounding_dino_device),
+                box_threshold=float(config.grounding_dino_box_threshold),
+                text_threshold=float(config.grounding_dino_text_threshold),
+                text_encoder_path=str(config.grounding_dino_text_encoder_path),
+                max_detections=int(config.grounding_dino_max_detections),
+                nms_iou_threshold=float(config.grounding_dino_nms_iou_threshold),
             ),
-            project_root=Path(__file__).resolve().parents[3],
             logger=logger,
         )
     def close(self) -> None:
         self._executor.shutdown(wait=False, cancel_futures=True)
 
     def require_ready(self) -> None:
-        self._segmenter.require_ready()
-
-    def consume_semantic_batch(self) -> SemanticPerceptionBatch | None:
-        batch = self._latest_batch
-        self._latest_batch = None
-        return batch
+        self._grounding_dino.require_ready()
 
     @property
     def request_in_flight(self) -> bool:
@@ -249,20 +221,20 @@ class TargetGrounder:
             return reusable or _empty_observation(
                 target_label=target_label,
                 timestamp_sec=timestamp_sec,
-                reason="target_detection_paused",
+                reason="grounding_paused",
             )
         if self._future is not None:
             return reusable or _empty_observation(
                 target_label=target_label,
                 timestamp_sec=timestamp_sec,
-                reason="target_detection_request_in_flight",
+                reason="grounding_request_in_flight",
             )
 
         if float(wall_time_sec) - float(self._last_call_started_wall_sec) < max(0.0, float(self._config.call_period_sec)):
             return reusable or _empty_observation(
                 target_label=target_label,
                 timestamp_sec=timestamp_sec,
-                reason="target_detection_call_period",
+                reason="grounding_call_period",
             )
 
         try:
@@ -285,7 +257,7 @@ class TargetGrounder:
                 semantic_relation_text=semantic_relation_text,
             )
         except Exception as exc:
-            self._logger.warning("[TargetPerceptionReject] target=%s reason=image_prepare_failed error=%s", target_label, exc)
+            self._logger.warning("[GroundingReject] target=%s reason=image_prepare_failed error=%s", target_label, exc)
             return reusable or _empty_observation(
                 target_label=target_label,
                 timestamp_sec=timestamp_sec,
@@ -299,7 +271,7 @@ class TargetGrounder:
         return reusable or _empty_observation(
             target_label=target_label,
             timestamp_sec=timestamp_sec,
-            reason="target_detection_request_started",
+            reason="grounding_request_started",
         )
 
     def _reuse_or_empty(self, *, target_label: str, timestamp_sec: float, reason: str) -> TargetObservation:
@@ -368,7 +340,6 @@ class TargetGrounder:
             turn_direction_consistent=self._last_observation.turn_direction_consistent,
             turn_relation_verified=bool(self._last_observation.turn_relation_verified),
             turn_relation_reason=str(self._last_observation.turn_relation_reason),
-            mask=None,
         )
 
     def _collect_finished_request(self, *, timestamp_sec: float, wall_time_sec: float, current_robot_pose: Pose2D | None = None) -> TargetObservation | None:
@@ -381,16 +352,12 @@ class TargetGrounder:
         if request is None:
             return None
         try:
-            detector_result = future.result()
+            content, reason = future.result()
         except Exception as exc:
-            self._logger.warning("[TargetPerceptionReject] target=%s reason=worker_failed error=%s", request.target_label, exc)
+            self._logger.warning("[GroundingReject] target=%s reason=worker_failed error=%s", request.target_label, exc)
             return None
-        content = detector_result.content
-        reason = detector_result.reason
-        if detector_result.batch is not None:
-            self._latest_batch = detector_result.batch
         if reason != "ok":
-            self._logger.warning("[TargetPerceptionReject] target=%s reason=%s", request.target_label, reason)
+            self._logger.warning("[GroundingReject] target=%s reason=%s", request.target_label, reason)
             observation = _copy_observation_with_timestamp(
                 _empty_observation(
                     target_label=request.target_label,
@@ -415,11 +382,7 @@ class TargetGrounder:
             config=self._config,
         )
         observation = _copy_observation_with_timestamp(
-            self._parse_and_validate(
-                content=content,
-                request=request,
-                selected_mask=detector_result.selected_mask,
-            ),
+            self._parse_and_validate(content=content, request=request),
             timestamp_sec=timestamp_sec,
             request_frame_index=request.frame_index,
             request_sim_time_sec=request.timestamp_sec,
@@ -431,7 +394,7 @@ class TargetGrounder:
         self._last_observation_wall_sec = float(wall_time_sec)
         if observation.visible and self._should_log_observation(observation=observation, wall_time_sec=wall_time_sec):
             self._logger.info(
-                "[TargetPerception] target=%s visible=1 bbox=%s depth=%.2f valid_ratio=%.2f mask_area=%.3f bearing_deg=%.1f world=%s confidence=%.2f coord=%s depth_source=%s age=%.2fs current=%s frame=%d evidence=%s semantic_source=%s can_confirm=%s vlm_verified=%s vlm_conf=%.2f vlm_reason=%s",
+                "[Grounding] target=%s visible=1 bbox=%s depth=%.2f valid_ratio=%.2f mask_area=%.3f bearing_deg=%.1f world=%s confidence=%.2f coord=%s seg=%s age=%.2fs current=%s frame=%d evidence=%s semantic_source=%s can_confirm=%s vlm_verified=%s vlm_conf=%.2f vlm_reason=%s",
                 observation.label,
                 list(observation.bbox or ()),
                 float(observation.depth_m or 0.0),
@@ -453,7 +416,7 @@ class TargetGrounder:
                 observation.vlm_verification_reason[:80],
             )
         elif not observation.visible and self._should_log_observation(observation=observation, wall_time_sec=wall_time_sec):
-            self._logger.info("[TargetPerceptionReject] target=%s reason=%s", observation.label, observation.reason)
+            self._logger.info("[GroundingReject] target=%s reason=%s", observation.label, observation.reason)
         return observation
 
     def _should_log_observation(self, *, observation: TargetObservation, wall_time_sec: float) -> bool:
@@ -478,36 +441,13 @@ class TargetGrounder:
             return True
         return False
 
-    def _call_grounding(self, request: _GroundingRequest) -> _DetectorResult:
-        observations = self._segmenter.predict(
-            request.rgb,
-            labels=request.semantic_labels,
+    def _call_grounding(self, request: _GroundingRequest) -> tuple[str, str]:
+        detections, reason = self._grounding_dino.detect_all(
+            rgb=request.rgb,
+            target_label=request.target_label,
         )
-        batch = SemanticPerceptionBatch(
-            observations=tuple(observations),
-            depth=None if request.depth is None else request.depth.copy(),
-            camera_intrinsics=None if request.camera_intrinsics is None else request.camera_intrinsics.copy(),
-            camera_view_matrix_ros=(
-                None
-                if request.camera_view_matrix_ros is None
-                else request.camera_view_matrix_ros.copy()
-            ),
-            timestamp_sec=float(request.timestamp_sec),
-            frame_index=int(request.frame_index),
-        )
-        target_key = _normalize_semantic_label(request.target_label)
-        detections = [
-            item
-            for item in observations
-            if _normalize_semantic_label(item.label) == target_key
-        ]
         if not detections:
-            return _DetectorResult(
-                content="",
-                reason="yoloe_no_target_detection",
-                selected_mask=None,
-                batch=batch,
-            )
+            return "", reason
         detection, selected_index, selection_reason = _select_grounding_detection(
             detections=detections,
             request=request,
@@ -519,17 +459,12 @@ class TargetGrounder:
                 detections=detections,
             )
             if relation_selection is None:
-                return _DetectorResult(
-                    content="",
-                    reason="relation_disambiguation_failed",
-                    selected_mask=None,
-                    batch=batch,
-                )
+                return "", "relation_disambiguation_failed"
             selected_index, relation_reason = relation_selection
             detection = detections[selected_index]
             selection_reason = f"semantic_relation:{relation_reason}"
         self._logger.info(
-            "[TargetInstanceSelect] target=%s proposals=%s selected=%s confidence=%.2f bbox=%s reason=%s",
+            "[GroundingInstanceSelect] target=%s proposals=%s selected=%s confidence=%.2f bbox=%s reason=%s",
             request.target_label,
             len(detections),
             selected_index,
@@ -543,16 +478,11 @@ class TargetGrounder:
             "bbox": list(detection.bbox),
             "confidence": float(detection.confidence),
             "coordinate_mode": "original_pixels",
-            "source": "yoloe",
+            "source": "grounding_dino",
             "proposal_count": len(detections),
             "selected_instance_index": selected_index,
         }
-        return _DetectorResult(
-            content=json.dumps(payload),
-            reason="ok",
-            selected_mask=np.asarray(detection.mask, dtype=bool).copy(),
-            batch=batch,
-        )
+        return json.dumps(payload), "ok"
 
     def _build_request(
         self,
@@ -626,16 +556,13 @@ class TargetGrounder:
             ),
             turn_direction_tolerance_deg=max(0.0, float(turn_direction_tolerance_deg)),
             semantic_relation_text=str(semantic_relation_text).strip(),
-            semantic_labels=_normalize_semantic_labels(
-                (*self._semantic_labels, target_label)
-            ),
         )
 
     def _select_detection_by_relation(
         self,
         *,
         request: _GroundingRequest,
-        detections: list[InstanceMaskObservation],
+        detections: list[GroundingDinoDetection],
     ) -> tuple[int, str] | None:
         image_bytes = _build_relation_contact_sheet_bytes(
             rgb=request.rgb,
@@ -664,7 +591,7 @@ class TargetGrounder:
         )
         if result.failed or not result.content:
             self._logger.warning(
-                "[TargetRelation] target=%s failed=%s",
+                "[GroundingRelation] target=%s failed=%s",
                 request.target_label,
                 result.reason,
             )
@@ -682,7 +609,7 @@ class TargetGrounder:
             reason = str(payload.get("reason", "")).strip() or "no_reason"
         except Exception as exc:
             self._logger.warning(
-                "[TargetRelation] target=%s invalid_json=%s",
+                "[GroundingRelation] target=%s invalid_json=%s",
                 request.target_label,
                 exc,
             )
@@ -693,7 +620,7 @@ class TargetGrounder:
             or confidence < float(self._config.semantic_verification_min_confidence)
         ):
             self._logger.info(
-                "[TargetRelation] target=%s rejected_index=%s confidence=%.2f reason=%s",
+                "[GroundingRelation] target=%s rejected_index=%s confidence=%.2f reason=%s",
                 request.target_label,
                 selected_index,
                 confidence,
@@ -701,7 +628,7 @@ class TargetGrounder:
             )
             return None
         self._logger.info(
-            "[TargetRelation] target=%s selected=%s confidence=%.2f reason=%s",
+            "[GroundingRelation] target=%s selected=%s confidence=%.2f reason=%s",
             request.target_label,
             selected_index,
             confidence,
@@ -709,13 +636,7 @@ class TargetGrounder:
         )
         return selected_index, reason
 
-    def _parse_and_validate(
-        self,
-        *,
-        content: str,
-        request: _GroundingRequest,
-        selected_mask: np.ndarray | None,
-    ) -> TargetObservation:
+    def _parse_and_validate(self, *, content: str, request: _GroundingRequest) -> TargetObservation:
         try:
             payload = _parse_json_object(content)
         except Exception:
@@ -741,13 +662,13 @@ class TargetGrounder:
             )
         if not visible_flag and bbox_upload is not None:
             self._logger.warning(
-                "[TargetDetectionRecover] target=%s reason=visible_false_with_bbox raw_bbox=%s",
+                "[GroundingRecover] target=%s reason=visible_false_with_bbox raw_bbox=%s",
                 request.target_label,
                 payload.get("bbox"),
             )
         if bbox_upload is None:
             self._logger.warning(
-                "[TargetDetectionReject] target=%s reject_reason=bbox_missing_or_invalid raw_bbox=%s image_size=%s upload_image_size=%s mapped_bbox=None",
+                "[GroundingRejectDebug] target=%s reject_reason=bbox_missing_or_invalid raw_bbox=%s image_size=%s upload_image_size=%s mapped_bbox=None",
                 request.target_label,
                 payload.get("bbox"),
                 request.original_size,
@@ -774,7 +695,7 @@ class TargetGrounder:
         )
         if mapped_bbox is None:
             self._logger.warning(
-                "[TargetDetectionReject] target=%s reject_reason=bbox_out_of_range raw_bbox=%s image_size=%s upload_image_size=%s mapped_bbox=None requested_mode=%s normalized_scale=%.1f",
+                "[GroundingRejectDebug] target=%s reject_reason=bbox_out_of_range raw_bbox=%s image_size=%s upload_image_size=%s mapped_bbox=None requested_mode=%s normalized_scale=%.1f",
                 request.target_label,
                 bbox_upload,
                 request.original_size,
@@ -787,9 +708,9 @@ class TargetGrounder:
                 timestamp_sec=request.timestamp_sec,
                 reason="bbox_out_of_range",
             )
-        source_prefix = str(payload.get("source", "yoloe")).strip() or "yoloe"
+        source_prefix = str(payload.get("source", "grounding_dino")).strip() or "grounding_dino"
         self._logger.debug(
-            "[TargetDetectionBbox] target=%s raw_bbox=%s mapped_bbox=%s image_size=%s upload_image_size=%s coord=%s source=%s",
+            "[GroundingBbox] target=%s raw_bbox=%s mapped_bbox=%s image_size=%s upload_image_size=%s coord=%s source=%s",
             request.target_label,
             bbox_upload,
             mapped_bbox.bbox,
@@ -804,7 +725,6 @@ class TargetGrounder:
             confidence=confidence,
             request=request,
             source_prefix=source_prefix,
-            mask=selected_mask,
         )
 
     def _validate_original_bbox(
@@ -815,7 +735,6 @@ class TargetGrounder:
         confidence: float,
         request: _GroundingRequest,
         source_prefix: str,
-        mask: np.ndarray | None,
     ) -> TargetObservation:
         image_height, image_width = request.rgb_shape
         xmin, ymin, xmax, ymax = bbox
@@ -840,33 +759,19 @@ class TargetGrounder:
             request.depth is not None and np.asarray(request.depth).ndim == 2
         )
 
-        valid_mask = _validate_mask(mask=mask, image_shape=(image_height, image_width))
         if depth_available:
-            if valid_mask is not None:
-                depth_m, valid_ratio, depth_cluster_area_ratio, center_uv = _mask_depth_statistic(
-                    depth=np.asarray(request.depth, dtype=np.float32),
-                    mask=valid_mask,
-                    bbox=bbox,
-                    min_depth_m=float(self._config.min_depth_m),
-                    max_depth_m=float(self._config.max_depth_m),
-                    statistic=str(self._config.depth_statistic),
-                    cluster_tolerance_ratio=float(self._config.depth_cluster_tolerance_ratio),
-                    cluster_min_pixels=int(self._config.depth_cluster_min_pixels),
-                )
-                depth_region_source = "instance_mask"
-            else:
-                depth_m, valid_ratio, depth_cluster_area_ratio, center_uv = _bbox_depth_cluster_statistic(
-                    depth=np.asarray(request.depth, dtype=np.float32),
-                    bbox=bbox,
-                    min_depth_m=float(self._config.min_depth_m),
-                    max_depth_m=float(self._config.max_depth_m),
-                    statistic=str(self._config.depth_statistic),
-                    depth_region=str(self._config.depth_region),
-                    center_patch_ratio=float(self._config.center_patch_ratio),
-                    cluster_tolerance_ratio=float(self._config.depth_cluster_tolerance_ratio),
-                    cluster_min_pixels=int(self._config.depth_cluster_min_pixels),
-                )
-                depth_region_source = str(self._config.depth_region)
+            depth_m, valid_ratio, depth_cluster_area_ratio, center_uv = _bbox_depth_cluster_statistic(
+                depth=np.asarray(request.depth, dtype=np.float32),
+                bbox=bbox,
+                min_depth_m=float(self._config.min_depth_m),
+                max_depth_m=float(self._config.max_depth_m),
+                statistic=str(self._config.depth_statistic),
+                depth_region=str(self._config.depth_region),
+                center_patch_ratio=float(self._config.center_patch_ratio),
+                cluster_tolerance_ratio=float(self._config.depth_cluster_tolerance_ratio),
+                cluster_min_pixels=int(self._config.depth_cluster_min_pixels),
+            )
+            depth_region_source = str(self._config.depth_region)
         else:
             depth_region_source = "no_depth"
         # Bearing from bbox center (works with or without depth)
@@ -875,7 +780,7 @@ class TargetGrounder:
         bearing_rad = float(np.arctan(((float(center_uv[0]) - cx_px) / max(cx_px, 1.0)) * np.tan(half_fov_rad)))
 
         semantic_source = source_prefix.split(":", 1)[0]
-        can_confirm = semantic_source.startswith("yoloe")
+        can_confirm = semantic_source.startswith("grounding_dino")
         vlm_verified = False
         vlm_verification_confidence = 0.0
         vlm_verification_reason = "not_run"
@@ -884,7 +789,7 @@ class TargetGrounder:
         depth_failed = valid_ratio < float(self._config.min_depth_valid_ratio) or depth_m is None or not np.isfinite(depth_m)
         if depth_failed:
             self._logger.info(
-                "[TargetDetectionNoDepth] target=%s valid_ratio=%.2f depth=%s reason=depth_invalid_but_visible source=%s",
+                "[GroundingNoDepth] target=%s valid_ratio=%.2f depth=%s reason=depth_invalid_but_visible source=%s",
                 request.target_label,
                 float(valid_ratio),
                 "none" if depth_m is None else f"{float(depth_m):.2f}",
@@ -927,7 +832,7 @@ class TargetGrounder:
             if not vlm_verified or vlm_verification_confidence < float(self._config.semantic_verification_min_confidence):
                 can_confirm = False
                 self._logger.info(
-                    "[TargetVerifyReject] target=%s source=%s detector_conf=%.2f vlm_conf=%.2f reason=%s",
+                    "[GroundingVerifyReject] target=%s source=%s detector_conf=%.2f vlm_conf=%.2f reason=%s",
                     request.target_label,
                     semantic_source,
                     float(confidence),
@@ -1014,7 +919,6 @@ class TargetGrounder:
             turn_direction_consistent=turn_direction_consistent,
             turn_relation_verified=turn_relation_verified,
             turn_relation_reason=turn_relation_reason,
-            mask=None if valid_mask is None else valid_mask.copy(),
         )
 
     def _verify_detection_semantics(
@@ -1036,7 +940,7 @@ class TargetGrounder:
         ):
             cached = self._last_verification_result
             self._logger.info(
-                "[TargetVerify] target=%s result=reused_same_observation verified=%s vlm_conf=%.2f",
+                "[GroundingVerify] target=%s result=reused_same_observation verified=%s vlm_conf=%.2f",
                 request.target_label,
                 int(bool(cached[0])),
                 float(cached[1]),
@@ -1079,7 +983,7 @@ class TargetGrounder:
         except Exception as exc:
             return False, 0.0, f"verification_invalid_json:{exc}"
         self._logger.info(
-            "[TargetVerify] target=%s source=%s detector_conf=%.2f verified=%s vlm_conf=%.2f reason=%s",
+            "[GroundingVerify] target=%s source=%s detector_conf=%.2f verified=%s vlm_conf=%.2f reason=%s",
             request.target_label,
             semantic_source,
             float(detector_confidence),
@@ -1163,7 +1067,7 @@ def _empty_observation(target_label: str, timestamp_sec: float, reason: str) -> 
         estimated_world_xy=None,
         depth_valid_ratio=0.0,
         area_ratio=0.0,
-        source="yoloe",
+        source="grounding_dino",
         reason=str(reason),
         timestamp_sec=float(timestamp_sec),
         depth_cluster_area_ratio=0.0,
@@ -1179,7 +1083,6 @@ def _empty_observation(target_label: str, timestamp_sec: float, reason: str) -> 
         turn_direction_consistent=None,
         turn_relation_verified=False,
         turn_relation_reason="",
-        mask=None,
     )
 
 
@@ -1225,7 +1128,6 @@ def _copy_observation_with_timestamp(
         turn_direction_consistent=observation.turn_direction_consistent,
         turn_relation_verified=bool(observation.turn_relation_verified),
         turn_relation_reason=str(observation.turn_relation_reason),
-        mask=None if observation.mask is None else np.asarray(observation.mask, dtype=bool).copy(),
     )
 
 
@@ -1264,7 +1166,7 @@ def _parse_json_object(content: str) -> dict[str, Any]:
         text = text[start : end + 1]
     payload = json.loads(text)
     if not isinstance(payload, dict):
-        raise ValueError("target detection response is not a JSON object")
+        raise ValueError("grounding response is not a JSON object")
     return payload
 
 
@@ -1280,92 +1182,6 @@ def _parse_float(value, *, default: float) -> float:
         return float(value)
     except Exception:
         return float(default)
-
-
-def _normalize_semantic_label(value: str) -> str:
-    return " ".join(str(value).strip().lower().replace("_", " ").split())
-
-
-def _normalize_semantic_labels(values) -> tuple[str, ...]:
-    labels: list[str] = []
-    seen: set[str] = set()
-    for value in values:
-        label = _normalize_semantic_label(value)
-        if not label or label in seen:
-            continue
-        seen.add(label)
-        labels.append(label)
-    return tuple(labels)
-
-
-def _validate_mask(
-    *,
-    mask: np.ndarray | None,
-    image_shape: tuple[int, int],
-) -> np.ndarray | None:
-    if mask is None:
-        return None
-    candidate = np.asarray(mask, dtype=bool)
-    expected = (int(image_shape[0]), int(image_shape[1]))
-    if candidate.shape != expected or int(np.count_nonzero(candidate)) < 4:
-        return None
-    return candidate
-
-
-def _mask_depth_statistic(
-    *,
-    depth: np.ndarray,
-    mask: np.ndarray,
-    bbox: tuple[int, int, int, int],
-    min_depth_m: float,
-    max_depth_m: float,
-    statistic: str,
-    cluster_tolerance_ratio: float,
-    cluster_min_pixels: int,
-) -> tuple[float | None, float, float, tuple[float, float]]:
-    depth_image = np.asarray(depth, dtype=np.float32)
-    instance_mask = np.asarray(mask, dtype=bool)
-    if depth_image.shape != instance_mask.shape:
-        return None, 0.0, 0.0, _bbox_center(bbox)
-    xmin, ymin, xmax, ymax = [int(value) for value in bbox]
-    bounded = np.zeros_like(instance_mask)
-    bounded[max(0, ymin):min(depth_image.shape[0], ymax), max(0, xmin):min(depth_image.shape[1], xmax)] = True
-    instance_mask &= bounded
-    mask_count = int(np.count_nonzero(instance_mask))
-    if mask_count <= 0:
-        return None, 0.0, 0.0, _bbox_center(bbox)
-    valid = (
-        instance_mask
-        & np.isfinite(depth_image)
-        & (depth_image >= float(min_depth_m))
-        & (depth_image <= float(max_depth_m))
-    )
-    valid_count = int(np.count_nonzero(valid))
-    valid_ratio = float(valid_count / max(1, mask_count))
-    if valid_count < max(1, int(cluster_min_pixels)):
-        return None, valid_ratio, 0.0, _bbox_center(bbox)
-
-    valid_depth = depth_image[valid].astype(np.float64)
-    center_depth = float(np.median(valid_depth))
-    tolerance_m = max(0.08, abs(center_depth) * max(0.02, float(cluster_tolerance_ratio)))
-    cluster_mask = valid & (np.abs(depth_image - center_depth) <= tolerance_m)
-    cluster_count = int(np.count_nonzero(cluster_mask))
-    if cluster_count < max(1, int(cluster_min_pixels)):
-        cluster_mask = valid
-        cluster_count = valid_count
-    values = depth_image[cluster_mask].astype(np.float64)
-    mode = str(statistic).strip().lower()
-    if mode == "trimmed_mean" and values.size >= 10:
-        values = np.sort(values)
-        trim = max(1, int(round(values.size * 0.10)))
-        values = values[trim:-trim] if values.size > 2 * trim else values
-        depth_m = float(np.mean(values))
-    else:
-        depth_m = float(np.median(values))
-    pixel_v, pixel_u = np.nonzero(cluster_mask)
-    center_uv = (float(np.median(pixel_u)), float(np.median(pixel_v)))
-    cluster_ratio = float(cluster_count / max(1, mask_count))
-    return depth_m, valid_ratio, cluster_ratio, center_uv
 
 
 def _parse_bbox(value) -> tuple[float, float, float, float] | None:
@@ -1571,16 +1387,16 @@ def _turn_directed_target_delta_deg(
 
 def _select_grounding_detection(
     *,
-    detections: list[InstanceMaskObservation],
+    detections: list[GroundingDinoDetection],
     request: _GroundingRequest,
     config: TargetGroundingConfig,
-) -> tuple[InstanceMaskObservation, int, str]:
+) -> tuple[GroundingDinoDetection, int, str]:
     if len(detections) == 1:
         return detections[0], 0, "single_proposal"
 
     preferred_world_xy = getattr(request, "preferred_world_xy", None)
     if preferred_world_xy is not None:
-        world_matches: list[tuple[float, int, InstanceMaskObservation]] = []
+        world_matches: list[tuple[float, int, GroundingDinoDetection]] = []
         for index, detection in enumerate(detections):
             world_xy = _rough_detection_world_xy(
                 detection=detection,
@@ -1641,13 +1457,12 @@ def _select_grounding_detection(
     if not credible:
         credible = list(enumerate(detections))
 
-    ranked: list[tuple[float, int, InstanceMaskObservation, float | None]] = []
+    ranked: list[tuple[float, int, GroundingDinoDetection, float | None]] = []
     for index, detection in credible:
         depth_m = _rough_bbox_depth_m(
             depth=request.depth,
             bbox=detection.bbox,
             config=config,
-            mask=detection.mask,
         )
         confidence_span = max(1e-6, 1.0 - float(config.min_confidence))
         confidence_score = float(np.clip(
@@ -1677,7 +1492,7 @@ def _select_grounding_detection(
 def _build_relation_contact_sheet_bytes(
     *,
     rgb: np.ndarray,
-    detections: list[InstanceMaskObservation],
+    detections: list[GroundingDinoDetection],
     max_edge_px: int,
 ) -> bytes:
     source = Image.fromarray(np.asarray(rgb, dtype=np.uint8)[..., :3]).convert("RGB")
@@ -1733,7 +1548,7 @@ def _build_relation_contact_sheet_bytes(
 
 def _detection_turn_direction_score(
     *,
-    detection: InstanceMaskObservation,
+    detection: GroundingDinoDetection,
     request: _GroundingRequest,
     horizontal_fov_deg: float,
 ) -> float:
@@ -1771,34 +1586,20 @@ def _rough_bbox_depth_m(
     depth: np.ndarray | None,
     bbox: tuple[int, int, int, int],
     config: TargetGroundingConfig,
-    mask: np.ndarray | None = None,
 ) -> float | None:
     if depth is None or np.asarray(depth).ndim != 2:
         return None
-    valid_mask = _validate_mask(mask=mask, image_shape=np.asarray(depth).shape)
-    if valid_mask is not None:
-        value, valid_ratio, _, _ = _mask_depth_statistic(
-            depth=np.asarray(depth, dtype=np.float32),
-            mask=valid_mask,
-            bbox=bbox,
-            min_depth_m=float(config.min_depth_m),
-            max_depth_m=float(config.max_depth_m),
-            statistic=str(config.depth_statistic),
-            cluster_tolerance_ratio=float(config.depth_cluster_tolerance_ratio),
-            cluster_min_pixels=int(config.depth_cluster_min_pixels),
-        )
-    else:
-        value, valid_ratio, _, _ = _bbox_depth_cluster_statistic(
-            depth=np.asarray(depth, dtype=np.float32),
-            bbox=bbox,
-            min_depth_m=float(config.min_depth_m),
-            max_depth_m=float(config.max_depth_m),
-            statistic=str(config.depth_statistic),
-            depth_region="center_patch",
-            center_patch_ratio=float(config.center_patch_ratio),
-            cluster_tolerance_ratio=float(config.depth_cluster_tolerance_ratio),
-            cluster_min_pixels=int(config.depth_cluster_min_pixels),
-        )
+    value, valid_ratio, _, _ = _bbox_depth_cluster_statistic(
+        depth=np.asarray(depth, dtype=np.float32),
+        bbox=bbox,
+        min_depth_m=float(config.min_depth_m),
+        max_depth_m=float(config.max_depth_m),
+        statistic=str(config.depth_statistic),
+        depth_region="center_patch",
+        center_patch_ratio=float(config.center_patch_ratio),
+        cluster_tolerance_ratio=float(config.depth_cluster_tolerance_ratio),
+        cluster_min_pixels=int(config.depth_cluster_min_pixels),
+    )
     if value is None or float(valid_ratio) < float(config.min_depth_valid_ratio):
         return None
     return float(value)
@@ -1806,7 +1607,7 @@ def _rough_bbox_depth_m(
 
 def _rough_detection_world_xy(
     *,
-    detection: InstanceMaskObservation,
+    detection: GroundingDinoDetection,
     request: _GroundingRequest,
     config: TargetGroundingConfig,
 ) -> list[float] | None:
@@ -1814,7 +1615,6 @@ def _rough_detection_world_xy(
         depth=request.depth,
         bbox=detection.bbox,
         config=config,
-        mask=detection.mask,
     )
     if depth_m is None:
         return None

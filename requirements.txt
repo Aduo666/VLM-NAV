@@ -7,7 +7,4 @@ isaacsim[all,extscache]==5.1.0
 numpy==1.26.0
 PyYAML==6.0.2
 Pillow==11.3.0
-opencv-python==4.11.0.86
-filelock==3.32.2
-ultralytics==8.4.104
-clip @ git+https://github.com/ultralytics/CLIP.git@488e81a6711eea7346872b46ea928b367da8889d
+opencv-contrib-python-headless==4.11.0.86

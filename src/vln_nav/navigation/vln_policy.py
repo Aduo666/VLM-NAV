@@ -14,7 +14,7 @@ from .instruction_manager import InstructionContext, RouteStep
 from .landmark_map import LandmarkMapEntry
 from .landmark_tracker import LandmarkState
 from .map_candidate_generator import MapCandidateGenerator
-from .observation_adapter import VLNObservation
+from .observation_adapter import Pose2D, VLNObservation
 from .progress_manager import ProgressManager
 from .region_transition import RegionTransitionConfig, RegionTransitionManager
 from .target_memory import TargetMemory
@@ -111,6 +111,10 @@ class PolicyStepResult:
     current_target: str = ""
     navigation_status: str = "RUNNING"
     last_error: str = ""
+    completed_primitive_action: str = ""
+    completed_primitive_reason: str = ""
+    completed_primitive_start_pose: tuple[float, float, float] | None = None
+    completed_primitive_end_pose: tuple[float, float, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -1025,6 +1029,25 @@ class VLNPolicy:
     def cancel_active_goal(self) -> None:
         self._clear_active_goal()
         self._semantic_turn_active_counts_as_scan = False
+
+    def active_primitive_context(self) -> tuple[str, Pose2D] | None:
+        action = str(self._active_action_name).strip().upper()
+        if action not in {"FORWARD", "BACKWARD", "TURN_LEFT", "TURN_RIGHT"}:
+            return None
+        if self._active_start_pose is None:
+            return None
+        return (
+            action,
+            Pose2D(
+                x=float(self._active_start_pose.x),
+                y=float(self._active_start_pose.y),
+                yaw_rad=float(self._active_start_pose.yaw_rad),
+            ),
+        )
+
+    def request_immediate_replan(self) -> None:
+        self.cancel_active_goal()
+        self._next_replan_time = 0.0
 
     def set_safety_context(self, text: str) -> None:
         self._safety_context_text = str(text).strip()
@@ -2172,6 +2195,7 @@ class VLNPolicy:
 
         if completion_reason:
             completed_candidate_id = self._active_candidate_id
+            completed_start_pose = self._active_start_pose
             completed_world_goal_xy = (
                 None
                 if is_turn or self._active_world_goal_xy is None
@@ -2201,6 +2225,22 @@ class VLNPolicy:
                 progress_signal=progress_signal,
                 replanned=False,
                 debug_image_path=None,
+                completed_primitive_action=action_name,
+                completed_primitive_reason=completion_reason,
+                completed_primitive_start_pose=(
+                    None
+                    if completed_start_pose is None
+                    else (
+                        float(completed_start_pose.x),
+                        float(completed_start_pose.y),
+                        float(completed_start_pose.yaw_rad),
+                    )
+                ),
+                completed_primitive_end_pose=(
+                    float(observation.pose.x),
+                    float(observation.pose.y),
+                    float(observation.pose.yaw_rad),
+                ),
                 **self._route_result_kwargs(),
             )
 

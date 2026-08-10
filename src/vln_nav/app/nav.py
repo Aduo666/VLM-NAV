@@ -22,8 +22,12 @@ from ..navigation.landmark_map import LandmarkMap, LandmarkMapConfig, LandmarkMa
 from ..navigation.landmark_tracker import LandmarkState, LandmarkTracker, LandmarkTrackerConfig
 from ..navigation.map_candidate_generator import MapCandidateGenerator, MapCandidateGeneratorConfig
 from ..navigation.occupancy_grid import GlobalOccupancyMap, OccupancyGridConfig
-from ..navigation.observation_adapter import ObservationAdapter
+from ..navigation.observation_adapter import ObservationAdapter, Pose2D
 from ..navigation.odometry import SimOdometrySensor
+from ..navigation.primitive_collision_checker import (
+    PrimitiveCollisionChecker,
+    PrimitiveCollisionCheckerConfig,
+)
 from ..navigation.progress_manager import ProgressManager
 from ..navigation.rgbd_geometry_map import (
     RGBDGeometryMapConfig,
@@ -573,7 +577,6 @@ def run_navigation(
             recovery_pause_sec=float(config.navigation.recovery.pause_sec),
             recovery_reverse_sec=float(config.navigation.recovery.reverse_sec),
             recovery_turn_sec=float(config.navigation.recovery.turn_sec),
-            recovery_turn_action=str(config.navigation.recovery.turn_action),
         ),
         logger=logger,
     )
@@ -741,6 +744,12 @@ def run_navigation(
         float(config.mapping.rgbd.obstacle_min_height_m),
         float(config.mapping.rgbd.obstacle_max_height_m),
     )
+    primitive_collision_checker = PrimitiveCollisionChecker(
+        config=PrimitiveCollisionCheckerConfig(
+            forward_distance_m=float(config.robot.primitives.forward_distance_m),
+            turn_angle_deg=float(config.robot.primitives.turn_angle_deg),
+        )
+    )
     map_candidate_generator = MapCandidateGenerator(
         config=MapCandidateGeneratorConfig(
             max_candidates=int(config.navigation.candidates.max_candidates),
@@ -750,6 +759,7 @@ def run_navigation(
             unknown_gain_weight=float(config.navigation.candidates.unknown_gain_weight),
             semantic_weight=float(config.navigation.candidates.semantic_weight),
         ),
+        collision_checker=primitive_collision_checker,
         logger=logger,
     )
     reasoner = VLNReasoner(
@@ -1396,8 +1406,40 @@ def run_navigation(
             )
             occupancy_bootstrap_done_logged = True
 
-        runtime_recovery_command = stuck_detector.recovery_command(now_sec=sim_time_sec)
+        runtime_recovery_command = stuck_detector.recovery_command(
+            now_sec=sim_time_sec,
+            observation=observation,
+        )
         if runtime_recovery_command.active:
+            if runtime_recovery_command.action_name in {
+                "FORWARD",
+                "BACKWARD",
+                "TURN_LEFT",
+                "TURN_RIGHT",
+            }:
+                recovery_collision = primitive_collision_checker.check(
+                    action_name=runtime_recovery_command.action_name,
+                    robot_pose=observation.pose,
+                    snapshot=occupancy_grid.snapshot(),
+                    travel_distance_m=float(runtime_recovery_command.remaining_distance_m),
+                    turn_angle_deg=float(runtime_recovery_command.remaining_yaw_deg),
+                )
+                if not recovery_collision.valid:
+                    runtime_recovery_command = stuck_detector.abort_recovery(
+                        now_sec=sim_time_sec,
+                        reason=f"rollback_collision:{recovery_collision.reason}",
+                    )
+                else:
+                    recovery_safety = depth_safety_monitor.apply(
+                        observation=observation,
+                        action_name=runtime_recovery_command.action_name,
+                        speed_scale=runtime_recovery_command.speed_scale,
+                    )
+                    if recovery_safety.overridden:
+                        runtime_recovery_command = stuck_detector.abort_recovery(
+                            now_sec=sim_time_sec,
+                            reason=f"rollback_emergency:{recovery_safety.reason}",
+                        )
             policy.cancel_active_goal()
             active_step_result = _runtime_recovery_step_result(
                 recovery_command=runtime_recovery_command,
@@ -1413,6 +1455,16 @@ def run_navigation(
                 wheel_velocity=last_applied_wheel_velocity,
                 steering_angle=last_applied_steering_angle,
             )
+            if runtime_recovery_command.completed:
+                policy.request_immediate_replan()
+                policy.set_safety_context(
+                    "RECOVERY_COMPLETE map refreshed; discard the blocked local action "
+                    "and replan the current instruction step."
+                )
+                logger.warning(
+                    "[RecoveryReplan] reason=%s result=checkpoint_exit next=fresh_map_replan",
+                    runtime_recovery_command.reason,
+                )
             continue
 
         settle_required = bool(
@@ -1474,9 +1526,14 @@ def run_navigation(
         # --- Fast path during active primitive execution ---
         is_motion_active = _is_executing_motion_step(active_step_result)
         if is_motion_active:
+            interrupted_primitive_context = policy.active_primitive_context()
             proposed_step_result = policy.step(observation, execution_feedback=last_policy_feedback)
             active_step_result = proposed_step_result
             step_result = active_step_result
+            _record_completed_primitive(
+                step_result=step_result,
+                stuck_detector=stuck_detector,
+            )
             for completed_label in step_result.completed_landmarks:
                 completed_key = str(completed_label).strip().lower()
                 if completed_key and completed_key not in landmark_map_reached_synced:
@@ -1509,9 +1566,16 @@ def run_navigation(
                     float(safety_decision.right_depth_m),
                 )
                 if runtime_safety_hold_streak >= 2:
+                    interrupted_action = ""
+                    interrupted_start_pose = None
+                    if interrupted_primitive_context is not None:
+                        interrupted_action, interrupted_start_pose = interrupted_primitive_context
                     stuck_detector.trigger_recovery(
                         now_sec=sim_time_sec,
                         reason="repeated_safety_hold",
+                        current_pose=observation.pose,
+                        interrupted_action=interrupted_action,
+                        interrupted_start_pose=interrupted_start_pose,
                     )
                     runtime_safety_hold_streak = 0
             else:
@@ -1761,17 +1825,8 @@ def run_navigation(
                 current_landmark,
             )
         should_refresh_policy = True
-        recovery_command = stuck_detector.recovery_command(now_sec=sim_time_sec)
-        if recovery_command.active:
-            policy.cancel_active_goal()
-            proposed_step_result = _runtime_recovery_step_result(
-                recovery_command=recovery_command,
-                previous_step_result=active_step_result,
-            )
-            proposed_command_token = active_command_token
-        else:
-            proposed_step_result = policy.step(observation, execution_feedback=last_policy_feedback)
-            proposed_command_token = active_command_token + int(bool(proposed_step_result.replanned))
+        proposed_step_result = policy.step(observation, execution_feedback=last_policy_feedback)
+        proposed_command_token = active_command_token + int(bool(proposed_step_result.replanned))
         active_step_result = proposed_step_result
         active_command_token = proposed_command_token
         step_result = active_step_result
@@ -1779,6 +1834,7 @@ def run_navigation(
             stuck_detector.trigger_recovery(
                 now_sec=sim_time_sec,
                 reason=str(step_result.last_error or step_result.reasoning_summary),
+                current_pose=observation.pose,
             )
         if str(step_result.decision_source) in {
             "APPROACH_SAFETY_HOLD",
@@ -1791,6 +1847,7 @@ def run_navigation(
                 stuck_detector.trigger_recovery(
                     now_sec=sim_time_sec,
                     reason="approach_path_unreachable",
+                    current_pose=observation.pose,
                 )
                 runtime_approach_hold_streak = 0
         elif str(step_result.decision_source) != "REPLAN_COOLDOWN":
@@ -1843,6 +1900,7 @@ def run_navigation(
                 stuck_detector.trigger_recovery(
                     now_sec=sim_time_sec,
                     reason="repeated_safety_hold",
+                    current_pose=observation.pose,
                 )
                 runtime_safety_hold_streak = 0
         else:
@@ -1870,7 +1928,7 @@ def run_navigation(
                 f"reason={stuck_event.reason}; "
                 f"displacement_m={stuck_event.displacement_m:.3f}; "
                 f"yaw_delta_deg={stuck_event.yaw_delta_deg:.1f}. "
-                "Runtime will back up and turn before requesting a fresh VLM decision."
+                "Runtime will retrace the latest verified-safe primitive and then replan."
             )
 
         policy_signature = (
@@ -2257,6 +2315,21 @@ def _runtime_recovery_step_result(*, recovery_command, previous_step_result) -> 
         current_step_type="" if previous_step_result is None else str(previous_step_result.current_step_type),
         current_target="" if previous_step_result is None else str(previous_step_result.current_target),
         navigation_status="RECOVERY",
+    )
+
+
+def _record_completed_primitive(*, step_result: PolicyStepResult, stuck_detector: StuckDetector) -> None:
+    if str(step_result.decision_source).strip().upper() != "PRIMITIVE_COMPLETE":
+        return
+    start = step_result.completed_primitive_start_pose
+    end = step_result.completed_primitive_end_pose
+    action = str(step_result.completed_primitive_action).strip().upper()
+    if start is None or end is None or not action:
+        return
+    stuck_detector.record_completed_primitive(
+        action_name=action,
+        start_pose=Pose2D(x=float(start[0]), y=float(start[1]), yaw_rad=float(start[2])),
+        end_pose=Pose2D(x=float(end[0]), y=float(end[1]), yaw_rad=float(end[2])),
     )
 
 

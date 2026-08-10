@@ -17,13 +17,37 @@ RGB-D geometry mapping, map-aware VLM reasoning, and robot-specific motion primi
 > find the wheelchair, then turn left, and in front of the stairs, turn right to find
 > the yellow warning sign and stop in front of it.”
 
-### Navigation Debug View
+<div align="center">
 
-[![Navigation debug demo](docs/assets/agx_fv.gif)](docs/assets/agx_fv.mp4)
+<h3>AGX</h3>
 
-### AGX Observer View
+<p><strong>First-Person Navigation View</strong></p>
 
-[![AGX observer demo](docs/assets/agx_tv.gif)](docs/assets/agx_tv.mp4)
+<a href="docs/assets/agx_fv.mp4">
+  <img src="docs/assets/agx_fv.gif" alt="AGX first-person navigation demo" width="800">
+</a>
+
+<p><strong>Observer View</strong></p>
+
+<a href="docs/assets/agx_tv.mp4">
+  <img src="docs/assets/agx_tv.gif" alt="AGX observer demo" width="400">
+</a>
+
+<h3>Unitree G1</h3>
+
+<p><strong>First-Person Navigation View</strong></p>
+
+<a href="docs/assets/g1_fv.mp4">
+  <img src="docs/assets/g1_fv.gif" alt="Unitree G1 first-person navigation demo" width="800">
+</a>
+
+<p><strong>Observer View</strong></p>
+
+<a href="docs/assets/g1_tv.mp4">
+  <img src="docs/assets/g1_tv.gif" alt="Unitree G1 observer demo" width="400">
+</a>
+
+</div>
 
 
 ## Overview

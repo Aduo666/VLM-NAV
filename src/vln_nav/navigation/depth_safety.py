@@ -98,44 +98,26 @@ class DepthSafetyMonitor:
                     left_depth_m=left_depth_m,
                     right_depth_m=right_depth_m,
                 )
-            if front_depth_m <= stop_distance_m + 0.25:
-                return self._decision(
-                    action_name="FORWARD",
-                    speed_scale=min(speed, 0.55),
-                    overridden=False,
-                    reason="front_close_slow",
-                    front_depth_m=front_depth_m,
-                    left_depth_m=left_depth_m,
-                    right_depth_m=right_depth_m,
-                )
 
         if action == "TURN_LEFT":
-            turn_block_distance_m = stop_distance_m + 0.08
-            if (
-                front_depth_m <= turn_block_distance_m
-                or left_depth_m <= turn_block_distance_m
-            ):
+            if left_depth_m <= stop_distance_m:
                 return self._decision(
                     action_name="STOP",
                     speed_scale=0.0,
                     overridden=True,
-                    reason="turn_left_blocked_safety_hold",
+                    reason="turn_left_emergency_stop",
                     front_depth_m=front_depth_m,
                     left_depth_m=left_depth_m,
                     right_depth_m=right_depth_m,
                 )
 
         if action == "TURN_RIGHT":
-            turn_block_distance_m = stop_distance_m + 0.08
-            if (
-                front_depth_m <= turn_block_distance_m
-                or right_depth_m <= turn_block_distance_m
-            ):
+            if right_depth_m <= stop_distance_m:
                 return self._decision(
                     action_name="STOP",
                     speed_scale=0.0,
                     overridden=True,
-                    reason="turn_right_blocked_safety_hold",
+                    reason="turn_right_emergency_stop",
                     front_depth_m=front_depth_m,
                     left_depth_m=left_depth_m,
                     right_depth_m=right_depth_m,

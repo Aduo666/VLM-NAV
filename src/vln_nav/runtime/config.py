@@ -262,7 +262,6 @@ class RecoveryRuntimeConfig:
     pause_sec: float
     reverse_sec: float
     turn_sec: float
-    turn_action: str
 
 
 @dataclass
@@ -542,8 +541,6 @@ def _validate_config(config: AppConfig) -> None:
         raise ValueError("navigation.progress.landmark_clearance_m must be > 0")
     if config.navigation.progress.final_success_clearance_m <= 0.0:
         raise ValueError("navigation.progress.final_success_clearance_m must be > 0")
-    if config.navigation.recovery.turn_action not in {"TURN_LEFT", "TURN_RIGHT"}:
-        raise ValueError("navigation.recovery.turn_action must be TURN_LEFT or TURN_RIGHT")
 
 
 def setup_logging(level: str) -> logging.Logger:

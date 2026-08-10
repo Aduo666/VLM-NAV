@@ -188,7 +188,6 @@ navigation:
     pause_sec: 0.5
     reverse_sec: 0.65
     turn_sec: 0.35
-    turn_action: "TURN_RIGHT"
 
 debug:
   image:

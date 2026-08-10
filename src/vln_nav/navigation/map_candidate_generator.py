@@ -9,6 +9,7 @@ from .landmark_map import LandmarkMapEntry
 from .landmark_tracker import LandmarkState
 from .observation_adapter import Pose2D, VLNObservation
 from .occupancy_grid import OccupancyGridSnapshot
+from .primitive_collision_checker import PrimitiveCollisionChecker
 
 
 @dataclass
@@ -31,8 +32,15 @@ class MapCandidateGenerator:
     contract without depending on the internal map representation.
     """
 
-    def __init__(self, *, config: MapCandidateGeneratorConfig, logger) -> None:
+    def __init__(
+        self,
+        *,
+        config: MapCandidateGeneratorConfig,
+        collision_checker: PrimitiveCollisionChecker,
+        logger,
+    ) -> None:
         self._config = config
+        self._collision_checker = collision_checker
         self._logger = logger.getChild("map_candidate_generator")
         self._last_signature: tuple | None = None
 
@@ -64,7 +72,6 @@ class MapCandidateGenerator:
         self._log_if_changed(
             current_target=current_target,
             ranked=ranked,
-            generated=ranked,
             valid_count=valid_count,
         )
         return CandidateSet(candidates=ranked, valid_count=int(valid_count), predictor_debug=debug)
@@ -82,11 +89,11 @@ class MapCandidateGenerator:
         """Represent the three executable outcomes, not arbitrary depth points."""
 
         primitive_specs = (
-            (0, "TURN_LEFT", 15.0),
+            (0, "TURN_LEFT", float(self._collision_checker.turn_angle_deg)),
             (1, "FORWARD", 0.0),
-            (2, "TURN_RIGHT", -15.0),
+            (2, "TURN_RIGHT", -float(self._collision_checker.turn_angle_deg)),
         )
-        distance_m = max(0.10, float(self._config.min_distance_m))
+        distance_m = max(0.10, float(self._collision_checker.forward_distance_m))
         anchor_world_xy = _confirmed_anchor_world_xy(
             landmark_state=landmark_state,
             landmark_entry=landmark_entry,
@@ -111,40 +118,30 @@ class MapCandidateGenerator:
             occupancy_reason = "not_available"
             occupancy_valid = True
 
-            if occupancy_snapshot is not None:
-                if action == "FORWARD":
-                    evaluation = _evaluate_local_goal(
-                        snapshot=occupancy_snapshot,
-                        robot_pose=observation.pose,
-                        local_goal_xy=local_goal,
-                        min_clearance_m=float(self._config.min_clearance_m),
-                        path_start_world_xy=occupancy_snapshot.sensor_origin_world_xy,
-                    )
-                    free_ratio = float(evaluation["free_ratio"])
-                    unknown_gain = float(evaluation["unknown_gain"])
-                    min_clearance_m = float(evaluation["clearance_m"])
-                    occupancy_valid = bool(evaluation["valid"]) and free_ratio >= 0.50
-                    occupancy_reason = str(evaluation["reason"])
-                    if bool(evaluation["valid"]) and free_ratio < 0.50:
-                        occupancy_reason = "corridor_not_known_free"
-                else:
-                    robot_cell = _world_to_cell(
-                        snapshot=occupancy_snapshot,
-                        world_xy=(float(observation.pose.x), float(observation.pose.y)),
-                    )
-                    min_clearance_m = (
-                        0.0
-                        if robot_cell is None
-                        else _clearance_m(
-                            snapshot=occupancy_snapshot,
-                            cell=robot_cell,
-                            max_radius_m=1.0,
-                        )
-                    )
-                    occupancy_valid = min_clearance_m >= float(self._config.min_clearance_m)
-                    occupancy_reason = "turn_footprint_clear" if occupancy_valid else "turn_footprint_occupied"
+            collision_result = self._collision_checker.check(
+                action_name=action,
+                robot_pose=observation.pose,
+                snapshot=occupancy_snapshot,
+                travel_distance_m=distance_m,
+                turn_angle_deg=abs(float(heading_deg)),
+            )
+            free_ratio = float(collision_result.known_free_ratio)
+            unknown_gain = max(0.0, 1.0 - free_ratio)
+            min_clearance_m = float(collision_result.raw_clearance_m)
+            occupancy_valid = bool(collision_result.valid)
+            occupancy_reason = str(collision_result.reason)
+            if (
+                action == "FORWARD"
+                and occupancy_snapshot is not None
+                and occupancy_valid
+                and free_ratio < 0.50
+            ):
+                occupancy_valid = False
+                occupancy_reason = "corridor_not_known_free"
 
-            valid = bool(occupancy_valid and (depth_valid or action != "FORWARD"))
+            # Depth candidates remain useful evidence for scoring and prompts,
+            # but collision validity has a single source: the map checker.
+            valid = bool(occupancy_valid)
             predicted_world_xy = _local_to_world_xy(robot_pose=observation.pose, local_xy=local_goal)
             anchor_delta_m = None
             anchor_bearing_after_deg = None
@@ -180,6 +177,8 @@ class MapCandidateGenerator:
                 "occupancy_reason": occupancy_reason,
                 "occupancy_valid": float(bool(occupancy_valid)),
                 "depth_valid": float(bool(depth_valid)),
+                "collision_sample_count": int(collision_result.sampled_pose_count),
+                "collision_truth": "inflated_map_center_trajectory",
                 "anchor_distance_delta_m": "none" if anchor_delta_m is None else round(float(anchor_delta_m), 3),
                 "anchor_bearing_after_deg": "none" if anchor_bearing_after_deg is None else round(float(anchor_bearing_after_deg), 1),
                 "route_alignment": 0.0,
@@ -433,52 +432,33 @@ class MapCandidateGenerator:
         *,
         current_target: str,
         ranked: list[WaypointCandidate],
-        generated: list[WaypointCandidate],
         valid_count: int,
     ) -> None:
         signature = (
             str(current_target),
             tuple(str(item.depth_support.get("map_candidate_type", "depth")) for item in ranked),
             tuple(int(item.valid) for item in ranked),
+            tuple(str(item.depth_support.get("occupancy_reason", "unknown")) for item in ranked),
             int(valid_count),
         )
         if signature == self._last_signature:
             return
         self._last_signature = signature
         self._logger.info(
-            "[MapCandidates] target=%s generated=%s final_valid=%s final=%s",
+            "[PrimitiveCheck] target=%s valid=%s checks=%s",
             current_target,
-            int(len(generated)),
             int(valid_count),
             [
                 {
-                    "id": int(item.slot_id),
-                    "type": str(item.depth_support.get("map_candidate_type", "depth")),
+                    "action": str(item.depth_support.get("primitive_action", item.label)).upper(),
                     "valid": int(item.valid),
-                    "heading": round(float(item.heading_delta_deg), 1),
-                    "dist": round(float(item.travel_distance_m), 2),
+                    "clearance": round(float(item.depth_support.get("min_clearance_m", 0.0)), 2),
+                    "free_ratio": round(float(item.depth_support.get("free_ratio", 0.0)), 2),
+                    "reason": str(item.depth_support.get("occupancy_reason", "unknown")),
                 }
                 for item in ranked
             ],
         )
-        forward = next(
-            (
-                item
-                for item in ranked
-                if str(item.depth_support.get("primitive_action", "")).upper()
-                == "FORWARD"
-            ),
-            None,
-        )
-        if forward is not None and not bool(forward.valid):
-            self._logger.info(
-                "[CandidateReject] action=FORWARD reason=%s free_ratio=%.2f "
-                "clearance_m=%.2f depth_valid=%s",
-                str(forward.depth_support.get("occupancy_reason", "unknown")),
-                float(forward.depth_support.get("free_ratio", 0.0)),
-                float(forward.depth_support.get("min_clearance_m", 0.0)),
-                int(float(forward.depth_support.get("depth_valid", 0.0)) > 0.0),
-            )
 
 
 def _evaluate_local_goal(

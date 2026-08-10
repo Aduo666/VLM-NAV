@@ -129,7 +129,6 @@ class LandmarkTracker:
         target_label: str,
         behavior_type: str,
         observation: TargetObservation,
-        semantic_evidence_observation: TargetObservation | None = None,
         robot_pose: Pose2D,
         timestamp_sec: float,
         arrival_distance_m: float | None = None,
@@ -174,7 +173,7 @@ class LandmarkTracker:
         is_depth_invalid = str(observation.reason).strip().lower() == "depth_invalid"
         is_reused = "reused" in str(observation.source).strip().lower()
         fresh_visible = bool(observation.visible) and (is_ok or is_depth_invalid) and not is_reused
-        evidence_observation = semantic_evidence_observation or observation
+        evidence_observation = observation
         evidence_reason = str(evidence_observation.reason).strip().lower()
         evidence_is_ok = evidence_reason == "ok"
         evidence_is_depth_invalid = evidence_reason == "depth_invalid"
@@ -304,7 +303,7 @@ class LandmarkTracker:
                     state=state,
                     observation=evidence_observation,
                 )
-            elif evidence_has_valid_depth and has_world and semantic_source != "opencv_tracker":
+            elif evidence_has_valid_depth and has_world:
                 reasons = []
                 if not high_conf and not low_confidence_vlm_verified:
                     reasons.append("low_confidence")

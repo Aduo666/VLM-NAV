@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 from datetime import datetime, timezone
 import json
 import os
@@ -35,7 +36,6 @@ from ..navigation.spatial_transform import (
 )
 from ..navigation.stuck_detector import StuckDetector, StuckDetectorConfig
 from ..navigation.target_grounding import TargetGrounder, TargetGroundingConfig, TargetObservation
-from ..navigation.target_tracker import TargetTracker, TargetTrackerConfig
 from ..navigation.topological_memory import TopologicalMemory, TopologicalMemoryConfig
 from ..navigation.vlm_client import VLMClient
 from ..navigation.vln_policy import ExecutionFeedback, PolicyStepResult, VLNPolicy, VLNPolicyConfig
@@ -498,13 +498,6 @@ def run_navigation(
         str(config.perception.grounding.detector.checkpoint_path),
     )
     logger.info(
-        "[TargetTrackerConfig] required=1 type=%s lost_frames=%s lost_sec=%.2f min_depth_valid_ratio=%.2f",
-        str(config.perception.grounding.tracker.tracker_type),
-        int(config.perception.grounding.tracker.max_lost_frames),
-        float(config.perception.grounding.tracker.lost_confirmed_sec),
-        float(config.perception.grounding.tracker.min_depth_valid_ratio),
-    )
-    logger.info(
         "[LandmarkTrackerConfig] arrival_distance=%.2f success_distance=%.2f min_visible=%s confirmations=%s landmark_map=%s map_ttl=%.1f",
         float(config.navigation.progress.landmark_clearance_m),
         float(config.navigation.progress.final_success_clearance_m),
@@ -637,23 +630,6 @@ def run_navigation(
         logger=logger,
     )
     target_perception.require_ready()
-    target_tracker = TargetTracker(
-        config=TargetTrackerConfig(
-            tracker_type=str(config.perception.grounding.tracker.tracker_type),
-            max_lost_frames=int(config.perception.grounding.tracker.max_lost_frames),
-            lost_confirmed_sec=float(config.perception.grounding.tracker.lost_confirmed_sec),
-            min_depth_valid_ratio=float(config.perception.grounding.tracker.min_depth_valid_ratio),
-            center_patch_ratio=float(config.perception.grounding.tracker.center_patch_ratio),
-            min_depth_m=float(config.perception.grounding.min_depth_m),
-            max_depth_m=float(config.perception.grounding.max_depth_m),
-            horizontal_fov_deg=float(config.robot.sensors.camera.horizontal_fov_deg),
-            min_bbox_area_ratio=float(config.perception.grounding.min_bbox_area_ratio),
-            max_bbox_area_ratio=float(config.perception.grounding.max_bbox_area_ratio),
-            confidence_decay_per_lost_frame=float(config.perception.grounding.tracker.confidence_decay_per_lost_frame),
-            min_tracking_confidence=float(config.perception.grounding.tracker.min_tracking_confidence),
-        ),
-        logger=logger,
-    )
     landmark_tracker = LandmarkTracker(
         config=LandmarkTrackerConfig(
             arrival_visible_depth_m=float(config.navigation.progress.landmark_clearance_m),
@@ -726,6 +702,18 @@ def run_navigation(
             semantic_goal_step_m=float(config.mapping.occupancy.semantic_goal_step_m),
             semantic_goal_min_step_m=float(config.mapping.occupancy.semantic_goal_min_step_m),
             semantic_goal_lateral_search_m=float(config.mapping.occupancy.semantic_goal_lateral_search_m),
+            semantic_anchor_snap_max_correction_m=float(
+                config.mapping.occupancy.semantic_anchor_snap_max_correction_m
+            ),
+            semantic_anchor_snap_angular_tolerance_deg=float(
+                config.mapping.occupancy.semantic_anchor_snap_angular_tolerance_deg
+            ),
+            semantic_anchor_snap_min_cells=int(
+                config.mapping.occupancy.semantic_anchor_snap_min_cells
+            ),
+            semantic_anchor_snap_front_band_m=float(
+                config.mapping.occupancy.semantic_anchor_snap_front_band_m
+            ),
         ),
         logger=logger,
     )
@@ -1029,7 +1017,6 @@ def run_navigation(
     observation_adapter.set_horizontal_fov_deg(actual_camera_hfov_deg)
     candidate_predictor.set_horizontal_fov_deg(actual_camera_hfov_deg)
     target_perception.set_horizontal_fov_deg(actual_camera_hfov_deg)
-    target_tracker.set_horizontal_fov_deg(actual_camera_hfov_deg)
     logger.info(
         "[CameraCalibration] configured_hfov_deg=%.2f usd_hfov_deg=%.2f source=front_camera_prim",
         configured_camera_hfov_deg,
@@ -1668,14 +1655,7 @@ def run_navigation(
                     "Front camera ROS view matrix is unavailable for landmark projection"
                 ) from exc
             remembered_landmark_entry = landmark_map.get(current_landmark)
-            target_tracker.set_target_label(current_landmark)
-            allow_new_target_detection = (
-                not skip_target_detection_once
-                and target_tracker.should_request_grounding(
-                    target_label=current_landmark,
-                    timestamp_sec=sim_time_sec,
-                )
-            )
+            allow_new_target_detection = not skip_target_detection_once
             target_detection_observation = target_perception.observe(
                 rgb=front_rgb,
                 depth=last_depth_image,
@@ -1752,37 +1732,19 @@ def run_navigation(
                 target_keyframe_wait_reason = None
             if skip_target_detection_once:
                 skip_target_detection_once = False
-            if (
-                bool(target_detection_observation.visible)
-                and bool(getattr(target_detection_observation, "can_confirm", False))
-                and bool(getattr(target_detection_observation, "is_current_frame", True))
-            ):
-                target_tracker.initialize_from_grounding(
-                    observation=target_detection_observation,
-                    rgb=front_rgb,
-                    timestamp_sec=sim_time_sec,
-                )
-            tracker_observation = target_tracker.update(
-                rgb=front_rgb,
-                depth=last_depth_image,
-                robot_pose=observation.pose,
-                timestamp_sec=sim_time_sec,
-                frame_index=frame_index,
-                camera_intrinsics=front_camera_intrinsics,
-                camera_view_matrix_ros=front_camera_view_matrix_ros,
-                robot_world_position_xyz=position,
-                robot_world_orientation_wxyz=orientation,
+            target_observation = _match_target_observation_to_occupancy(
+                observation=target_detection_observation,
+                occupancy_grid=occupancy_grid,
+                behavior_type=policy.current_grounding_behavior_type,
+                logger=logger,
             )
-            target_observation = _select_target_observation(
-                detection_observation=target_detection_observation,
-                tracker_observation=tracker_observation,
-            )
+            target_detection_observation = target_observation
             if target_keyframe_ready:
                 logger.info(
                     "[TargetFrame] target=%s bbox_source=%s semantic_source=%s "
                     "request_valid=%s grounding_bbox_current=%s",
                     current_landmark,
-                    str(target_observation.source),
+                    str(target_detection_observation.source),
                     str(target_detection_observation.semantic_source),
                     int(bool(getattr(target_detection_observation, "request_evidence_valid", False))),
                     int(bool(target_detection_observation.is_current_frame)),
@@ -1791,11 +1753,6 @@ def run_navigation(
                 target_label=current_landmark,
                 behavior_type=policy.current_grounding_behavior_type,
                 observation=target_observation,
-                semantic_evidence_observation=(
-                    target_detection_observation
-                    if _is_valid_request_semantic_evidence(target_detection_observation)
-                    else None
-                ),
                 robot_pose=observation.pose,
                 timestamp_sec=sim_time_sec,
                 arrival_distance_m=float(policy.current_arrival_distance_m),
@@ -1815,7 +1772,6 @@ def run_navigation(
                 )
             )
         else:
-            target_tracker.reset()
             policy.set_landmark_state(None)
             policy.set_landmark_map_entry(None)
             policy.set_landmark_map_summary("")
@@ -2467,40 +2423,77 @@ def _is_executing_motion_step(step_result) -> bool:
     return remaining > 0
 
 
-def _select_target_observation(
+def _match_target_observation_to_occupancy(
     *,
-    detection_observation: TargetObservation,
-    tracker_observation: TargetObservation,
+    observation: TargetObservation,
+    occupancy_grid: GlobalOccupancyMap,
+    behavior_type: str,
+    logger,
 ) -> TargetObservation:
-    if (
-        bool(detection_observation.visible)
-        and detection_observation.bbox is not None
-        and bool(getattr(detection_observation, "is_current_frame", True))
-    ):
-        return detection_observation
-    if (
-        bool(tracker_observation.visible)
-        and tracker_observation.bbox is not None
-        and bool(getattr(tracker_observation, "is_current_frame", True))
-    ):
-        return tracker_observation
-    if _is_transient_target_detection_observation(detection_observation):
-        return tracker_observation if bool(tracker_observation.visible) else detection_observation
-    return detection_observation
+    """Snap go-to geometry to a supported physical surface in the RGB-D map."""
 
+    if str(behavior_type).strip().lower() != "go_to":
+        return observation
+    if (
+        not bool(observation.visible)
+        or str(observation.reason).strip().lower() != "ok"
+        or not bool(getattr(observation, "request_evidence_valid", False))
+        or observation.estimated_world_xy is None
+        or observation.request_robot_pose is None
+    ):
+        return observation
 
-def _is_valid_request_semantic_evidence(observation: TargetObservation | None) -> bool:
-    if observation is None or not bool(observation.visible):
-        return False
-    if "reused" in str(observation.source).strip().lower():
-        return False
-    return bool(
-        getattr(observation, "can_confirm", False)
-        and getattr(
-            observation,
-            "request_evidence_valid",
-            getattr(observation, "is_current_frame", True),
+    raw_world_xy = (
+        list(observation.raw_estimated_world_xy)
+        if observation.raw_estimated_world_xy is not None
+        else list(observation.estimated_world_xy)
+    )
+    surface_match = occupancy_grid.match_landmark_surface(
+        observer_pose=observation.request_robot_pose,
+        raw_world_xy=raw_world_xy,
+    )
+    if not surface_match.matched or surface_match.world_xy is None:
+        logger.info(
+            "[LandmarkGeometry] target=%s matched=0 raw=%s reason=%s support=%s",
+            observation.label,
+            [round(float(value), 2) for value in raw_world_xy],
+            surface_match.reason,
+            int(surface_match.support_cells),
         )
+        return replace(
+            observation,
+            raw_estimated_world_xy=raw_world_xy,
+            surface_supported=False,
+            surface_support_cells=int(surface_match.support_cells),
+            surface_correction_m=float(surface_match.correction_m),
+            surface_depth_m=None,
+        )
+
+    surface_world_xy = [
+        float(surface_match.world_xy[0]),
+        float(surface_match.world_xy[1]),
+    ]
+    logger.info(
+        "[LandmarkGeometry] target=%s matched=1 raw=%s surface=%s "
+        "raw_depth=%.2f surface_depth=%.2f correction=%.2f support=%s",
+        observation.label,
+        [round(float(value), 2) for value in raw_world_xy],
+        [round(float(value), 2) for value in surface_world_xy],
+        float(observation.depth_m or 0.0),
+        float(surface_match.surface_distance_m),
+        float(surface_match.correction_m),
+        int(surface_match.support_cells),
+    )
+    return replace(
+        observation,
+        depth_m=float(surface_match.surface_distance_m),
+        estimated_world_xy=surface_world_xy,
+        source=f"{observation.source}:surface_matched",
+        raw_estimated_world_xy=raw_world_xy,
+        surface_supported=True,
+        surface_support_cells=int(surface_match.support_cells),
+        surface_correction_m=float(surface_match.correction_m),
+        surface_depth_m=float(surface_match.surface_distance_m),
     )
 
 
@@ -2642,11 +2635,7 @@ def _draw_grounded_target_overlay(
             xmax = max(0, min(width, xmax))
             ymax = max(0, min(height, ymax))
             can_confirm = bool(getattr(observation, "can_confirm", False))
-            semantic_source = str(getattr(observation, "semantic_source", "unknown"))
-            is_tracker = semantic_source == "opencv_tracker"
-            color = (70, 220, 255) if is_tracker else (
-                (70, 255, 120) if can_confirm else (255, 190, 55)
-            )
+            color = (70, 255, 120) if can_confirm else (255, 190, 55)
             draw.rectangle((xmin, ymin, xmax, ymax), outline=color, width=4)
             if observation.center_uv is not None:
                 center_u, center_v = [int(round(float(value))) for value in observation.center_uv]
@@ -2656,9 +2645,8 @@ def _draw_grounded_target_overlay(
                 f"verify={int(bool(getattr(observation, 'vlm_verified', False)))}"
                 f"/{float(getattr(observation, 'vlm_verification_confidence', 0.0)):.2f}"
             )
-            overlay_kind = "tracked" if is_tracker else "grounded"
             label = (
-                f"{overlay_kind} {observation.label} depth={depth_text} conf={observation.confidence:.2f} "
+                f"grounded {observation.label} depth={depth_text} conf={observation.confidence:.2f} "
                 f"can_confirm={int(can_confirm)} {verify_text} depth_region={depth_region_source}"
             )
             draw.rectangle((xmin, max(0, ymin - 28), min(width, xmin + 620), ymin), fill=(0, 0, 0))

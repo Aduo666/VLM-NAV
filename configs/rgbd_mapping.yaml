@@ -3,7 +3,7 @@ geometry:
   size_m: 80.0
   update_period_sec: 0.20
   min_depth_m: 0.30
-  max_depth_m: 8.0
+  max_depth_m: 10.0
   pixel_stride: 8
   vertical_min_ratio: 0.12
   vertical_max_ratio: 0.95

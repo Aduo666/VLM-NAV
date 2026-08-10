@@ -77,14 +77,6 @@ perception:
       min_confidence: 0.50
       max_edge_px: 768
       auto_accept_confidence: 0.75
-    tracker:
-      tracker_type: "CSRT"
-      max_lost_frames: 8
-      lost_confirmed_sec: 2.0
-      min_depth_valid_ratio: 0.08
-      center_patch_ratio: 0.35
-      confidence_decay_per_lost_frame: 0.06
-      min_tracking_confidence: 0.35
   landmark_tracking:
     min_visible_count: 2
     arrival_confirmations: 1
@@ -118,10 +110,14 @@ mapping:
     semantic_goal_step_m: 0.9
     semantic_goal_min_step_m: 0.45
     semantic_goal_lateral_search_m: 0.8
+    semantic_anchor_snap_max_correction_m: 1.5
+    semantic_anchor_snap_angular_tolerance_deg: 12.0
+    semantic_anchor_snap_min_cells: 3
+    semantic_anchor_snap_front_band_m: 0.30
   rgbd:
     update_period_sec: 0.20
     min_depth_m: 0.30
-    max_depth_m: 8.0
+    max_depth_m: 10.0
     pixel_stride: 8
     vertical_min_ratio: 0.12
     vertical_max_ratio: 0.95
@@ -203,11 +199,11 @@ debug:
     depth_enabled: false
     depth_path: "debug/local/depth_debug.png"
   video:
-    enabled: false
+    enabled: true
     path: "debug/local/videos/vln_debug.mp4"
     fps: 4.0
   observer_video:
-    enabled: false
+    enabled: true
     path: "debug/local/observevideos/observer.mp4"
     fps: 10.0
 

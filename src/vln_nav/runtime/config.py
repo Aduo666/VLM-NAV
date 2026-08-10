@@ -83,17 +83,6 @@ class SemanticVerificationConfig:
 
 
 @dataclass
-class TargetTrackerRuntimeConfig:
-    tracker_type: str
-    max_lost_frames: int
-    lost_confirmed_sec: float
-    min_depth_valid_ratio: float
-    center_patch_ratio: float
-    confidence_decay_per_lost_frame: float
-    min_tracking_confidence: float
-
-
-@dataclass
 class GroundingRuntimeConfig:
     call_period_sec: float
     reuse_last_observation_sec: float
@@ -120,7 +109,6 @@ class GroundingRuntimeConfig:
     max_result_yaw_delta_deg: float
     detector: GroundingDetectorConfig
     semantic_verification: SemanticVerificationConfig
-    tracker: TargetTrackerRuntimeConfig
 
 
 @dataclass
@@ -169,6 +157,10 @@ class OccupancyRuntimeConfig:
     semantic_goal_step_m: float
     semantic_goal_min_step_m: float
     semantic_goal_lateral_search_m: float
+    semantic_anchor_snap_max_correction_m: float
+    semantic_anchor_snap_angular_tolerance_deg: float
+    semantic_anchor_snap_min_cells: int
+    semantic_anchor_snap_front_band_m: float
 
 
 @dataclass

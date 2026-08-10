@@ -622,13 +622,9 @@ class VLNPolicy:
         observation = None if state is None else state.last_observation
         if observation is None:
             return None, None, 0.0
-        tracker_identity_verified = bool(
-            str(getattr(observation, "semantic_source", "")).strip().lower() == "opencv_tracker"
-            and getattr(observation, "vlm_verified", False)
-        )
         if not (
             bool(getattr(observation, "visible", False))
-            and (bool(getattr(observation, "can_confirm", False)) or tracker_identity_verified)
+            and bool(getattr(observation, "can_confirm", False))
             and bool(getattr(observation, "is_current_frame", True))
             and getattr(observation, "bbox", None) is not None
             and getattr(observation, "bearing_rad", None) is not None
@@ -2103,13 +2099,9 @@ class VLNPolicy:
             and "reused" not in source.strip().lower()
         )
         proposal_visible = bool(getattr(observation, "visible", False))
-        tracked_verified = bool(
-            str(getattr(observation, "semantic_source", "")).strip().lower() == "opencv_tracker"
-            and getattr(observation, "vlm_verified", False)
-        )
         verified_visible = bool(
             proposal_visible
-            and (getattr(observation, "can_confirm", False) or tracked_verified)
+            and getattr(observation, "can_confirm", False)
         )
         return (
             f"label={getattr(observation, 'label', self._current_target_text())} "

@@ -55,6 +55,10 @@ class OccupancyGridConfig:
     semantic_goal_step_m: float = 0.90
     semantic_goal_min_step_m: float = 0.45
     semantic_goal_lateral_search_m: float = 0.80
+    semantic_anchor_snap_max_correction_m: float = 1.50
+    semantic_anchor_snap_angular_tolerance_deg: float = 12.0
+    semantic_anchor_snap_min_cells: int = 3
+    semantic_anchor_snap_front_band_m: float = 0.30
 
 
 @dataclass
@@ -84,6 +88,17 @@ class SemanticSubgoalPlan:
     distance_to_target_m: float = 0.0
     bearing_deg: float = 0.0
     path_world_xy: list[tuple[float, float]] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class LandmarkSurfaceMatch:
+    matched: bool
+    world_xy: tuple[float, float] | None = None
+    support_cells: int = 0
+    correction_m: float = 0.0
+    raw_distance_m: float = 0.0
+    surface_distance_m: float = 0.0
+    reason: str = "no_match"
 
 
 # ---------------------------------------------------------------------------
@@ -706,6 +721,135 @@ class GlobalOccupancyMap:
             origin_x=self._origin_x,
             origin_y=self._origin_y,
             sensor_origin_world_xy=self._last_sensor_origin_world_xy,
+        )
+
+    def match_landmark_surface(
+        self,
+        *,
+        observer_pose: Pose2D,
+        raw_world_xy: list[float] | tuple[float, float],
+    ) -> LandmarkSurfaceMatch:
+        """Match a visual anchor to the frontmost supported occupied surface.
+
+        The search is constrained to a narrow cone from the request-time robot
+        pose and to a bounded neighborhood of the raw RGB-D anchor. Inflated
+        cells are deliberately excluded so the result remains a physical
+        surface estimate rather than a navigation-clearance boundary.
+        """
+
+        raw = np.asarray(raw_world_xy, dtype=np.float64).reshape(-1)
+        if raw.size < 2 or not np.all(np.isfinite(raw[:2])):
+            return LandmarkSurfaceMatch(matched=False, reason="raw_anchor_invalid")
+        raw = raw[:2]
+        origin = np.asarray(
+            [float(observer_pose.x), float(observer_pose.y)], dtype=np.float64
+        )
+        raw_delta = raw - origin
+        raw_distance = float(np.linalg.norm(raw_delta))
+        if raw_distance <= max(0.05, float(self._config.min_range_m)):
+            return LandmarkSurfaceMatch(
+                matched=False,
+                raw_distance_m=raw_distance,
+                reason="raw_anchor_too_close",
+            )
+
+        center_cell = self._world_to_cell(float(raw[0]), float(raw[1]))
+        if center_cell is None:
+            return LandmarkSurfaceMatch(
+                matched=False,
+                raw_distance_m=raw_distance,
+                reason="raw_anchor_outside_map",
+            )
+        max_correction = max(
+            self._resolution_m,
+            float(self._config.semantic_anchor_snap_max_correction_m),
+        )
+        radius_cells = max(1, int(np.ceil(max_correction / self._resolution_m)))
+        center_row, center_col = center_cell
+        row0 = max(0, center_row - radius_cells)
+        row1 = min(self._cell_count, center_row + radius_cells + 1)
+        col0 = max(0, center_col - radius_cells)
+        col1 = min(self._cell_count, center_col + radius_cells + 1)
+        occupied = self._occupied_mask()[row0:row1, col0:col1]
+        occupied_rows, occupied_cols = np.nonzero(occupied)
+        if occupied_rows.size == 0:
+            return LandmarkSurfaceMatch(
+                matched=False,
+                raw_distance_m=raw_distance,
+                reason="no_occupied_cells_near_anchor",
+            )
+
+        rows = occupied_rows + row0
+        cols = occupied_cols + col0
+        world_x = self._origin_x + (cols.astype(np.float64) + 0.5) * self._resolution_m
+        world_y = self._origin_y + (rows.astype(np.float64) + 0.5) * self._resolution_m
+        points = np.stack((world_x, world_y), axis=1)
+        correction = np.linalg.norm(points - raw[None, :], axis=1)
+        vectors = points - origin[None, :]
+        ranges = np.linalg.norm(vectors, axis=1)
+        raw_heading = float(np.arctan2(raw_delta[1], raw_delta[0]))
+        headings = np.arctan2(vectors[:, 1], vectors[:, 0])
+        angle_error = np.abs(
+            np.arctan2(np.sin(headings - raw_heading), np.cos(headings - raw_heading))
+        )
+        angular_limit = float(
+            np.deg2rad(
+                max(1.0, float(self._config.semantic_anchor_snap_angular_tolerance_deg))
+            )
+        )
+        plausible = (
+            np.isfinite(correction)
+            & np.isfinite(ranges)
+            & (correction <= max_correction)
+            & (ranges >= float(self._config.min_range_m))
+            & (ranges <= raw_distance + float(self._config.semantic_anchor_snap_front_band_m))
+            & (angle_error <= angular_limit)
+        )
+        if not np.any(plausible):
+            return LandmarkSurfaceMatch(
+                matched=False,
+                raw_distance_m=raw_distance,
+                reason="no_surface_in_anchor_cone",
+            )
+
+        points = points[plausible]
+        ranges = ranges[plausible]
+        nearest_range = float(np.min(ranges))
+        front_band = max(
+            self._resolution_m,
+            float(self._config.semantic_anchor_snap_front_band_m),
+        )
+        front_points = points[ranges <= nearest_range + front_band]
+        min_support = max(1, int(self._config.semantic_anchor_snap_min_cells))
+        if front_points.shape[0] < min_support:
+            return LandmarkSurfaceMatch(
+                matched=False,
+                support_cells=int(front_points.shape[0]),
+                raw_distance_m=raw_distance,
+                surface_distance_m=nearest_range,
+                reason="insufficient_surface_support",
+            )
+
+        surface = np.median(front_points, axis=0)
+        surface_distance = float(np.linalg.norm(surface - origin))
+        surface_correction = float(np.linalg.norm(surface - raw))
+        if surface_correction > max_correction:
+            return LandmarkSurfaceMatch(
+                matched=False,
+                support_cells=int(front_points.shape[0]),
+                correction_m=surface_correction,
+                raw_distance_m=raw_distance,
+                surface_distance_m=surface_distance,
+                reason="surface_correction_too_large",
+            )
+        return LandmarkSurfaceMatch(
+            matched=True,
+            world_xy=(float(surface[0]), float(surface[1])),
+            support_cells=int(front_points.shape[0]),
+            correction_m=surface_correction,
+            raw_distance_m=raw_distance,
+            surface_distance_m=surface_distance,
+            reason="ok",
         )
 
     # -- local submap (for candidate filtering & A*) -------------------------

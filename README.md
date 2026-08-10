@@ -17,14 +17,19 @@ RGB-D geometry mapping, map-aware VLM reasoning, and robot-specific motion primi
 > find the wheelchair, then turn left, and in front of the stairs, turn right to find
 > the yellow warning sign and stop in front of it.”
 
-AGX first-view
-<video src="docs/assets/agx_fv.mp4" controls="controls" width="500" height="300"></video>
-AGX third-view
-<video src="docs/assets/agx_tv.mp4" controls="controls" width="500" height="300"></video>
-G1 first-view
-<video src="docs/assets/g1_fv.mp4" controls="controls" width="500" height="300"></video>
-G1 third-view
-<video src="docs/assets/g1_tv.mp4" controls="controls" width="500" height="300"></video>
+### Navigation Debug View
+
+<video src="https://raw.githubusercontent.com/Aduo666/VLM-NAV/main/docs/assets/agx_fv.mp4" controls width="100%"></video>
+
+[Open the first-person MP4 directly](https://raw.githubusercontent.com/Aduo666/VLM-NAV/main/docs/assets/agx_fv.mp4)
+
+### AGX Observer View
+
+<video src="https://raw.githubusercontent.com/Aduo666/VLM-NAV/main/docs/assets/agx_tv.mp4" controls width="720"></video>
+
+[Open the observer MP4 directly](https://raw.githubusercontent.com/Aduo666/VLM-NAV/main/docs/assets/agx_tv.mp4)
+
+
 ## Overview
 
 CAPTAINav is a closed-loop VLN research prototype built on Isaac Sim 5.1. It combines:
@@ -48,7 +53,8 @@ English instruction
   -> stopped decision keyframe
        RGB-D observation
        task-conditioned GroundingDINO proposals
-       robust bbox-region depth and world projection
+       frontmost supported bbox-depth cluster and world projection
+       semantic-anchor matching against physical occupancy surfaces
        VLM verification for ambiguous proposals
        RGB-D global occupancy + topological memory
        persistent semantic landmark anchors
@@ -76,8 +82,13 @@ invalid and no matching cache exists, startup fails explicitly.
 
 GroundingDINO is the semantic detector used by the navigation path. At stopped decision keyframes
 it searches for the active route target using an open-vocabulary text query. Depth is estimated
-robustly inside the selected box and projected into the world frame. High-confidence proposals can
-be accepted directly; ambiguous proposals are verified by the VLM using a clean crop.
+from the nearest sufficiently supported depth layer inside the selected box rather than from the
+whole-box median. This prevents a background wall from dominating the geometry of a thin object.
+The resulting point is projected into the odometry frame. For `GO_TO`, CAPTAINav then searches a
+bounded viewing cone in the non-inflated occupancy map and matches the raw semantic point to the
+frontmost supported physical surface. The raw and matched anchors remain available in logs for
+diagnosis. High-confidence proposals can be accepted directly; ambiguous proposals are verified
+by the VLM using a clean crop.
 
 Only the active target can become a route-completing landmark anchor after the existing identity,
 depth, temporal-consistency, and geometry gates pass. RGB-D occupancy mapping remains geometric;
@@ -101,7 +112,8 @@ The occupancy image remains available in `debug/local/vln_debug.png` for human i
 
 The global occupancy map is built only from calibrated front-camera RGB-D rays. LiDAR readings do
 not write occupancy cells; they are retained only as an independent near-field safety signal and
-for turn-clearance estimation.
+for turn-clearance estimation. RGB-D geometry is fused out to `10 m`; invalid and out-of-range
+depth samples remain excluded.
 
 ### Robot-Aware Safety
 
@@ -126,6 +138,7 @@ polygon footprint and full primitive sweep are not part of the active navigation
 | Isaac Sim | 5.1.0 pip distribution |
 | CUDA GPU | Required for Isaac Sim and GroundingDINO |
 | VLM API | OpenAI-compatible endpoint; SiliconFlow is configured by default |
+| FFmpeg | Required with `libx264` for debug and observer video recording |
 
 ## Installation
 
@@ -144,6 +157,13 @@ pip install -r requirements.txt
 ```
 
 The requirements pin Isaac Sim 5.1 and `numpy==1.26.0`, together with Pillow, PyYAML, and OpenCV.
+
+Install FFmpeg through the operating system and verify that H.264 encoding is available:
+
+```bash
+sudo apt-get install ffmpeg
+ffmpeg -hide_banner -encoders | grep libx264
+```
 
 ### 3. Install GroundingDINO
 
@@ -349,6 +369,10 @@ logs/
 `nav_latest.log` is the complete launcher/Isaac console capture. `vln.log` contains the CAPTAINav
 logger stream. Both are overwritten on the next local run.
 
+Both `vln_debug_<timestamp>.mp4` and `observer_<timestamp>.mp4` are written directly as H.264,
+YUV420P, fast-start MP4 files. The recorder fails explicitly when FFmpeg or `libx264` is missing;
+it does not silently fall back to the incompatible OpenCV `mp4v` codec.
+
 ## Tests
 
 Pure-code tests do not start Isaac Sim:
@@ -364,7 +388,7 @@ semantic turns, occupancy behavior, and robot-specific primitive safety.
 
 - VLM latency remains the main delay between decision keyframes.
 - Open-vocabulary grounding boxes can still be ambiguous despite temporal evidence and crop verification.
-- World anchors depend on camera calibration, depth quality, and odometry consistency.
+- World anchors depend on camera calibration, RGB-D surface support, and odometry consistency.
 - The Unitree G1 behavior depends strongly on the quality and deployment compatibility of its policy.
 - CAPTAINav is a research prototype, not a safety-certified navigation system.
 

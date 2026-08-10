@@ -56,6 +56,11 @@ class TargetObservation:
     turn_direction_consistent: bool | None = None
     turn_relation_verified: bool = False
     turn_relation_reason: str = ""
+    raw_estimated_world_xy: list[float] | None = None
+    surface_supported: bool = False
+    surface_support_cells: int = 0
+    surface_correction_m: float = 0.0
+    surface_depth_m: float | None = None
 
 
 @dataclass
@@ -357,6 +362,15 @@ class TargetGrounder:
             turn_direction_consistent=self._last_observation.turn_direction_consistent,
             turn_relation_verified=bool(self._last_observation.turn_relation_verified),
             turn_relation_reason=str(self._last_observation.turn_relation_reason),
+            raw_estimated_world_xy=(
+                None
+                if self._last_observation.raw_estimated_world_xy is None
+                else list(self._last_observation.raw_estimated_world_xy)
+            ),
+            surface_supported=bool(self._last_observation.surface_supported),
+            surface_support_cells=int(self._last_observation.surface_support_cells),
+            surface_correction_m=float(self._last_observation.surface_correction_m),
+            surface_depth_m=self._last_observation.surface_depth_m,
         )
 
     def _collect_finished_request(self, *, timestamp_sec: float, wall_time_sec: float, current_robot_pose: Pose2D | None = None) -> TargetObservation | None:
@@ -950,6 +964,7 @@ class TargetGrounder:
             turn_direction_consistent=turn_direction_consistent,
             turn_relation_verified=turn_relation_verified,
             turn_relation_reason=turn_relation_reason,
+            raw_estimated_world_xy=(None if estimated_xy is None else list(estimated_xy)),
         )
 
     def _verify_detection_semantics(
@@ -1166,6 +1181,15 @@ def _copy_observation_with_timestamp(
         turn_direction_consistent=observation.turn_direction_consistent,
         turn_relation_verified=bool(observation.turn_relation_verified),
         turn_relation_reason=str(observation.turn_relation_reason),
+        raw_estimated_world_xy=(
+            None
+            if observation.raw_estimated_world_xy is None
+            else list(observation.raw_estimated_world_xy)
+        ),
+        surface_supported=bool(observation.surface_supported),
+        surface_support_cells=int(observation.surface_support_cells),
+        surface_correction_m=float(observation.surface_correction_m),
+        surface_depth_m=observation.surface_depth_m,
     )
 
 
@@ -1785,13 +1809,16 @@ def _bbox_depth_cluster_statistic(
     if valid.size == 0:
         return None, valid_ratio, 0.0, bbox_center_uv
 
-    seed_depth = float(np.median(valid))
     selected_mask = valid_mask
     if region in {"bbox_depth_cluster", "depth_cluster"} and valid.size >= max(3, int(cluster_min_pixels)):
-        tolerance = max(0.15, float(seed_depth) * max(0.05, float(cluster_tolerance_ratio)))
-        near_mask = valid_mask & (np.abs(patch - seed_depth) <= tolerance)
-        if int(np.count_nonzero(near_mask)) >= max(3, int(cluster_min_pixels)):
-            selected_mask = near_mask
+        foreground_mask = _frontmost_supported_depth_cluster(
+            patch=patch,
+            valid_mask=valid_mask,
+            cluster_tolerance_ratio=float(cluster_tolerance_ratio),
+            cluster_min_pixels=int(cluster_min_pixels),
+        )
+        if foreground_mask is not None:
+            selected_mask = foreground_mask
 
     selected = patch[selected_mask]
     mask_area_ratio = float(np.count_nonzero(selected_mask) / max(1, height * width))
@@ -1813,3 +1840,65 @@ def _bbox_depth_cluster_statistic(
     if str(statistic).strip().lower() in {"near_percentile", "p35", "percentile_35"}:
         return float(np.percentile(selected, 35.0)), valid_ratio, mask_area_ratio, center_uv
     return float(np.median(selected)), valid_ratio, mask_area_ratio, center_uv
+
+
+def _frontmost_supported_depth_cluster(
+    *,
+    patch: np.ndarray,
+    valid_mask: np.ndarray,
+    cluster_tolerance_ratio: float,
+    cluster_min_pixels: int,
+) -> np.ndarray | None:
+    """Select the nearest depth layer with enough pixel support.
+
+    A whole-bbox median is often the wall behind a thin object. This scans
+    depth from near to far and accepts the first coherent layer with enough
+    support. The lowest part of the bbox is excluded only while choosing the
+    seed, which reduces floor leakage without discarding object pixels from
+    the final cluster.
+    """
+
+    valid_count = int(np.count_nonzero(valid_mask))
+    if valid_count == 0:
+        return None
+    min_support = max(
+        3,
+        int(cluster_min_pixels),
+        int(np.ceil(0.02 * float(valid_count))),
+    )
+    seed_mask = valid_mask.copy()
+    bottom_start = int(np.floor(0.90 * float(seed_mask.shape[0])))
+    if bottom_start > 0:
+        seed_mask[bottom_start:, :] = False
+    if int(np.count_nonzero(seed_mask)) < min_support:
+        seed_mask = valid_mask
+
+    seed_values = np.asarray(patch[seed_mask], dtype=np.float32)
+    if seed_values.size < min_support:
+        return None
+    near_reference = float(np.percentile(seed_values, 35.0))
+    tolerance_ratio = float(
+        np.clip(max(0.03, float(cluster_tolerance_ratio) * 0.20), 0.03, 0.10)
+    )
+    bin_width = float(np.clip(near_reference * tolerance_ratio, 0.12, 0.40))
+    depth_min = float(np.min(seed_values))
+    depth_max = float(np.max(seed_values))
+    if depth_max - depth_min <= bin_width:
+        return valid_mask.copy()
+
+    edges = np.arange(depth_min, depth_max + 2.0 * bin_width, bin_width)
+    counts, edges = np.histogram(seed_values, bins=edges)
+    for index, count in enumerate(counts):
+        if int(count) == 0:
+            continue
+        lower = float(edges[index])
+        upper = float(edges[index + 1])
+        in_bin = (seed_values >= lower) & (seed_values < upper)
+        if index == len(counts) - 1:
+            in_bin |= seed_values == upper
+        seed_depth = float(np.median(seed_values[in_bin]))
+        tolerance = float(np.clip(seed_depth * tolerance_ratio, 0.15, 0.50))
+        candidate_mask = valid_mask & (np.abs(patch - seed_depth) <= tolerance)
+        if int(np.count_nonzero(candidate_mask)) >= min_support:
+            return candidate_mask
+    return None

@@ -11,7 +11,7 @@ class RGBDGeometryMapConfig:
     size_m: float = 80.0
     update_period_sec: float = 0.20
     min_depth_m: float = 0.30
-    max_depth_m: float = 8.0
+    max_depth_m: float = 10.0
     pixel_stride: int = 8
     vertical_min_ratio: float = 0.12
     vertical_max_ratio: float = 0.95

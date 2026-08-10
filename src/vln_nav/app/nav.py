@@ -20,7 +20,6 @@ from ..navigation.depth_safety import DepthSafetyConfig, DepthSafetyMonitor
 from ..navigation.instruction_manager import InstructionContext, InstructionManager
 from ..navigation.landmark_map import LandmarkMap, LandmarkMapConfig, LandmarkMapEntry
 from ..navigation.landmark_tracker import LandmarkState, LandmarkTracker, LandmarkTrackerConfig
-from ..navigation.lidar_sensor import PhysXLidarConfig, PhysXLidarReader
 from ..navigation.map_candidate_generator import MapCandidateGenerator, MapCandidateGeneratorConfig
 from ..navigation.occupancy_grid import GlobalOccupancyMap, OccupancyGridConfig
 from ..navigation.observation_adapter import ObservationAdapter
@@ -735,35 +734,12 @@ def run_navigation(
     )
     logger.info(
         "[GeometryMapConfig] source=rgbd depth_range=[%.2f, %.2f]m stride=%s "
-        "height_band=[%.2f, %.2f]m lidar_mapping=0",
+        "height_band=[%.2f, %.2f]m",
         float(config.mapping.rgbd.min_depth_m),
         float(config.mapping.rgbd.max_depth_m),
         int(config.mapping.rgbd.pixel_stride),
         float(config.mapping.rgbd.obstacle_min_height_m),
         float(config.mapping.rgbd.obstacle_max_height_m),
-    )
-    _g1_lidar_robot_frame_path = None
-    if config.robot.is_g1:
-        _g1_lidar_robot_frame_path = _resolve_robot_relative_prim_path(
-            robot_root_path=str(config.robot.asset.prim_path),
-            prim_path=str(config.robot.asset.articulation_path),
-        )
-    lidar_reader = PhysXLidarReader(
-        config=PhysXLidarConfig(
-            prim_path=str(config.robot.sensors.lidar.prim_path),
-            horizontal_fov_deg=float(config.robot.sensors.lidar.horizontal_fov_deg),
-            vertical_fov_deg=float(config.robot.sensors.lidar.vertical_fov_deg),
-            horizontal_resolution_deg=float(config.robot.sensors.lidar.horizontal_resolution_deg),
-            vertical_resolution_deg=float(config.robot.sensors.lidar.vertical_resolution_deg),
-            rotation_rate_hz=float(config.robot.sensors.lidar.rotation_rate_hz),
-            min_range_m=float(config.robot.sensors.lidar.min_range_m),
-            max_range_m=float(config.robot.sensors.lidar.max_range_m),
-            yaw_offset_deg=float(config.robot.sensors.lidar.yaw_offset_deg),
-            sector_merge_keep_sec=float(config.robot.sensors.lidar.sector_merge_keep_sec),
-        ),
-        robot_root_path=str(config.robot.asset.prim_path),
-        logger=logger,
-        dynamic_robot_frame_path=_g1_lidar_robot_frame_path,
     )
     map_candidate_generator = MapCandidateGenerator(
         config=MapCandidateGeneratorConfig(
@@ -828,9 +804,6 @@ def run_navigation(
             ),
             semantic_turn_corridor_step_deg=float(
                 config.navigation.policy.semantic_turn.corridor_step_deg
-            ),
-            semantic_turn_lidar_bin_half_width_deg=float(
-                config.navigation.policy.semantic_turn.lidar_bin_half_width_deg
             ),
             semantic_turn_min_corridor_width_deg=float(
                 config.navigation.policy.semantic_turn.min_corridor_width_deg
@@ -1033,13 +1006,6 @@ def run_navigation(
         observer_camera.initialize()
         logger.info("observer camera initialize() complete")
         _attach_camera_annotators(camera=observer_camera, logger=logger, enable_depth=False)
-    lidar_initialized = lidar_reader.initialize(stage=stage)
-    if not bool(lidar_initialized):
-        raise RuntimeError(
-            f"The {config.robot.name} profile requires its USD LiDAR prim to exist at "
-            f"{config.robot.asset.prim_path.rstrip('/')}/{config.robot.sensors.lidar.prim_path.lstrip('/')}"
-        )
-
     _bind_viewport_to_camera(
         camera_prim_path=front_camera_prim_path,
         logger=logger,
@@ -1124,18 +1090,6 @@ def run_navigation(
         int(config.mapping.occupancy.occupied_min_neighbors),
         occupancy_grid.output_path,
     )
-    logger.info(
-        "[LidarConfig] source=required_usd prim_path=%s fov=[%.1f,%.1f] res=[%.2f,%.2f] range=[%.2f,%.2f] yaw_offset=%.1f",
-        str(config.robot.sensors.lidar.prim_path),
-        float(config.robot.sensors.lidar.horizontal_fov_deg),
-        float(config.robot.sensors.lidar.vertical_fov_deg),
-        float(config.robot.sensors.lidar.horizontal_resolution_deg),
-        float(config.robot.sensors.lidar.vertical_resolution_deg),
-        float(config.robot.sensors.lidar.min_range_m),
-        float(config.robot.sensors.lidar.max_range_m),
-        float(config.robot.sensors.lidar.yaw_offset_deg),
-    )
-
     last_depth_image: np.ndarray | None = None
     last_depth_eval_time = 0.0
     frame_index = 0
@@ -1405,35 +1359,6 @@ def run_navigation(
                     rgbd_mapping_ready = True
             except Exception as exc:
                 logger.warning("[RGBDMap] frame_rejected error=%s", exc)
-        lidar_scan = lidar_reader.read(
-            pose=mapping_pose,
-            timestamp_sec=sim_time_sec,
-        )
-        if lidar_scan is not None:
-            lidar_sector_depths = _lidar_sector_depths(
-                beam_endpoints_local_xy=np.asarray(lidar_scan.beam_endpoints_local_xy, dtype=np.float32),
-                beam_hit_mask=np.asarray(lidar_scan.beam_hit_mask, dtype=bool),
-                sensor_origin_local_xy=getattr(lidar_scan, "sensor_origin_local_xy", None),
-            )
-            observation.meta["lidar"] = {
-                "enabled": True,
-                "source": lidar_scan.source,
-                "sensor_path": lidar_scan.sensor_path,
-                "point_count": int(lidar_scan.point_count),
-                "current_point_count": int(getattr(lidar_scan, "current_point_count", lidar_scan.point_count)),
-                "merged_beam_count": int(lidar_scan.beam_endpoints_local_xy.shape[0]),
-                "raw_beam_count": int(lidar_scan.raw_beam_count),
-                "valid_beam_count": int(lidar_scan.valid_beam_count),
-                "effective_fov_deg": float(lidar_scan.effective_fov_deg),
-                **lidar_sector_depths,
-            }
-        else:
-            observation.meta["lidar"] = {
-                "enabled": True,
-                "source": "unavailable",
-                "sensor_path": lidar_reader.sensor_path,
-                "point_count": 0,
-            }
         bootstrap_time_ready = sim_time_sec >= float(occupancy_bootstrap_end_sec)
         bootstrap_deadline_reached = sim_time_sec >= float(occupancy_bootstrap_deadline_sec)
         if not (
@@ -1629,14 +1554,6 @@ def run_navigation(
         if policy.current_step_type == "TURN":
             policy.update_turn_heading_context(
                 robot_pose=mapping_pose,
-                beam_endpoints_local_xy=(
-                    None
-                    if lidar_scan is None
-                    else np.asarray(
-                        lidar_scan.beam_endpoints_local_xy,
-                        dtype=np.float32,
-                    )
-                ),
                 occupancy_snapshot=occupancy_grid.snapshot(),
             )
 
@@ -3454,44 +3371,6 @@ def _build_semantic_map_summary(
     if action_history:
         lines.append(action_history)
     return "\n".join(lines)
-
-
-def _lidar_sector_depths(
-    *,
-    beam_endpoints_local_xy: np.ndarray,
-    beam_hit_mask: np.ndarray,
-    sensor_origin_local_xy,
-) -> dict[str, float]:
-    endpoints = np.asarray(beam_endpoints_local_xy, dtype=np.float32)
-    hits = np.asarray(beam_hit_mask, dtype=bool).reshape(-1)
-    if endpoints.ndim != 2 or endpoints.shape[0] != hits.shape[0] or endpoints.shape[1] < 2:
-        return {
-            "front_depth_m": float("inf"),
-            "left_depth_m": float("inf"),
-            "right_depth_m": float("inf"),
-        }
-    origin = np.asarray(
-        [0.0, 0.0] if sensor_origin_local_xy is None else sensor_origin_local_xy,
-        dtype=np.float32,
-    ).reshape(-1)
-    origin_xy = np.zeros((2,), dtype=np.float32)
-    origin_xy[: min(2, origin.size)] = origin[: min(2, origin.size)]
-    relative = endpoints[:, :2] - origin_xy[None, :]
-    ranges = np.linalg.norm(relative, axis=1)
-    angles_deg = np.degrees(np.arctan2(relative[:, 1], relative[:, 0]))
-    valid = hits & np.isfinite(ranges) & (ranges > 0.05)
-
-    def sector_depth(low_deg: float, high_deg: float) -> float:
-        sector = ranges[valid & (angles_deg >= low_deg) & (angles_deg <= high_deg)]
-        if sector.size == 0:
-            return float("inf")
-        return float(np.percentile(sector, 15.0))
-
-    return {
-        "front_depth_m": sector_depth(-22.5, 22.5),
-        "left_depth_m": sector_depth(22.5, 90.0),
-        "right_depth_m": sector_depth(-90.0, -22.5),
-    }
 
 
 if __name__ == "__main__":

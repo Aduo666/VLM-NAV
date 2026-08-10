@@ -219,7 +219,7 @@ class RGBDGeometryMap:
 
     Each image column becomes one virtual planar ray. The nearest point inside
     the obstacle height band is treated as a hit; otherwise the farthest observed
-    floor point clears free space. No LiDAR or semantic detector is used.
+    floor point clears free space. No semantic detector is used.
     """
 
     def __init__(

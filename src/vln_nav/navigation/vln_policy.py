@@ -80,7 +80,6 @@ class VLNPolicyConfig:
     semantic_turn_direction_tolerance_deg: float = 10.0
     semantic_turn_corridor_half_fov_deg: float = 60.0
     semantic_turn_corridor_step_deg: float = 5.0
-    semantic_turn_lidar_bin_half_width_deg: float = 3.0
     semantic_turn_min_corridor_width_deg: float = 15.0
     semantic_turn_corridor_max_clearance_m: float = 4.0
     semantic_turn_max_recovery_attempts: int = 2
@@ -262,9 +261,6 @@ class VLNPolicy:
                     self._config.semantic_turn_corridor_half_fov_deg
                 ),
                 heading_step_deg=float(self._config.semantic_turn_corridor_step_deg),
-                lidar_bin_half_width_deg=float(
-                    self._config.semantic_turn_lidar_bin_half_width_deg
-                ),
                 min_corridor_width_deg=float(
                     self._config.semantic_turn_min_corridor_width_deg
                 ),
@@ -1240,7 +1236,6 @@ class VLNPolicy:
         self,
         *,
         robot_pose,
-        beam_endpoints_local_xy: np.ndarray | None,
         occupancy_snapshot,
     ) -> None:
         if self.current_step_type != "TURN":
@@ -1251,7 +1246,6 @@ class VLNPolicy:
             return
         self._semantic_turn_latest_heading = self._turn_heading_estimator.estimate(
             robot_pose=robot_pose,
-            beam_endpoints_local_xy=beam_endpoints_local_xy,
             occupancy_snapshot=occupancy_snapshot,
         )
 

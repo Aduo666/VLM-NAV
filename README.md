@@ -19,15 +19,11 @@ RGB-D geometry mapping, map-aware VLM reasoning, and robot-specific motion primi
 
 ### Navigation Debug View
 
-<video src="https://raw.githubusercontent.com/Aduo666/VLM-NAV/main/docs/assets/agx_fv.mp4" controls width="100%"></video>
-
-[Open the first-person MP4 directly](https://raw.githubusercontent.com/Aduo666/VLM-NAV/main/docs/assets/agx_fv.mp4)
+[![Navigation debug demo](docs/assets/agx_fv.gif)](docs/assets/agx_fv.mp4)
 
 ### AGX Observer View
 
-<video src="https://raw.githubusercontent.com/Aduo666/VLM-NAV/main/docs/assets/agx_tv.mp4" controls width="720"></video>
-
-[Open the observer MP4 directly](https://raw.githubusercontent.com/Aduo666/VLM-NAV/main/docs/assets/agx_tv.mp4)
+[![AGX observer demo](docs/assets/agx_tv.gif)](docs/assets/agx_tv.mp4)
 
 
 ## Overview
@@ -60,7 +56,7 @@ English instruction
        persistent semantic landmark anchors
   -> primitive-aligned candidate table
   -> VLM selects one valid candidate/action
-  -> DepthSafetyMonitor checks front/left/right RGB-D and LiDAR clearance
+  -> DepthSafetyMonitor checks front/left/right RGB-D clearance
   -> AGX 4WS controller or Unitree G1 locomotion policy
   -> odometry-verified primitive completion
   -> next decision keyframe
@@ -110,15 +106,14 @@ The VLM does not receive the occupancy image. Its navigation request contains:
 
 The occupancy image remains available in `debug/local/vln_debug.png` for human inspection.
 
-The global occupancy map is built only from calibrated front-camera RGB-D rays. LiDAR readings do
-not write occupancy cells; they are retained only as an independent near-field safety signal and
-for turn-clearance estimation. RGB-D geometry is fused out to `10 m`; invalid and out-of-range
-depth samples remain excluded.
+The global occupancy map, turn-clearance estimation, and near-field safety path all use calibrated
+front-camera RGB-D data. Geometry is fused out to `10 m`; invalid and out-of-range depth samples
+remain excluded.
 
 ### Robot-Aware Safety
 
-`DepthSafetyMonitor` is the runtime obstacle-avoidance gate. It combines robust depth statistics
-from front/left/right image regions with the corresponding LiDAR sector distances:
+`DepthSafetyMonitor` is the runtime obstacle-avoidance gate. It uses robust depth statistics from
+front/left/right image regions:
 
 - `FORWARD` stops at the robot profile's obstacle threshold and slows in the near field.
 - `TURN_LEFT` checks front and left clearance.
@@ -215,8 +210,8 @@ debug/eval/                    # Dataset evaluation artifacts
 ```
 
 The main navigation path uses GroundingDINO for active-target perception. The standalone mapping
-entry point exercises only RGB-D geometry projection and does not start the detector, VLM, LiDAR,
-or navigation policy.
+entry point exercises only RGB-D geometry projection and does not start the detector, VLM, or
+navigation policy.
 
 ## Running
 
@@ -274,7 +269,7 @@ balance. The test automatically resets after a confirmed fall.
 
 ### RGB-D Geometry Mapping Test
 
-The standalone AGX test builds a north-up global geometry map from the front RGB-D camera. LiDAR,
+The standalone AGX test builds a north-up global geometry map from the front RGB-D camera.
 GroundingDINO, the VLM, and the navigation policy are not started, so geometry can be validated
 independently.
 

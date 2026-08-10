@@ -61,7 +61,7 @@ class _MappingControlPanel:
         )
         with self._window.frame:
             with ui.VStack(spacing=8):
-                ui.Label("RGB-D geometry only: LiDAR, detector, VLM and navigation are disabled")
+                ui.Label("RGB-D geometry only: detector, VLM and navigation are disabled")
                 ui.Label("Hold arrow keys or buttons to drive; release to STOP")
                 ui.Separator()
                 with ui.HStack(height=42):
@@ -392,7 +392,7 @@ def _run(*, simulation_app, config, settings: _StandaloneMappingSettings, logger
     )
     logger.warning(
         "[RGBDMapping] READY source=front_camera_depth+isaac_world_pose "
-        "lidar=disabled semantics=disabled output=%s floor_z=%.3f",
+        "semantics=disabled output=%s floor_z=%.3f",
         settings.output_path,
         floor_z_m,
     )

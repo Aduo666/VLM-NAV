@@ -231,7 +231,6 @@ class SemanticTurnRuntimeConfig:
     direction_tolerance_deg: float
     corridor_half_fov_deg: float
     corridor_step_deg: float
-    lidar_bin_half_width_deg: float
     min_corridor_width_deg: float
     corridor_max_clearance_m: float
     max_recovery_attempts: int

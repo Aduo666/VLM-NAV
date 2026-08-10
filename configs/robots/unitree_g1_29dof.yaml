@@ -34,18 +34,6 @@ sensors:
     obstacle_center_width_ratio: 0.34
     obstacle_side_width_ratio: 0.30
     depth_eval_period_sec: 0.12
-  lidar:
-    prim_path: "pelvis/Lidar"
-    horizontal_fov_deg: 180.0
-    vertical_fov_deg: 10.0
-    horizontal_resolution_deg: 0.4
-    vertical_resolution_deg: 4.0
-    rotation_rate_hz: 30.0
-    min_range_m: 0.40
-    max_range_m: 10.0
-    yaw_offset_deg: 0.0
-    sector_merge_keep_sec: 1.5
-
 controller:
   policy_path: "src/unitree_model/g1_29dof/policy/policy.pt"
   deploy_config_path: "src/unitree_model/g1_29dof/policy/deploy.yaml"

@@ -46,23 +46,8 @@ class CameraProfile:
 
 
 @dataclass(frozen=True)
-class LidarProfile:
-    prim_path: str
-    horizontal_fov_deg: float
-    vertical_fov_deg: float
-    horizontal_resolution_deg: float
-    vertical_resolution_deg: float
-    rotation_rate_hz: float
-    min_range_m: float
-    max_range_m: float
-    yaw_offset_deg: float
-    sector_merge_keep_sec: float
-
-
-@dataclass(frozen=True)
 class RobotSensorProfile:
     camera: CameraProfile
-    lidar: LidarProfile
 
     @property
     def front_camera_prim_path(self) -> str:
@@ -79,11 +64,6 @@ class RobotSensorProfile:
     @property
     def camera_frequency_hz(self) -> int:
         return self.camera.frequency_hz
-
-    @property
-    def lidar_prim_path(self) -> str:
-        return self.lidar.prim_path
-
 
 @dataclass(frozen=True)
 class PrimitiveProfile:
@@ -233,7 +213,7 @@ def load_robot_profile(*, profile_name: str, project_root: Path) -> RobotProfile
     sensors_data = _mapping(payload, "sensors", normalized_name)
     _require_exact_keys(
         sensors_data,
-        required={"camera", "lidar"},
+        required={"camera"},
         context=f"{normalized_name}.sensors",
     )
     camera_data = _mapping(sensors_data, "camera", f"{normalized_name}.sensors")
@@ -258,24 +238,6 @@ def load_robot_profile(*, profile_name: str, project_root: Path) -> RobotProfile
         },
         context=f"{normalized_name}.sensors.camera",
     )
-    lidar_data = _mapping(sensors_data, "lidar", f"{normalized_name}.sensors")
-    _require_exact_keys(
-        lidar_data,
-        required={
-            "prim_path",
-            "horizontal_fov_deg",
-            "vertical_fov_deg",
-            "horizontal_resolution_deg",
-            "vertical_resolution_deg",
-            "rotation_rate_hz",
-            "min_range_m",
-            "max_range_m",
-            "yaw_offset_deg",
-            "sector_merge_keep_sec",
-        },
-        context=f"{normalized_name}.sensors.lidar",
-    )
-
     primitives_data = _mapping(payload, "primitives", normalized_name)
     primitive_keys = {
         "forward_distance_m",
@@ -413,24 +375,6 @@ def load_robot_profile(*, profile_name: str, project_root: Path) -> RobotProfile
                 obstacle_center_width_ratio=float(camera_data["obstacle_center_width_ratio"]),
                 obstacle_side_width_ratio=float(camera_data["obstacle_side_width_ratio"]),
                 depth_eval_period_sec=_positive_float(camera_data["depth_eval_period_sec"], "camera.depth_eval_period_sec"),
-            ),
-            lidar=LidarProfile(
-                prim_path=str(lidar_data["prim_path"]).strip(),
-                horizontal_fov_deg=_positive_float(lidar_data["horizontal_fov_deg"], "lidar.horizontal_fov_deg"),
-                vertical_fov_deg=_positive_float(lidar_data["vertical_fov_deg"], "lidar.vertical_fov_deg"),
-                horizontal_resolution_deg=_positive_float(
-                    lidar_data["horizontal_resolution_deg"], "lidar.horizontal_resolution_deg"
-                ),
-                vertical_resolution_deg=_positive_float(
-                    lidar_data["vertical_resolution_deg"], "lidar.vertical_resolution_deg"
-                ),
-                rotation_rate_hz=_positive_float(lidar_data["rotation_rate_hz"], "lidar.rotation_rate_hz"),
-                min_range_m=_nonnegative_float(lidar_data["min_range_m"], "lidar.min_range_m"),
-                max_range_m=_positive_float(lidar_data["max_range_m"], "lidar.max_range_m"),
-                yaw_offset_deg=float(lidar_data["yaw_offset_deg"]),
-                sector_merge_keep_sec=_nonnegative_float(
-                    lidar_data["sector_merge_keep_sec"], "lidar.sector_merge_keep_sec"
-                ),
             ),
         ),
         primitives=PrimitiveProfile(

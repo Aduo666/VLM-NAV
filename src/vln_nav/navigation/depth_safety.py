@@ -66,12 +66,6 @@ class DepthSafetyMonitor:
         else:
             front_depth_m, left_depth_m, right_depth_m = self._region_depths(depth)
 
-        lidar_meta = observation.meta.get("lidar", {})
-        if isinstance(lidar_meta, dict) and bool(lidar_meta.get("enabled", False)):
-            front_depth_m = _minimum_finite(front_depth_m, lidar_meta.get("front_depth_m"))
-            left_depth_m = _minimum_finite(left_depth_m, lidar_meta.get("left_depth_m"))
-            right_depth_m = _minimum_finite(right_depth_m, lidar_meta.get("right_depth_m"))
-
         stop_distance_m = float(self._config.stop_distance_m)
         now_sec = float(observation.meta.get("timestamp_sec", 0.0))
         front_depth_m, left_depth_m, right_depth_m = self._apply_near_field_memory(
@@ -240,15 +234,3 @@ def _robust_patch_depth(patch: np.ndarray) -> float:
     if valid.size == 0:
         return float("inf")
     return float(np.percentile(valid, 20.0))
-
-
-def _minimum_finite(first, second) -> float:
-    values = []
-    for value in (first, second):
-        try:
-            numeric = float(value)
-        except (TypeError, ValueError):
-            continue
-        if np.isfinite(numeric):
-            values.append(numeric)
-    return min(values) if values else float("inf")

@@ -14,7 +14,6 @@ class TurnHeadingEstimatorConfig:
 
     heading_half_fov_deg: float = 60.0
     heading_step_deg: float = 5.0
-    lidar_bin_half_width_deg: float = 3.0
     min_corridor_width_deg: float = 15.0
     min_clearance_m: float = 0.60
     max_clearance_m: float = 4.0
@@ -27,7 +26,6 @@ class TurnHeadingEstimate:
     local_heading_deg: float = 0.0
     world_yaw_rad: float = 0.0
     fused_clearance_m: float = 0.0
-    lidar_clearance_m: float = 0.0
     map_clearance_m: float = 0.0
     map_known_ratio: float = 0.0
     corridor_width_deg: float = 0.0
@@ -38,14 +36,12 @@ class TurnHeadingEstimator:
     """Estimate the centerline of the safest visible corridor.
 
     Frame assumptions:
-    - LiDAR endpoints use robot-local ``+X forward, +Y left``.
     - ``Pose2D`` and the occupancy snapshot share the odom/world frame.
     - Occupancy rows increase with world ``+Y`` and columns with world ``+X``.
 
     The estimator deliberately does not use navigation action candidates.
-    It first creates a heading-clearance profile from LiDAR, validates each
-    direction against inflated global occupancy, then chooses the center of a
-    contiguous safe heading cluster.
+    It creates a heading-clearance profile from the RGB-D occupancy map and
+    chooses the center of a contiguous safe heading cluster.
     """
 
     def __init__(self, config: TurnHeadingEstimatorConfig) -> None:
@@ -55,41 +51,24 @@ class TurnHeadingEstimator:
         self,
         *,
         robot_pose: Pose2D,
-        beam_endpoints_local_xy: np.ndarray | None,
         occupancy_snapshot: Any | None,
     ) -> TurnHeadingEstimate:
-        endpoints = _valid_endpoints(beam_endpoints_local_xy)
         snapshot = _valid_snapshot(occupancy_snapshot)
-        if endpoints.shape[0] == 0 and snapshot is None:
-            return TurnHeadingEstimate(valid=False, reason="no_lidar_or_occupancy")
+        if snapshot is None:
+            return TurnHeadingEstimate(valid=False, reason="no_occupancy")
 
         half_fov = max(5.0, float(self._config.heading_half_fov_deg))
         step_deg = max(1.0, float(self._config.heading_step_deg))
         headings = np.arange(-half_fov, half_fov + 0.5 * step_deg, step_deg, dtype=np.float32)
-        lidar_angles, lidar_ranges = _polar_endpoints(endpoints)
-
         samples: list[dict[str, float | bool]] = []
         for heading_deg in headings:
-            lidar_clearance = _lidar_clearance(
-                heading_deg=float(heading_deg),
-                angles_deg=lidar_angles,
-                ranges_m=lidar_ranges,
-                bin_half_width_deg=max(
-                    0.5,
-                    float(self._config.lidar_bin_half_width_deg),
-                ),
-                max_clearance_m=max(0.2, float(self._config.max_clearance_m)),
-            )
             map_clearance, known_ratio = _map_clearance(
                 snapshot=snapshot,
                 robot_pose=robot_pose,
                 local_heading_deg=float(heading_deg),
                 max_clearance_m=max(0.2, float(self._config.max_clearance_m)),
             )
-            fused_clearance = _fuse_clearance(
-                lidar_clearance=lidar_clearance,
-                map_clearance=map_clearance,
-            )
+            fused_clearance = map_clearance
             valid = bool(
                 np.isfinite(fused_clearance)
                 and float(fused_clearance) >= float(self._config.min_clearance_m)
@@ -97,7 +76,6 @@ class TurnHeadingEstimator:
             samples.append(
                 {
                     "heading_deg": float(heading_deg),
-                    "lidar_clearance_m": float(lidar_clearance),
                     "map_clearance_m": float(map_clearance),
                     "map_known_ratio": float(known_ratio),
                     "fused_clearance_m": float(fused_clearance),
@@ -147,24 +125,11 @@ class TurnHeadingEstimator:
             local_heading_deg=float(center_heading),
             world_yaw_rad=float(world_yaw),
             fused_clearance_m=float(center_sample["fused_clearance_m"]),
-            lidar_clearance_m=float(center_sample["lidar_clearance_m"]),
             map_clearance_m=float(center_sample["map_clearance_m"]),
             map_known_ratio=float(center_sample["map_known_ratio"]),
             corridor_width_deg=float(corridor_width),
             score=float(score),
         )
-
-
-def _valid_endpoints(value: np.ndarray | None) -> np.ndarray:
-    if value is None:
-        return np.zeros((0, 2), dtype=np.float32)
-    endpoints = np.asarray(value, dtype=np.float32)
-    if endpoints.ndim != 2 or endpoints.shape[1] < 2:
-        return np.zeros((0, 2), dtype=np.float32)
-    endpoints = endpoints[:, :2]
-    finite = np.isfinite(endpoints).all(axis=1)
-    ranges = np.linalg.norm(endpoints, axis=1)
-    return np.ascontiguousarray(endpoints[finite & (ranges > 0.05)], dtype=np.float32)
 
 
 def _valid_snapshot(snapshot: Any | None) -> Any | None:
@@ -177,36 +142,6 @@ def _valid_snapshot(snapshot: Any | None) -> Any | None:
     if occupied.size == 0:
         return None
     return snapshot
-
-
-def _polar_endpoints(endpoints: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    if endpoints.shape[0] == 0:
-        return (
-            np.zeros((0,), dtype=np.float32),
-            np.zeros((0,), dtype=np.float32),
-        )
-    angles = np.degrees(np.arctan2(endpoints[:, 1], endpoints[:, 0])).astype(np.float32)
-    ranges = np.linalg.norm(endpoints, axis=1).astype(np.float32)
-    return angles, ranges
-
-
-def _lidar_clearance(
-    *,
-    heading_deg: float,
-    angles_deg: np.ndarray,
-    ranges_m: np.ndarray,
-    bin_half_width_deg: float,
-    max_clearance_m: float,
-) -> float:
-    if angles_deg.size == 0:
-        return float("nan")
-    delta = np.abs(_wrap_angle_deg_array(angles_deg - float(heading_deg)))
-    selected = ranges_m[delta <= float(bin_half_width_deg)]
-    if selected.size == 0:
-        return float("nan")
-    # A low percentile rejects isolated long miss beams while remaining less
-    # sensitive than a raw minimum to one noisy return.
-    return float(np.clip(np.percentile(selected, 20.0), 0.0, max_clearance_m))
 
 
 def _map_clearance(
@@ -242,18 +177,6 @@ def _map_clearance(
         last_clear_distance = float(distance_m)
     known_ratio = 0.0 if sample_count <= 0 else float(known_count) / float(sample_count)
     return float(last_clear_distance), float(known_ratio)
-
-
-def _fuse_clearance(*, lidar_clearance: float, map_clearance: float) -> float:
-    lidar_valid = bool(np.isfinite(lidar_clearance))
-    map_valid = bool(np.isfinite(map_clearance))
-    if lidar_valid and map_valid:
-        return float(min(lidar_clearance, map_clearance))
-    if lidar_valid:
-        return float(lidar_clearance)
-    if map_valid:
-        return float(map_clearance)
-    return float("nan")
 
 
 def _contiguous_safe_clusters(
@@ -319,10 +242,6 @@ def _cluster_score(
         + 0.15 * float(np.mean(known))
         + 0.10 * center_score
     )
-
-
-def _wrap_angle_deg_array(values: np.ndarray) -> np.ndarray:
-    return (np.asarray(values, dtype=np.float32) + 180.0) % 360.0 - 180.0
 
 
 def _wrap_angle_rad(value: float) -> float:

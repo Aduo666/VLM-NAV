@@ -8,8 +8,8 @@ simulation:
   warmup_steps: 30
 
 robot:
-  profile: "unitree_g1_29dof"
-  #profile: "agx"
+  #profile: "unitree_g1_29dof"
+  profile: "agx"
 
 scene:
   usd_path: "usd/hospital.usd"
@@ -33,7 +33,7 @@ llm:
 
 instruction:
   text: ""
-  parse_max_tokens: 768
+  parse_max_tokens: 1536
   parse_timeout_sec: 90
   cache_enabled: true
   cache_path: ".cache/instruction_plans.json"

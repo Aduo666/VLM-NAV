@@ -39,6 +39,9 @@ export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.9}"
 
 "${PYTHON_BIN}" -m pip install -r "${ROOT_DIR}/requirements-grounding.txt"
 "${PYTHON_BIN}" -m pip install --no-build-isolation --no-deps -e .
+install -m 0644 \
+  "${GROUNDING_DINO_DIR}/groundingdino/config/GroundingDINO_SwinT_OGC.py" \
+  "${WEIGHT_DIR}/GroundingDINO_SwinT_OGC.py"
 "${PYTHON_BIN}" - <<PY
 from huggingface_hub import snapshot_download
 
@@ -63,16 +66,15 @@ cat <<EOF
 GroundingDINO code is installed in:
   ${GROUNDING_DINO_DIR}
 
-Put or symlink these files here:
+The model config was copied to:
   ${WEIGHT_DIR}/GroundingDINO_SwinT_OGC.py
-  ${WEIGHT_DIR}/groundingdino_swint_ogc.pth
-  ${WEIGHT_DIR}/bert-base-uncased/config.json
 
-If you already have CA-Nav weights, this is enough:
-  ln -sf /home/Lab/qiangsibin/CA-Nav-code/data/grounded_sam/GroundingDINO_SwinT_OGC.py ${WEIGHT_DIR}/GroundingDINO_SwinT_OGC.py
-  ln -sf /home/Lab/qiangsibin/CA-Nav-code/data/grounded_sam/groundingdino_swint_ogc.pth ${WEIGHT_DIR}/groundingdino_swint_ogc.pth
+Place the checkpoint here:
+  ${WEIGHT_DIR}/groundingdino_swint_ogc.pth
+
+The text encoder is stored under:
+  ${WEIGHT_DIR}/bert-base-uncased/config.json
 
 Then run:
   bash scripts/run_nav.sh
 EOF
-

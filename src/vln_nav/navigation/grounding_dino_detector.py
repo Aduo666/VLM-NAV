@@ -73,8 +73,29 @@ class GroundingDinoDetector:
         return (detections[0] if detections else None), reason
 
     def detect_all(self, *, rgb: np.ndarray, target_label: str) -> tuple[list[GroundingDinoDetection], str]:
+        grouped, reason = self.detect_queries(rgb=rgb, target_labels=(target_label,))
+        return grouped.get(str(target_label).strip().lower(), []), reason
+
+    def detect_queries(
+        self,
+        *,
+        rgb: np.ndarray,
+        target_labels: tuple[str, ...] | list[str],
+    ) -> tuple[dict[str, list[GroundingDinoDetection]], str]:
+        """Ground multiple instruction phrases in one model forward pass."""
+
+        labels = tuple(
+            dict.fromkeys(
+                str(label).strip().lower()
+                for label in target_labels
+                if str(label).strip()
+            )
+        )
+        grouped: dict[str, list[GroundingDinoDetection]] = {label: [] for label in labels}
+        if not labels:
+            return grouped, "no_queries"
         if self._load_failed_reason is not None:
-            return [], self._load_failed_reason
+            return grouped, self._load_failed_reason
         if not self.available:
             missing = [
                 name
@@ -85,38 +106,57 @@ class GroundingDinoDetector:
                 )
                 if not _path_exists(value)
             ]
-            return [], f"grounding_dino_missing_{'_'.join(missing) or 'files'}"
+            return grouped, f"grounding_dino_missing_{'_'.join(missing) or 'files'}"
         text_encoder_path = Path(self._config.text_encoder_path).expanduser()
         if not text_encoder_path.is_dir() or not (text_encoder_path / "config.json").is_file():
-            return [], "grounding_dino_missing_text_encoder"
+            return grouped, "grounding_dino_missing_text_encoder"
         model, reason = self._load_model()
         if model is None:
-            return [], reason
+            return grouped, reason
 
         image_rgb = np.asarray(rgb, dtype=np.uint8)
         if image_rgb.ndim != 3 or image_rgb.shape[-1] < 3:
-            return [], "invalid_rgb"
+            return grouped, "invalid_rgb"
         image_bgr = image_rgb[:, :, :3][:, :, ::-1].copy()
         try:
             with _suppress_grounding_dino_noise():
                 detections = model.predict_with_classes(
                     image=image_bgr,
-                    classes=[str(target_label).strip().lower()],
+                    classes=list(labels),
                     box_threshold=float(self._config.box_threshold),
                     text_threshold=float(self._config.text_threshold),
                 )
         except Exception as exc:
-            self._logger.warning("[GroundingDINO] predict_failed target=%s error=%s", target_label, exc)
-            return [], "grounding_dino_predict_failed"
+            self._logger.warning("[GroundingDINO] predict_failed queries=%s error=%s", labels, exc)
+            return grouped, "grounding_dino_predict_failed"
 
         xyxy = np.asarray(getattr(detections, "xyxy", []), dtype=np.float32)
         confidence = np.asarray(getattr(detections, "confidence", []), dtype=np.float32)
+        raw_class_ids = getattr(detections, "class_id", None)
         if xyxy.size == 0 or confidence.size == 0:
-            return [], "grounding_dino_no_detection"
+            return grouped, "grounding_dino_no_detection"
+        if raw_class_ids is None:
+            if len(labels) != 1:
+                return grouped, "grounding_dino_missing_class_id"
+            class_ids = np.zeros(confidence.shape[0], dtype=np.int64)
+        else:
+            raw_class_array = np.asarray(raw_class_ids, dtype=object).reshape(-1)
+            class_ids = np.asarray(
+                [
+                    0 if value is None and len(labels) == 1 else -1 if value is None else int(value)
+                    for value in raw_class_array
+                ],
+                dtype=np.int64,
+            )
+        if class_ids.shape[0] != confidence.shape[0]:
+            return grouped, "grounding_dino_missing_class_id"
 
         height, width = image_rgb.shape[:2]
-        proposals: list[GroundingDinoDetection] = []
         for index in np.argsort(-confidence).tolist():
+            class_index = int(class_ids[int(index)])
+            if class_index < 0 or class_index >= len(labels):
+                continue
+            label = labels[class_index]
             x0, y0, x1, y1 = xyxy[int(index)].tolist()
             bbox = (
                 int(np.clip(round(x0), 0, width - 1)),
@@ -126,21 +166,22 @@ class GroundingDinoDetector:
             )
             if not (bbox[0] < bbox[2] and bbox[1] < bbox[3]):
                 continue
-            proposals.append(
+            grouped[label].append(
                 GroundingDinoDetection(
                     bbox=bbox,
                     confidence=float(confidence[int(index)]),
-                    phrase=str(target_label).strip().lower(),
+                    phrase=label,
                 )
             )
-        kept = _nms_detections(
-            proposals,
-            iou_threshold=float(self._config.nms_iou_threshold),
-            max_detections=max(1, int(self._config.max_detections)),
-        )
-        if not kept:
-            return [], "grounding_dino_invalid_bbox"
-        return kept, "ok"
+        for label in labels:
+            grouped[label] = _nms_detections(
+                grouped[label],
+                iou_threshold=float(self._config.nms_iou_threshold),
+                max_detections=max(1, int(self._config.max_detections)),
+            )
+        if not any(grouped.values()):
+            return grouped, "grounding_dino_invalid_bbox"
+        return grouped, "ok"
 
     def _load_model(self):
         if self._model is not None:
@@ -322,4 +363,3 @@ def _ensure_supervision_compat() -> None:
     module.MaskAnnotator = _NoOpAnnotator
     module.__version__ = "compat"
     sys.modules["supervision"] = module
-

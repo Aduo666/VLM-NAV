@@ -11,7 +11,7 @@ from pathlib import Path
 
 
 INSTRUCTION_SCHEMA_VERSION = "2.0"
-INSTRUCTION_PROMPT_VERSION = "2026-07-22.2"
+INSTRUCTION_PROMPT_VERSION = "2026-08-12.1"
 SUPPORTED_STEP_TYPES = {"GO_TO", "REGION_TRANSITION", "TURN"}
 SUPPORTED_DIRECTIONS = {"none", "left", "right", "forward"}
 
@@ -332,6 +332,8 @@ def _instruction_system_prompt() -> str:
         "Distinguish trusted starting context, context objects, action triggers, regions, and true navigation targets.\n"
         "The only supported step types are GO_TO, REGION_TRANSITION, and TURN.\n"
         "Preserve temporal order and explicit directional relations.\n"
+        "Keep the graph compact: landmarks that are only passed, seen, or used as route context are not execution steps.\n"
+        "Create no more than one step for each explicit navigation operation and omit redundant descriptions.\n"
         "Do not invent objects, regions, or actions absent from the instruction."
     )
 

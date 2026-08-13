@@ -227,6 +227,8 @@ src/vln_nav/
   control/                     # AGX and Unitree locomotion adapters
   navigation/                  # Instruction, perception, maps, policy, and safety
   runtime/                     # Strict config, robot profiles, and debug recording
+  training/                    # Causal replay contracts, frontier labels, and dataset writers
+training/                      # Independent expert replay collection and validation
 third_party/                   # External source trees only; never model checkpoints
 weights/grounded_sam/          # GroundingDINO checkpoints and text encoder, ignored by Git
 debug/local/                   # Local debug image and timestamped videos
@@ -332,6 +334,29 @@ SPLIT=val_unseen EPISODE_INDEX=0 bash eval/vlnpe/run.sh
 Dataset adapters normalize source episodes into `eval/current_episode.json`. Evaluation artifacts
 are written under `debug/eval/`, including a structured result JSON for each episode.
 
+## Training Data
+
+The first learned-policy milestone is an independent expert replay dataset, not online traces from
+the current navigation policy. InteriorNav `train` routes are replayed with the calibrated AGX
+front RGB-D camera while physics is paused. The collector builds causal partial maps and semantic
+tracks, then labels instruction progress and persistent frontiers using the privileged future
+route.
+
+Training records keep three strict namespaces: `StudentSample` for runtime-visible inputs,
+`OracleTargets` for labels, and `DebugOracle` for future-route auditing. `val_seen` and
+`val_unseen` are rejected by the collector and remain evaluation-only splits.
+
+```bash
+SPLIT=train EPISODE_INDEX=0 bash training/scripts/collect_interiornav.sh
+PYTHONPATH=src python training/scripts/validate_expert_replay.py --split train --episode-index 0
+```
+
+This stage freezes and validates the data contract only; model training and runtime policy
+integration are intentionally not enabled yet. See [training/README.md](training/README.md) for
+the schema, output layout, timeline viewer, and small-batch collection commands. Generated data is
+written under `/Data/qiang/data/CAPTAINav/expert_replay` so large RGB-D datasets do not consume the
+project or Home filesystem.
+
 ## Configuration
 
 `configs/default.yaml` is a complete strict configuration. A custom YAML may contain only the
@@ -388,10 +413,6 @@ logs/
 `nav_latest.log` is the complete launcher/Isaac console capture. `vln.log` contains the CAPTAINav
 logger stream. Both are overwritten on the next local run.
 
-Both `vln_debug_<timestamp>.mp4` and `observer_<timestamp>.mp4` are written directly as H.264,
-YUV420P, fast-start MP4 files. The recorder fails explicitly when FFmpeg or `libx264` is missing;
-it does not silently fall back to the incompatible OpenCV `mp4v` codec.
-
 ## Tests
 
 Pure-code tests do not start Isaac Sim:
@@ -409,6 +430,7 @@ semantic turns, occupancy behavior, and robot-specific primitive safety.
 - Open-vocabulary grounding boxes can still be ambiguous despite temporal evidence and crop verification.
 - World anchors depend on camera calibration, RGB-D surface support, and odometry consistency.
 - The Unitree G1 behavior depends strongly on the quality and deployment compatibility of its policy.
+- Offline trainable policies remain disconnected until their checkpoints pass held-out validation.
 - CAPTAINav is a research prototype, not a safety-certified navigation system.
 
 ## Research Context

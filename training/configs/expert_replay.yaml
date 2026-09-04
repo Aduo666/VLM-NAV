@@ -5,6 +5,10 @@ data:
 capture:
   render_warmup_frames: 8
   render_frames_per_pose: 2
+  pose_position_tolerance_m: 0.02
+  pose_orientation_tolerance_deg: 2.0
+  rgb_history_frames: 8
+  motion_history_frames: 32
   local_map_size_m: 12.0
   local_map_cells: 128
   global_map_cells: 320

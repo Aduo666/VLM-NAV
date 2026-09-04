@@ -6,7 +6,7 @@ from typing import Any
 
 CANONICAL_EPISODE_SCHEMA_VERSION = "captainav-canonical-episode-v1"
 EXPERT_REPLAY_SCHEMA_VERSION = "captainav-expert-replay-v1"
-TRAINING_SAMPLE_SCHEMA_VERSION = "captainav-training-sample-v2"
+TRAINING_SAMPLE_SCHEMA_VERSION = "captainav-training-sample-v3"
 
 
 class JsonRecord:
@@ -116,19 +116,13 @@ class FrontierToken(JsonRecord):
 
 
 @dataclass(frozen=True)
-class CausalObservationState(JsonRecord):
-    """Runtime-available state. Privileged future information is forbidden."""
+class MotionHistoryToken(JsonRecord):
+    """Executed motion available to the agent at the current replay frame."""
 
-    episode_id: str
     frame_index: int
-    timestamp_sec: float
-    robot_pose_xyyaw: tuple[float, float, float]
-    rgb_history_paths: tuple[str, ...]
-    local_map_path: str
-    global_map_path: str
-    trajectory_world_xy: tuple[tuple[float, float], ...]
-    observed_landmarks: tuple[ObservedLandmark, ...]
-    frontiers: tuple[FrontierToken, ...]
+    motion_type: str
+    delta_distance_m: float
+    delta_yaw_rad: float
 
 
 @dataclass(frozen=True)
@@ -154,27 +148,77 @@ class RouteAlignmentRecord(JsonRecord):
 
 
 @dataclass(frozen=True)
-class StudentSample(JsonRecord):
-    """Information available to the learned policy at inference time."""
+class ProgressObservation(JsonRecord):
+    """Causal input contract for semantic instruction-progress learning."""
 
+    episode_id: str
+    frame_index: int
+    timestamp_sec: float
     instruction: str
     instruction_words: tuple[str, ...]
-    observation: CausalObservationState
+    current_rgb_path: str
+    rgb_history_paths: tuple[str, ...]
+    motion_history: tuple[MotionHistoryToken, ...]
+
+
+@dataclass(frozen=True)
+class ProgressSupervision(JsonRecord):
+    """Weak progress labels kept separate from the causal observation."""
+
+    completed_prefix_weights: tuple[float, ...]
+    active_span_weights: tuple[float, ...]
+    active_span_text: str
+    active_event_type: str
+    active_span_completion_probability: float
+    path_progress: float
+    alignment_confidence: float
+    supervision_valid: bool
+
+
+@dataclass(frozen=True)
+class ProgressTrainingView(JsonRecord):
+    observation: ProgressObservation
+    supervision: ProgressSupervision
+
+
+@dataclass(frozen=True)
+class SpatialSubgoalObservation(JsonRecord):
+    """Causal map/candidate contract for semantic-spatial subgoal ranking."""
+
+    episode_id: str
+    frame_index: int
+    timestamp_sec: float
+    instruction: str
+    instruction_words: tuple[str, ...]
+    current_rgb_path: str
+    robot_pose_xyyaw: tuple[float, float, float]
+    local_map_path: str
+    global_map_path: str
+    trajectory_world_xy: tuple[tuple[float, float], ...]
+    observed_landmarks: tuple[ObservedLandmark, ...]
+    frontiers: tuple[FrontierToken, ...]
     query_phrases: tuple[PerceptionQuery, ...]
 
 
 @dataclass(frozen=True)
-class OracleTargets(JsonRecord):
-    """Supervision derived from the reference route, never a model input."""
+class SpatialSubgoalSupervision(JsonRecord):
+    """Privileged route-derived labels, never an inference-time input."""
 
-    active_span_weights: tuple[float, ...]
-    event_type: str
-    completion_probability: float
-    semantic_progress: float
     navigation_mode: str
     frontier_ids: tuple[int, ...]
     frontier_value_targets: tuple[float, ...]
     selected_frontier_id: int | None
+    goal_relative_distance_m: float
+    goal_relative_bearing_rad: float
+    remaining_route_distance_m: float
+    oracle_confidence: float
+    supervision_valid: bool
+
+
+@dataclass(frozen=True)
+class SpatialSubgoalTrainingView(JsonRecord):
+    observation: SpatialSubgoalObservation
+    supervision: SpatialSubgoalSupervision
 
 
 @dataclass(frozen=True)
@@ -191,10 +235,10 @@ class DebugOracle(JsonRecord):
 
 
 @dataclass(frozen=True)
-class TrainingSampleV2(JsonRecord):
+class TrainingSampleV3(JsonRecord):
     schema_version: str
     sample_id: str
-    student: StudentSample
-    targets: OracleTargets
+    progress: ProgressTrainingView
+    spatial_subgoal: SpatialSubgoalTrainingView
     debug_oracle: DebugOracle
     quality_flags: tuple[str, ...] = field(default_factory=tuple)

@@ -342,9 +342,11 @@ front RGB-D camera while physics is paused. The collector builds causal partial 
 tracks, then labels instruction progress and persistent frontiers using the privileged future
 route.
 
-Training records keep three strict namespaces: `StudentSample` for runtime-visible inputs,
-`OracleTargets` for labels, and `DebugOracle` for future-route auditing. `val_seen` and
-`val_unseen` are rejected by the collector and remain evaluation-only splits.
+Training records expose two strict model views: `ProgressTrainingView` contains causal instruction,
+RGB history and executed motion, while `SpatialSubgoalTrainingView` contains causal map tensors,
+semantic tracks and reachable frontiers. Their supervision stays separate from both observations,
+and `DebugOracle` retains future-route evidence for auditing only. `val_seen` and `val_unseen` are
+rejected by the collector and remain evaluation-only splits.
 
 ```bash
 SPLIT=train EPISODE_INDEX=0 bash training/scripts/collect_interiornav.sh
@@ -353,7 +355,8 @@ PYTHONPATH=src python training/scripts/validate_expert_replay.py --split train -
 
 This stage freezes and validates the data contract only; model training and runtime policy
 integration are intentionally not enabled yet. See [training/README.md](training/README.md) for
-the schema, output layout, timeline viewer, and small-batch collection commands. Generated data is
+the V3 schema, fixed-scale timeline audit, quality report, output layout and small-batch collection
+commands. Generated data is
 written under `/Data/qiang/data/CAPTAINav/expert_replay` so large RGB-D datasets do not consume the
 project or Home filesystem.
 

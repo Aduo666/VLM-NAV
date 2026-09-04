@@ -31,19 +31,23 @@ from vln_nav.training.offline_perception import (
 )
 from vln_nav.training.perception_scheduler import PerceptionScheduler, PerceptionSchedulerConfig
 from vln_nav.training.query_compiler import QueryCompiler
-from vln_nav.training.route_alignment import active_alignment_at_frame, align_instruction_to_route
+from vln_nav.training.route_alignment import align_instruction_to_route, progress_alignment_at_frame
 from vln_nav.training.schemas import (
     CameraCalibration,
-    CausalObservationState,
     DebugOracle,
     EXPERT_REPLAY_SCHEMA_VERSION,
     ExpertReplayFrame,
-    OracleTargets,
-    StudentSample,
+    MotionHistoryToken,
+    ProgressObservation,
+    ProgressSupervision,
+    ProgressTrainingView,
+    SpatialSubgoalObservation,
+    SpatialSubgoalSupervision,
+    SpatialSubgoalTrainingView,
     TRAINING_SAMPLE_SCHEMA_VERSION,
-    TrainingSampleV2,
+    TrainingSampleV3,
 )
-from vln_nav.training.timeline import render_timeline_frame
+from vln_nav.training.timeline import fixed_timeline_bounds, render_timeline_frame
 
 
 @dataclass(frozen=True)
@@ -60,6 +64,10 @@ class CollectionSettings:
     output_root: Path
     render_warmup_frames: int
     render_frames_per_pose: int
+    pose_position_tolerance_m: float
+    pose_orientation_tolerance_deg: float
+    rgb_history_frames: int
+    motion_history_frames: int
     local_map_size_m: float
     local_map_cells: int
     global_map_cells: int
@@ -261,6 +269,27 @@ def _collect(
     world.step(render=True)
     for _ in range(max(0, int(settings.render_warmup_frames) - 1)):
         _render_without_physics(simulation_app=simulation_app)
+    camera_pose_writer = _ReplayCameraPoseWriter(camera=camera, robot=robot)
+    logger.info(
+        "[ExpertReplayCamera] calibrated relative_position_m=%s relative_orientation_wxyz=%s",
+        np.round(camera_pose_writer.relative_position_m, 4).tolist(),
+        np.round(camera_pose_writer.relative_orientation_wxyz, 5).tolist(),
+    )
+    pose_writer.set(pose=replay[0])
+    _render_without_physics(simulation_app=simulation_app)
+    pose_writer.verify(
+        pose=replay[0],
+        position_tolerance_m=settings.pose_position_tolerance_m,
+        orientation_tolerance_deg=settings.pose_orientation_tolerance_deg,
+    )
+    camera_pose_writer.set(robot_state=_normalized_pose(robot.get_world_pose()))
+    _render_without_physics(simulation_app=simulation_app)
+    camera_pose_writer.verify(
+        robot_state=_normalized_pose(robot.get_world_pose()),
+        frame_index=0,
+        position_tolerance_m=settings.pose_position_tolerance_m,
+        orientation_tolerance_deg=settings.pose_orientation_tolerance_deg,
+    )
     _capture_rgbd(
         camera=camera,
         world=world,
@@ -317,17 +346,45 @@ def _collect(
         writer.episode_dir / "route_alignment.json",
         {"alignments": [item.to_dict() for item in alignments]},
     )
-    history_paths: deque[str] = deque(maxlen=4)
+    history_paths: deque[str] = deque(maxlen=max(1, int(settings.rgb_history_frames)))
+    motion_history: deque[MotionHistoryToken] = deque(
+        maxlen=max(1, int(settings.motion_history_frames))
+    )
     trajectory: list[tuple[float, float]] = []
     reference_path_xy = np.asarray(episode.reference_path_xyz, dtype=np.float64)[:, :2]
+    timeline_bounds = fixed_timeline_bounds(reference_path_xy=reference_path_xy)
     previous_rgb: np.ndarray | None = None
     previous_depth: np.ndarray | None = None
+    previous_view_matrix: np.ndarray | None = None
 
     for pose in replay:
+        pose_changed = (
+            float(pose.delta_distance_m) > 1.0e-4
+            or abs(float(pose.delta_yaw_rad)) > 1.0e-4
+        )
         pose_writer.set(pose=pose)
+        # Let the articulation hierarchy consume the root teleport first, then
+        # place the capture camera explicitly from its calibrated root offset.
+        _render_without_physics(simulation_app=simulation_app)
+        pose_writer.verify(
+            pose=pose,
+            position_tolerance_m=settings.pose_position_tolerance_m,
+            orientation_tolerance_deg=settings.pose_orientation_tolerance_deg,
+        )
+        camera_pose_writer.set(robot_state=_normalized_pose(robot.get_world_pose()))
         for _ in range(max(1, int(settings.render_frames_per_pose))):
             _render_without_physics(simulation_app=simulation_app)
-        pose_writer.verify(pose=pose)
+        pose_writer.verify(
+            pose=pose,
+            position_tolerance_m=settings.pose_position_tolerance_m,
+            orientation_tolerance_deg=settings.pose_orientation_tolerance_deg,
+        )
+        camera_pose_writer.verify(
+            robot_state=_normalized_pose(robot.get_world_pose()),
+            frame_index=pose.frame_index,
+            position_tolerance_m=settings.pose_position_tolerance_m,
+            orientation_tolerance_deg=settings.pose_orientation_tolerance_deg,
+        )
         rgb, depth = _capture_rgbd(
             camera=camera,
             world=world,
@@ -335,15 +392,23 @@ def _collect(
             max_attempts=max(8, int(settings.render_frames_per_pose) + 4),
             previous_rgb=previous_rgb,
             previous_depth=previous_depth,
-            require_changed=(
-                float(pose.delta_distance_m) > 1.0e-4
-                or abs(float(pose.delta_yaw_rad)) > 1.0e-4
-            ),
+            require_changed=pose_changed,
         )
         previous_rgb = rgb
         previous_depth = depth
         intrinsics = np.asarray(camera.get_intrinsics_matrix(), dtype=np.float64).reshape(3, 3)
         view_matrix = np.asarray(camera.get_view_matrix_ros(), dtype=np.float64).reshape(4, 4)
+        if (
+            pose_changed
+            and previous_view_matrix is not None
+            and np.allclose(view_matrix, previous_view_matrix, rtol=0.0, atol=1.0e-7)
+        ):
+            raise RuntimeError(
+                "Expert replay camera view matrix remained fixed after a path motion: "
+                f"frame={pose.frame_index} delta_distance_m={pose.delta_distance_m:.6f} "
+                f"delta_yaw_rad={pose.delta_yaw_rad:.6f}"
+            )
+        previous_view_matrix = view_matrix.copy()
         robot_pose = Pose2D(x=pose.position_xyz[0], y=pose.position_xyz[1], yaw_rad=pose.yaw_rad)
         ray_frame = projector.project(
             depth_image=depth,
@@ -406,12 +471,13 @@ def _collect(
             reference_path_xy=reference_path_xy,
             config=settings.frontier_oracle,
         )
-        active_weights, event_type, completion = active_alignment_at_frame(
-            alignments,
-            frame_index=pose.frame_index,
-            token_count=len(episode.instruction_words),
+        completed_prefix_weights, active_weights, active_alignment, completion = (
+            progress_alignment_at_frame(
+                alignments,
+                frame_index=pose.frame_index,
+                token_count=len(episode.instruction_words),
+            )
         )
-        active_alignment = _active_alignment(alignments=alignments, frame_index=pose.frame_index)
         future_route = tuple(
             (float(point[0]), float(point[1]))
             for point in reference_path_xy[oracle.nearest_reference_path_index :]
@@ -454,6 +520,7 @@ def _collect(
             oracle_crossing_world_xy=oracle.first_unknown_world_xy,
             oracle_reason=oracle.reason,
             frame_index=pose.frame_index,
+            display_bounds=timeline_bounds,
         )
         paths = writer.write_frame_assets(
             frame=replay_frame,
@@ -469,17 +536,13 @@ def _collect(
             free_threshold=settings.occupancy.free_threshold,
         )
         history_paths.append(paths["rgb"])
-        observation = CausalObservationState(
-            episode_id=episode.episode_id,
-            frame_index=pose.frame_index,
-            timestamp_sec=pose.timestamp_sec,
-            robot_pose_xyyaw=pose_xyyaw,
-            rgb_history_paths=tuple(history_paths),
-            local_map_path=paths["local_map"],
-            global_map_path=paths["global_map"],
-            trajectory_world_xy=tuple(trajectory),
-            observed_landmarks=landmarks,
-            frontiers=oracle.frontier_tokens,
+        motion_history.append(
+            MotionHistoryToken(
+                frame_index=int(pose.frame_index),
+                motion_type=str(pose.motion_type),
+                delta_distance_m=float(pose.delta_distance_m),
+                delta_yaw_rad=float(pose.delta_yaw_rad),
+            )
         )
         quality_flags = _quality_flags(
             active_alignment=active_alignment,
@@ -487,24 +550,78 @@ def _collect(
             perception_reason=perception_reason,
             ray_count=ray_frame.ray_count,
         )
-        sample = TrainingSampleV2(
+        sample_id = (
+            f"{episode.split}:{episode.scene_id}:{episode.episode_id}:{pose.frame_index:05d}"
+        )
+        goal_distance_m, goal_bearing_rad = _relative_goal_metrics(
+            pose_xyyaw=pose_xyyaw,
+            goal_xy=episode.goal_xyz[:2],
+        )
+        sample = TrainingSampleV3(
             schema_version=TRAINING_SAMPLE_SCHEMA_VERSION,
-            sample_id=f"{episode.split}:{episode.scene_id}:{episode.episode_id}:{pose.frame_index:05d}",
-            student=StudentSample(
-                instruction=episode.instruction,
-                instruction_words=episode.instruction_words,
-                observation=observation,
-                query_phrases=queries,
+            sample_id=sample_id,
+            progress=ProgressTrainingView(
+                observation=ProgressObservation(
+                    episode_id=episode.episode_id,
+                    frame_index=pose.frame_index,
+                    timestamp_sec=pose.timestamp_sec,
+                    instruction=episode.instruction,
+                    instruction_words=episode.instruction_words,
+                    current_rgb_path=paths["rgb"],
+                    rgb_history_paths=tuple(history_paths),
+                    motion_history=tuple(motion_history),
+                ),
+                supervision=ProgressSupervision(
+                    completed_prefix_weights=completed_prefix_weights,
+                    active_span_weights=active_weights,
+                    active_span_text="" if active_alignment is None else active_alignment.text,
+                    active_event_type=(
+                        "CONTINUE" if active_alignment is None else active_alignment.event_type
+                    ),
+                    active_span_completion_probability=float(completion),
+                    path_progress=float(pose.path_progress),
+                    alignment_confidence=(
+                        0.0 if active_alignment is None else float(active_alignment.confidence)
+                    ),
+                    supervision_valid=bool(
+                        active_alignment is not None
+                        and float(active_alignment.confidence) >= 0.50
+                    ),
+                ),
             ),
-            targets=OracleTargets(
-                active_span_weights=active_weights,
-                event_type=event_type,
-                completion_probability=float(completion),
-                semantic_progress=float(pose.path_progress),
-                navigation_mode=mode,
-                frontier_ids=tuple(item.frontier_id for item in oracle.frontier_tokens),
-                frontier_value_targets=oracle.frontier_value_targets,
-                selected_frontier_id=oracle.selected_frontier_id,
+            spatial_subgoal=SpatialSubgoalTrainingView(
+                observation=SpatialSubgoalObservation(
+                    episode_id=episode.episode_id,
+                    frame_index=pose.frame_index,
+                    timestamp_sec=pose.timestamp_sec,
+                    instruction=episode.instruction,
+                    instruction_words=episode.instruction_words,
+                    current_rgb_path=paths["rgb"],
+                    robot_pose_xyyaw=pose_xyyaw,
+                    local_map_path=paths["local_map"],
+                    global_map_path=paths["global_map"],
+                    trajectory_world_xy=tuple(trajectory),
+                    observed_landmarks=landmarks,
+                    frontiers=oracle.frontier_tokens,
+                    query_phrases=queries,
+                ),
+                supervision=SpatialSubgoalSupervision(
+                    navigation_mode=mode,
+                    frontier_ids=tuple(item.frontier_id for item in oracle.frontier_tokens),
+                    frontier_value_targets=oracle.frontier_value_targets,
+                    selected_frontier_id=oracle.selected_frontier_id,
+                    goal_relative_distance_m=goal_distance_m,
+                    goal_relative_bearing_rad=goal_bearing_rad,
+                    remaining_route_distance_m=_remaining_route_distance(
+                        reference_path_xy=reference_path_xy,
+                        start_index=oracle.nearest_reference_path_index,
+                    ),
+                    oracle_confidence=float(oracle.confidence),
+                    supervision_valid=bool(
+                        oracle.selected_frontier_id is not None
+                        and oracle.reason == "reliable_route_frontier_crossing"
+                    ),
+                ),
             ),
             debug_oracle=DebugOracle(
                 future_reference_path_xy=future_route,
@@ -561,10 +678,31 @@ def _navigation_mode(
     return str(default_mode)
 
 
-def _active_alignment(*, alignments, frame_index: int):
-    if not alignments:
-        return None
-    return min(alignments, key=lambda item: abs(int(item.peak_frame_index) - int(frame_index)))
+def _relative_goal_metrics(
+    *,
+    pose_xyyaw: tuple[float, float, float],
+    goal_xy: tuple[float, float],
+) -> tuple[float, float]:
+    delta_x = float(goal_xy[0]) - float(pose_xyyaw[0])
+    delta_y = float(goal_xy[1]) - float(pose_xyyaw[1])
+    cosine = float(np.cos(float(pose_xyyaw[2])))
+    sine = float(np.sin(float(pose_xyyaw[2])))
+    forward = cosine * delta_x + sine * delta_y
+    left = -sine * delta_x + cosine * delta_y
+    return float(np.hypot(delta_x, delta_y)), float(np.arctan2(left, forward))
+
+
+def _remaining_route_distance(
+    *,
+    reference_path_xy: np.ndarray,
+    start_index: int,
+) -> float:
+    route = np.asarray(reference_path_xy, dtype=np.float64)
+    start = max(0, min(int(start_index), max(0, route.shape[0] - 1)))
+    remaining = route[start:, :2]
+    if remaining.shape[0] <= 1:
+        return 0.0
+    return float(np.sum(np.linalg.norm(np.diff(remaining, axis=0), axis=1)))
 
 
 def _quality_flags(*, active_alignment, oracle_reason: str, perception_reason: str, ray_count: int) -> tuple[str, ...]:
@@ -593,30 +731,42 @@ class _ReplayPoseWriter:
         self._spawn_z_m = float(spawn_z_m)
 
     def set_default(self, *, pose) -> None:
-        position, orientation = self._state(pose=pose)
+        position, orientation = self.state(pose=pose)
         self._robot.set_default_state(position=position, orientation=orientation)
 
     def set(self, *, pose) -> None:
-        position, orientation = self._state(pose=pose)
+        position, orientation = self.state(pose=pose)
         self._robot.set_world_pose(position=position, orientation=orientation)
 
-    def verify(self, *, pose) -> None:
-        expected_position, expected_orientation = self._state(pose=pose)
+    def verify(
+        self,
+        *,
+        pose,
+        position_tolerance_m: float,
+        orientation_tolerance_deg: float,
+    ) -> None:
+        expected_position, expected_orientation = self.state(pose=pose)
         actual_position, actual_orientation = self._robot.get_world_pose()
         actual_position = np.asarray(actual_position, dtype=np.float64).reshape(3)
         actual_orientation = np.asarray(actual_orientation, dtype=np.float64).reshape(4)
         position_error = float(np.linalg.norm(actual_position - expected_position))
-        orientation_alignment = abs(
-            float(np.dot(actual_orientation, expected_orientation))
+        orientation_error_deg = _quaternion_error_deg(
+            actual_orientation,
+            expected_orientation,
         )
-        if position_error > 1.0e-3 or orientation_alignment < 1.0 - 1.0e-5:
+        if (
+            position_error > float(position_tolerance_m)
+            or orientation_error_deg > float(orientation_tolerance_deg)
+        ):
             raise RuntimeError(
                 "Expert replay articulation pose did not match the requested path pose: "
                 f"frame={pose.frame_index} position_error_m={position_error:.6f} "
-                f"quaternion_alignment={orientation_alignment:.6f}"
+                f"orientation_error_deg={orientation_error_deg:.4f} "
+                f"position_tolerance_m={position_tolerance_m:.4f} "
+                f"orientation_tolerance_deg={orientation_tolerance_deg:.2f}"
             )
 
-    def _state(self, *, pose) -> tuple[np.ndarray, np.ndarray]:
+    def state(self, *, pose) -> tuple[np.ndarray, np.ndarray]:
         yaw_half = 0.5 * float(pose.yaw_rad)
         return (
             np.asarray(
@@ -632,6 +782,144 @@ class _ReplayPoseWriter:
                 dtype=np.float32,
             ),
         )
+
+
+class _ReplayCameraPoseWriter:
+    """Keep the capture camera rigidly attached to a teleported replay root."""
+
+    def __init__(self, *, camera, robot) -> None:
+        self._camera = camera
+        robot_position, robot_orientation = _normalized_pose(robot.get_world_pose())
+        camera_position, camera_orientation = _normalized_pose(
+            camera.get_world_pose(camera_axes="world")
+        )
+        inverse_robot_orientation = _quaternion_conjugate_wxyz(robot_orientation)
+        self.relative_position_m = _quaternion_rotate_wxyz(
+            inverse_robot_orientation,
+            camera_position - robot_position,
+        )
+        self.relative_orientation_wxyz = _quaternion_normalize_wxyz(
+            _quaternion_multiply_wxyz(inverse_robot_orientation, camera_orientation)
+        )
+
+    def set(self, *, robot_state: tuple[np.ndarray, np.ndarray]) -> None:
+        position, orientation = self._world_camera_pose(robot_state=robot_state)
+        self._camera.set_world_pose(
+            position=position,
+            orientation=orientation,
+            camera_axes="world",
+        )
+
+    def verify(
+        self,
+        *,
+        robot_state: tuple[np.ndarray, np.ndarray],
+        frame_index: int,
+        position_tolerance_m: float,
+        orientation_tolerance_deg: float,
+    ) -> None:
+        expected_position, expected_orientation = self._world_camera_pose(
+            robot_state=robot_state
+        )
+        actual_position, actual_orientation = _normalized_pose(
+            self._camera.get_world_pose(camera_axes="world")
+        )
+        position_error = float(np.linalg.norm(actual_position - expected_position))
+        orientation_error_deg = _quaternion_error_deg(
+            actual_orientation,
+            expected_orientation,
+        )
+        if (
+            position_error > float(position_tolerance_m)
+            or orientation_error_deg > float(orientation_tolerance_deg)
+        ):
+            raise RuntimeError(
+                "Expert replay camera pose did not follow the requested path pose: "
+                f"frame={frame_index} position_error_m={position_error:.6f} "
+                f"orientation_error_deg={orientation_error_deg:.4f} "
+                f"position_tolerance_m={position_tolerance_m:.4f} "
+                f"orientation_tolerance_deg={orientation_tolerance_deg:.2f}"
+            )
+
+    def _world_camera_pose(
+        self,
+        *,
+        robot_state: tuple[np.ndarray, np.ndarray],
+    ) -> tuple[np.ndarray, np.ndarray]:
+        robot_position, robot_orientation = _normalized_pose(robot_state)
+        camera_position = robot_position + _quaternion_rotate_wxyz(
+            robot_orientation,
+            self.relative_position_m,
+        )
+        camera_orientation = _quaternion_normalize_wxyz(
+            _quaternion_multiply_wxyz(
+                robot_orientation,
+                self.relative_orientation_wxyz,
+            )
+        )
+        return camera_position.astype(np.float32), camera_orientation.astype(np.float32)
+
+
+def _normalized_pose(pose) -> tuple[np.ndarray, np.ndarray]:
+    position, orientation = pose
+    return (
+        np.asarray(position, dtype=np.float64).reshape(3),
+        _quaternion_normalize_wxyz(
+            np.asarray(orientation, dtype=np.float64).reshape(4)
+        ),
+    )
+
+
+def _quaternion_normalize_wxyz(quaternion: np.ndarray) -> np.ndarray:
+    value = np.asarray(quaternion, dtype=np.float64).reshape(4)
+    norm = float(np.linalg.norm(value))
+    if norm <= 1.0e-12:
+        raise ValueError("Replay pose contains a zero-length quaternion")
+    return value / norm
+
+
+def _quaternion_conjugate_wxyz(quaternion: np.ndarray) -> np.ndarray:
+    w, x, y, z = _quaternion_normalize_wxyz(quaternion)
+    return np.asarray([w, -x, -y, -z], dtype=np.float64)
+
+
+def _quaternion_error_deg(lhs: np.ndarray, rhs: np.ndarray) -> float:
+    alignment = abs(
+        float(
+            np.dot(
+                _quaternion_normalize_wxyz(lhs),
+                _quaternion_normalize_wxyz(rhs),
+            )
+        )
+    )
+    return float(np.degrees(2.0 * np.arccos(np.clip(alignment, 0.0, 1.0))))
+
+
+def _quaternion_multiply_wxyz(lhs: np.ndarray, rhs: np.ndarray) -> np.ndarray:
+    lw, lx, ly, lz = np.asarray(lhs, dtype=np.float64).reshape(4)
+    rw, rx, ry, rz = np.asarray(rhs, dtype=np.float64).reshape(4)
+    return np.asarray(
+        [
+            lw * rw - lx * rx - ly * ry - lz * rz,
+            lw * rx + lx * rw + ly * rz - lz * ry,
+            lw * ry - lx * rz + ly * rw + lz * rx,
+            lw * rz + lx * ry - ly * rx + lz * rw,
+        ],
+        dtype=np.float64,
+    )
+
+
+def _quaternion_rotate_wxyz(quaternion: np.ndarray, vector: np.ndarray) -> np.ndarray:
+    orientation = _quaternion_normalize_wxyz(quaternion)
+    vector_quaternion = np.asarray(
+        [0.0, *np.asarray(vector, dtype=np.float64).reshape(3)],
+        dtype=np.float64,
+    )
+    rotated = _quaternion_multiply_wxyz(
+        _quaternion_multiply_wxyz(orientation, vector_quaternion),
+        _quaternion_conjugate_wxyz(orientation),
+    )
+    return rotated[1:]
 
 
 def _render_without_physics(*, simulation_app) -> None:
@@ -703,12 +991,17 @@ def _rgbd_changed(
         equal_nan=True,
     )
     return bool(rgb_changed or depth_changed)
+
+
 def _get_rgb(*, camera, frame: dict) -> tuple[np.ndarray | None, tuple[int, ...] | None]:
-    values = [frame.get("rgb")]
+    # get_current_frame() is simulation-time gated and remains cached while the
+    # replay timeline is paused. The annotator itself contains the latest render.
+    values = []
     try:
         values.append(camera.get_rgba())
     except Exception:
         values.append(None)
+    values.append(frame.get("rgb"))
     last_shape: tuple[int, ...] | None = None
     for value in values:
         if value is None:
@@ -729,11 +1022,12 @@ def _get_rgb(*, camera, frame: dict) -> tuple[np.ndarray | None, tuple[int, ...]
 
 
 def _get_depth(*, camera, frame: dict) -> tuple[np.ndarray | None, tuple[int, ...] | None]:
-    values = [frame.get("distance_to_image_plane")]
+    values = []
     try:
         values.append(camera.get_depth())
     except Exception:
         values.append(None)
+    values.append(frame.get("distance_to_image_plane"))
     last_shape: tuple[int, ...] | None = None
     for value in values:
         if value is None:
@@ -813,6 +1107,12 @@ def _load_collection_settings(*, path: Path, output_override: str) -> Collection
         output_root=_project_path(output_value),
         render_warmup_frames=int(capture.get("render_warmup_frames", 8)),
         render_frames_per_pose=int(capture.get("render_frames_per_pose", 2)),
+        pose_position_tolerance_m=float(capture.get("pose_position_tolerance_m", 0.02)),
+        pose_orientation_tolerance_deg=float(
+            capture.get("pose_orientation_tolerance_deg", 2.0)
+        ),
+        rgb_history_frames=max(1, int(capture.get("rgb_history_frames", 8))),
+        motion_history_frames=max(1, int(capture.get("motion_history_frames", 32))),
         local_map_size_m=float(capture.get("local_map_size_m", 12.0)),
         local_map_cells=int(capture.get("local_map_cells", 128)),
         global_map_cells=int(capture.get("global_map_cells", 320)),

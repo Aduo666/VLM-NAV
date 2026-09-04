@@ -10,7 +10,7 @@ from PIL import Image
 from vln_nav.navigation.occupancy_grid import OccupancyGridSnapshot
 
 from .geometry import crop_egocentric_occupancy
-from .schemas import CanonicalEpisode, ExpertReplayFrame, TrainingSampleV2
+from .schemas import CanonicalEpisode, ExpertReplayFrame, TrainingSampleV3
 from .timeline import write_timeline_html
 
 
@@ -101,16 +101,25 @@ class ExpertReplayDatasetWriter:
             "timeline": str(timeline_path.relative_to(self.episode_dir)),
         }
 
-    def write_sample(self, *, sample: TrainingSampleV2, paths: dict[str, str]) -> None:
-        sample_path = self.frames_dir / f"{sample.student.observation.frame_index:05d}" / "sample.json"
+    def write_sample(self, *, sample: TrainingSampleV3, paths: dict[str, str]) -> None:
+        frame_index = int(sample.progress.observation.frame_index)
+        sample_path = self.frames_dir / f"{frame_index:05d}" / "sample.json"
         self.write_json(sample_path, sample.to_dict())
         self._manifest_frames.append(
             {
-                "frame_index": sample.student.observation.frame_index,
+                "frame_index": frame_index,
                 "sample_path": str(sample_path.relative_to(self.episode_dir)),
                 "paths": paths,
-                "mode": sample.targets.navigation_mode,
-                "selected_frontier_id": sample.targets.selected_frontier_id,
+                "mode": sample.spatial_subgoal.supervision.navigation_mode,
+                "selected_frontier_id": (
+                    sample.spatial_subgoal.supervision.selected_frontier_id
+                ),
+                "progress_supervision_valid": (
+                    sample.progress.supervision.supervision_valid
+                ),
+                "spatial_supervision_valid": (
+                    sample.spatial_subgoal.supervision.supervision_valid
+                ),
                 "quality_flags": list(sample.quality_flags),
             }
         )

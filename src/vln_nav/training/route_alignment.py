@@ -156,13 +156,17 @@ def compile_instruction_spans(instruction: str) -> tuple[InstructionSpan, ...]:
         if not covered:
             continue
         lowered = text.lower()
+        event_type = _event_type(lowered)
+        if event_type == "STOP_AT":
+            text = str(instruction)[clause.start() :].strip()
+            covered = list(range(int(covered[0]), len(word_matches)))
         spans.append(
             InstructionSpan(
                 span_id=f"span_{len(spans):02d}",
                 token_start=int(covered[0]),
                 token_end=int(covered[-1] + 1),
                 text=text,
-                event_type=_event_type(lowered),
+                event_type=event_type,
                 direction=_direction(lowered),
             )
         )
@@ -281,30 +285,80 @@ def extract_route_events(
     return tuple(events)
 
 
-def active_alignment_at_frame(
+def progress_alignment_at_frame(
     alignments: tuple[RouteAlignmentRecord, ...],
     *,
     frame_index: int,
     token_count: int,
-) -> tuple[tuple[float, ...], str, float]:
-    weights = np.zeros((max(0, int(token_count)),), dtype=np.float32)
+) -> tuple[
+    tuple[float, ...],
+    tuple[float, ...],
+    RouteAlignmentRecord | None,
+    float,
+]:
+    """Build weak semantic-progress supervision for one causal replay frame.
+
+    ``completed_prefix_weights`` is monotonic by construction. It is a training
+    target only and is never copied into either student observation contract.
+    """
+
+    completed = np.zeros((max(0, int(token_count)),), dtype=np.float32)
+    active_weights = np.zeros_like(completed)
     if not alignments:
-        return tuple(float(value) for value in weights), "CONTINUE", 0.0
+        empty = tuple(float(value) for value in completed)
+        return empty, empty, None, 0.0
+
+    for alignment in alignments:
+        start_frame = int(alignment.start_frame_index)
+        end_frame = max(start_frame + 1, int(alignment.end_frame_index))
+        if int(frame_index) < start_frame:
+            span_completion = 0.0
+        elif int(frame_index) >= int(alignment.end_frame_index):
+            span_completion = 1.0
+        else:
+            span_completion = float(
+                np.clip(
+                    (float(frame_index) - float(start_frame))
+                    / float(end_frame - start_frame),
+                    0.0,
+                    1.0,
+                )
+            )
+        token_start = max(0, min(completed.size, int(alignment.token_start)))
+        token_end = max(token_start, min(completed.size, int(alignment.token_end)))
+        if token_end > token_start:
+            completed[token_start:token_end] = np.maximum(
+                completed[token_start:token_end],
+                span_completion,
+            )
+    if completed.size > 1:
+        completed = np.minimum.accumulate(completed)
+
     distances = [abs(int(item.peak_frame_index) - int(frame_index)) for item in alignments]
     active = alignments[int(np.argmin(np.asarray(distances, dtype=np.int32)))]
-    start = max(0, min(weights.size, int(active.token_start)))
-    end = max(start, min(weights.size, int(active.token_end)))
+    start = max(0, min(active_weights.size, int(active.token_start)))
+    end = max(start, min(active_weights.size, int(active.token_end)))
     if end > start:
-        weights[start:end] = 1.0 / float(end - start)
-    duration = max(1, int(active.end_frame_index) - int(active.start_frame_index))
-    completion = float(
-        np.clip(
-            (float(frame_index) - float(active.start_frame_index)) / float(duration),
-            0.0,
-            1.0,
+        active_weights[start:end] = 1.0 / float(end - start)
+    if int(frame_index) >= int(active.end_frame_index):
+        completion = 1.0
+    elif int(frame_index) <= int(active.start_frame_index):
+        completion = 0.0
+    else:
+        duration = max(1, int(active.end_frame_index) - int(active.start_frame_index))
+        completion = float(
+            np.clip(
+                (float(frame_index) - float(active.start_frame_index)) / float(duration),
+                0.0,
+                1.0,
+            )
         )
+    return (
+        tuple(float(value) for value in completed),
+        tuple(float(value) for value in active_weights),
+        active,
+        completion,
     )
-    return tuple(float(value) for value in weights), active.event_type, completion
 
 
 def _find_compatible_event(

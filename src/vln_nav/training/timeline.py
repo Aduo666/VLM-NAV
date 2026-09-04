@@ -27,6 +27,7 @@ def render_timeline_frame(
     oracle_crossing_world_xy: tuple[float, float] | None,
     oracle_reason: str,
     frame_index: int,
+    display_bounds: tuple[float, float, float, float],
 ) -> Image.Image:
     panel_size = 600
     first_person = Image.fromarray(np.asarray(rgb, dtype=np.uint8)[..., :3]).convert("RGB")
@@ -73,6 +74,8 @@ def render_timeline_frame(
         oracle_crossing_world_xy=None,
         title="STUDENT: causal partial map",
         panel_size=panel_size,
+        display_bounds=display_bounds,
+        oracle_audit=False,
     )
     oracle_map = _render_map(
         snapshot=snapshot,
@@ -83,8 +86,10 @@ def render_timeline_frame(
         selected_frontier_id=selected_frontier_id,
         future_reference_path_xy=future_reference_path_xy,
         oracle_crossing_world_xy=oracle_crossing_world_xy,
-        title="ORACLE AUDIT: future route",
+        title="ORACLE AUDIT - NOT MODEL INPUT",
         panel_size=panel_size,
+        display_bounds=display_bounds,
+        oracle_audit=True,
     )
     canvas = Image.new("RGB", (panel_size * 3, panel_size + 130), (12, 15, 18))
     canvas.paste(rgb_panel, (0, 130))
@@ -163,57 +168,44 @@ def _render_map(
     oracle_crossing_world_xy: tuple[float, float] | None,
     title: str,
     panel_size: int,
+    display_bounds: tuple[float, float, float, float],
+    oracle_audit: bool,
 ) -> Image.Image:
-    image = Image.new("RGB", (panel_size, panel_size), (78, 82, 88))
+    image = Image.new("RGB", (panel_size, panel_size), (18, 22, 27))
     draw = ImageDraw.Draw(image)
-    points: list[tuple[float, float]] = list(trajectory_world_xy)
-    points.extend(frontier.boundary_world_xy for frontier in frontiers)
-    points.extend(frontier.navigation_goal_world_xy for frontier in frontiers)
-    points.extend(
-        landmark.estimated_world_xy
-        for landmark in landmarks
-        if landmark.estimated_world_xy is not None
-    )
-    points.extend(future_reference_path_xy)
-    if oracle_crossing_world_xy is not None:
-        points.append(oracle_crossing_world_xy)
-    points.append((float(robot_pose_xyyaw[0]), float(robot_pose_xyyaw[1])))
-    bounds = _map_bounds(snapshot=snapshot, points=points, minimum_size_m=12.0, margin_m=1.5)
-    x0, y0, x1, y1 = bounds
-    map_top = 54
-    map_height = panel_size - map_top
-
-    occupied_rows, occupied_cols = np.nonzero(snapshot.occupied_mask)
-    free_rows, free_cols = np.nonzero(snapshot.free_mask)
-    _draw_cells(
-        draw=draw,
-        rows=free_rows,
-        cols=free_cols,
+    bounds = tuple(float(value) for value in display_bounds)
+    map_viewport = (50, 86, 500, 500)
+    occupancy = _render_occupancy_raster(
         snapshot=snapshot,
         bounds=bounds,
-        viewport=(0, map_top, panel_size, map_height),
-        fill=(235, 237, 239),
-        radius=1,
+        output_size=map_viewport[2],
     )
-    _draw_cells(
-        draw=draw,
-        rows=occupied_rows,
-        cols=occupied_cols,
-        snapshot=snapshot,
-        bounds=bounds,
-        viewport=(0, map_top, panel_size, map_height),
-        fill=(20, 24, 28),
-        radius=2,
+    image.paste(occupancy, (map_viewport[0], map_viewport[1]))
+    draw.rectangle(
+        (
+            map_viewport[0] - 1,
+            map_viewport[1] - 1,
+            map_viewport[0] + map_viewport[2],
+            map_viewport[1] + map_viewport[3],
+        ),
+        outline=(118, 128, 138),
+        width=1,
     )
     if len(trajectory_world_xy) >= 2:
         draw.line(
-            [_world_to_pixel(point, bounds=bounds, viewport=(0, map_top, panel_size, map_height)) for point in trajectory_world_xy],
+            [
+                _world_to_pixel(point, bounds=bounds, viewport=map_viewport)
+                for point in trajectory_world_xy
+            ],
             fill=(40, 145, 255),
             width=3,
         )
     if len(future_reference_path_xy) >= 2:
         draw.line(
-            [_world_to_pixel(point, bounds=bounds, viewport=(0, map_top, panel_size, map_height)) for point in future_reference_path_xy],
+            [
+                _world_to_pixel(point, bounds=bounds, viewport=map_viewport)
+                for point in future_reference_path_xy
+            ],
             fill=(235, 70, 210),
             width=3,
         )
@@ -221,15 +213,14 @@ def _render_map(
         boundary_pixel = _world_to_pixel(
             frontier.boundary_world_xy,
             bounds=bounds,
-            viewport=(0, map_top, panel_size, map_height),
+            viewport=map_viewport,
         )
         goal_pixel = _world_to_pixel(
             frontier.navigation_goal_world_xy,
             bounds=bounds,
-            viewport=(0, map_top, panel_size, map_height),
+            viewport=map_viewport,
         )
         selected = frontier.frontier_id == selected_frontier_id
-        color = (255, 195, 45) if selected else (0, 215, 225)
         draw.line((boundary_pixel, goal_pixel), fill=(0, 150, 165), width=2)
         draw.ellipse(
             (
@@ -241,21 +232,37 @@ def _render_map(
             outline=(0, 215, 225),
             width=2,
         )
-        radius = 7 if selected else 4
-        draw.ellipse(
-            (
-                goal_pixel[0] - radius,
-                goal_pixel[1] - radius,
-                goal_pixel[0] + radius,
-                goal_pixel[1] + radius,
-            ),
-            fill=color,
+        if selected:
+            draw.polygon(_star_points(goal_pixel, outer_radius=9, inner_radius=4), fill=(255, 195, 45))
+        else:
+            draw.ellipse(
+                (
+                    goal_pixel[0] - 4,
+                    goal_pixel[1] - 4,
+                    goal_pixel[0] + 4,
+                    goal_pixel[1] + 4,
+                ),
+                fill=(0, 215, 225),
+            )
+        _draw_text(
+            draw,
+            (boundary_pixel[0] + 6, boundary_pixel[1] - 18),
+            f"F{frontier.frontier_id}",
+            fill=(0, 215, 225),
+            size=12,
+        )
+        _draw_text(
+            draw,
+            (goal_pixel[0] + 6, goal_pixel[1] + 2),
+            f"G{frontier.frontier_id}",
+            fill=(255, 195, 45) if selected else (0, 190, 205),
+            size=12,
         )
     if oracle_crossing_world_xy is not None:
         crossing_pixel = _world_to_pixel(
             oracle_crossing_world_xy,
             bounds=bounds,
-            viewport=(0, map_top, panel_size, map_height),
+            viewport=map_viewport,
         )
         draw.line(
             (
@@ -280,36 +287,51 @@ def _render_map(
     for landmark in landmarks:
         if landmark.estimated_world_xy is None:
             continue
-        pixel = _world_to_pixel(landmark.estimated_world_xy, bounds=bounds, viewport=(0, map_top, panel_size, map_height))
+        pixel = _world_to_pixel(
+            landmark.estimated_world_xy,
+            bounds=bounds,
+            viewport=map_viewport,
+        )
         draw.rectangle((pixel[0] - 6, pixel[1] - 6, pixel[0] + 6, pixel[1] + 6), fill=(65, 230, 110))
-        _draw_text(draw, (pixel[0] + 8, pixel[1] - 9), landmark.label, fill=(20, 70, 30), size=14)
-    robot_pixel = _world_to_pixel(robot_pose_xyyaw[:2], bounds=bounds, viewport=(0, map_top, panel_size, map_height))
-    draw.ellipse((robot_pixel[0] - 7, robot_pixel[1] - 7, robot_pixel[0] + 7, robot_pixel[1] + 7), fill=(235, 60, 55))
+        _draw_text(
+            draw,
+            (pixel[0] + 8, pixel[1] - 9),
+            f"L:{landmark.label}",
+            fill=(45, 210, 95),
+            size=13,
+        )
+    robot_pixel = _world_to_pixel(robot_pose_xyyaw[:2], bounds=bounds, viewport=map_viewport)
     yaw = float(robot_pose_xyyaw[2])
-    heading = (robot_pixel[0] + 22 * np.cos(yaw), robot_pixel[1] - 22 * np.sin(yaw))
-    draw.line((robot_pixel, heading), fill=(235, 60, 55), width=4)
+    draw.polygon(_robot_triangle(robot_pixel, yaw_rad=yaw), fill=(235, 60, 55))
+    _draw_text(draw, (robot_pixel[0] + 9, robot_pixel[1] + 7), "R", fill=(235, 60, 55), size=13)
     _draw_text(draw, (14, 12), title, fill=(245, 245, 245), size=22)
     _draw_text(
         draw,
-        (14, 36),
-        "ring=boundary dot=safe goal yellow=reliable oracle",
+        (14, 42),
+        "black=occupied  white=free  gray=unknown  blue=history",
         fill=(185, 205, 215),
         size=13,
     )
+    legend = (
+        "yellow star=Oracle selection  magenta=future route  X=crossing"
+        if oracle_audit
+        else "F#=frontier boundary  G#=safe goal  L=landmark  R=robot"
+    )
+    _draw_text(draw, (14, 61), legend, fill=(185, 205, 215), size=13)
     return image
 
 
-def _map_bounds(
+def fixed_timeline_bounds(
     *,
-    snapshot: OccupancyGridSnapshot,
-    points: list[tuple[float, float]],
-    minimum_size_m: float,
-    margin_m: float,
+    reference_path_xy: np.ndarray,
+    minimum_size_m: float = 12.0,
+    margin_m: float = 2.0,
 ) -> tuple[float, float, float, float]:
-    if points:
-        array = np.asarray(points, dtype=np.float64)
-        center = 0.5 * (np.min(array, axis=0) + np.max(array, axis=0))
-        extent = np.max(np.max(array, axis=0) - np.min(array, axis=0)) + 2.0 * margin_m
+    points = np.asarray(reference_path_xy, dtype=np.float64)
+    if points.ndim == 2 and points.shape[0] > 0 and points.shape[1] >= 2:
+        points = points[:, :2]
+        center = 0.5 * (np.min(points, axis=0) + np.max(points, axis=0))
+        extent = np.max(np.max(points, axis=0) - np.min(points, axis=0)) + 2.0 * margin_m
     else:
         center = np.asarray([0.0, 0.0], dtype=np.float64)
         extent = minimum_size_m
@@ -317,25 +339,69 @@ def _map_bounds(
     return center[0] - 0.5 * size, center[1] - 0.5 * size, center[0] + 0.5 * size, center[1] + 0.5 * size
 
 
-def _draw_cells(
+def _render_occupancy_raster(
     *,
-    draw: ImageDraw.ImageDraw,
-    rows: np.ndarray,
-    cols: np.ndarray,
     snapshot: OccupancyGridSnapshot,
     bounds: tuple[float, float, float, float],
-    viewport: tuple[int, int, int, int],
-    fill: tuple[int, int, int],
-    radius: int,
-) -> None:
-    if rows.size == 0:
-        return
-    world_x = float(snapshot.origin_x) + (cols.astype(np.float64) + 0.5) * float(snapshot.resolution_m)
-    world_y = float(snapshot.origin_y) + (rows.astype(np.float64) + 0.5) * float(snapshot.resolution_m)
-    inside = (world_x >= bounds[0]) & (world_x <= bounds[2]) & (world_y >= bounds[1]) & (world_y <= bounds[3])
-    for point in zip(world_x[inside].tolist(), world_y[inside].tolist()):
-        pixel = _world_to_pixel(point, bounds=bounds, viewport=viewport)
-        draw.rectangle((pixel[0] - radius, pixel[1] - radius, pixel[0] + radius, pixel[1] + radius), fill=fill)
+    output_size: int,
+) -> Image.Image:
+    size = max(16, int(output_size))
+    x0, y0, x1, y1 = bounds
+    world_x = x0 + (np.arange(size, dtype=np.float64) + 0.5) * (x1 - x0) / float(size)
+    world_y = y1 - (np.arange(size, dtype=np.float64) + 0.5) * (y1 - y0) / float(size)
+    cols = np.floor((world_x - float(snapshot.origin_x)) / float(snapshot.resolution_m)).astype(np.intp)
+    rows = np.floor((world_y - float(snapshot.origin_y)) / float(snapshot.resolution_m)).astype(np.intp)
+    row_grid, col_grid = np.meshgrid(rows, cols, indexing="ij")
+    inside = (
+        (row_grid >= 0)
+        & (row_grid < snapshot.occupied_mask.shape[0])
+        & (col_grid >= 0)
+        & (col_grid < snapshot.occupied_mask.shape[1])
+    )
+    canvas = np.full((size, size, 3), (92, 98, 105), dtype=np.uint8)
+    safe_rows = np.clip(row_grid, 0, snapshot.occupied_mask.shape[0] - 1)
+    safe_cols = np.clip(col_grid, 0, snapshot.occupied_mask.shape[1] - 1)
+    free = inside & np.asarray(snapshot.free_mask, dtype=bool)[safe_rows, safe_cols]
+    occupied = inside & np.asarray(snapshot.occupied_mask, dtype=bool)[safe_rows, safe_cols]
+    canvas[free] = (238, 239, 236)
+    canvas[occupied] = (18, 22, 26)
+    return Image.fromarray(canvas, mode="RGB")
+
+
+def _star_points(
+    center: tuple[int, int],
+    *,
+    outer_radius: float,
+    inner_radius: float,
+) -> list[tuple[float, float]]:
+    points: list[tuple[float, float]] = []
+    for index in range(10):
+        angle = -0.5 * np.pi + index * np.pi / 5.0
+        radius = outer_radius if index % 2 == 0 else inner_radius
+        points.append(
+            (
+                float(center[0]) + radius * float(np.cos(angle)),
+                float(center[1]) + radius * float(np.sin(angle)),
+            )
+        )
+    return points
+
+
+def _robot_triangle(
+    center: tuple[int, int],
+    *,
+    yaw_rad: float,
+) -> list[tuple[float, float]]:
+    local = ((13.0, 0.0), (-8.0, 7.0), (-8.0, -7.0))
+    cosine = float(np.cos(yaw_rad))
+    sine = float(np.sin(yaw_rad))
+    return [
+        (
+            float(center[0]) + cosine * forward - sine * left,
+            float(center[1]) - (sine * forward + cosine * left),
+        )
+        for forward, left in local
+    ]
 
 
 def _world_to_pixel(

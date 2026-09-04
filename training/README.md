@@ -4,7 +4,7 @@ This directory contains the first, data-only stage of the learned VLN stack. It 
 
 ## Why `train` is used
 
-InteriorNav's `train` split provides demonstrations for fitting learned components. Each episode contains a natural-language instruction, a scene, a start pose, a reference path and a goal. The reference path is privileged supervision. It is never copied into `StudentSample`.
+InteriorNav's `train` split provides demonstrations for fitting learned components. Each episode contains a natural-language instruction, a scene, a start pose, a reference path and a goal. The reference path is privileged supervision. It is never copied into either model observation.
 
 `val_seen` and `val_unseen` remain evaluation splits. The collector rejects any split other than `train` to prevent accidental validation leakage.
 
@@ -26,17 +26,28 @@ paused Isaac Sim replay with the AGX front RGB-D camera
         +--> scheduled GroundingDINO --> low-confidence VLM crop verification
         |
         v
-StudentSample + OracleTargets + DebugOracle
+ProgressTrainingView + SpatialSubgoalTrainingView + DebugOracle
 ```
 
 The replay clock is synthetic because InteriorNav does not provide expert controls or timestamps. Camera yaw is derived from the reference-path tangent. This is recorded explicitly rather than presented as an original dataset action sequence.
 
 ## Data boundary
 
-- `StudentSample` contains only runtime-available information: raw instruction words, RGB history, causal local/global maps, past trajectory, observed semantic tracks and current frontier candidates. It never contains the current-frame Oracle selection.
+- `ProgressTrainingView.observation` contains only the raw instruction, current/recent RGB paths and recent executed motion. Its weak supervision contains completed-prefix weights, active-span weights and alignment confidence.
+- `SpatialSubgoalTrainingView.observation` contains only causal local/global maps, current RGB, past trajectory, observed semantic tracks, perception queries and reachable frontier candidates. Its supervision contains route-derived frontier values and auxiliary goal geometry.
 - Each frontier records a true free/unknown boundary and a separate safe, reachable navigation goal moved into known free space.
-- `OracleTargets` contains progress, event, mode and frontier labels derived from a reliable future-route crossing. Ambiguous frames remain unlabeled.
 - `DebugOracle` contains the future reference route, crossing point and alignment evidence for auditing only.
+- `sample.json` uses schema `captainav-training-sample-v3`; generated V2 samples must be recollected.
+
+The map PNG in `timeline.html` is never a model input. Training uses the numeric occupancy tensors in `local_map.npz` and `global_map.npz`:
+
+```text
+channel 0 = occupied
+channel 1 = known free
+channel 2 = unknown
+```
+
+Frontiers and landmarks remain structured tokens rather than colored pixels.
 
 ## Collect one episode
 
@@ -72,6 +83,7 @@ Each episode is stored under:
 ├── route_alignment.json
 ├── final_observed_global_map.npz
 ├── final_observed_global_map.png
+├── quality_report.json
 ├── timeline.html
 └── frames/
     └── 00000/
@@ -84,7 +96,7 @@ Each episode is stored under:
         └── timeline.png
 ```
 
-Open `timeline.html` directly in VS Code or a browser. Its three panels separate current RGB, the causal student map and the privileged future-route audit view. A cyan ring is the true free/unknown boundary, a cyan dot is the safe navigation goal, and a yellow goal appears only for a reliable Oracle route crossing. `final_observed_global_map.png` is the map accumulated over the complete replay and is for audit only; earlier student samples keep their causal partial maps.
+Open `timeline.html` directly in VS Code or a browser. Its fixed-scale panels separate current RGB, the causal student map and the privileged future-route audit view. `F#` is a true free/unknown boundary, `G#` is its safe navigation goal, and a yellow star appears only for a reliable Oracle route crossing. The right panel is explicitly marked `ORACLE AUDIT - NOT MODEL INPUT`. `final_observed_global_map.png` is accumulated over the complete replay and is also for audit only.
 
 Validate the path conversion and instruction alignment without starting Isaac Sim:
 
@@ -92,12 +104,14 @@ Validate the path conversion and instruction alignment without starting Isaac Si
 PYTHONPATH=src python training/scripts/validate_expert_replay.py --split train --episode-index 0
 ```
 
-After collection, validate every referenced file and check that privileged fields did not leak into `StudentSample`:
+After collection, validate every referenced file, check both causal contracts for privileged leakage and generate `quality_report.json`:
 
 ```bash
 PYTHONPATH=src python training/scripts/validate_expert_replay.py \
   --episode-dir /Data/qiang/data/CAPTAINav/expert_replay/train/kujiale_0067_955
 ```
+
+The report summarizes RGB/depth/view changes on moving frames, valid-depth ratios, map growth, map tensor shapes, progress monotonicity, frontier counts, reliable-label coverage and quality flags. Do not start large-scale collection until a small multi-scene pilot passes these checks.
 
 ## Configuration
 

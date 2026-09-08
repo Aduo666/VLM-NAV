@@ -228,6 +228,14 @@ class GlobalOccupancyMap:
             0.02, float(self._config.update_period_sec)
         ):
             return
+        if self.integrate_world_rays(robot_pose=robot_pose, sensor_world_xy=sensor_world_xy,
+                                     beam_endpoints_world_xy=beam_endpoints_world_xy,
+                                     beam_hit_mask=beam_hit_mask):
+            self._last_update_time_sec = float(timestamp_sec)
+
+    def integrate_world_rays(self, *, robot_pose: Pose2D, sensor_world_xy: np.ndarray,
+                             beam_endpoints_world_xy: np.ndarray, beam_hit_mask: np.ndarray) -> bool:
+        """Fuse one source without throttling; synchronized callers schedule batches."""
         endpoints = np.asarray(beam_endpoints_world_xy, dtype=np.float64)
         hits = np.asarray(beam_hit_mask, dtype=bool).reshape(-1)
         sensor = np.asarray(sensor_world_xy, dtype=np.float64).reshape(-1)
@@ -238,7 +246,7 @@ class GlobalOccupancyMap:
             or hits.shape[0] != endpoints.shape[0]
             or sensor.size < 2
         ):
-            return
+            return False
         endpoints = endpoints[:, :2]
         sensor = sensor[:2]
         distances = np.linalg.norm(endpoints - sensor[None, :], axis=1)
@@ -251,8 +259,7 @@ class GlobalOccupancyMap:
             & (distances <= max_range)
         )
         if not np.any(valid):
-            self._last_update_time_sec = float(timestamp_sec)
-            return
+            return True
 
         endpoints = endpoints[valid]
         distances = distances[valid]
@@ -268,7 +275,6 @@ class GlobalOccupancyMap:
             end_xy_arr=endpoints,
             endpoint_hit_mask=hits,
         )
-        self._last_update_time_sec = float(timestamp_sec)
         if n_occ > 0:
             self._logger.debug(
                 "[Occupancy] rgbd_update free_cells=%s occupied_cells=%s occupied_total=%s",
@@ -276,6 +282,7 @@ class GlobalOccupancyMap:
                 n_occ,
                 int(np.count_nonzero(self._occupied_mask())),
             )
+        return True
 
     # -- vectorised ray marking ----------------------------------------------
 

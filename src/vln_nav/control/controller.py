@@ -270,6 +270,26 @@ class SteeringDriveController:
 
         return self._apply_targets(wheel_targets=wheel_targets, steering_targets=steering_targets)
 
+    def apply_continuous_joint_targets(
+        self, wheel_targets: dict[str, float], steering_targets: dict[str, float]
+    ) -> None:
+        """Continuous drives use velocity targets, not per-frame state teleporting.
+
+        Explicit zero wheels are actively braked, but steering returns through
+        its position drive instead of overwriting the measured joint position.
+        """
+        if set(wheel_targets) != set(self._wheel_dofs) or set(steering_targets) != set(
+            self._steering_dofs | self._passive_steering_dofs
+        ):
+            raise ValueError("Continuous command must specify every wheel and steering joint")
+        if not all(np.isfinite(v) for v in [*wheel_targets.values(), *steering_targets.values()]):
+            raise ValueError("Non-finite continuous joint target")
+        self._apply_targets(
+            wheel_targets=wheel_targets,
+            steering_targets=steering_targets,
+            force_wheel_state=all(abs(v) < 1e-9 for v in wheel_targets.values()),
+        )
+
     def _zero_targets(self) -> tuple[dict[str, float], dict[str, float]]:
         wheel_targets = {joint_name: 0.0 for joint_name in self._wheel_dofs}
         steering_targets = {joint_name: 0.0 for joint_name in [*self._steering_dofs, *self._passive_steering_dofs]}
@@ -290,13 +310,15 @@ class SteeringDriveController:
         wheel_targets: dict[str, float],
         steering_targets: dict[str, float],
         force_steering_zero: bool = False,
+        force_wheel_state: bool = True,
     ) -> tuple[float, float]:
         self._dc.wake_up_articulation(self._articulation)
 
         for joint_name, dof in self._wheel_dofs.items():
             wheel_velocity = float(wheel_targets.get(joint_name, 0.0))
             self._dc.set_dof_velocity_target(dof, wheel_velocity)
-            self._dc.set_dof_velocity(dof, wheel_velocity)
+            if force_wheel_state:
+                self._dc.set_dof_velocity(dof, wheel_velocity)
 
         for joint_name, dof in self._steering_dofs.items():
             target = float(steering_targets.get(joint_name, 0.0))

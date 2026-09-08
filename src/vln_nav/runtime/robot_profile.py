@@ -6,6 +6,8 @@ from typing import Any
 
 import yaml
 
+from vln_nav.control.trajectory import TrajectoryConfig
+
 
 PROFILE_SCHEMA_VERSION = "2.0"
 SUPPORTED_PROFILES = {"agx", "unitree_g1_29dof"}
@@ -112,6 +114,7 @@ class AgxControllerProfile:
     steering_damping: float
     hold_joint_stiffness: float
     hold_joint_damping: float
+    continuous: TrajectoryConfig
 
 
 @dataclass(frozen=True)
@@ -301,6 +304,7 @@ def load_robot_profile(*, profile_name: str, project_root: Path) -> RobotProfile
             "steering_damping",
             "hold_joint_stiffness",
             "hold_joint_damping",
+            "continuous",
         }
         _require_exact_keys(controller_data, required=required, context=f"{normalized_name}.controller")
         agx_controller = AgxControllerProfile(
@@ -318,7 +322,14 @@ def load_robot_profile(*, profile_name: str, project_root: Path) -> RobotProfile
             steering_damping=_nonnegative_float(controller_data["steering_damping"], "steering_damping"),
             hold_joint_stiffness=_nonnegative_float(controller_data["hold_joint_stiffness"], "hold_joint_stiffness"),
             hold_joint_damping=_nonnegative_float(controller_data["hold_joint_damping"], "hold_joint_damping"),
+            continuous=TrajectoryConfig.from_mapping(controller_data["continuous"]),
         )
+        if {w.drive_joint for w in agx_controller.continuous.wheels} != set(
+            agx_controller.left_wheel_joint_names + agx_controller.right_wheel_joint_names
+        ) or {w.steering_joint for w in agx_controller.continuous.wheels} != set(
+            agx_controller.steering_joint_names
+        ):
+            raise ValueError("AGX continuous wheel pairs must match controller joint names")
     else:
         required = {
             "policy_path",

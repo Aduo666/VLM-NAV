@@ -1,0 +1,26 @@
+# Phase-1 AGX arm-viewpoint acceptance. Main navigation does not load this file.
+camera:
+  arm_prim_path: link6/Camera
+  width: 640
+  height: 480
+  frequency_hz: 15
+  valid_depth_range_m: [0.12, 6.0]
+
+arm:
+  urdf_path: src/ros2_car_model_ws/src/1557/urdf/1557_all.urdf
+  base_link: base_link
+  tip_link: link6
+  joint_names: [joint1, joint2, joint3, joint4, joint5, joint6]
+  max_speed_deg_per_sec: 60.0
+  position_tolerance_deg: 1.5
+  command_timeout_sec: 12.0
+  stable_duration_sec: 0.50
+  required_fresh_depth_frames: 3
+  # Saved targets are offsets from the measured startup pose.
+  pose_slots: [OBSERVE_LEFT_FRONT, OBSERVE_FORWARD_NEAR, OBSERVE_RIGHT_FRONT]
+  pose_offsets_deg:
+    HOME: [0, 0, 0, 0, 0, 0]
+
+debug:
+  output_path: debug/local/agx_active_perception.png
+  update_period_sec: 0.25

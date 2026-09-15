@@ -197,11 +197,11 @@ debug:
     depth_enabled: false
     depth_path: "debug/local/depth_debug.png"
   video:
-    enabled: true
+    enabled: false
     path: "debug/local/videos/vln_debug.mp4"
     fps: 4.0
   observer_video:
-    enabled: true
+    enabled: false
     path: "debug/local/observevideos/observer.mp4"
     fps: 8.0
 

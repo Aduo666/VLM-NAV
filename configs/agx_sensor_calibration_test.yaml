@@ -1,0 +1,39 @@
+# P0 only: validate the three sensing cameras in one AGX base frame.
+sensors:
+  front:
+    prim_path: pan_tilt_pitch_link/pan_tilt_surface/camera_mount/camera_body/camera_base/PanCamera
+    expected_forward_base_xyz: [1.0, 0.0, 0.0]
+    check_image_left_is_robot_left: true
+  down:
+    prim_path: dummy_base_link/DownCamera
+    # DownCamera is an oblique near-field camera: it looks forward and down.
+    expected_forward_base_xyz: [0.92, 0.0, -0.39]
+    check_image_left_is_robot_left: false
+  arm:
+    prim_path: link6/Camera
+    expected_forward_base_xyz: null
+    check_image_left_is_robot_left: false
+  observer_prim_path: dummy_base_link/observeCamera
+
+camera:
+  width: 640
+  height: 480
+  frequency_hz: 15
+  valid_depth_range_m: [0.12, 6.0]
+  point_stride: 8
+
+validation:
+  warmup_render_frames: 20
+  max_frame_age_sec: 0.20
+  max_frame_skew_sec: 0.08
+  min_valid_depth_ratio: 0.001
+  min_axis_alignment_cos: 0.50
+  minimum_rigid_determinant: 0.99
+  maximum_rigid_determinant: 1.01
+
+debug:
+  output_path: debug/local/agx_sensor_calibration.png
+  update_period_sec: 0.25
+  forward_range_m: [-2.0, 6.0]
+  left_range_m: [-4.0, 4.0]
+  height_range_m: [-0.3, 2.5]

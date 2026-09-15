@@ -363,7 +363,7 @@
     </collision>
   </link>
   <joint name="lifting_joint" type="fixed">
-    <origin rpy="0 0 0" xyz="0 0 0"/>
+    <origin rpy="0 0 0" xyz="0 0 0.15"/>
     <parent link="box_link"/>
     <child link="lifting_link"/>
     <axis xyz="0 0 0"/>
@@ -855,12 +855,12 @@
     <child link="base_link"/>
   </joint>
   <joint name="ranger_with_xarm" type="fixed">
-    <origin rpy="0 -1.57 3.14" xyz="-0.08 -0.01 0.646 "/>
+    <origin rpy="0 -1.57 3.14" xyz="-0.08 -0.01 0.796 "/>
     <parent link="base_link"/>
     <child link="link_base"/>
   </joint>
   <joint name="pan_tilt_joint" type="fixed">
-    <origin rpy="0 0 0" xyz="-0.12 -0.002 0.8"/>
+    <origin rpy="0 0 0" xyz="-0.12 -0.002 0.95"/>
     <parent link="base_link"/>
     <child link="pan_base_link"/>
   </joint>

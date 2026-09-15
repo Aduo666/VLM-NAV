@@ -216,10 +216,15 @@ export SILICONFLOW_API_KEY="your_api_key"
 ```text
 configs/
   default.yaml                 # Shared navigation, perception, mapping, and debug settings
+  agx_sensor_calibration_test.yaml # P0 three-camera geometry acceptance
+  agx_local_3d_map_test.yaml   # P1 local 3-D occupancy acceptance
   rgbd_mapping.yaml            # Standalone RGB-D geometry-map test
   robots/                      # Robot-specific assets, sensors, primitives, and controllers
 scripts/
   run_nav.sh                   # Main navigation launcher
+  run_agx_sensor_calibration_test.sh # AGX three-camera frame/transform acceptance
+  run_agx_local_3d_map_test.sh # AGX three-camera sliding-map acceptance
+  run_agx_active_perception_test.sh # AGX arm-viewpoint pose acceptance
   run_rgbd_mapping.sh          # Isolated RGB-D geometry validation
   setup_grounding_dino_local.sh # GroundingDINO dependency setup
 src/vln_nav/
@@ -367,6 +372,87 @@ cells as free. Camera frames are paired with exposure-time poses; stale or unmat
 cannot update the map. Simulation-time freshness is 0.35 s; a separate 2 s wall-clock limit
 catches data delivery stalls. Braking and body dimensions still require physical acceptance.
 The VLN entry and G1 remain unchanged; map-aware replanning is not integrated in this test.
+
+### AGX RGB-D Frame Acceptance
+
+Before building active-perception memory or tuning arm viewpoints, validate that the three sensing
+cameras agree in the AGX base frame:
+
+```bash
+conda activate vlmnav
+bash scripts/run_agx_sensor_calibration_test.sh
+```
+
+This P0 entry holds the base and arm still and loads a small calibration scene. The fixed front
+sensor is the pan-tilt `PanCamera`; `DownCamera` covers the near field; `link6/Camera` supplies the
+arm-mounted view. `observeCamera` remains a GUI camera and is never fused as perception.
+
+The test checks RGB/depth dimensions, pinhole intrinsics, frame age and cross-camera skew, rigid
+transforms, expected optical-axis directions, and the fixed front camera's left/right sign. It
+projects all three depth streams into the convention `+X forward, +Y left, +Z up` and overwrites
+`debug/local/agx_sensor_calibration.png`. Cyan, orange, and magenta respectively identify front,
+downward, and arm-camera points; points from different sensors should coincide on the same physical
+surfaces. Runtime details overwrite `logs/agx_sensor_calibration_test.log`.
+
+Sensor roles and acceptance limits are isolated in `configs/agx_sensor_calibration_test.yaml`.
+Passing P0 does not build a navigation map and does not enable active arm motion.
+
+### AGX Local 3-D Map Acceptance
+
+After P0 passes, build the P1 geometric memory in the configured hospital scene. The arm remains at
+its initial pose, while the AGX base can be driven with the arrow keys or the compact control panel:
+
+```bash
+conda activate vlmnav
+bash scripts/run_agx_local_3d_map_test.sh
+```
+
+The test loads `scene.usd_path` and the start pose from `configs/default.yaml`, then fuses
+`PanCamera`, `DownCamera`, and `link6/Camera` depth into one world-aligned local 3-D
+voxel map. Ray traversal marks observed free space, depth endpoints mark occupied space, and unseen
+space remains explicitly unknown. The fixed-size window follows the robot in voxel increments while
+preserving evidence in its overlapping region. `observeCamera` is used only for the GUI viewport.
+
+The overwrite-only result is `debug/local/agx_local_3d_map.png`; runtime status is written to
+`logs/agx_local_3d_map_test.log`. The image contains only an oblique 3-D view of occupied voxels on
+a black background. Voxel color encodes height; the small marker indicates robot position and heading.
+P1 passes when all three cameras contribute and perceived surfaces remain aligned while driving.
+Releasing a direction key commands `STOP`; `CLEAR MAP` resets the local memory at the current pose.
+This entry does not move the arm, run navigation, or plan a trajectory.
+
+### AGX Arm Viewpoint Authoring
+
+Author and validate the arm-mounted camera poses before enabling active-perception mapping or
+trajectory verification:
+
+```bash
+conda activate vlmnav
+bash scripts/run_agx_active_perception_test.sh
+```
+
+This entry loads only the AGX, a ground plane, lighting, the observer camera, and the arm camera.
+The base remains stopped. It does not run instruction parsing, GroundingDINO, the VLM, occupancy
+mapping, or trajectory execution.
+
+First select `MOVE HOME` and wait for `PASS`. Use the six degree-valued joint controls to prepare a
+target; changing an editor value alone never moves the arm. Select `MOVE EDITOR TARGET`, wait for
+`PASS EDITOR`, and inspect the arm-camera view through the normal Isaac Sim Viewport camera menu.
+When the position and view are useful, save the measured pose as `OBSERVE_LEFT_FRONT`,
+`OBSERVE_FORWARD_NEAR`, or `OBSERVE_RIGHT_FRONT`. Saving writes its offset from HOME back to the
+test configuration. Return to HOME between views and use each `MOVE OBSERVE_*` button to verify the
+saved result. `HOLD CURRENT / STOP` immediately replaces an active target with the measured joint
+positions.
+
+Arm commands use a time-based minimum-jerk trajectory capped at the configured joint speed instead
+of repeatedly commanding a tiny offset from the latest readback. A pose passes only when all arm
+joints remain within tolerance for the settling interval and the reached viewpoint produces the
+required number of fresh depth frames.
+
+The panel and `debug/local/agx_active_perception.png` report current and target joint angles,
+maximum error, camera RGB/depth, and the result of every saved pose. Pose slots, speed,
+tolerance, timeout, and camera validation settings are isolated in
+`configs/agx_active_perception_test.yaml`. Logs overwrite
+`logs/agx_active_perception_test.log` on each launch.
 
 ### G1 Policy Test
 

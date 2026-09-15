@@ -6,7 +6,7 @@ camera:
 near_camera:
   # Relative to asset.prim_path. Existing USD Camera: keep its authored pose/lens.
   # If absent, create a temporary downward-facing camera in this test Stage only.
-  prim_path: dummy_base_link/base_link/box_link/DownCamera
+  prim_path: dummy_base_link/DownCamera
   position_m: [0.0, 0.0, 1.6]
   pitch_down_deg: 90.0
   horizontal_fov_deg: 100.0

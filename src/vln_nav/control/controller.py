@@ -290,6 +290,22 @@ class SteeringDriveController:
             force_wheel_state=all(abs(v) < 1e-9 for v in wheel_targets.values()),
         )
 
+    def release_hold_joints(self, joint_names: Iterable[str]) -> None:
+        """Transfer selected non-drive joints to an external controller.
+
+        Navigation never calls this method, so its existing hold behavior is
+        unchanged. The active-perception acceptance test uses it explicitly to
+        prevent the wheel controller from overwriting arm position targets.
+        """
+        requested = {str(name) for name in joint_names}
+        missing = requested - set(self._hold_dofs)
+        if missing:
+            raise ValueError(f"Cannot release joints not owned by hold control: {sorted(missing)}")
+        for name in requested:
+            self._hold_dofs.pop(name)
+            self.hold_joint_targets.pop(name, None)
+        self._logger.info("Released hold control for joints: %s", sorted(requested))
+
     def _zero_targets(self) -> tuple[dict[str, float], dict[str, float]]:
         wheel_targets = {joint_name: 0.0 for joint_name in self._wheel_dofs}
         steering_targets = {joint_name: 0.0 for joint_name in [*self._steering_dofs, *self._passive_steering_dofs]}

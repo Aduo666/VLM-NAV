@@ -19,9 +19,9 @@ simulation:
 
 sensors:
   camera:
-    front_prim_path: "link6/Camera"
+    front_prim_path: "pan_tilt_pitch_link/pan_tilt_surface/camera_mount/camera_body/camera_base/PanCamera"
     observer_enabled: true
-    observer_prim_path: "dummy_base_link/observecamera"
+    observer_prim_path: "dummy_base_link/observeCamera"
     width: 1280
     height: 960
     frequency_hz: 15

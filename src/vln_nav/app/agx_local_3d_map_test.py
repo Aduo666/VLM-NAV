@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import fields
+from collections import deque
 import logging
 import math
 import os
@@ -28,6 +29,13 @@ from vln_nav.active_perception.local_geometry import (
     LocalVoxelSnapshot,
     VoxelMapUpdate,
 )
+from vln_nav.active_perception.map_diagnostics import (
+    HistoryProbe,
+    MapCheckConfig,
+    build_report,
+    choose_reference,
+    stable_frames_reason,
+)
 from vln_nav.control.locomotion import create_locomotion_controller
 from vln_nav.runtime.config import DEFAULT_CONFIG_PATH, PROJECT_ROOT, load_config
 from vln_nav.runtime.isaac_runtime_utils import (
@@ -46,8 +54,9 @@ SETTINGS_PATH = PROJECT_ROOT / "configs/agx_local_3d_map_test.yaml"
 def _load_settings() -> tuple[dict, LocalVoxelMapConfig]:
     with SETTINGS_PATH.open(encoding="utf-8") as handle:
         settings = yaml.safe_load(handle) or {}
-    if set(settings) != {"sensors", "camera", "map", "validation", "debug"}:
-        raise ValueError("P1 config requires exactly sensors, camera, map, validation, and debug")
+    if set(settings) != {"sensors", "camera", "map", "validation", "debug", "diagnostics"}:
+        raise ValueError("P1 config requires sensors, camera, map, validation, debug, and diagnostics")
+    MapCheckConfig(**settings["diagnostics"]).validate()
     sensors = settings["sensors"]
     expected_sensor_keys = {
         "front_prim_path",
@@ -111,7 +120,7 @@ class _DrivePanel:
         "RIGHT": "TURN_RIGHT",
     }
 
-    def __init__(self, *, clear_map_callback) -> None:
+    def __init__(self, *, clear_map_callback, check_callback) -> None:
         import carb.input
         import omni.appwindow
         import omni.ui as ui
@@ -122,7 +131,7 @@ class _DrivePanel:
         self._press_order: list[str] = []
         self._clear_map_callback = clear_map_callback
         self._speed_model = ui.SimpleFloatModel(0.65)
-        self._window = ui.Window("AGX Local Map Drive", width=330, height=245, visible=True)
+        self._window = ui.Window("AGX Local Map Drive", width=410, height=325, visible=True)
         with self._window.frame:
             with ui.VStack(spacing=7):
                 with ui.HStack(height=42):
@@ -141,6 +150,10 @@ class _DrivePanel:
                     ui.Label("Speed", width=55)
                     ui.FloatSlider(model=self._speed_model, min=0.10, max=1.0, step=0.05)
                 ui.Button("CLEAR MAP", height=30, clicked_fn=self._clear_map_callback)
+                with ui.HStack(height=30, spacing=5):
+                    ui.Button("SET REFERENCE", clicked_fn=lambda: check_callback("reference"))
+                    ui.Button("CHECK MAP", clicked_fn=lambda: check_callback("check"))
+                self._check_status = ui.Label("Check: no reference", height=22)
 
         app_window = omni.appwindow.get_default_app_window()
         if app_window is None:
@@ -165,6 +178,9 @@ class _DrivePanel:
     def clear_motion(self) -> None:
         self._held_actions.clear()
         self._press_order.clear()
+
+    def set_check_status(self, status: str) -> None:
+        self._check_status.text = status
 
     def shutdown(self) -> None:
         if self._keyboard_subscription is not None:
@@ -210,6 +226,251 @@ class _DrivePanel:
         self._held_actions.pop(source, None)
         if source in self._press_order:
             self._press_order.remove(source)
+
+
+class _LocalMapSceneView:
+    """Interactive RViz-like view of the occupied voxels in the sliding map."""
+
+    def __init__(self) -> None:
+        import carb.input
+        import omni.ui as ui
+        from omni.ui import scene as sc
+
+        class _OrbitCameraModel(sc.AbstractManipulatorModel):
+            def __init__(self) -> None:
+                super().__init__()
+                self._yaw_deg = 45.0
+                self._pitch_deg = 32.0
+                self._distance_m = 12.0
+                self._pan_x_m = 0.0
+                self._pan_y_m = 0.0
+
+            def orbit(self, delta_x: float, delta_y: float) -> None:
+                self._yaw_deg += delta_x * 180.0
+                self._pitch_deg = float(
+                    np.clip(self._pitch_deg - delta_y * 140.0, -85.0, 85.0)
+                )
+                self._item_changed("view")
+
+            def pan(self, delta_x: float, delta_y: float) -> None:
+                scale = 0.85 * self._distance_m
+                self._pan_x_m += delta_x * scale
+                self._pan_y_m -= delta_y * scale
+                self._item_changed("view")
+
+            def zoom(self, scroll_y: float) -> None:
+                scroll_y = float(np.clip(scroll_y, -5.0, 5.0))
+                self._distance_m = float(
+                    np.clip(
+                        self._distance_m * math.exp(-0.22 * scroll_y),
+                        2.0,
+                        40.0,
+                    )
+                )
+                self._item_changed("view")
+
+            def zoom_by_drag(self, delta_y: float) -> None:
+                self._distance_m = float(
+                    np.clip(
+                        self._distance_m * math.exp(3.0 * delta_y),
+                        2.0,
+                        40.0,
+                    )
+                )
+                self._item_changed("view")
+
+            def get_as_floats(self, item):
+                if item == self.get_item("projection"):
+                    return [
+                        1.15, 0.0, 0.0, 0.0,
+                        0.0, 1.15, 0.0, 0.0,
+                        0.0, 0.0, -1.0, -1.0,
+                        0.0, 0.0, -0.2, 0.0,
+                    ]
+                if item == self.get_item("view"):
+                    rotation = sc.Matrix44.get_rotation_matrix(
+                        self._pitch_deg,
+                        self._yaw_deg,
+                        0.0,
+                        True,
+                    )
+                    translation = sc.Matrix44.get_translation_matrix(
+                        self._pan_x_m,
+                        self._pan_y_m,
+                        -self._distance_m,
+                    )
+                    view = translation * rotation
+                    return [view[index] for index in range(16)]
+                return []
+
+        class _ZoomGesture(sc.ScrollGesture):
+            def __init__(self, camera_model) -> None:
+                super().__init__()
+                self._camera_model = camera_model
+
+            def on_ended(self) -> None:
+                scroll_x = float(self.scroll[0])
+                scroll_y = float(self.scroll[1])
+                scroll_delta = scroll_y if abs(scroll_y) >= abs(scroll_x) else scroll_x
+                if abs(scroll_delta) > 1.0e-6:
+                    self._camera_model.zoom(scroll_delta)
+
+        self._ui = ui
+        self._camera_model = _OrbitCameraModel()
+        self._window = ui.Window("AGX Local 3-D Map", width=920, height=720, visible=True)
+
+        def orbit(sender) -> None:
+            moved = sender.gesture_payload.mouse_moved
+            self._camera_model.orbit(float(moved[0]), float(moved[1]))
+
+        def pan(sender) -> None:
+            moved = sender.gesture_payload.mouse_moved
+            self._camera_model.pan(float(moved[0]), float(moved[1]))
+
+        def zoom_by_drag(sender) -> None:
+            moved = sender.gesture_payload.mouse_moved
+            self._camera_model.zoom_by_drag(float(moved[1]))
+
+        self._orbit_gesture = sc.DragGesture(
+            mouse_button=int(carb.input.MouseInput.LEFT_BUTTON),
+            on_changed_fn=orbit,
+        )
+        self._pan_gesture = sc.DragGesture(
+            mouse_button=int(carb.input.MouseInput.RIGHT_BUTTON),
+            on_changed_fn=pan,
+        )
+        self._drag_zoom_gesture = sc.DragGesture(
+            mouse_button=int(carb.input.MouseInput.MIDDLE_BUTTON),
+            on_changed_fn=zoom_by_drag,
+        )
+        self._wheel_zoom_gesture = _ZoomGesture(self._camera_model)
+
+        with self._window.frame:
+            with ui.ZStack():
+                ui.Rectangle(style={"background_color": ui.color(0.0, 0.0, 0.0, 1.0)})
+                self._scene_view = sc.SceneView(
+                    self._camera_model,
+                    aspect_ratio_policy=sc.AspectRatioPolicy.PRESERVE_ASPECT_FIT,
+                )
+                with self._scene_view.scene:
+                    self._occupied_points = sc.Points(
+                        [[0.0, 0.0, 0.0]],
+                        colors=[[0.0, 0.0, 0.0, 0.0]],
+                        sizes=[0.1],
+                    )
+                    # Draw the reference after the cloud, with a dark halo and large markers.
+                    self._reference_backing_lines = [
+                        sc.Line([0., 0., 0.], [0., 0., 0.],
+                                color=ui.color(0.0, 0.0, 0.0, 1.0), thickness=12.0,
+                                visible=False)
+                        for _ in range(4)
+                    ]
+                    self._reference_lines = [
+                        sc.Line([0., 0., 0.], [0., 0., 0.],
+                                color=ui.color(0.0, 1.0, 1.0, 1.0), thickness=7.0,
+                                visible=False)
+                        for _ in range(4)
+                    ]
+                    self._reference_points = sc.Points(
+                        [[0.0, 0.0, 0.0]],
+                        colors=[[0.0, 1.0, 1.0, 0.0]],
+                        sizes=[0.1],
+                    )
+                    self._reference_normal = sc.Line(
+                        [0.0, 0.0, 0.0],
+                        [0.0, 0.0, 0.0],
+                        color=ui.color(1.0, 1.0, 1.0, 1.0),
+                        thickness=5.0,
+                        visible=False,
+                    )
+                    self._robot_point = sc.Points(
+                        [[0.0, 0.0, 0.0]],
+                        colors=[[1.0, 0.80, 0.10, 1.0]],
+                        sizes=[12.0],
+                    )
+                    self._heading_line = sc.Line(
+                        [0.0, 0.0, 0.0],
+                        [0.8, 0.0, 0.0],
+                        color=ui.color(1.0, 0.25, 0.08, 1.0),
+                        thickness=4.0,
+                    )
+                    sc.Screen(
+                        gestures=[
+                            self._orbit_gesture,
+                            self._pan_gesture,
+                            self._drag_zoom_gesture,
+                            self._wheel_zoom_gesture,
+                        ]
+                    )
+
+    def update(
+        self,
+        snapshot: LocalVoxelSnapshot,
+        *,
+        robot_pose: tuple[float, float, float, float],
+    ) -> None:
+        occupied_zyx = np.argwhere(snapshot.state == OCCUPIED)
+        robot_xyz = np.asarray(robot_pose[:3], dtype=np.float64)
+        if occupied_zyx.size:
+            points_world = snapshot.origin_world_xyz + (
+                occupied_zyx[:, [2, 1, 0]].astype(np.float64) + 0.5
+            ) * snapshot.resolution_m
+            relative = points_world - robot_xyz
+            # SceneView uses Y-up. The map remains world-aligned while centered on the robot.
+            scene_points = np.column_stack(
+                (relative[:, 0], relative[:, 2], -relative[:, 1])
+            )
+            rgb = _height_colors(relative[:, 2]).astype(np.float64) / 255.0
+            rgba = np.column_stack((rgb, np.ones(len(rgb), dtype=np.float64)))
+            self._occupied_points.positions = scene_points.tolist()
+            self._occupied_points.colors = rgba.tolist()
+            self._occupied_points.sizes = [3.0] * len(scene_points)
+        else:
+            self._occupied_points.positions = [[0.0, 0.0, 0.0]]
+            self._occupied_points.colors = [[0.0, 0.0, 0.0, 0.0]]
+            self._occupied_points.sizes = [0.1]
+
+        robot_yaw = float(robot_pose[3])
+        self._heading_line.start = [0.0, 0.0, 0.0]
+        self._heading_line.end = [
+            0.8 * math.cos(robot_yaw),
+            0.0,
+            -0.8 * math.sin(robot_yaw),
+        ]
+
+    def shutdown(self) -> None:
+        self._window.visible = False
+
+    def show_reference(self, reference, robot_pose) -> None:
+        if reference is None:
+            for line in self._reference_backing_lines + self._reference_lines:
+                line.visible = False
+            self._reference_points.colors = [[0.0, 1.0, 1.0, 0.0]]
+            self._reference_points.sizes = [0.1]
+            self._reference_normal.visible = False
+            return
+        relative = reference.corners() - np.asarray(robot_pose[:3])
+        points = np.column_stack((relative[:, 0], relative[:, 2], -relative[:, 1]))
+        for lines in (self._reference_backing_lines, self._reference_lines):
+            for index, line in enumerate(lines):
+                line.start = points[index].tolist()
+                line.end = points[(index + 1) % 4].tolist()
+                line.visible = True
+        center_relative = reference.center - np.asarray(robot_pose[:3])
+        center = np.asarray(
+            [center_relative[0], center_relative[2], -center_relative[1]],
+            dtype=np.float64,
+        )
+        marker_points = np.vstack((points, center))
+        self._reference_points.positions = marker_points.tolist()
+        self._reference_points.colors = [[0.0, 1.0, 1.0, 1.0]] * len(marker_points)
+        self._reference_points.sizes = [16.0] * len(marker_points)
+        normal_world = reference.center + 0.40 * reference.normal
+        normal_relative = normal_world - np.asarray(robot_pose[:3])
+        normal_end = [normal_relative[0], normal_relative[2], -normal_relative[1]]
+        self._reference_normal.start = center.tolist()
+        self._reference_normal.end = normal_end
+        self._reference_normal.visible = True
 
 
 def _height_colors(relative_height_m: np.ndarray) -> np.ndarray:
@@ -273,6 +534,7 @@ def _render_local_occupancy(
     snapshot: LocalVoxelSnapshot,
     *,
     robot_pose: tuple[float, float, float, float],
+    reference=None,
     image_size: tuple[int, int] = (1280, 900),
 ) -> Image.Image:
     occupied_zyx = np.argwhere(snapshot.state == OCCUPIED)
@@ -332,6 +594,26 @@ def _render_local_occupancy(
             fill=(255, 205, 35),
         )
         draw.line((*robot_pixel, *heading_pixel), fill=(255, 85, 35), width=4)
+    if reference is not None:
+        reference_u, reference_v, _, _ = _project_local_points(
+            reference.corners(),
+            robot_pose=robot_pose,
+            image_size=image_size,
+        )
+        if len(reference_u) == 4:
+            pixels = [
+                (int(reference_u[index]), int(reference_v[index]))
+                for index in range(4)
+            ]
+            draw.line(pixels + [pixels[0]], fill=(0, 0, 0), width=14)
+            draw.line(pixels + [pixels[0]], fill=(0, 255, 255), width=8)
+            for pixel in pixels:
+                draw.ellipse(
+                    (pixel[0] - 8, pixel[1] - 8, pixel[0] + 8, pixel[1] + 8),
+                    fill=(0, 255, 255),
+                    outline=(0, 0, 0),
+                    width=2,
+                )
     return image
 
 
@@ -365,8 +647,11 @@ def _save_debug(
     path: Path,
     snapshot: LocalVoxelSnapshot,
     robot_pose: tuple[float, float, float, float],
+    reference=None,
 ) -> None:
-    canvas = _render_local_occupancy(snapshot, robot_pose=robot_pose)
+    canvas = _render_local_occupancy(
+        snapshot, robot_pose=robot_pose, reference=reference
+    )
 
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
@@ -550,7 +835,22 @@ def _run(app, config, profile, settings, map_config, logger) -> int:
     latest_update = VoxelMapUpdate(0, False, tuple(), 0, 0, 0)
     integration_period = float(settings["map"]["integration_period_sec"])
     clear_map_requested = [False]
-    panel = _DrivePanel(clear_map_callback=lambda: clear_map_requested.__setitem__(0, True))
+    check_requested = [None]
+    check_config = MapCheckConfig(**settings["diagnostics"])
+    check_batches = deque(maxlen=check_config.stable_frames)
+    reference = history_probe = None
+    report_path = output_path.with_name("agx_map_check.md")
+    panel = _DrivePanel(
+        clear_map_callback=lambda: clear_map_requested.__setitem__(0, True),
+        check_callback=lambda mode: check_requested.__setitem__(0, mode),
+    )
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text("# P1 局部地图检查\n\n本次运行尚未检查。停车后点击 SET REFERENCE。\n", encoding="utf-8")
+    map_scene_view = _LocalMapSceneView()
+    logger.info(
+        "[P1Viewer] left-drag=orbit right-drag=pan wheel/middle-drag=zoom; "
+        "full height range is shown"
+    )
     last_action = ""
 
     try:
@@ -558,6 +858,7 @@ def _run(app, config, profile, settings, map_config, logger) -> int:
             if not world.is_playing():
                 drive.apply("STOP", speed_scale=0.0)
                 panel.clear_motion()
+                check_batches.clear()
                 app.update()
                 continue
             action = panel.action
@@ -571,7 +872,13 @@ def _run(app, config, profile, settings, map_config, logger) -> int:
             if clear_map_requested[0]:
                 local_map.reset(np.asarray(position[:3], dtype=np.float64))
                 clear_map_requested[0] = False
+                reference = history_probe = None
+                check_batches.clear()
+                panel.set_check_status("Check: no reference")
+                report_path.write_text("# P1 局部地图检查\n\n地图已清空，请重新 SET REFERENCE。\n", encoding="utf-8")
                 logger.info("[P1Map] cleared at robot position")
+            if action != "STOP":
+                check_batches.clear()
             if now - last_integration_time < integration_period:
                 frame_index += 1
                 continue
@@ -613,6 +920,52 @@ def _run(app, config, profile, settings, map_config, logger) -> int:
                     center_world_xyz=np.asarray(position[:3], dtype=np.float64),
                 )
                 last_integration_time = now
+                if action == "STOP" and (not check_batches or all(
+                    captured[source].timestamp_sec > check_batches[-1][source].timestamp_sec
+                    for source in SOURCE_BITS
+                )):
+                    check_batches.append(captured)
+
+            if check_requested[0] is not None:
+                mode = check_requested[0]
+                check_requested[0] = None
+                reason = ("相机缺帧或时间不同步。" if capture_failures else
+                          stable_frames_reason(list(check_batches), now, check_config))
+                if action != "STOP":
+                    reason = "请先松开方向键，停车约 1 秒再检查。"
+                if reason is None:
+                    try:
+                        if mode == "reference":
+                            new_reference = choose_reference(
+                                captured["front"], check_config, map_config.min_depth_m,
+                                map_config.max_depth_m, map_config.max_ray_length_m,
+                            )
+                            reference = new_reference
+                            history_probe = HistoryProbe.capture(local_map.snapshot())
+                            panel.set_check_status("Reference set: CYAN BOX + DOTS")
+                            report_path.write_text(
+                                "# P1 局部地图检查\n\n参考面已设置。请确认青色粗框和圆点落在静止墙面，点击 CHECK MAP 检查；移动后继续用 CHECK MAP 对比同一参考面。\n",
+                                encoding="utf-8",
+                            )
+                            logger.info("[P1Check] reference set at %s; cyan box and dots; report=%s",
+                                        np.round(reference.center, 3).tolist(), report_path)
+                        elif reference is None:
+                            reason = "请先点击 SET REFERENCE 设置一块静止墙面。"
+                        else:
+                            result, report = build_report(
+                                reference, history_probe, list(check_batches), local_map.snapshot(),
+                                check_config, map_config.min_depth_m, map_config.max_depth_m,
+                                map_config.max_ray_length_m,
+                            )
+                            report_path.write_text(report, encoding="utf-8")
+                            panel.set_check_status(f"Check: {result} (see report)")
+                            logger.info("[P1Check] result=%s report=%s", result, report_path)
+                    except ValueError as exc:
+                        reason = str(exc)
+                if reason is not None:
+                    panel.set_check_status("Check: INCONCLUSIVE (see report)")
+                    report_path.write_text(f"# P1 局部地图检查\n\nINCONCLUSIVE：{reason}\n", encoding="utf-8")
+                    logger.info("[P1Check] INCONCLUSIVE: %s", reason)
 
             if now - last_debug_time >= float(settings["debug"]["update_period_sec"]):
                 snapshot = local_map.snapshot()
@@ -631,13 +984,16 @@ def _run(app, config, profile, settings, map_config, logger) -> int:
                     path=output_path,
                     snapshot=snapshot,
                     robot_pose=robot_pose,
+                    reference=reference,
                 )
+                map_scene_view.update(snapshot, robot_pose=robot_pose)
+                map_scene_view.show_reference(reference, robot_pose)
                 ready = not failures
                 signature = (ready, tuple(failures))
                 if signature != last_status_signature:
                     logger.info(
                         "[P1Summary] result=%s updates=%d rays=%d known=%d occupied=%d reason=%s",
-                        "READY" if ready else "BUILDING",
+                        "DATA_READY" if ready else "BUILDING",
                         snapshot.version,
                         latest_update.ray_count,
                         int(np.count_nonzero(snapshot.state != UNKNOWN)),
@@ -651,6 +1007,7 @@ def _run(app, config, profile, settings, map_config, logger) -> int:
             frame_index += 1
     finally:
         drive.apply("STOP", speed_scale=0.0)
+        map_scene_view.shutdown()
         panel.shutdown()
     return 0
 

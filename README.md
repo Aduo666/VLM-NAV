@@ -216,12 +216,14 @@ export SILICONFLOW_API_KEY="your_api_key"
 ```text
 configs/
   default.yaml                 # Shared navigation, perception, mapping, and debug settings
+  agx_navdp_trajectory_test.yaml # NavDP server, BEV goal picker, and candidate-test settings
   agx_sensor_calibration_test.yaml # P0 three-camera geometry acceptance
   agx_local_3d_map_test.yaml   # P1 local 3-D occupancy acceptance
   rgbd_mapping.yaml            # Standalone RGB-D geometry-map test
   robots/                      # Robot-specific assets, sensors, primitives, and controllers
 scripts/
   run_nav.sh                   # Main navigation launcher
+  run_agx_navdp_trajectory_test.sh # NavDP candidate generation/following acceptance
   run_agx_sensor_calibration_test.sh # AGX three-camera frame/transform acceptance
   run_agx_local_3d_map_test.sh # AGX three-camera sliding-map acceptance
   run_agx_active_perception_test.sh # AGX arm-viewpoint pose acceptance
@@ -287,7 +289,52 @@ configs/robots/unitree_g1_29dof.yaml
 The semantic meaning of a primitive is shared, while its distance, angle, command magnitude,
 timeout, and swept envelope come from the selected profile.
 
-### AGX Continuous Trajectory Acceptance
+### AGX Trajectory Acceptance
+
+#### NavDP Candidate Trajectory Acceptance
+
+Phase 1 of the active geometric-perception work connects the official NavDP point-goal
+server to the existing AGX continuous follower. It is intentionally separate from the
+main navigation policy, safety filtering, VLM, and arm motion. A local three-camera map
+is used only to let the operator select a point goal; it does not filter or certify any
+candidate trajectory.
+
+NavDP is deployed as its own process, following its official HTTP interface. Clone and
+install NavDP outside this repository, obtain its checkpoint, and start the server first:
+
+```bash
+cd /path/to/NavDP/baselines/navdp
+python navdp_server.py --port 8889 --checkpoint /path/to/navdp.ckpt
+```
+
+Then start Isaac Sim from the CAPTAINav environment:
+
+```bash
+conda activate vlmnav
+bash scripts/run_agx_navdp_trajectory_test.sh
+```
+
+In **AGX NavDP Goal**, the compact BEV uses white for known free space, black for
+obstacles, gray for unknown space, blue for the robot, and red for the selected goal.
+The interaction is intentionally limited to:
+
+1. Click known free space on the BEV. The goal is frozen in odometry coordinates.
+2. The test captures a stopped RGB-D keyframe, calls NavDP, follows NavDP's selected
+   candidate, and requests another segment automatically if the point goal remains ahead.
+3. **STOP** cancels inference or tracking and brakes the robot.
+
+Candidate IDs, critic values, and the model-selected path are written to the overwrite-only
+`debug/local/agx_navdp_candidates.png`. Critic values are displayed only as relative NavDP
+preferences; they are not treated as safety probabilities. The configuration is isolated
+in `configs/agx_navdp_trajectory_test.yaml`.
+
+Trajectory curves and the goal marker are never inserted into the USD Stage, so the RGB-D
+map cannot observe its own debug graphics. A result is rejected if the robot moves while
+inference is pending. Phase 2 will add local 3-D evidence and
+`SAFE / BLOCKED / UNRESOLVED` classification; none of those decisions are silently present
+in this Phase-1 entry.
+
+#### Fixed-Path Continuous-Control Test
 
 This isolated first-stage test follows a fixed XY path using continuous body velocities
 and four-wheel inverse kinematics. The navigation entry still uses its existing primitives;
@@ -416,9 +463,43 @@ preserving evidence in its overlapping region. `observeCamera` is used only for 
 The overwrite-only result is `debug/local/agx_local_3d_map.png`; runtime status is written to
 `logs/agx_local_3d_map_test.log`. The image contains only an oblique 3-D view of occupied voxels on
 a black background. Voxel color encodes height; the small marker indicates robot position and heading.
-P1 passes when all three cameras contribute and perceived surfaces remain aligned while driving.
+The live `AGX Local 3-D Map` window shows the same occupied voxels without clipping the ceiling.
+Drag with the left mouse button to orbit, drag with the right mouse button to pan, and use the mouse
+wheel or middle-button vertical drag to zoom. The view stays centered on the robot while preserving
+the map's world orientation.
+`DATA_READY` only means that all cameras have supplied enough map evidence; it does not certify accuracy.
 Releasing a direction key commands `STOP`; `CLEAR MAP` resets the local memory at the current pose.
 This entry does not move the arm, run navigation, or plan a trajectory.
+
+#### Check Map Quality
+
+1. Drive near a flat, static wall and release the direction keys. Wait about one second for five
+   distinct, stationary RGB-D batches, then click `SET REFERENCE`.
+2. Confirm that the thick cyan rectangle and five cyan dots in the interactive map lie on that wall.
+   The same marker is written into `agx_local_3d_map.png`. It marks one planar front-camera patch
+   fixed in world coordinates; ceilings and the floor are still retained in the map.
+3. Click `CHECK MAP`. Open `debug/local/agx_map_check.md` for the Chinese report. It lists per-camera
+   surface offset/thickness, cross-camera normal-offset differences, fused-voxel error, nearby floor
+   height stability, history retention, and map state counts. Each check overwrites this report;
+   checks run only on demand.
+4. Drive a short distance or turn, stop, and click `CHECK MAP` again. Keep the original reference to
+   expose drift. Use `SET REFERENCE` only when intentionally selecting a different surface.
+
+`PASS` means the measured local quantities meet the diagnostic thresholds; `FAIL` means a measured
+quantity exceeds them. `INCONCLUSIVE` means missing overlap, stale frames, motion, too few samples,
+or too few unchanged history cells. It is never counted as a pass. The downward camera may not see
+the selected wall, so cross-camera coverage must be checked before claiming full P1 acceptance.
+Normal-direction agreement on one wall cannot certify all translation/rotation components. Samples
+must lie inside the rectangle and near the original plane, so nearby furniture or a second wall layer
+is not silently mixed into the same measurement.
+
+The thresholds live under `diagnostics` in `configs/agx_local_3d_map_test.yaml`. Raw-depth residuals
+and 5 cm voxel-center residuals have separate thresholds. Reference selection uses no simulator
+ground truth; confirm its physical surface yourself. Map state counts alone do not prove that live
+obstacles or occlusions were classified correctly. Synthetic tests validate ray carving, hidden-space
+states, and world-coordinate history retention independently of the GUI. The floor check only verifies
+that the downward camera and fused voxels produce a stable local support height. P1 does not yet label
+floor, steps, drop-offs, or obstacles for planning.
 
 ### AGX Arm Viewpoint Authoring
 

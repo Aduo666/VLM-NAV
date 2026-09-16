@@ -40,3 +40,23 @@ validation:
 debug:
   output_path: debug/local/agx_local_3d_map.png
   update_period_sec: 0.50
+
+# On-demand diagnostics only. These thresholds do not affect occupancy or control.
+diagnostics:
+  stable_frames: 5
+  max_frame_age_sec: 0.10
+  max_stationary_translation_m: 0.01
+  max_stationary_rotation_deg: 0.5
+  min_surface_points: 60
+  max_reference_sigma_m: 0.02
+  reference_association_distance_m: 0.18
+  max_surface_error_m: 0.05
+  max_map_error_m: 0.10
+  floor_min_points: 80
+  floor_min_radius_m: 0.30
+  floor_max_radius_m: 2.50
+  floor_search_min_relative_z_m: -0.80
+  floor_search_max_relative_z_m: 0.25
+  floor_cluster_half_width_m: 0.06
+  max_floor_height_span_m: 0.05
+  max_floor_thickness_m: 0.06

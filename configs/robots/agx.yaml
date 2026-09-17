@@ -10,7 +10,7 @@ asset:
   articulation_path: "dummy_base_link"
 
 spawn:
-  z_m: 0.0
+  z_m: 0.32
 
 simulation:
   physics_dt: 0.0166667

@@ -217,14 +217,14 @@ export SILICONFLOW_API_KEY="your_api_key"
 configs/
   default.yaml                 # Shared navigation, perception, mapping, and debug settings
   agx_navdp_trajectory_test.yaml # NavDP server, BEV goal picker, and candidate-test settings
-  agx_sensor_calibration_test.yaml # P0 three-camera geometry acceptance
+  agx_trajectory_test.yaml     # Continuous control and narrow-passage acceptance
   agx_local_3d_map_test.yaml   # P1 local 3-D occupancy acceptance
   rgbd_mapping.yaml            # Standalone RGB-D geometry-map test
   robots/                      # Robot-specific assets, sensors, primitives, and controllers
 scripts/
   run_nav.sh                   # Main navigation launcher
   run_agx_navdp_trajectory_test.sh # NavDP candidate generation/following acceptance
-  run_agx_sensor_calibration_test.sh # AGX three-camera frame/transform acceptance
+  run_agx_trajectory_test.sh   # AGX continuous and narrow-passage acceptance
   run_agx_local_3d_map_test.sh # AGX three-camera sliding-map acceptance
   run_agx_active_perception_test.sh # AGX arm-viewpoint pose acceptance
   run_rgbd_mapping.sh          # Isolated RGB-D geometry validation
@@ -334,119 +334,38 @@ inference is pending. Phase 2 will add local 3-D evidence and
 `SAFE / BLOCKED / UNRESOLVED` classification; none of those decisions are silently present
 in this Phase-1 entry.
 
-#### Fixed-Path Continuous-Control Test
+#### Continuous-Control And Narrow-Passage Test
 
-This isolated first-stage test follows a fixed XY path using continuous body velocities
-and four-wheel inverse kinematics. The navigation entry still uses its existing primitives;
-G1, RGB-D mapping, perception and VLN decisions are unchanged.
+This isolated test validates AGX continuous body-velocity tracking and repeatable traversal
+of known feasible paths through a narrow passage.
 
 ```bash
 conda activate vlmnav
 bash scripts/run_agx_trajectory_test.sh
 ```
 
-The AGX, floor, light, front and near-field RGB-D cameras, and configured observer camera are loaded.
-No GroundingDINO, VLM or navigation policy is started. The robot starts idle.
-Select **STRAIGHT** (3 m), **LEFT ARC** or **RIGHT ARC** (1.5 m radius, 90 degrees).
-**IRREGULAR** adds a repeatable variable-curvature route: a straight entry, unequal
-left/right bends and a straight exit, spanning 8 m forward. Its lateral offsets
-are +0.7 m, -0.6 m and +0.4 m relative to the starting heading. Smooth transitions
-test steering reversals without introducing impossible instantaneous corners;
-this does not establish that arbitrary polylines are feasible.
-The green line is the reference path; the panel reports path error and measured motion.
-**STOP / CANCEL** brakes the wheels and commands steering back to zero. A new selection
-starts a new path relative to the current pose; there is no automatic recovery or reverse.
-Changing paths during motion cancels the current path. Wait for the measured speed to
-settle, then select again; paths are never blended while the robot is still moving.
+The AGX, floor, light and observer camera are loaded. The robot starts idle. `STRAIGHT`,
+`LEFT ARC`, `RIGHT ARC`, and `S CURVE` exercise continuous steering and steering reversals.
+`DOOR STRAIGHT`, `DOOR OFFSET`, and `DOOR ANGLED` reset the robot, create a 0.95 m doorway,
+and follow a predefined feasible path through it. Every scenario starts from the same pose,
+so repeated trials are comparable. `RESET` restores the initial articulation state and
+removes the path and doorway; `STOP` brakes without resetting the scene.
+
+The green line is the reference path. During large steering changes the wheels roll under
+the normal acceleration limit while steering converges; the previous hard zero-speed gate
+could leave the chassis indefinitely in `ALIGNING_STEERING`. The panel and
+`logs/agx_trajectory_test.log` report `STEERING_TRANSIENT`, maximum steering error, target
+joint angles, measured joint angles, path error and applied body velocity.
 
 Parameters are in `configs/robots/agx.yaml`, under `controller.continuous`, in meters,
 seconds and radians. Nominal wheel radii and positions come from `1557_all.urdf`;
 loaded USD joint positions, axis signs and limits are checked before motion. Radius and
-physical tracking still need simulator acceptance. Test both arcs, endpoint stopping and
-manual cancellation before integrating this controller into navigation.
-
-The same entry also provides independent **RGB-D safety acceptance**. Select a new test
-only after stopping; each selection replaces the test obstacles and clears old map evidence:
-
-| Test | What To Observe |
-| --- | --- |
-| `BLOCKED STRAIGHT` | Slow down and hold before the block; no automatic steering or reverse. |
-| `INNER CURVE` | Catch a body-side collision even when the centerline misses the block. |
-| `NARROW DOOR` | Attempt a centered passage through a 0.95 m gap, only when the swept envelope is known free. |
-| `FREEZE RGB-D` | Stop after depth expires while simulation/rendering continue; resume requires fresh observations. |
-
-`configs/agx_trajectory_test.yaml` holds the test camera, depth range, approximate rectangular
-body envelope, braking assumptions and freshness limits. `near_camera.prim_path` is relative
-to the robot root. If a Camera already exists there, its authored pose and lens are preserved.
-Otherwise the test creates a temporary downward camera using `position_m` (relative to its
-parent), `pitch_down_deg`, and `horizontal_fov_deg`. The default is 1.6 m above the base,
-looking down with a 100-degree horizontal field of view. This is a test mounting proposal,
-not a calibrated hardware installation. To use your manually added camera, change its path
-in this file. The front camera and original USD are never edited or saved.
-
-Both cameras must provide fresh, time-aligned depth and robot-only instance-ID masks.
-Instance IDs remove rendered robot surfaces, not environmental objects; no detector or VLM
-is involved. Missing or stale input stops the test. A near camera does not guarantee full
-coverage: regions still hidden by the body remain subject to the unknown-space stop rule.
-The safety guard checks the whole
-predicted reaction/braking motion against **raw** RGB-D occupancy, adding the body margin
-once. Current depth hits are included immediately, without waiting for accumulated map
-confidence to overcome earlier free-space evidence. It also checks measured motion, not
-just the requested velocity. Commands may be
-proportionally reduced or stopped, but safety never invents a turn or replaces the path.
-Unknown space and out-of-map motion are blocked. Sensor startup needs three fresh observations;
-release after a geometric hold separately requires three clear observations. A cached frame
-is not fresh evidence. `waiting_stable_rgbd` means sensor startup/recovery, whereas
-`waiting_clear_path` means geometric release confirmation. Safety holds retain the reference
-path. Safe speed limits cap the tracking acceleration ramp instead of repeatedly multiplying
-the previous limited velocity; no useful safe speed means HOLD, not indefinite creeping.
-
-Watch the panel's `CLEAR / SLOW / HOLD`, reason, depth age and actual velocity. The single
-overwrite-only `debug/local/agx_safety.png` shows front depth above near-field depth on the left and raw
-occupancy plus the checked envelope on the right. Black is occupied, white free, gray unknown;
-green is the reference path, blue the robot heading, cyan a clear sweep, orange a limited or
-blocked sweep. A red cross marks the first blocking obstacle or unknown cell. This
-fixed-orientation 8 m view follows the robot without rotating. Console
-events are also saved to `logs/agx_trajectory_test.log`, overwritten on each launch.
-
-This is an **experimental static-scene guard**, not certified safety or autonomous detour
-planning. The initial placement and its margin are assumed clear only for test bootstrap;
-newly traversed space is not automatically declared free. The map comes from calibrated
-depth, not the positions used to create the blocks. Sparse depth, self-occlusion, the configured
-height band and camera blind spots can cause conservative holds or missed small objects.
-If the robot holds at a doorway, inspect its reason and depth/map instead of treating unknown
-cells as free. Camera frames are paired with exposure-time poses; stale or unmatched frames
-cannot update the map. Simulation-time freshness is 0.35 s; a separate 2 s wall-clock limit
-catches data delivery stalls. Braking and body dimensions still require physical acceptance.
-The VLN entry and G1 remain unchanged; map-aware replanning is not integrated in this test.
-
-### AGX RGB-D Frame Acceptance
-
-Before building active-perception memory or tuning arm viewpoints, validate that the three sensing
-cameras agree in the AGX base frame:
-
-```bash
-conda activate vlmnav
-bash scripts/run_agx_sensor_calibration_test.sh
-```
-
-This P0 entry holds the base and arm still and loads a small calibration scene. The fixed front
-sensor is the pan-tilt `PanCamera`; `DownCamera` covers the near field; `link6/Camera` supplies the
-arm-mounted view. `observeCamera` remains a GUI camera and is never fused as perception.
-
-The test checks RGB/depth dimensions, pinhole intrinsics, frame age and cross-camera skew, rigid
-transforms, expected optical-axis directions, and the fixed front camera's left/right sign. It
-projects all three depth streams into the convention `+X forward, +Y left, +Z up` and overwrites
-`debug/local/agx_sensor_calibration.png`. Cyan, orange, and magenta respectively identify front,
-downward, and arm-camera points; points from different sensors should coincide on the same physical
-surfaces. Runtime details overwrite `logs/agx_sensor_calibration_test.log`.
-
-Sensor roles and acceptance limits are isolated in `configs/agx_sensor_calibration_test.yaml`.
-Passing P0 does not build a navigation map and does not enable active arm motion.
+physical tracking still need simulator acceptance. The passage paths are known references for
+controller validation; map-based fine planning is the next stage.
 
 ### AGX Local 3-D Map Acceptance
 
-After P0 passes, build the P1 geometric memory in the configured hospital scene. The arm remains at
+Build the local geometric memory in the configured hospital scene. The arm remains at
 its initial pose, while the AGX base can be driven with the arrow keys or the compact control panel:
 
 ```bash

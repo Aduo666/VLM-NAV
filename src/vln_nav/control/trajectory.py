@@ -118,11 +118,21 @@ def wheel_targets(command: VelocityCommand, config: TrajectoryConfig):
 
 
 class AgxVelocityAdapter:
-    """Write drive targets, holding motion until physical steering is aligned."""
+    """Write a smooth body command while steering converges to its target.
+
+    A four-wheel-steering chassis must usually roll a little while changing a
+    large steering angle.  Hard-zeroing the drive wheels until every steering
+    joint is aligned can therefore deadlock against tire contact friction.
+    PathTracker already ramps velocity from zero, so the transient remains
+    bounded without a separate stop gate.
+    """
     def __init__(self, drive, config: TrajectoryConfig):
         config.validate()
         self.drive, self.config = drive, config
         self.status = "STOPPED"
+        self._steering_target_rad: dict[str, float] = {}
+        self._steering_measured_rad: dict[str, float] = {}
+        self._max_steering_error_rad = 0.0
 
     def apply(self, command: VelocityCommand) -> VelocityCommand:
         try:
@@ -131,11 +141,14 @@ class AgxVelocityAdapter:
             errors = [abs(measured[name] - value) for name, value in steering.items()]
             if not all(math.isfinite(e) for e in errors):
                 raise ValueError("Non-finite steering readback")
+            self._steering_target_rad = dict(steering)
+            self._steering_measured_rad = {
+                name: float(measured[name]) for name in steering
+            }
+            self._max_steering_error_rad = max(errors, default=0.0)
             self.status = "TRACKING"
-            if max(errors) > self.config.steering_alignment_rad:
-                motors = dict.fromkeys(motors, 0.0)
-                applied = VelocityCommand()
-                self.status = "ALIGNING_STEERING"
+            if self._max_steering_error_rad > self.config.steering_alignment_rad:
+                self.status = "STEERING_TRANSIENT"
             if command == VelocityCommand():
                 self.status = "STOPPED"
             self.drive.apply_continuous_joint_targets(motors, steering)
@@ -143,6 +156,14 @@ class AgxVelocityAdapter:
         except Exception:
             self.stop()
             raise
+
+    def steering_diagnostics(self) -> dict[str, object]:
+        return {
+            "status": self.status,
+            "max_error_rad": float(self._max_steering_error_rad),
+            "target_rad": dict(self._steering_target_rad),
+            "measured_rad": dict(self._steering_measured_rad),
+        }
 
     def stop(self) -> None:
         self.drive.apply_continuous_joint_targets(

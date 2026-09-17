@@ -521,6 +521,8 @@ def _run(
     segment_index = 0
     idle_status = "Click known free space to navigate"
     previous_tracking_status = None
+    previous_adapter_status = None
+    last_steering_log_time = -float("inf")
     render_stride = max(1, round(float(profile.simulation.rendering_dt) / dt))
     frame_index = 0
     debug_path = PROJECT_ROOT / settings["debug"]["candidate_image_path"]
@@ -672,6 +674,7 @@ def _run(
                         )
                         segment_index += 1
                         previous_tracking_status = None
+                        previous_adapter_status = None
                         idle_status = (
                             f"AUTO EXECUTE segment={segment_index} model candidate "
                             f"#{selected.source.index}"
@@ -741,6 +744,24 @@ def _run(
                 )
                 applied = adapter.apply(tracking.command)
                 tracker.feedback(applied)
+                steering = adapter.steering_diagnostics()
+                if (
+                    adapter.status != previous_adapter_status
+                    or (
+                        adapter.status == "STEERING_TRANSIENT"
+                        and now - last_steering_log_time >= 1.0
+                    )
+                ):
+                    logger.info(
+                        "[NavDPSteering] status=%s max_error_deg=%.2f "
+                        "target_deg=%s measured_deg=%s",
+                        adapter.status,
+                        math.degrees(float(steering["max_error_rad"])),
+                        _degree_map(steering["target_rad"]),
+                        _degree_map(steering["measured_rad"]),
+                    )
+                    previous_adapter_status = adapter.status
+                    last_steering_log_time = now
                 status_text = (
                     f"{tracking.status}/{adapter.status} candidate={selected_index} "
                     f"remaining={tracking.remaining_m:.2f}m error={tracking.cross_track_m:.2f}m\n"
@@ -1052,6 +1073,13 @@ def _log_candidate_table(logger, candidates: list[_FrozenCandidate]) -> None:
 
 def _format_value(value: float | None) -> str:
     return "N/A" if value is None else f"{value:.4f}"
+
+
+def _degree_map(values: dict[str, float]) -> dict[str, float]:
+    return {
+        name: round(math.degrees(float(value)), 1)
+        for name, value in values.items()
+    }
 
 
 def _is_stopped(state: OdomState) -> bool:

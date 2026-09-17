@@ -1,13 +1,6 @@
-"""Phase-1 NavDP integration: click a map goal and navigate to it.
-
-The local map is used only as a human point-goal selector. It does not filter,
-score, or certify candidate trajectories; those decisions belong to Phase 2.
-NavDP's own selected candidate is followed automatically and regenerated until
-the fixed odometry-frame point goal is reached.
-"""
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 import logging
 import math
 from pathlib import Path
@@ -26,13 +19,26 @@ from vln_nav.active_perception.camera_geometry import (
 )
 from vln_nav.active_perception.contracts import TimedDepthObservation
 from vln_nav.active_perception.local_geometry import (
-    SOURCE_BITS,
     LocalVoxelMap,
     LocalVoxelMapConfig,
+    LocalVoxelSnapshot,
 )
 from vln_nav.app.agx_trajectory_test import _validate_geometry
+from vln_nav.app.agx_local_3d_map_test import (
+    _project_local_points,
+    _render_local_occupancy,
+)
 from vln_nav.control.locomotion import create_locomotion_controller
-from vln_nav.control.trajectory import AgxVelocityAdapter, PathTracker
+from vln_nav.control.trajectory import (
+    AgxVelocityAdapter,
+    PathTracker,
+    VelocityCommand,
+    wheel_targets,
+)
+from vln_nav.navigation.fine_local_planner import (
+    FineLocalPlanner,
+    FinePlannerConfig,
+)
 from vln_nav.navigation.navdp_client import (
     NavDPCandidate,
     NavDPClient,
@@ -40,6 +46,12 @@ from vln_nav.navigation.navdp_client import (
     NavDPResult,
 )
 from vln_nav.navigation.odometry import OdomState, SimOdometrySensor
+from vln_nav.navigation.trajectory_clearance import (
+    FootprintConfig,
+    assess_path_clearance,
+    clear_current_footprint,
+    planning_grid_from_snapshot,
+)
 from vln_nav.runtime.config import DEFAULT_CONFIG_PATH, PROJECT_ROOT, load_config
 from vln_nav.runtime.isaac_runtime_utils import (
     bind_viewport_to_camera,
@@ -74,9 +86,17 @@ class _InferenceJob:
     odom_state: OdomState
 
 
-class _NavDPWorker:
-    """Keep network/model latency away from the Isaac simulation thread."""
+@dataclass(frozen=True)
+class _FinePlanningJob:
+    request_id: int
+    snapshot: LocalVoxelSnapshot
+    start_pose_world: tuple[float, float, float]
+    goal_world_xy: tuple[float, float]
+    submitted_sim_time_sec: float
+    floor_z_m: float
 
+
+class _NavDPWorker:
     def __init__(self, client: NavDPClient) -> None:
         self._client = client
         self._initialized = False
@@ -122,9 +142,69 @@ class _NavDPWorker:
                 self._busy = False
 
 
-class _GoalMapPanel:
-    """Compact control panel whose BEV image is also the point-goal picker."""
+class _FinePlanningWorker:
+    def __init__(
+        self,
+        *,
+        planner: FineLocalPlanner,
+        obstacle_min_height_m: float,
+        obstacle_max_height_m: float,
+    ) -> None:
+        self._planner = planner
+        self._obstacle_min_height_m = float(obstacle_min_height_m)
+        self._obstacle_max_height_m = float(obstacle_max_height_m)
+        self._busy = False
+        self._lock = threading.Lock()
+        self._results: queue.Queue = queue.Queue()
 
+    @property
+    def busy(self) -> bool:
+        with self._lock:
+            return self._busy
+
+    def submit(self, job: _FinePlanningJob) -> bool:
+        with self._lock:
+            if self._busy:
+                return False
+            self._busy = True
+        threading.Thread(target=self._run, args=(job,), daemon=True).start()
+        return True
+
+    def poll(self):
+        try:
+            return self._results.get_nowait()
+        except queue.Empty:
+            return None
+
+    def _run(self, job: _FinePlanningJob) -> None:
+        try:
+            grid = planning_grid_from_snapshot(
+                job.snapshot,
+                floor_z_m=job.floor_z_m,
+                obstacle_min_height_m=self._obstacle_min_height_m,
+                obstacle_max_height_m=self._obstacle_max_height_m,
+            )
+            grid = clear_current_footprint(
+                grid,
+                x_m=job.start_pose_world[0],
+                y_m=job.start_pose_world[1],
+                yaw_rad=job.start_pose_world[2],
+                footprint=self._planner.footprint,
+            )
+            plan = self._planner.plan(
+                grid=grid,
+                start_pose_world=job.start_pose_world,
+                goal_world_xy=job.goal_world_xy,
+            )
+            self._results.put((job, grid, plan, None))
+        except Exception as exc:
+            self._results.put((job, None, None, exc))
+        finally:
+            with self._lock:
+                self._busy = False
+
+
+class _GoalMapPanel:
     def __init__(self, ui, *, image_size_px: int, command_sink) -> None:
         self._ui = ui
         self._command_sink = command_sink
@@ -136,9 +216,9 @@ class _GoalMapPanel:
         self._provider = ui.ByteImageProvider()
         self._provider.set_data_array(initial.reshape(-1), [size, size])
         self.window = ui.Window(
-            "AGX NavDP Goal",
+            "AGX Navigation Modes",
             width=size + 34,
-            height=size + 150,
+            height=size + 195,
             visible=True,
         )
         with self.window.frame:
@@ -152,9 +232,19 @@ class _GoalMapPanel:
                     opaque_for_mouse_events=True,
                 )
                 self._image.set_mouse_pressed_fn(self._on_map_pressed)
-                self.goal_label = ui.Label("Click known free space to navigate")
+                with ui.HStack(height=34):
+                    ui.Button(
+                        "COARSE NAVDP",
+                        clicked_fn=lambda: command_sink(("SET_MODE", "COARSE_NAVDP")),
+                    )
+                    ui.Button(
+                        "FINE HYBRID A*",
+                        clicked_fn=lambda: command_sink(("SET_MODE", "FINE_HYBRID_ASTAR")),
+                    )
+                self.mode_label = ui.Label("Mode: COARSE_NAVDP")
+                self.goal_label = ui.Label("Click known free space to select a goal")
                 ui.Button("STOP", height=34, clicked_fn=lambda: command_sink("STOP"))
-                self.candidate_label = ui.Label("Candidate: none")
+                self.candidate_label = ui.Label("Path: none")
                 self.status_label = ui.Label("Building local map", word_wrap=True)
 
     def update_map(self, goal_map: BevGoalMap) -> None:
@@ -164,7 +254,7 @@ class _GoalMapPanel:
 
     def set_goal_text(self, forward_m: float, left_m: float) -> None:
         self.goal_label.text = (
-            f"Goal  forward {forward_m:.2f} m   left {left_m:+.2f} m"
+            f"Goal: forward {forward_m:.2f} m, left {left_m:+.2f} m"
         )
 
     def set_goal_error(self, message: str) -> None:
@@ -201,42 +291,130 @@ class _GoalMapPanel:
         self._command_sink(("SELECT_GOAL", forward, left))
 
 
-def _load_settings() -> tuple[dict, NavDPClientConfig, dict, LocalVoxelMapConfig]:
+class _FineGeometryPanel:
+    def __init__(self, ui, *, width: int = 800, height: int = 560) -> None:
+        initial = np.zeros((height, width, 4), dtype=np.uint8)
+        initial[:, :, 3] = 255
+        self._provider = ui.ByteImageProvider()
+        self._provider.set_data_array(initial.reshape(-1), [width, height])
+        self.window = ui.Window(
+            "Fine Geometry",
+            width=width + 24,
+            height=height + 24,
+            visible=True,
+        )
+        with self.window.frame:
+            ui.ImageWithProvider(
+                self._provider,
+                width=width,
+                height=height,
+                fill_policy=ui.IwpFillPolicy.IWP_STRETCH,
+                pixel_aligned=True,
+            )
+
+    def update(self, image: Image.Image) -> None:
+        rgba = np.ascontiguousarray(np.asarray(image.convert("RGBA"), dtype=np.uint8))
+        height, width = rgba.shape[:2]
+        self._provider.set_data_array(rgba.reshape(-1), [width, height])
+
+    def shutdown(self) -> None:
+        self.window.visible = False
+
+
+def _load_settings() -> tuple[
+    dict,
+    NavDPClientConfig,
+    dict,
+    LocalVoxelMapConfig,
+    FinePlannerConfig,
+    FootprintConfig,
+]:
     with SETTINGS_PATH.open(encoding="utf-8") as handle:
         data = yaml.safe_load(handle) or {}
-    expected = {"server", "camera", "goal", "execution", "map_selector", "debug"}
+    expected = {
+        "server",
+        "camera",
+        "goal",
+        "execution",
+        "fine_planner",
+        "map_selector",
+        "debug",
+    }
     if set(data) != expected:
-        raise ValueError(f"NavDP Phase-1 config requires exactly: {sorted(expected)}")
+        raise ValueError(f"Navigation modes config requires exactly: {sorted(expected)}")
     server = NavDPClientConfig.from_mapping(data["server"])
 
     camera = data["camera"]
     if set(camera) != {"width", "height", "frequency_hz", "warmup_render_frames"}:
-        raise ValueError("Invalid NavDP Phase-1 camera fields")
+        raise ValueError("Invalid navigation modes camera fields")
     if any(int(camera[name]) <= 0 for name in camera):
-        raise ValueError("NavDP Phase-1 camera values must be positive")
+        raise ValueError("Navigation modes camera values must be positive")
 
     goal = data["goal"]
     if set(goal) != {
         "min_distance_m",
         "max_distance_m",
     }:
-        raise ValueError("Invalid NavDP Phase-1 goal fields")
+        raise ValueError("Invalid navigation modes goal fields")
     if not 0 < float(goal["min_distance_m"]) < float(goal["max_distance_m"]) <= 10.0:
         raise ValueError("NavDP point-goal distance bounds must satisfy 0 < min < max <= 10")
 
     execution = data["execution"]
     if set(execution) != {
-        "max_result_pose_delta_m",
-        "max_result_yaw_delta_deg",
+        "default_mode",
+        "coarse_planning_period_sec",
+        "fine_planning_period_sec",
+        "fine_heading_prepare_deg",
+        "fine_heading_stop_deg",
+        "fine_heading_rate_radps",
+        "max_result_age_sec",
+        "max_path_join_error_m",
+        "min_remaining_path_m",
         "goal_reached_tolerance_m",
     }:
-        raise ValueError("Invalid NavDP Phase-1 execution fields")
-    if any(float(value) <= 0 for value in execution.values()):
+        raise ValueError("Invalid navigation modes execution fields")
+    if execution["default_mode"] not in {"COARSE_NAVDP", "FINE_HYBRID_ASTAR"}:
+        raise ValueError("Invalid default navigation mode")
+    if any(
+        float(value) <= 0
+        for name, value in execution.items()
+        if name != "default_mode"
+    ):
         raise ValueError("NavDP execution tolerances must be positive")
+    if float(execution["fine_heading_stop_deg"]) >= float(
+        execution["fine_heading_prepare_deg"]
+    ):
+        raise ValueError("Fine heading stop angle must be smaller than prepare angle")
+
+    fine = data["fine_planner"]
+    fine_fields = {
+        "footprint",
+        "obstacle_min_height_m",
+        "obstacle_max_height_m",
+        *{item.name for item in fields(FinePlannerConfig)},
+    }
+    if set(fine) != fine_fields:
+        raise ValueError(f"fine_planner requires exactly: {sorted(fine_fields)}")
+    footprint_data = fine["footprint"]
+    footprint_fields = {item.name for item in fields(FootprintConfig)}
+    if not isinstance(footprint_data, dict) or set(footprint_data) != footprint_fields:
+        raise ValueError(f"fine_planner.footprint requires: {sorted(footprint_fields)}")
+    footprint = FootprintConfig(**{
+        name: float(footprint_data[name]) for name in footprint_fields
+    })
+    footprint.validate()
+    if not 0 <= float(fine["obstacle_min_height_m"]) < float(
+        fine["obstacle_max_height_m"]
+    ):
+        raise ValueError("Invalid fine planner obstacle height interval")
+    fine_config = FinePlannerConfig.from_mapping({
+        item.name: fine[item.name] for item in fields(FinePlannerConfig)
+    })
 
     selector = data["map_selector"]
     selector_fields = {
         "source_config_path",
+        "sources",
         "image_size_px",
         "view_size_m",
         "rear_view_m",
@@ -246,6 +424,9 @@ def _load_settings() -> tuple[dict, NavDPClientConfig, dict, LocalVoxelMapConfig
     }
     if set(selector) != selector_fields:
         raise ValueError(f"NavDP map_selector requires exactly: {sorted(selector_fields)}")
+    map_sources = tuple(map(str, selector["sources"]))
+    if map_sources != ("front", "down"):
+        raise ValueError("Navigation modes map sources must be front and down")
     if int(selector["image_size_px"]) < 128:
         raise ValueError("map_selector.image_size_px must be at least 128")
     if float(selector["view_size_m"]) <= 0 or float(selector["render_period_sec"]) <= 0:
@@ -279,19 +460,35 @@ def _load_settings() -> tuple[dict, NavDPClientConfig, dict, LocalVoxelMapConfig
         raise ValueError("map integration period must be positive")
 
     debug = data["debug"]
-    if set(debug) != {"candidate_image_path", "view_size_m"}:
-        raise ValueError("Invalid NavDP Phase-1 debug fields")
-    if not str(debug["candidate_image_path"]).strip():
-        raise ValueError("NavDP candidate debug path is empty")
-    if float(debug["view_size_m"]) <= 0:
+    if set(debug) != {
+        "candidate_image_path",
+        "fine_image_path",
+        "fine_update_period_sec",
+        "view_size_m",
+    }:
+        raise ValueError("Invalid navigation modes debug fields")
+    if not str(debug["candidate_image_path"]).strip() or not str(
+        debug["fine_image_path"]
+    ).strip():
+        raise ValueError("Navigation debug path is empty")
+    if float(debug["view_size_m"]) <= 0 or float(
+        debug["fine_update_period_sec"]
+    ) <= 0:
         raise ValueError("Invalid NavDP candidate debug view size")
-    return data, server, map_settings, map_config
+    return data, server, map_settings, map_config, fine_config, footprint
 
 
 def main() -> int:
     config = load_config(DEFAULT_CONFIG_PATH)
     profile = load_robot_profile(profile_name="agx", project_root=PROJECT_ROOT)
-    settings, client_config, map_settings, map_config = _load_settings()
+    (
+        settings,
+        client_config,
+        map_settings,
+        map_config,
+        fine_config,
+        footprint,
+    ) = _load_settings()
     logger = _make_logger()
 
     from isaacsim import SimulationApp
@@ -314,29 +511,31 @@ def main() -> int:
                 client_config,
                 map_settings,
                 map_config,
+                fine_config,
+                footprint,
                 logger,
             )
         except Exception:
-            logger.exception("[NavDPPhase1Fatal] test crashed")
+            logger.exception("[NavigationModesFatal] test crashed")
             return 1
     finally:
         app.close()
 
 
 def _make_logger() -> logging.Logger:
-    logger = logging.getLogger("agx_navdp_phase1")
+    logger = logging.getLogger("agx_navigation_modes")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
     formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
     console = logging.StreamHandler(sys.stdout)
     console.setFormatter(formatter)
     logger.addHandler(console)
-    log_path = PROJECT_ROOT / "logs/agx_navdp_trajectory_test.log"
+    log_path = PROJECT_ROOT / "logs/agx_navigation_modes_test.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     file_handler = logging.FileHandler(log_path, mode="w", encoding="utf-8")
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
-    logger.info("[NavDPPhase1] log=%s", log_path)
+    logger.info("[NavigationModes] log=%s", log_path)
     return logger
 
 
@@ -348,6 +547,8 @@ def _run(
     client_config,
     map_settings,
     map_config,
+    fine_config,
+    footprint,
     logger,
 ) -> int:
     import omni.ui as ui
@@ -368,7 +569,7 @@ def _run(
     if not scene_path.is_absolute():
         scene_path = PROJECT_ROOT / scene_path
     if not scene_path.is_file():
-        raise FileNotFoundError(f"NavDP Phase-1 scene USD does not exist: {scene_path}")
+        raise FileNotFoundError(f"Navigation modes scene USD does not exist: {scene_path}")
     add_reference_to_stage(str(scene_path), config.scene.prim_path)
     if config.scene.add_default_ground_plane:
         world.scene.add_default_ground_plane()
@@ -380,7 +581,7 @@ def _run(
         is_stage_loading=is_stage_loading,
         timeout_sec=config.scene.stage_load_timeout_sec,
         logger=logger,
-        label="AGX NavDP Phase-1 scene",
+        label="AGX navigation modes scene",
     )
     set_local_xform(
         stage=stage,
@@ -400,7 +601,7 @@ def _run(
     robot = world.scene.add(
         SingleArticulation(
             prim_path=articulation_path,
-            name="agx_navdp_phase1",
+            name="agx_navigation_modes",
             reset_xform_properties=False,
         )
     )
@@ -420,6 +621,7 @@ def _run(
         ),
         kind="NavDP observer camera",
     )
+    map_sources = tuple(map(str, settings["map_selector"]["sources"]))
     map_role_paths = {
         source: resolve_existing_prim_path(
             stage=stage,
@@ -429,7 +631,7 @@ def _run(
             ),
             kind=f"NavDP goal-map {source} camera",
         )
-        for source in SOURCE_BITS
+        for source in map_sources
     }
     if map_role_paths["front"] != camera_path:
         raise RuntimeError(
@@ -451,7 +653,9 @@ def _run(
     )
     map_camera_config = map_settings["camera"]
     map_cameras = {"front": camera}
-    for source in ("down", "arm"):
+    for source in map_sources:
+        if source == "front":
+            continue
         path = map_role_paths[source]
         if not stage.GetPrimAtPath(path).IsA(UsdGeom.Camera):
             raise RuntimeError(f"NavDP goal-map {source} prim is not a Camera: {path}")
@@ -481,8 +685,27 @@ def _run(
     adapter = AgxVelocityAdapter(drive, profile.agx_controller.continuous)
     odom = SimOdometrySensor(logger=logger)
     worker = _NavDPWorker(NavDPClient(client_config))
+    fine_planner = FineLocalPlanner(fine_config, footprint)
+    for curvature in fine_config.curvature_samples_per_m:
+        wheel_targets(
+            VelocityCommand(0.20, 0.20 * float(curvature)),
+            profile.agx_controller.continuous,
+        )
+    fine_worker = _FinePlanningWorker(
+        planner=fine_planner,
+        obstacle_min_height_m=float(settings["fine_planner"]["obstacle_min_height_m"]),
+        obstacle_max_height_m=float(settings["fine_planner"]["obstacle_max_height_m"]),
+    )
+    fine_tracking_config = replace(
+        profile.agx_controller.continuous,
+        max_linear_mps=0.20,
+        max_angular_radps=0.35,
+        lookahead_m=0.20,
+        arrival_distance_m=0.05,
+        max_path_error_m=0.20,
+    )
     logger.info(
-        "[NavDPPhase1] scene=%s camera=%s server=%s frame=base(+X forward,+Y left)",
+        "[NavigationModes] scene=%s camera=%s server=%s frame=base(+X forward,+Y left)",
         scene_path,
         camera_path,
         client_config.base_url,
@@ -500,6 +723,7 @@ def _run(
         image_size_px=int(settings["map_selector"]["image_size_px"]),
         command_sink=lambda value: command.__setitem__(0, value),
     )
+    fine_panel = _FineGeometryPanel(ui)
 
     for _ in range(int(camera_config["warmup_render_frames"])):
         adapter.stop()
@@ -510,34 +734,50 @@ def _run(
     local_map.reset(np.asarray(position[:3], dtype=np.float64))
 
     tracker = None
+    tracker_mode: str | None = None
+    fine_heading_active = False
+    display_path_odom_xy: np.ndarray | None = None
     frozen_candidates: list[_FrozenCandidate] = []
     selected_index = 0
     request_id = 0
     accepted_request_id = 0
-    active_job: _InferenceJob | None = None
+    fine_request_id = 0
+    accepted_fine_request_id = 0
     selected_goal_odom_xy: np.ndarray | None = None
     navigation_active = False
-    replan_pending = False
-    segment_index = 0
-    idle_status = "Click known free space to navigate"
+    mode = str(settings["execution"]["default_mode"])
+    generation_index = 0
+    idle_status = "Click known free space to select a goal"
     previous_tracking_status = None
     previous_adapter_status = None
     last_steering_log_time = -float("inf")
     render_stride = max(1, round(float(profile.simulation.rendering_dt) / dt))
     frame_index = 0
     debug_path = PROJECT_ROOT / settings["debug"]["candidate_image_path"]
+    fine_debug_path = PROJECT_ROOT / settings["debug"]["fine_image_path"]
     last_map_integration_time = -float("inf")
     last_map_render_time = -float("inf")
+    last_coarse_request_time = -float("inf")
+    last_fine_request_time = -float("inf")
+    last_fine_debug_time = -float("inf")
     map_integration_period = float(map_settings["map"]["integration_period_sec"])
     map_render_period = float(settings["map_selector"]["render_period_sec"])
+    latest_snapshot = local_map.snapshot()
+    fine_summary = "Fine path: none"
+    panel.mode_label.text = f"Mode: {mode}"
 
     try:
         while app.is_running():
             if not world.is_playing():
                 adapter.stop()
                 tracker = None
+                navigation_active = False
                 command[0] = None
-                panel.status_label.text = "PAUSED: resume, then select a goal"
+                request_id += 1
+                accepted_request_id = request_id
+                fine_request_id += 1
+                accepted_fine_request_id = fine_request_id
+                panel.status_label.text = "PAUSED: resume and select a new goal"
                 app.update()
                 continue
 
@@ -585,7 +825,9 @@ def _run(
                             ],
                             center_world_xyz=np.asarray(position[:3], dtype=np.float64),
                         )
+                        latest_snapshot = local_map.snapshot()
                         last_map_integration_time = now
+
             if now - last_map_render_time >= map_render_period:
                 displayed_goal = (
                     None
@@ -593,7 +835,7 @@ def _run(
                     else _odom_goal_to_local(selected_goal_odom_xy, state)
                 )
                 goal_map = render_bev_goal_map(
-                    local_map.snapshot(),
+                    latest_snapshot,
                     robot_world_xyz=position[:3],
                     robot_yaw_rad=robot_yaw_world,
                     view_size_m=float(settings["map_selector"]["view_size_m"]),
@@ -607,48 +849,89 @@ def _run(
                     ),
                     goal_local_xy=displayed_goal,
                 )
+                if display_path_odom_xy is not None:
+                    path_local = _odom_path_to_local(display_path_odom_xy, state)
+                    goal_map = _overlay_path_on_goal_map(
+                        goal_map,
+                        path_local,
+                        color=(34, 177, 76, 255)
+                        if tracker_mode == "FINE_HYBRID_ASTAR"
+                        else (238, 184, 45, 255),
+                    )
                 panel.update_map(goal_map)
                 if displayed_goal is not None:
                     panel.set_goal_text(*displayed_goal)
                 last_map_render_time = now
 
+            if (
+                mode == "FINE_HYBRID_ASTAR"
+                and now - last_fine_debug_time
+                >= float(settings["debug"]["fine_update_period_sec"])
+            ):
+                debug_path_world = (
+                    None
+                    if display_path_odom_xy is None
+                    else _odom_path_to_world(display_path_odom_xy, state)
+                )
+                debug_goal_world = (
+                    None
+                    if selected_goal_odom_xy is None
+                    else _odom_path_to_world(selected_goal_odom_xy[None, :], state)[0]
+                )
+                geometry_image = _render_fine_geometry(
+                    latest_snapshot,
+                    robot_pose=(
+                        float(position[0]),
+                        float(position[1]),
+                        float(position[2]),
+                        float(robot_yaw_world),
+                    ),
+                    path_world_xy=debug_path_world,
+                    goal_world_xy=debug_goal_world,
+                )
+                fine_panel.update(geometry_image)
+                _save_image(fine_debug_path, geometry_image)
+                last_fine_debug_time = now
+
             completed = worker.poll()
             if completed is not None:
                 job, result, error = completed
-                if job.request_id != accepted_request_id:
+                if (
+                    job.request_id != accepted_request_id
+                    or mode != "COARSE_NAVDP"
+                    or not navigation_active
+                ):
                     logger.info("[NavDPResult] ignored stale request=%d", job.request_id)
                 elif error is not None:
-                    active_job = None
-                    navigation_active = False
-                    replan_pending = False
-                    idle_status = f"INFERENCE FAILED: {error}"
+                    idle_status = "NavDP inference failed; see log"
                     logger.error("[NavDPResult] request=%d failed: %s", job.request_id, error)
                 else:
-                    active_job = None
-                    drift_m = float(np.hypot(
-                        state.pose.x - job.odom_state.pose.x,
-                        state.pose.y - job.odom_state.pose.y,
-                    ))
-                    drift_deg = abs(math.degrees(_wrap_angle(
-                        state.pose.yaw_rad - job.odom_state.pose.yaw_rad
-                    )))
+                    result_age = now - float(job.odom_state.timestamp_sec)
+                    frozen_candidates = _freeze_candidates(result, job)
+                    selected_index = result.model_choice_index
+                    selected = frozen_candidates[selected_index]
+                    joined_path, join_error, remaining_length = _join_path_from_current(
+                        selected.odom_path_xy,
+                        current_xy=(state.pose.x, state.pose.y),
+                    )
                     execution = settings["execution"]
-                    if (
-                        drift_m > float(execution["max_result_pose_delta_m"])
-                        or drift_deg > float(execution["max_result_yaw_delta_deg"])
-                    ):
-                        navigation_active = False
-                        replan_pending = False
-                        idle_status = "RESULT REJECTED: robot moved during inference"
-                        logger.error(
-                            "[NavDPResult] request=%d rejected pose_delta=%.3fm yaw_delta=%.2fdeg",
+                    rejection = _rolling_result_rejection(
+                        result_age_sec=result_age,
+                        join_error_m=join_error,
+                        remaining_length_m=remaining_length,
+                        execution=execution,
+                    )
+                    if rejection is not None:
+                        logger.warning(
+                            "[NavDPReject] request=%d reason=%s age=%.3fs "
+                            "join_error=%.3fm remaining=%.3fm",
                             job.request_id,
-                            drift_m,
-                            drift_deg,
+                            rejection,
+                            result_age,
+                            join_error,
+                            remaining_length,
                         )
                     else:
-                        frozen_candidates = _freeze_candidates(result, job)
-                        selected_index = result.model_choice_index
                         _save_candidate_debug(
                             debug_path,
                             result,
@@ -656,51 +939,129 @@ def _run(
                             goal_xy=(job.goal_forward_m, job.goal_left_m),
                             view_size_m=float(settings["debug"]["view_size_m"]),
                         )
-                        logger.info(
-                            "[NavDPResult] request=%d candidates=%d model_choice=%d "
-                            "latency=%.3fs goal=[%.2f,%.2f]",
-                            job.request_id,
-                            len(frozen_candidates),
-                            result.model_choice_index,
-                            result.latency_sec,
-                            job.goal_forward_m,
-                            job.goal_left_m,
-                        )
-                        _log_candidate_table(logger, frozen_candidates)
-                        selected = frozen_candidates[selected_index]
                         tracker = PathTracker(
-                            selected.odom_path_xy,
+                            joined_path,
                             profile.agx_controller.continuous,
+                            initial_speed_mps=state.linear_velocity_mps,
                         )
-                        segment_index += 1
+                        display_path_odom_xy = joined_path.copy()
+                        tracker_mode = mode
+                        generation_index += 1
                         previous_tracking_status = None
                         previous_adapter_status = None
-                        idle_status = (
-                            f"AUTO EXECUTE segment={segment_index} model candidate "
-                            f"#{selected.source.index}"
+                        logger.info(
+                            "[NavDPSwitch] generation=%d request=%d candidate=%d "
+                            "age=%.3fs join_error=%.3fm remaining=%.3fm latency=%.3fs",
+                            generation_index,
+                            job.request_id,
+                            selected.source.index,
+                            result_age,
+                            join_error,
+                            remaining_length,
+                            result.latency_sec,
+                        )
+
+            fine_completed = fine_worker.poll()
+            if fine_completed is not None:
+                job, grid, plan, error = fine_completed
+                if (
+                    job.request_id != accepted_fine_request_id
+                    or mode != "FINE_HYBRID_ASTAR"
+                    or not navigation_active
+                ):
+                    logger.info("[FineResult] ignored stale request=%d", job.request_id)
+                elif error is not None:
+                    idle_status = "Fine planning failed; inspect Fine Geometry and log"
+                    logger.error("[FineResult] request=%d failed: %s", job.request_id, error)
+                else:
+                    result_age = now - job.submitted_sim_time_sec
+                    path_odom = _world_path_to_odom(plan.path_world_xy, state)
+                    joined_path, join_error, remaining_length = _join_path_from_current(
+                        path_odom,
+                        current_xy=(state.pose.x, state.pose.y),
+                    )
+                    clearance = assess_path_clearance(
+                        grid,
+                        plan.path_world_xy,
+                        footprint=footprint,
+                    )
+                    rejection = _rolling_result_rejection(
+                        result_age_sec=result_age,
+                        join_error_m=join_error,
+                        remaining_length_m=remaining_length,
+                        execution=settings["execution"],
+                    )
+                    if clearance.collision:
+                        rejection = "fine_path_collision"
+                    if rejection is not None:
+                        logger.warning(
+                            "[FineReject] request=%d reason=%s age=%.3fs "
+                            "join_error=%.3fm remaining=%.3fm",
+                            job.request_id,
+                            rejection,
+                            result_age,
+                            join_error,
+                            remaining_length,
+                        )
+                    else:
+                        tracker = PathTracker(
+                            joined_path,
+                            fine_tracking_config,
+                            initial_speed_mps=state.linear_velocity_mps,
+                        )
+                        display_path_odom_xy = joined_path.copy()
+                        tracker_mode = mode
+                        generation_index += 1
+                        previous_tracking_status = None
+                        previous_adapter_status = None
+                        fine_summary = (
+                            f"Fine nodes={plan.expanded_node_count} "
+                            f"clearance={clearance.min_clearance_m:.2f}m "
+                            f"unknown={100.0 * clearance.unknown_ratio:.1f}%"
                         )
                         logger.info(
-                            "[NavDPAutoExecute] segment=%d candidate=%d rank=%s "
-                            "value=%s length=%.2fm",
-                            segment_index,
-                            selected.source.index,
-                            selected.rank,
-                            _format_value(selected.source.value),
-                            float(tracker.s[-1]),
+                            "[FineSwitch] generation=%d request=%d nodes=%d cost=%.3f "
+                            "age=%.3fs join_error=%.3fm remaining=%.3fm "
+                            "clearance=%.3fm unknown=%.3f rejected=[collision:%d,unknown:%d,outside:%d]",
+                            generation_index,
+                            job.request_id,
+                            plan.expanded_node_count,
+                            plan.path_cost,
+                            result_age,
+                            join_error,
+                            remaining_length,
+                            clearance.min_clearance_m,
+                            clearance.unknown_ratio,
+                            plan.rejected_collision_count,
+                            plan.rejected_unknown_count,
+                            plan.rejected_outside_count,
                         )
 
             if command[0] is not None:
                 action, command[0] = command[0], None
-                if isinstance(action, tuple) and action[0] == "SELECT_GOAL":
-                    if tracker is not None or worker.busy or not _is_stopped(state):
-                        idle_status = "WAIT: stop before selecting a new goal"
-                        panel.set_goal_error("Stop before selecting a new goal")
+                if isinstance(action, tuple) and action[0] == "SET_MODE":
+                    adapter.stop()
+                    tracker = None
+                    tracker_mode = None
+                    fine_heading_active = False
+                    display_path_odom_xy = None
+                    navigation_active = False
+                    request_id += 1
+                    accepted_request_id = request_id
+                    fine_request_id += 1
+                    accepted_fine_request_id = fine_request_id
+                    mode = str(action[1])
+                    panel.mode_label.text = f"Mode: {mode}"
+                    idle_status = f"MODE: {mode}; click a goal"
+                    logger.info("[NavigationMode] selected=%s", mode)
+                elif isinstance(action, tuple) and action[0] == "SELECT_GOAL":
+                    if tracker is not None or not _is_stopped(state):
+                        idle_status = "Stop the robot before selecting a new goal"
+                        panel.set_goal_error("Stop the robot before selecting a new goal")
                     else:
                         try:
                             forward, left = _validate_goal_values(
-                                float(action[1]),
-                                float(action[2]),
-                                settings,
+                                float(action[1]), float(action[2]), settings
                             )
                             selected_goal_odom_xy = _transform_xy(
                                 np.asarray([[forward, left]], dtype=np.float64),
@@ -708,16 +1069,24 @@ def _run(
                                 state.pose.y,
                                 state.pose.yaw_rad,
                             )[0]
+                            request_id += 1
+                            accepted_request_id = request_id
+                            fine_request_id += 1
+                            accepted_fine_request_id = fine_request_id
                             frozen_candidates = []
+                            display_path_odom_xy = None
                             selected_index = 0
                             navigation_active = True
-                            replan_pending = True
-                            segment_index = 0
+                            fine_heading_active = False
+                            generation_index = 0
+                            last_coarse_request_time = -float("inf")
+                            last_fine_request_time = -float("inf")
                             panel.set_goal_text(forward, left)
-                            idle_status = "Goal selected: waiting to request NavDP"
+                            idle_status = f"GOAL ACTIVE: {mode}"
                             logger.info(
-                                "[NavDPGoal] selected forward=%.2fm left=%+.2fm "
-                                "odom=[%.2f,%.2f] auto=1",
+                                "[NavigationGoal] mode=%s forward=%.2fm left=%+.2fm "
+                                "odom=[%.2f,%.2f]",
+                                mode,
                                 forward,
                                 left,
                                 float(selected_goal_odom_xy[0]),
@@ -725,22 +1094,71 @@ def _run(
                             )
                         except ValueError as exc:
                             panel.set_goal_error(str(exc))
-                            idle_status = f"GOAL REJECTED: {exc}"
+                            idle_status = "Goal rejected; see log"
                 elif action == "STOP":
                     request_id += 1
                     accepted_request_id = request_id
+                    fine_request_id += 1
+                    accepted_fine_request_id = fine_request_id
                     adapter.stop()
                     tracker = None
-                    active_job = None
+                    tracker_mode = None
+                    fine_heading_active = False
+                    display_path_odom_xy = None
                     navigation_active = False
-                    replan_pending = False
-                    idle_status = "CANCELLED"
-                    logger.info("[NavDPControl] STOP")
+                    idle_status = "NAVIGATION STOPPED"
+                    logger.info("[NavigationControl] STOP")
+
+            goal_distance = float("inf")
+            fine_goal_bearing = 0.0
+            if selected_goal_odom_xy is not None:
+                goal_distance = float(np.linalg.norm(
+                    selected_goal_odom_xy
+                    - np.asarray([state.pose.x, state.pose.y], dtype=np.float64)
+                ))
+                forward, left = _odom_goal_to_local(selected_goal_odom_xy, state)
+                fine_goal_bearing = math.atan2(left, forward)
+            if navigation_active and goal_distance <= float(
+                settings["execution"]["goal_reached_tolerance_m"]
+            ):
+                navigation_active = False
+                tracker = None
+                tracker_mode = None
+                fine_heading_active = False
+                adapter.stop()
+                idle_status = f"GOAL REACHED: distance={goal_distance:.2f}m"
+                logger.info(
+                    "[NavigationGoalReached] mode=%s generations=%d distance=%.3fm",
+                    mode,
+                    generation_index,
+                    goal_distance,
+                )
+
+            if (
+                navigation_active
+                and mode == "FINE_HYBRID_ASTAR"
+                and tracker is None
+                and not fine_worker.busy
+            ):
+                prepare_angle = math.radians(
+                    float(settings["execution"]["fine_heading_prepare_deg"])
+                )
+                stop_angle = math.radians(
+                    float(settings["execution"]["fine_heading_stop_deg"])
+                )
+                if fine_heading_active:
+                    fine_heading_active = abs(fine_goal_bearing) > stop_angle
+                elif abs(fine_goal_bearing) >= prepare_angle:
+                    fine_heading_active = True
 
             if tracker is not None:
+                tracking_config = (
+                    fine_tracking_config
+                    if tracker_mode == "FINE_HYBRID_ASTAR"
+                    else profile.agx_controller.continuous
+                )
                 tracking = tracker.step(
-                    (state.pose.x, state.pose.y, state.pose.yaw_rad),
-                    dt,
+                    (state.pose.x, state.pose.y, state.pose.yaw_rad), dt
                 )
                 applied = adapter.apply(tracking.command)
                 tracker.feedback(applied)
@@ -753,8 +1171,9 @@ def _run(
                     )
                 ):
                     logger.info(
-                        "[NavDPSteering] status=%s max_error_deg=%.2f "
+                        "[NavigationSteering] mode=%s status=%s max_error_deg=%.2f "
                         "target_deg=%s measured_deg=%s",
+                        tracker_mode,
                         adapter.status,
                         math.degrees(float(steering["max_error_rad"])),
                         _degree_map(steering["target_rad"]),
@@ -763,140 +1182,126 @@ def _run(
                     previous_adapter_status = adapter.status
                     last_steering_log_time = now
                 status_text = (
-                    f"{tracking.status}/{adapter.status} candidate={selected_index} "
+                    f"{tracker_mode} {tracking.status}/{adapter.status} "
                     f"remaining={tracking.remaining_m:.2f}m error={tracking.cross_track_m:.2f}m\n"
-                    f"v={applied.linear_mps:.3f}m/s w={applied.angular_radps:.3f}rad/s"
+                    f"v={applied.linear_mps:.3f}m/s w={applied.angular_radps:.3f}rad/s "
+                    f"limit={tracking_config.max_linear_mps:.2f}m/s"
                 )
                 if tracking.status != previous_tracking_status:
-                    logger.info("[NavDPTracking] %s", status_text.replace("\n", " "))
+                    logger.info(
+                        "[NavigationTracking] %s", status_text.replace("\n", " ")
+                    )
                     previous_tracking_status = tracking.status
                 if tracking.status != "TRACKING":
                     adapter.stop()
-                    if tracking.status == "ARRIVED" and selected_goal_odom_xy is not None:
-                        goal_distance = float(np.linalg.norm(
-                            selected_goal_odom_xy
-                            - np.asarray([state.pose.x, state.pose.y], dtype=np.float64)
-                        ))
-                        if goal_distance <= float(
-                            settings["execution"]["goal_reached_tolerance_m"]
-                        ):
-                            navigation_active = False
-                            replan_pending = False
-                            idle_status = f"GOAL REACHED: distance={goal_distance:.2f}m"
-                            logger.info(
-                                "[NavDPGoalReached] segments=%d distance=%.3fm",
-                                segment_index,
-                                goal_distance,
-                            )
-                        else:
-                            replan_pending = True
-                            idle_status = (
-                                f"SEGMENT {segment_index} COMPLETE: goal remains "
-                                f"{goal_distance:.2f}m; replanning"
-                            )
-                            logger.info(
-                                "[NavDPSegment] segment=%d complete goal_remaining=%.3fm",
-                                segment_index,
-                                goal_distance,
-                            )
-                    else:
-                        navigation_active = False
-                        replan_pending = False
-                        idle_status = status_text
-                        logger.error(
-                            "[NavDPTrackingFailed] segment=%d status=%s",
-                            segment_index,
-                            tracking.status,
-                        )
                     tracker = None
+                    tracker_mode = None
+                    idle_status = (
+                        f"TRACKER {tracking.status}; waiting for rolling replanning"
+                    )
+            elif fine_heading_active:
+                angular = math.copysign(
+                    float(settings["execution"]["fine_heading_rate_radps"]),
+                    fine_goal_bearing,
+                )
+                applied = adapter.apply(VelocityCommand(0.0, angular))
+                status_text = (
+                    f"FINE HEADING PREP bearing={math.degrees(fine_goal_bearing):+.1f}deg "
+                    f"w={applied.angular_radps:+.3f}rad/s"
+                )
             else:
                 adapter.stop()
                 status_text = idle_status
 
             if (
                 navigation_active
-                and replan_pending
-                and tracker is None
-                and not worker.busy
+                and mode == "COARSE_NAVDP"
                 and selected_goal_odom_xy is not None
+                and not worker.busy
+                and now - last_coarse_request_time
+                >= float(settings["execution"]["coarse_planning_period_sec"])
             ):
-                if not _is_stopped(state):
-                    idle_status = "WAITING FOR FULL STOP BEFORE NAVDP"
-                else:
-                    goal_distance = float(np.linalg.norm(
-                        selected_goal_odom_xy
-                        - np.asarray([state.pose.x, state.pose.y], dtype=np.float64)
-                    ))
-                    if goal_distance <= float(
-                        settings["execution"]["goal_reached_tolerance_m"]
-                    ):
-                        navigation_active = False
-                        replan_pending = False
-                        idle_status = f"GOAL REACHED: distance={goal_distance:.2f}m"
-                        logger.info(
-                            "[NavDPGoalReached] segments=%d distance=%.3fm",
-                            segment_index,
-                            goal_distance,
-                        )
-                    else:
-                        try:
-                            forward, left = _validate_goal_values(
-                                *_odom_goal_to_local(selected_goal_odom_xy, state),
-                                settings,
-                            )
-                            panel.set_goal_text(forward, left)
-                            rgb, depth = _capture_rgbd(camera)
-                            request_id += 1
-                            accepted_request_id = request_id
-                            active_job = _InferenceJob(
-                                request_id=request_id,
-                                intrinsics=np.asarray(
-                                    camera.get_intrinsics_matrix(), dtype=np.float64
-                                ).copy(),
-                                rgb=rgb.copy(),
-                                depth_m=depth.copy(),
-                                goal_forward_m=forward,
-                                goal_left_m=left,
-                                odom_state=state,
-                            )
-                            if not worker.submit(active_job):
-                                raise RuntimeError(
-                                    "NavDP worker rejected a concurrent request"
-                                )
-                            replan_pending = False
-                            idle_status = (
-                                f"INFERENCE: goal forward={forward:.2f}m "
-                                f"left={left:+.2f}m"
-                            )
-                            logger.info(
-                                "[NavDPRequest] request=%d segment=%d "
-                                "goal=[%.2f,%.2f] rgb=%s depth=%s",
-                                request_id,
-                                segment_index + 1,
-                                forward,
-                                left,
-                                rgb.shape,
-                                depth.shape,
-                            )
-                        except Exception as exc:
-                            active_job = None
-                            navigation_active = False
-                            replan_pending = False
-                            idle_status = f"REQUEST REJECTED: {exc}"
-                            logger.error("[NavDPRequest] rejected: %s", exc)
+                try:
+                    forward, left = _validate_goal_values(
+                        *_odom_goal_to_local(selected_goal_odom_xy, state), settings
+                    )
+                    rgb, depth = _capture_rgbd(camera)
+                    request_id += 1
+                    accepted_request_id = request_id
+                    job = _InferenceJob(
+                        request_id=request_id,
+                        intrinsics=np.asarray(
+                            camera.get_intrinsics_matrix(), dtype=np.float64
+                        ).copy(),
+                        rgb=rgb.copy(),
+                        depth_m=depth.copy(),
+                        goal_forward_m=forward,
+                        goal_left_m=left,
+                        odom_state=state,
+                    )
+                    if not worker.submit(job):
+                        raise RuntimeError("NavDP worker rejected a concurrent request")
+                    last_coarse_request_time = now
+                    logger.info(
+                        "[NavDPRequest] request=%d goal=[%.2f,%.2f] moving=%s",
+                        request_id,
+                        forward,
+                        left,
+                        not _is_stopped(state),
+                    )
+                except Exception as exc:
+                    idle_status = "NavDP request failed; see log"
+                    logger.error("[NavDPRequest] rejected: %s", exc)
+
+            if (
+                navigation_active
+                and mode == "FINE_HYBRID_ASTAR"
+                and selected_goal_odom_xy is not None
+                and latest_snapshot.version > 0
+                and not fine_worker.busy
+                and not fine_heading_active
+                and now - last_fine_request_time
+                >= float(settings["execution"]["fine_planning_period_sec"])
+            ):
+                fine_request_id += 1
+                accepted_fine_request_id = fine_request_id
+                goal_world = _odom_path_to_world(
+                    selected_goal_odom_xy[None, :], state
+                )[0]
+                job = _FinePlanningJob(
+                    request_id=fine_request_id,
+                    snapshot=latest_snapshot,
+                    start_pose_world=(
+                        float(position[0]),
+                        float(position[1]),
+                        float(robot_yaw_world),
+                    ),
+                    goal_world_xy=(float(goal_world[0]), float(goal_world[1])),
+                    submitted_sim_time_sec=now,
+                    floor_z_m=float(position[2]) - float(profile.spawn_z_m),
+                )
+                if fine_worker.submit(job):
+                    last_fine_request_time = now
+                    logger.info(
+                        "[FineRequest] request=%d map_version=%d goal_world=[%.2f,%.2f]",
+                        fine_request_id,
+                        latest_snapshot.version,
+                        goal_world[0],
+                        goal_world[1],
+                    )
 
             if tracker is None:
                 status_text = idle_status
-
-            if frozen_candidates:
+            if mode == "COARSE_NAVDP" and frozen_candidates:
                 selected = frozen_candidates[selected_index]
                 panel.candidate_label.text = (
                     f"Candidate #{selected.source.index} | rank={selected.rank or 'N/A'} | "
-                    f"value={_format_value(selected.source.value)} | "
-                    f"model_choice={selected.source.is_model_choice}"
+                    f"value={_format_value(selected.source.value)}"
                 )
+            elif mode == "FINE_HYBRID_ASTAR":
+                panel.candidate_label.text = fine_summary
             else:
-                panel.candidate_label.text = "Candidate: none"
+                panel.candidate_label.text = "Path: none"
             if frame_index % render_stride == 0:
                 panel.status_label.text = status_text
             world.step(render=frame_index % render_stride == 0)
@@ -904,6 +1309,7 @@ def _run(
     finally:
         adapter.stop()
         panel.shutdown()
+        fine_panel.shutdown()
     return 0
 
 
@@ -949,6 +1355,147 @@ def _odom_goal_to_local(goal_odom_xy: np.ndarray, state: OdomState) -> tuple[flo
     forward = cosine * delta[0] + sine * delta[1]
     left = -sine * delta[0] + cosine * delta[1]
     return float(forward), float(left)
+
+
+def _odom_path_to_world(path_odom_xy: np.ndarray, state: OdomState) -> np.ndarray:
+    return _transform_xy(
+        np.asarray(path_odom_xy, dtype=np.float64),
+        state.origin_world_xy[0],
+        state.origin_world_xy[1],
+        state.origin_world_yaw_rad,
+    )
+
+
+def _odom_path_to_local(path_odom_xy: np.ndarray, state: OdomState) -> np.ndarray:
+    points = np.asarray(path_odom_xy, dtype=np.float64)
+    delta = points - np.asarray([state.pose.x, state.pose.y], dtype=np.float64)
+    cosine = math.cos(state.pose.yaw_rad)
+    sine = math.sin(state.pose.yaw_rad)
+    return delta @ np.asarray([[cosine, -sine], [sine, cosine]])
+
+
+def _world_path_to_odom(path_world_xy: np.ndarray, state: OdomState) -> np.ndarray:
+    points = np.asarray(path_world_xy, dtype=np.float64)
+    delta = points - np.asarray(state.origin_world_xy, dtype=np.float64)
+    cosine = math.cos(state.origin_world_yaw_rad)
+    sine = math.sin(state.origin_world_yaw_rad)
+    return delta @ np.asarray([[cosine, -sine], [sine, cosine]])
+
+
+def _overlay_path_on_goal_map(
+    goal_map: BevGoalMap,
+    path_local_xy: np.ndarray,
+    *,
+    color: tuple[int, int, int, int],
+) -> BevGoalMap:
+    points = np.asarray(path_local_xy, dtype=np.float64)
+    if points.ndim != 2 or points.shape[1] != 2 or len(points) < 2:
+        return goal_map
+    height, width = goal_map.selectable_mask.shape
+    pixels = []
+    for forward, left in points:
+        column = (0.5 - float(left) / goal_map.view_size_m) * width
+        row = (
+            1.0
+            - (float(forward) + goal_map.rear_view_m) / goal_map.view_size_m
+        ) * height
+        if 0 <= column < width and 0 <= row < height:
+            pixels.append((int(round(column)), int(round(row))))
+    if len(pixels) < 2:
+        return goal_map
+    image = Image.fromarray(goal_map.rgba, mode="RGBA")
+    ImageDraw.Draw(image).line(pixels, fill=color, width=4)
+    return BevGoalMap(
+        rgba=np.ascontiguousarray(np.asarray(image, dtype=np.uint8)),
+        selectable_mask=goal_map.selectable_mask,
+        view_size_m=goal_map.view_size_m,
+        rear_view_m=goal_map.rear_view_m,
+    )
+
+
+def _render_fine_geometry(
+    snapshot: LocalVoxelSnapshot,
+    *,
+    robot_pose: tuple[float, float, float, float],
+    path_world_xy: np.ndarray | None,
+    goal_world_xy: np.ndarray | None,
+    image_size: tuple[int, int] = (800, 560),
+) -> Image.Image:
+    image = _render_local_occupancy(
+        snapshot,
+        robot_pose=robot_pose,
+        image_size=image_size,
+    )
+    draw = ImageDraw.Draw(image)
+    robot_z = float(robot_pose[2])
+    if path_world_xy is not None and len(path_world_xy) >= 2:
+        path = np.asarray(path_world_xy, dtype=np.float64)
+        path_xyz = np.column_stack((path, np.full(len(path), robot_z)))
+        u, v, _, _ = _project_local_points(
+            path_xyz,
+            robot_pose=robot_pose,
+            image_size=image_size,
+        )
+        if len(u) >= 2:
+            pixels = [(int(x), int(y)) for x, y in zip(u, v)]
+            draw.line(pixels, fill=(30, 255, 90), width=5)
+    if goal_world_xy is not None:
+        goal = np.asarray(
+            [[float(goal_world_xy[0]), float(goal_world_xy[1]), robot_z]],
+            dtype=np.float64,
+        )
+        u, v, _, _ = _project_local_points(
+            goal,
+            robot_pose=robot_pose,
+            image_size=image_size,
+        )
+        if len(u) == 1:
+            x, y = int(u[0]), int(v[0])
+            draw.ellipse((x - 9, y - 9, x + 9, y + 9), fill=(255, 45, 35))
+    return image
+
+
+def _save_image(path: Path, image: Image.Image) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    image.save(temporary, format="PNG")
+    temporary.replace(path)
+
+
+def _join_path_from_current(
+    path_xy: np.ndarray,
+    *,
+    current_xy: tuple[float, float],
+) -> tuple[np.ndarray, float, float]:
+    points = np.asarray(path_xy, dtype=np.float64)
+    if points.ndim != 2 or points.shape[1] != 2 or len(points) < 2:
+        raise ValueError("Rolling trajectory requires at least two XY points")
+    current = np.asarray(current_xy, dtype=np.float64)
+    distances = np.linalg.norm(points - current, axis=1)
+    nearest_index = int(np.argmin(distances))
+    join_error = float(distances[nearest_index])
+    suffix = points[nearest_index:]
+    joined = np.vstack((current[None, :], suffix))
+    segment_length = np.linalg.norm(np.diff(joined, axis=0), axis=1)
+    joined = joined[np.r_[True, segment_length > 1.0e-5]]
+    remaining = float(np.sum(np.linalg.norm(np.diff(joined, axis=0), axis=1)))
+    return np.ascontiguousarray(joined), join_error, remaining
+
+
+def _rolling_result_rejection(
+    *,
+    result_age_sec: float,
+    join_error_m: float,
+    remaining_length_m: float,
+    execution: dict,
+) -> str | None:
+    if result_age_sec > float(execution["max_result_age_sec"]):
+        return "result_too_old"
+    if join_error_m > float(execution["max_path_join_error_m"]):
+        return "path_join_error"
+    if remaining_length_m < float(execution["min_remaining_path_m"]):
+        return "path_too_short"
+    return None
 
 
 def _freeze_candidates(result: NavDPResult, job: _InferenceJob) -> list[_FrozenCandidate]:
@@ -1084,10 +1631,6 @@ def _degree_map(values: dict[str, float]) -> dict[str, float]:
 
 def _is_stopped(state: OdomState) -> bool:
     return state.linear_velocity_mps < 0.03 and abs(state.angular_velocity_radps) < 0.05
-
-
-def _wrap_angle(value: float) -> float:
-    return float((value + math.pi) % (2.0 * math.pi) - math.pi)
 
 
 if __name__ == "__main__":

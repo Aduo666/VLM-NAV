@@ -1,5 +1,4 @@
-# Phase 1 only: NavDP multi-candidate generation and AGX continuous tracking.
-# No occupancy map, collision filtering, VLM, or active arm observation is used.
+# AGX 粗粒度 NavDP 与细粒度 Hybrid A* 独立模式测试。
 server:
   base_url: "http://127.0.0.1:8889"
   timeout_sec: 30.0
@@ -17,19 +16,49 @@ camera:
   warmup_render_frames: 30
 
 goal:
-  # The goal is selected from the robot-centric BEV map.
+  # 目标点从机器人中心 BEV 地图中选择。
   min_distance_m: 0.25
   max_distance_m: 10.0
 
 execution:
-  # Reject an asynchronous result if the robot drifted away from its capture pose.
-  max_result_pose_delta_m: 0.05
-  max_result_yaw_delta_deg: 2.0
+  default_mode: "COARSE_NAVDP"
+  coarse_planning_period_sec: 0.50
+  fine_planning_period_sec: 0.20
+  fine_heading_prepare_deg: 45.0
+  fine_heading_stop_deg: 15.0
+  fine_heading_rate_radps: 0.25
+  max_result_age_sec: 1.00
+  max_path_join_error_m: 0.35
+  min_remaining_path_m: 0.15
   goal_reached_tolerance_m: 0.30
 
+fine_planner:
+  footprint:
+    front_m: 0.40
+    rear_m: 0.40
+    half_width_m: 0.32
+    margin_m: 0.03
+  obstacle_min_height_m: 0.05
+  obstacle_max_height_m: 1.50
+  yaw_resolution_deg: 5.0
+  step_length_m: 0.10
+  collision_sample_step_m: 0.05
+  curvature_samples_per_m: [-1.2, -0.6, 0.0, 0.6, 1.2]
+  goal_tolerance_m: 0.15
+  max_plan_distance_m: 4.0
+  max_expansions: 10000
+  unknown_block_radius_m: 0.80
+  max_near_unknown_ratio: 0.05
+  clearance_weight: 0.01
+  unknown_weight: 2.0
+  curvature_weight: 0.01
+  curvature_change_weight: 0.01
+  heuristic_weight: 8.0
+
 map_selector:
-  # Reuse the accepted three-camera map geometry without using it for safety decisions.
+  # 复用局部体素地图参数，导航模式只融合前视和下视相机。
   source_config_path: "configs/agx_local_3d_map_test.yaml"
+  sources: ["front", "down"]
   image_size_px: 420
   view_size_m: 10.0
   rear_view_m: 1.5
@@ -39,4 +68,6 @@ map_selector:
 
 debug:
   candidate_image_path: "debug/local/agx_navdp_candidates.png"
+  fine_image_path: "debug/local/agx_fine_navigation.png"
+  fine_update_period_sec: 0.50
   view_size_m: 10.0

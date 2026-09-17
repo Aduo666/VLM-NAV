@@ -179,8 +179,16 @@ class PathTracker:
     Input paths must already be feasible and collision checked. This class is
     not an obstacle planner; it never invents a turn/recovery for an invalid path.
     """
-    def __init__(self, path_xy, config: TrajectoryConfig):
+    def __init__(
+        self,
+        path_xy,
+        config: TrajectoryConfig,
+        *,
+        initial_speed_mps: float = 0.0,
+    ):
         config.validate()
+        if not math.isfinite(float(initial_speed_mps)) or float(initial_speed_mps) < 0:
+            raise ValueError("initial_speed_mps 必须为有限非负数")
         path = np.asarray(path_xy, dtype=float)
         if path.ndim != 2 or path.shape[1] != 2 or len(path) < 2 or not np.isfinite(path).all():
             raise ValueError("Path must have at least two finite XY points")
@@ -191,7 +199,8 @@ class PathTracker:
         self.path, self.config = path, config
         self.lengths = np.linalg.norm(np.diff(path, axis=0), axis=1)
         self.s = np.r_[0.0, np.cumsum(self.lengths)]
-        self.progress = self.speed = self.elapsed = 0.0
+        self.progress = self.elapsed = 0.0
+        self.speed = min(float(initial_speed_mps), float(config.max_linear_mps))
         self.finished = False
         self.fault: str | None = None
 

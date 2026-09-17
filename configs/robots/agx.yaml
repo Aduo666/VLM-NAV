@@ -58,9 +58,9 @@ controller:
       - {drive_joint: fr_wheel, steering_joint: fr_steering_joint, x_m: 0.25, y_m: -0.19, radius_m: 0.09, steering_sign: -1, drive_sign: 1}
       - {drive_joint: rl_wheel, steering_joint: rl_steering_joint, x_m: -0.25, y_m: 0.19, radius_m: 0.09, steering_sign: -1, drive_sign: 1}
       - {drive_joint: rr_wheel, steering_joint: rr_steering_joint, x_m: -0.23, y_m: -0.206, radius_m: 0.09, steering_sign: -1, drive_sign: 1}
-    max_linear_mps: 0.45
+    max_linear_mps: 0.60
     max_angular_radps: 0.5
-    max_acceleration_mps2: 0.4
+    max_acceleration_mps2: 0.60
     max_lateral_acceleration_mps2: 0.35
     max_wheel_radps: 14.0
     max_steering_rad: 1.4

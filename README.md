@@ -291,48 +291,45 @@ timeout, and swept envelope come from the selected profile.
 
 ### AGX Trajectory Acceptance
 
-#### NavDP Candidate Trajectory Acceptance
+#### 粗粒度与细粒度导航模式
 
-Phase 1 of the active geometric-perception work connects the official NavDP point-goal
-server to the existing AGX continuous follower. It is intentionally separate from the
-main navigation policy, safety filtering, VLM, and arm motion. A local three-camera map
-is used only to let the operator select a point goal; it does not filter or certify any
-candidate trajectory.
+这个入口在相同的 RGB-D、里程计、目标点和连续轮式控制器下测试两种 AGX
+局部导航模式。`COARSE_NAVDP` 在机器人跟踪当前轨迹期间持续进行 NavDP 异步滚动推理。
+`FINE_HYBRID_ASTAR` 使用前视与下视 RGB-D 融合局部体素地图、AGX 矩形车体轮廓和 SE(2) 搜索。
 
-NavDP is deployed as its own process, following its official HTTP interface. Clone and
-install NavDP outside this repository, obtain its checkpoint, and start the server first:
+NavDP 按照官方 HTTP 接口作为独立进程运行。启动 Isaac Sim 前需要启动 NavDP 服务：
 
 ```bash
 cd /path/to/NavDP/baselines/navdp
 python navdp_server.py --port 8889 --checkpoint /path/to/navdp.ckpt
 ```
 
-Then start Isaac Sim from the CAPTAINav environment:
+随后从 CAPTAINav 环境启动 Isaac Sim：
 
 ```bash
 conda activate vlmnav
 bash scripts/run_agx_navdp_trajectory_test.sh
 ```
 
-In **AGX NavDP Goal**, the compact BEV uses white for known free space, black for
-obstacles, gray for unknown space, blue for the robot, and red for the selected goal.
-The interaction is intentionally limited to:
+`AGX Navigation Modes` 面板中的 BEV 使用白色表示已知空闲区域，黑色表示障碍物，
+灰色表示未知区域，蓝色表示机器人，红色表示目标点。操作顺序如下：
 
-1. Click known free space on the BEV. The goal is frozen in odometry coordinates.
-2. The test captures a stopped RGB-D keyframe, calls NavDP, follows NavDP's selected
-   candidate, and requests another segment automatically if the point goal remains ahead.
-3. **STOP** cancels inference or tracking and brakes the robot.
+1. 在机器人停止时选择 `COARSE NAVDP` 或 `FINE HYBRID A*`。
+2. 点击 BEV 中的已知空闲区域，目标点会固定在里程计坐标系中。
+3. 机器人持续跟踪当前轨迹，同时所选模式在后台重新规划。
+4. `STOP` 会废弃尚未处理的结果并停止机器人。
 
-Candidate IDs, critic values, and the model-selected path are written to the overwrite-only
-`debug/local/agx_navdp_candidates.png`. Critic values are displayed only as relative NavDP
-preferences; they are not treated as safety probabilities. The configuration is isolated
-in `configs/agx_navdp_trajectory_test.yaml`.
+NavDP 候选编号、critic 数值和模型选择轨迹写入覆盖更新的
+`debug/local/agx_navdp_candidates.png`。critic 数值表示 NavDP 候选相对偏好。
+所有测试参数位于 `configs/agx_navdp_trajectory_test.yaml`。
 
-Trajectory curves and the goal marker are never inserted into the USD Stage, so the RGB-D
-map cannot observe its own debug graphics. A result is rejected if the robot moves while
-inference is pending. Phase 2 will add local 3-D evidence and
-`SAFE / BLOCKED / UNRESOLVED` classification; none of those decisions are silently present
-in this Phase-1 entry.
+粗粒度轨迹根据观测时位姿转换到固定里程计坐标系。细粒度路径在世界坐标局部占用地图中
+规划，随后转换到相同里程计坐标系。新结果的年龄、轨迹连接误差和剩余长度满足配置要求后，
+才会替换当前跟踪轨迹。细粒度规划器禁止车体进入障碍物和近场未知区域，对远处未知区域增加
+代价，并使用 AGX 车轮几何检查所有候选曲率。调试轨迹和目标标记不会写入 USD Stage。
+细粒度模式同时显示独立的 `Fine Geometry` 窗口，并覆盖更新
+`debug/local/agx_fine_navigation.png`。图像只包含局部 3D 占用体素、绿色规划路径、
+红色目标和机器人姿态，不叠加说明文字。主面板统一使用英文，兼容 Isaac Sim 默认字体。
 
 #### Continuous-Control And Narrow-Passage Test
 

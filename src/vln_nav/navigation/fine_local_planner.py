@@ -6,7 +6,10 @@ import math
 
 import numpy as np
 
-from vln_nav.navigation.trajectory_clearance import FootprintConfig, PlanningGrid
+from vln_nav.navigation.trajectory_clearance import (
+    FootprintCollisionChecker,
+    PlanningGrid,
+)
 
 
 @dataclass(frozen=True)
@@ -16,14 +19,20 @@ class FinePlannerConfig:
     collision_sample_step_m: float
     curvature_samples_per_m: tuple[float, ...]
     goal_tolerance_m: float
+    goal_yaw_tolerance_deg: float
     max_plan_distance_m: float
     max_expansions: int
     unknown_block_radius_m: float
     max_near_unknown_ratio: float
+    min_near_unknown_area_m2: float
     clearance_weight: float
     unknown_weight: float
     curvature_weight: float
     curvature_change_weight: float
+    reverse_penalty: float
+    direction_change_penalty: float
+    spin_step_deg: float
+    spin_penalty: float
     heuristic_weight: float
 
     @classmethod
@@ -51,18 +60,26 @@ class FinePlannerConfig:
             self.step_length_m,
             self.collision_sample_step_m,
             self.goal_tolerance_m,
+            self.goal_yaw_tolerance_deg,
             self.max_plan_distance_m,
             self.unknown_block_radius_m,
+            self.min_near_unknown_area_m2,
             self.clearance_weight,
             self.unknown_weight,
             self.curvature_weight,
             self.curvature_change_weight,
+            self.reverse_penalty,
+            self.direction_change_penalty,
+            self.spin_step_deg,
+            self.spin_penalty,
             self.heuristic_weight,
         )
         if not all(math.isfinite(float(value)) and float(value) > 0 for value in positive):
             raise ValueError("细粒度规划器数值配置必须为有限正数")
         if not 1.0 <= self.yaw_resolution_deg <= 30.0:
             raise ValueError("细粒度规划器朝向分辨率必须位于 1 至 30 度范围内")
+        if not 1.0 <= self.goal_yaw_tolerance_deg <= 90.0:
+            raise ValueError("细粒度目标航向容差必须位于 1 至 90 度范围内")
         if self.collision_sample_step_m > self.step_length_m:
             raise ValueError("碰撞采样间隔不能超过运动段长度")
         if self.max_expansions < 100:
@@ -79,43 +96,82 @@ class FinePlannerConfig:
 class FinePlan:
     path_world_xy: np.ndarray
     path_world_yaw_rad: np.ndarray
+    path_motion_direction: np.ndarray
     expanded_node_count: int
     path_cost: float
     map_version: int
-    local_goal_world_xy: tuple[float, float]
+    local_goal_world_pose: tuple[float, float, float]
     rejected_collision_count: int
     rejected_unknown_count: int
     rejected_outside_count: int
 
 
+@dataclass(frozen=True)
+class _MotionPrimitive:
+    name: str
+    direction: int
+    curvature_per_m: float
+    spin_rad: float
+
+
 class FineLocalPlanner:
-    def __init__(self, config: FinePlannerConfig, footprint: FootprintConfig) -> None:
+    def __init__(
+        self,
+        config: FinePlannerConfig,
+        collision_checker: FootprintCollisionChecker,
+    ) -> None:
         config.validate()
-        footprint.validate()
         self.config = config
-        self.footprint = footprint
+        self.collision_checker = collision_checker
+        self.footprint = collision_checker.footprint
         self._yaw_step = math.radians(config.yaw_resolution_deg)
         self._yaw_bins = int(round(2.0 * math.pi / self._yaw_step))
-        self._footprint_offset_cache: dict[tuple[float, int], np.ndarray] = {}
+        self._actions = tuple(
+            [
+                _MotionPrimitive(
+                    name=f"forward_{index}",
+                    direction=1,
+                    curvature_per_m=float(curvature),
+                    spin_rad=0.0,
+                )
+                for index, curvature in enumerate(config.curvature_samples_per_m)
+            ]
+            + [
+                _MotionPrimitive(
+                    name=f"reverse_{index}",
+                    direction=-1,
+                    curvature_per_m=float(curvature),
+                    spin_rad=0.0,
+                )
+                for index, curvature in enumerate(config.curvature_samples_per_m)
+            ]
+            + [
+                _MotionPrimitive("spin_left", 0, 0.0, math.radians(config.spin_step_deg)),
+                _MotionPrimitive("spin_right", 0, 0.0, -math.radians(config.spin_step_deg)),
+            ]
+        )
 
     def plan(
         self,
         *,
         grid: PlanningGrid,
         start_pose_world: tuple[float, float, float],
-        goal_world_xy: tuple[float, float],
+        goal_world_pose: tuple[float, float, float],
     ) -> FinePlan:
         start = np.asarray(start_pose_world, dtype=np.float64)
-        goal = np.asarray(goal_world_xy, dtype=np.float64)
-        if start.shape != (3,) or goal.shape != (2,) or not (
+        goal = np.asarray(goal_world_pose, dtype=np.float64)
+        if start.shape != (3,) or goal.shape != (3,) or not (
             np.isfinite(start).all() and np.isfinite(goal).all()
         ):
             raise ValueError("细粒度规划器需要有限的起始位姿和目标坐标")
-        goal_delta = goal - start[:2]
+        goal_delta = goal[:2] - start[:2]
         goal_distance = float(np.linalg.norm(goal_delta))
         if goal_distance > self.config.max_plan_distance_m:
-            goal = start[:2] + goal_delta / goal_distance * self.config.max_plan_distance_m
-        start_key = self._state_key(grid, start[0], start[1], start[2], 0)
+            goal[:2] = (
+                start[:2]
+                + goal_delta / goal_distance * self.config.max_plan_distance_m
+            )
+        start_key = self._state_key(grid, start[0], start[1], start[2], -1)
         if start_key is None:
             raise RuntimeError("细粒度规划器起始位姿位于局部地图外部")
 
@@ -129,7 +185,7 @@ class FineLocalPlanner:
         heapq.heappush(
             queue,
             (
-                self.config.heuristic_weight * self._heuristic(start[:2], goal),
+                self.config.heuristic_weight * self._heuristic(start, goal),
                 counter,
                 start_key,
             ),
@@ -144,27 +200,47 @@ class FineLocalPlanner:
             _, _, key = heapq.heappop(queue)
             pose = pose_by_key[key]
             cost = g_score[key]
-            if math.hypot(pose[0] - goal[0], pose[1] - goal[1]) <= self.config.goal_tolerance_m:
+            goal_position_error = math.hypot(pose[0] - goal[0], pose[1] - goal[1])
+            goal_yaw_error = abs(self._wrap_angle(pose[2] - goal[2]))
+            if (
+                goal_position_error <= self.config.goal_tolerance_m
+                and goal_yaw_error <= math.radians(self.config.goal_yaw_tolerance_deg)
+            ):
                 goal_key = key
                 break
             expanded += 1
-            previous_curvature = self.config.curvature_samples_per_m[key[3]]
-            for curvature_index, curvature in enumerate(self.config.curvature_samples_per_m):
-                primitive = self._sample_primitive(pose, curvature)
-                metrics = [self._footprint_metrics(grid, sample) for sample in primitive[1:]]
-                if any(item[3] > 0 for item in metrics):
+            previous_action = self._actions[key[3]] if key[3] >= 0 else None
+            for action_index, action in enumerate(self._actions):
+                primitive = self._sample_primitive(pose, action)
+                metrics = [
+                    self.collision_checker.metrics(
+                        grid,
+                        x_m=float(sample[0]),
+                        y_m=float(sample[1]),
+                        yaw_rad=float(sample[2]),
+                    )
+                    for sample in primitive[1:]
+                ]
+                if any(item.outside_ratio > 0 for item in metrics):
                     rejected_outside += 1
                     continue
-                if any(item[0] for item in metrics):
+                if any(item.collision for item in metrics):
                     rejected_collision += 1
                     continue
+                unknown_metrics = self.collision_checker.incremental_unknown_metrics(
+                    grid,
+                    initial_pose=start,
+                    swept_poses=primitive[1:],
+                )
+                unknown_ratio = unknown_metrics.ratio
                 distance_from_start = math.hypot(
                     primitive[-1, 0] - start[0], primitive[-1, 1] - start[1]
                 )
                 if (
                     distance_from_start <= self.config.unknown_block_radius_m
-                    and max((item[2] for item in metrics), default=0.0)
-                    > self.config.max_near_unknown_ratio
+                    and unknown_ratio > self.config.max_near_unknown_ratio
+                    and unknown_metrics.area_m2
+                    >= self.config.min_near_unknown_area_m2
                 ):
                     rejected_unknown += 1
                     continue
@@ -174,36 +250,53 @@ class FineLocalPlanner:
                     endpoint[0],
                     endpoint[1],
                     endpoint[2],
-                    curvature_index,
+                    action_index,
                 )
                 if next_key is None:
                     continue
                 min_clearance = min(
-                    (item[1] for item in metrics), default=0.0
+                    (item.min_clearance_m for item in metrics), default=0.0
                 )
-                unknown_ratio = max(
-                    (item[2] for item in metrics), default=0.0
+                transition_length = (
+                    self.config.step_length_m
+                    if action.direction != 0
+                    else self.collision_checker.bounding_radius_m * abs(action.spin_rad)
                 )
-                transition_cost = self.config.step_length_m
+                transition_cost = transition_length
+                if action.direction < 0:
+                    transition_cost *= self.config.reverse_penalty
+                elif action.direction == 0:
+                    transition_cost *= self.config.spin_penalty
+                if (
+                    previous_action is not None
+                    and previous_action.direction != 0
+                    and action.direction != 0
+                    and previous_action.direction != action.direction
+                ):
+                    transition_cost *= self.config.direction_change_penalty
                 transition_cost += (
                     self.config.clearance_weight
-                    * self.config.step_length_m
+                    * transition_length
                     / max(min_clearance, 0.02)
                 )
                 transition_cost += (
                     self.config.unknown_weight
                     * unknown_ratio
-                    * self.config.step_length_m
+                    * transition_length
                 )
                 transition_cost += (
                     self.config.curvature_weight
-                    * abs(curvature)
-                    * self.config.step_length_m
+                    * abs(action.curvature_per_m)
+                    * transition_length
                 )
-                transition_cost += (
-                    self.config.curvature_change_weight
-                    * abs(curvature - previous_curvature)
-                )
+                if previous_action is not None:
+                    transition_cost += (
+                        self.config.curvature_change_weight
+                        * abs(
+                            action.curvature_per_m
+                            - previous_action.curvature_per_m
+                        )
+                    )
                 new_cost = cost + transition_cost
                 if new_cost >= g_score.get(next_key, float("inf")):
                     continue
@@ -212,7 +305,7 @@ class FineLocalPlanner:
                 parent[next_key] = key
                 counter += 1
                 priority = new_cost + self.config.heuristic_weight * self._heuristic(
-                    endpoint[:2], goal
+                    endpoint, goal
                 )
                 heapq.heappush(queue, (priority, counter, next_key))
 
@@ -229,15 +322,20 @@ class FineLocalPlanner:
             current = parent[current]
         keys.reverse()
         poses = np.asarray([pose_by_key[key] for key in keys], dtype=np.float64)
+        motion_direction = np.asarray(
+            [0] + [self._actions[key[3]].direction for key in keys[1:]],
+            dtype=np.int8,
+        )
         if len(poses) < 2:
             raise RuntimeError("细粒度规划器返回了零长度路径")
         return FinePlan(
             path_world_xy=np.ascontiguousarray(poses[:, :2]),
             path_world_yaw_rad=np.ascontiguousarray(poses[:, 2]),
+            path_motion_direction=np.ascontiguousarray(motion_direction),
             expanded_node_count=int(expanded),
             path_cost=float(g_score[goal_key]),
             map_version=int(grid.map_version),
-            local_goal_world_xy=(float(goal[0]), float(goal[1])),
+            local_goal_world_pose=(float(goal[0]), float(goal[1]), float(goal[2])),
             rejected_collision_count=int(rejected_collision),
             rejected_unknown_count=int(rejected_unknown),
             rejected_outside_count=int(rejected_outside),
@@ -261,16 +359,35 @@ class FineLocalPlanner:
     def _sample_primitive(
         self,
         pose: tuple[float, float, float],
-        curvature: float,
+        action: _MotionPrimitive,
     ) -> np.ndarray:
+        x, y, yaw = map(float, pose)
+        if action.direction == 0:
+            sample_count = max(
+                2,
+                int(math.ceil(abs(action.spin_rad) / self._yaw_step)) + 1,
+            )
+            sample_yaw = yaw + np.linspace(0.0, action.spin_rad, sample_count)
+            sample_yaw = (sample_yaw + math.pi) % (2.0 * math.pi) - math.pi
+            return np.column_stack(
+                (
+                    np.full_like(sample_yaw, x),
+                    np.full_like(sample_yaw, y),
+                    sample_yaw,
+                )
+            )
         sample_count = max(
             2,
             int(math.ceil(
                 self.config.step_length_m / self.config.collision_sample_step_m
             )) + 1,
         )
-        distances = np.linspace(0.0, self.config.step_length_m, sample_count)
-        x, y, yaw = map(float, pose)
+        distances = np.linspace(
+            0.0,
+            float(action.direction) * self.config.step_length_m,
+            sample_count,
+        )
+        curvature = action.curvature_per_m
         if abs(curvature) < 1.0e-9:
             sample_x = x + distances * math.cos(yaw)
             sample_y = y + distances * math.sin(yaw)
@@ -282,66 +399,16 @@ class FineLocalPlanner:
         sample_yaw = (sample_yaw + math.pi) % (2.0 * math.pi) - math.pi
         return np.column_stack((sample_x, sample_y, sample_yaw))
 
-    def _footprint_metrics(
-        self,
-        grid: PlanningGrid,
-        pose: np.ndarray,
-    ) -> tuple[bool, float, float, float]:
-        row, column, inside_center = grid.world_to_cell(
-            float(pose[0]), float(pose[1])
+    @staticmethod
+    def _heuristic(pose: np.ndarray, goal_pose: np.ndarray) -> float:
+        position_cost = float(
+            np.linalg.norm(np.asarray(pose[:2]) - np.asarray(goal_pose[:2]))
         )
-        if not inside_center:
-            return False, 0.0, 1.0, 1.0
-        yaw_index = int(
-            round(((float(pose[2]) + math.pi) % (2.0 * math.pi)) / self._yaw_step)
-        ) % self._yaw_bins
-        cache_key = (float(grid.resolution_m), yaw_index)
-        offsets = self._footprint_offset_cache.get(cache_key)
-        if offsets is None:
-            yaw = yaw_index * self._yaw_step - math.pi
-            local_x = np.arange(
-                -self.footprint.rear_m - self.footprint.margin_m,
-                self.footprint.front_m + self.footprint.margin_m + 0.5 * grid.resolution_m,
-                grid.resolution_m,
-            )
-            local_y = np.arange(
-                -self.footprint.half_width_m - self.footprint.margin_m,
-                self.footprint.half_width_m + self.footprint.margin_m + 0.5 * grid.resolution_m,
-                grid.resolution_m,
-            )
-            xx, yy = np.meshgrid(local_x, local_y, indexing="xy")
-            cosine, sine = math.cos(yaw), math.sin(yaw)
-            column_offset = np.rint(
-                (cosine * xx - sine * yy) / grid.resolution_m
-            ).astype(np.int64)
-            row_offset = np.rint(
-                (sine * xx + cosine * yy) / grid.resolution_m
-            ).astype(np.int64)
-            offsets = np.unique(
-                np.column_stack((row_offset.ravel(), column_offset.ravel())), axis=0
-            )
-            self._footprint_offset_cache[cache_key] = offsets
-        rows = row + offsets[:, 0]
-        columns = column + offsets[:, 1]
-        inside = (
-            (rows >= 0)
-            & (rows < grid.shape[0])
-            & (columns >= 0)
-            & (columns < grid.shape[1])
+        heading_cost = 0.10 * abs(
+            FineLocalPlanner._wrap_angle(float(pose[2]) - float(goal_pose[2]))
         )
-        outside_ratio = float(1.0 - np.mean(inside))
-        if not np.any(inside):
-            return False, 0.0, 1.0, 1.0
-        valid_rows = rows[inside]
-        valid_columns = columns[inside]
-        collision = bool(np.any(grid.occupied_mask[valid_rows, valid_columns]))
-        unknown_count = int(
-            np.count_nonzero(grid.unknown_mask[valid_rows, valid_columns])
-        ) + int(np.count_nonzero(~inside))
-        unknown_ratio = float(unknown_count / len(inside))
-        min_clearance = float(np.min(grid.clearance_m[valid_rows, valid_columns]))
-        return collision, min_clearance, unknown_ratio, outside_ratio
+        return position_cost + heading_cost
 
     @staticmethod
-    def _heuristic(position_xy: np.ndarray, goal_xy: np.ndarray) -> float:
-        return float(np.linalg.norm(np.asarray(position_xy) - np.asarray(goal_xy)))
+    def _wrap_angle(angle_rad: float) -> float:
+        return (float(angle_rad) + math.pi) % (2.0 * math.pi) - math.pi

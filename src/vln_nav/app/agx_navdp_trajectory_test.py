@@ -29,6 +29,7 @@ from vln_nav.app.agx_local_3d_map_test import (
     _render_local_occupancy,
 )
 from vln_nav.control.locomotion import create_locomotion_controller
+from vln_nav.control.fine_path_tracker import FinePathTracker
 from vln_nav.control.trajectory import (
     AgxVelocityAdapter,
     PathTracker,
@@ -48,6 +49,7 @@ from vln_nav.navigation.navdp_client import (
 from vln_nav.navigation.odometry import OdomState, SimOdometrySensor
 from vln_nav.navigation.trajectory_clearance import (
     FootprintConfig,
+    FootprintCollisionChecker,
     assess_path_clearance,
     clear_current_footprint,
     planning_grid_from_snapshot,
@@ -91,7 +93,7 @@ class _FinePlanningJob:
     request_id: int
     snapshot: LocalVoxelSnapshot
     start_pose_world: tuple[float, float, float]
-    goal_world_xy: tuple[float, float]
+    goal_world_pose: tuple[float, float, float]
     submitted_sim_time_sec: float
     floor_z_m: float
 
@@ -177,6 +179,7 @@ class _FinePlanningWorker:
             return None
 
     def _run(self, job: _FinePlanningJob) -> None:
+        grid = None
         try:
             grid = planning_grid_from_snapshot(
                 job.snapshot,
@@ -189,16 +192,16 @@ class _FinePlanningWorker:
                 x_m=job.start_pose_world[0],
                 y_m=job.start_pose_world[1],
                 yaw_rad=job.start_pose_world[2],
-                footprint=self._planner.footprint,
+                collision_checker=self._planner.collision_checker,
             )
             plan = self._planner.plan(
                 grid=grid,
                 start_pose_world=job.start_pose_world,
-                goal_world_xy=job.goal_world_xy,
+                goal_world_pose=job.goal_world_pose,
             )
             self._results.put((job, grid, plan, None))
         except Exception as exc:
-            self._results.put((job, None, None, exc))
+            self._results.put((job, grid, None, exc))
         finally:
             with self._lock:
                 self._busy = False
@@ -336,6 +339,7 @@ def _load_settings() -> tuple[
         "camera",
         "goal",
         "execution",
+        "fine_tracking",
         "fine_planner",
         "map_selector",
         "debug",
@@ -364,9 +368,7 @@ def _load_settings() -> tuple[
         "default_mode",
         "coarse_planning_period_sec",
         "fine_planning_period_sec",
-        "fine_heading_prepare_deg",
-        "fine_heading_stop_deg",
-        "fine_heading_rate_radps",
+        "fine_local_goal_lookahead_m",
         "max_result_age_sec",
         "max_path_join_error_m",
         "min_remaining_path_m",
@@ -381,11 +383,29 @@ def _load_settings() -> tuple[
         if name != "default_mode"
     ):
         raise ValueError("NavDP execution tolerances must be positive")
-    if float(execution["fine_heading_stop_deg"]) >= float(
-        execution["fine_heading_prepare_deg"]
-    ):
-        raise ValueError("Fine heading stop angle must be smaller than prepare angle")
 
+    fine_tracking = data["fine_tracking"]
+    fine_tracking_fields = {
+        "max_linear_mps",
+        "max_angular_radps",
+        "lookahead_m",
+        "arrival_distance_m",
+        "max_path_error_m",
+    }
+    if not isinstance(fine_tracking, dict) or set(fine_tracking) != fine_tracking_fields:
+        raise ValueError(
+            f"fine_tracking requires exactly: {sorted(fine_tracking_fields)}"
+        )
+    if any(float(value) <= 0 for value in fine_tracking.values()):
+        raise ValueError("Fine tracking values must be positive")
+    if not (
+        float(fine_tracking["arrival_distance_m"])
+        < float(fine_tracking["lookahead_m"])
+        <= float(fine_tracking["max_path_error_m"])
+    ):
+        raise ValueError(
+            "Fine tracking requires arrival_distance < lookahead <= max_path_error"
+        )
     fine = data["fine_planner"]
     fine_fields = {
         "footprint",
@@ -395,14 +415,7 @@ def _load_settings() -> tuple[
     }
     if set(fine) != fine_fields:
         raise ValueError(f"fine_planner requires exactly: {sorted(fine_fields)}")
-    footprint_data = fine["footprint"]
-    footprint_fields = {item.name for item in fields(FootprintConfig)}
-    if not isinstance(footprint_data, dict) or set(footprint_data) != footprint_fields:
-        raise ValueError(f"fine_planner.footprint requires: {sorted(footprint_fields)}")
-    footprint = FootprintConfig(**{
-        name: float(footprint_data[name]) for name in footprint_fields
-    })
-    footprint.validate()
+    footprint = FootprintConfig.from_mapping(fine["footprint"])
     if not 0 <= float(fine["obstacle_min_height_m"]) < float(
         fine["obstacle_max_height_m"]
     ):
@@ -410,7 +423,6 @@ def _load_settings() -> tuple[
     fine_config = FinePlannerConfig.from_mapping({
         item.name: fine[item.name] for item in fields(FinePlannerConfig)
     })
-
     selector = data["map_selector"]
     selector_fields = {
         "source_config_path",
@@ -475,7 +487,14 @@ def _load_settings() -> tuple[
         debug["fine_update_period_sec"]
     ) <= 0:
         raise ValueError("Invalid NavDP candidate debug view size")
-    return data, server, map_settings, map_config, fine_config, footprint
+    return (
+        data,
+        server,
+        map_settings,
+        map_config,
+        fine_config,
+        footprint,
+    )
 
 
 def main() -> int:
@@ -685,10 +704,18 @@ def _run(
     adapter = AgxVelocityAdapter(drive, profile.agx_controller.continuous)
     odom = SimOdometrySensor(logger=logger)
     worker = _NavDPWorker(NavDPClient(client_config))
-    fine_planner = FineLocalPlanner(fine_config, footprint)
+    collision_checker = FootprintCollisionChecker(
+        footprint,
+        yaw_resolution_deg=fine_config.yaw_resolution_deg,
+    )
+    fine_planner = FineLocalPlanner(fine_config, collision_checker)
+    fine_tracking = settings["fine_tracking"]
     for curvature in fine_config.curvature_samples_per_m:
         wheel_targets(
-            VelocityCommand(0.20, 0.20 * float(curvature)),
+            VelocityCommand(
+                float(fine_tracking["max_linear_mps"]),
+                float(fine_tracking["max_linear_mps"]) * float(curvature),
+            ),
             profile.agx_controller.continuous,
         )
     fine_worker = _FinePlanningWorker(
@@ -698,11 +725,11 @@ def _run(
     )
     fine_tracking_config = replace(
         profile.agx_controller.continuous,
-        max_linear_mps=0.20,
-        max_angular_radps=0.35,
-        lookahead_m=0.20,
-        arrival_distance_m=0.05,
-        max_path_error_m=0.20,
+        max_linear_mps=float(fine_tracking["max_linear_mps"]),
+        max_angular_radps=float(fine_tracking["max_angular_radps"]),
+        lookahead_m=float(fine_tracking["lookahead_m"]),
+        arrival_distance_m=float(fine_tracking["arrival_distance_m"]),
+        max_path_error_m=float(fine_tracking["max_path_error_m"]),
     )
     logger.info(
         "[NavigationModes] scene=%s camera=%s server=%s frame=base(+X forward,+Y left)",
@@ -735,8 +762,8 @@ def _run(
 
     tracker = None
     tracker_mode: str | None = None
-    fine_heading_active = False
     display_path_odom_xy: np.ndarray | None = None
+    fine_guide_odom_xy: np.ndarray | None = None
     frozen_candidates: list[_FrozenCandidate] = []
     selected_index = 0
     request_id = 0
@@ -763,6 +790,9 @@ def _run(
     map_integration_period = float(map_settings["map"]["integration_period_sec"])
     map_render_period = float(settings["map_selector"]["render_period_sec"])
     latest_snapshot = local_map.snapshot()
+    latest_planning_grid = None
+    last_failed_fine_occupancy = None
+    last_failed_fine_goal_pose = None
     fine_summary = "Fine path: none"
     panel.mode_label.text = f"Mode: {mode}"
 
@@ -826,6 +856,23 @@ def _run(
                             center_world_xyz=np.asarray(position[:3], dtype=np.float64),
                         )
                         latest_snapshot = local_map.snapshot()
+                        latest_planning_grid = planning_grid_from_snapshot(
+                            latest_snapshot,
+                            floor_z_m=float(position[2]) - float(profile.spawn_z_m),
+                            obstacle_min_height_m=float(
+                                settings["fine_planner"]["obstacle_min_height_m"]
+                            ),
+                            obstacle_max_height_m=float(
+                                settings["fine_planner"]["obstacle_max_height_m"]
+                            ),
+                        )
+                        latest_planning_grid = clear_current_footprint(
+                            latest_planning_grid,
+                            x_m=float(position[0]),
+                            y_m=float(position[1]),
+                            yaw_rad=float(robot_yaw_world),
+                            collision_checker=collision_checker,
+                        )
                         last_map_integration_time = now
 
             if now - last_map_render_time >= map_render_period:
@@ -898,7 +945,7 @@ def _run(
                 job, result, error = completed
                 if (
                     job.request_id != accepted_request_id
-                    or mode != "COARSE_NAVDP"
+                    or mode not in {"COARSE_NAVDP", "FINE_HYBRID_ASTAR"}
                     or not navigation_active
                 ):
                     logger.info("[NavDPResult] ignored stale request=%d", job.request_id)
@@ -931,7 +978,7 @@ def _run(
                             join_error,
                             remaining_length,
                         )
-                    else:
+                    elif mode == "COARSE_NAVDP":
                         _save_candidate_debug(
                             debug_path,
                             result,
@@ -960,6 +1007,19 @@ def _run(
                             remaining_length,
                             result.latency_sec,
                         )
+                    else:
+                        fine_guide_odom_xy = joined_path.copy()
+                        if tracker is None:
+                            display_path_odom_xy = joined_path.copy()
+                        logger.info(
+                            "[FineGuide] request=%d candidate=%d age=%.3fs "
+                            "join_error=%.3fm remaining=%.3fm",
+                            job.request_id,
+                            selected.source.index,
+                            result_age,
+                            join_error,
+                            remaining_length,
+                        )
 
             fine_completed = fine_worker.poll()
             if fine_completed is not None:
@@ -971,19 +1031,34 @@ def _run(
                 ):
                     logger.info("[FineResult] ignored stale request=%d", job.request_id)
                 elif error is not None:
+                    if grid is not None:
+                        last_failed_fine_occupancy = grid.occupied_mask.copy()
+                        last_failed_fine_goal_pose = np.asarray(
+                            job.goal_world_pose,
+                            dtype=np.float64,
+                        )
                     idle_status = "Fine planning failed; inspect Fine Geometry and log"
                     logger.error("[FineResult] request=%d failed: %s", job.request_id, error)
                 else:
                     result_age = now - job.submitted_sim_time_sec
                     path_odom = _world_path_to_odom(plan.path_world_xy, state)
-                    joined_path, join_error, remaining_length = _join_path_from_current(
-                        path_odom,
-                        current_xy=(state.pose.x, state.pose.y),
+                    joined_path = np.ascontiguousarray(path_odom)
+                    join_error = float(np.linalg.norm(
+                        joined_path[0]
+                        - np.asarray([state.pose.x, state.pose.y], dtype=np.float64)
+                    ))
+                    remaining_length = float(np.sum(
+                        np.linalg.norm(np.diff(joined_path, axis=0), axis=1)
+                    ))
+                    path_odom_yaw = _world_yaw_to_odom(
+                        plan.path_world_yaw_rad,
+                        state,
                     )
                     clearance = assess_path_clearance(
                         grid,
                         plan.path_world_xy,
-                        footprint=footprint,
+                        plan.path_world_yaw_rad,
+                        collision_checker=collision_checker,
                     )
                     rejection = _rolling_result_rejection(
                         result_age_sec=result_age,
@@ -994,6 +1069,16 @@ def _run(
                     if clearance.collision:
                         rejection = "fine_path_collision"
                     if rejection is not None:
+                        last_failed_fine_occupancy = (
+                            grid.occupied_mask.copy()
+                            if rejection == "fine_path_collision"
+                            else None
+                        )
+                        last_failed_fine_goal_pose = (
+                            np.asarray(job.goal_world_pose, dtype=np.float64)
+                            if rejection == "fine_path_collision"
+                            else None
+                        )
                         logger.warning(
                             "[FineReject] request=%d reason=%s age=%.3fs "
                             "join_error=%.3fm remaining=%.3fm",
@@ -1004,8 +1089,12 @@ def _run(
                             remaining_length,
                         )
                     else:
-                        tracker = PathTracker(
+                        last_failed_fine_occupancy = None
+                        last_failed_fine_goal_pose = None
+                        tracker = FinePathTracker(
                             joined_path,
+                            path_odom_yaw,
+                            plan.path_motion_direction,
                             fine_tracking_config,
                             initial_speed_mps=state.linear_velocity_mps,
                         )
@@ -1043,14 +1132,16 @@ def _run(
                     adapter.stop()
                     tracker = None
                     tracker_mode = None
-                    fine_heading_active = False
                     display_path_odom_xy = None
+                    fine_guide_odom_xy = None
                     navigation_active = False
                     request_id += 1
                     accepted_request_id = request_id
                     fine_request_id += 1
                     accepted_fine_request_id = fine_request_id
                     mode = str(action[1])
+                    last_failed_fine_occupancy = None
+                    last_failed_fine_goal_pose = None
                     panel.mode_label.text = f"Mode: {mode}"
                     idle_status = f"MODE: {mode}; click a goal"
                     logger.info("[NavigationMode] selected=%s", mode)
@@ -1075,9 +1166,11 @@ def _run(
                             accepted_fine_request_id = fine_request_id
                             frozen_candidates = []
                             display_path_odom_xy = None
+                            fine_guide_odom_xy = None
                             selected_index = 0
                             navigation_active = True
-                            fine_heading_active = False
+                            last_failed_fine_occupancy = None
+                            last_failed_fine_goal_pose = None
                             generation_index = 0
                             last_coarse_request_time = -float("inf")
                             last_fine_request_time = -float("inf")
@@ -1103,28 +1196,25 @@ def _run(
                     adapter.stop()
                     tracker = None
                     tracker_mode = None
-                    fine_heading_active = False
                     display_path_odom_xy = None
+                    fine_guide_odom_xy = None
                     navigation_active = False
                     idle_status = "NAVIGATION STOPPED"
                     logger.info("[NavigationControl] STOP")
 
             goal_distance = float("inf")
-            fine_goal_bearing = 0.0
             if selected_goal_odom_xy is not None:
                 goal_distance = float(np.linalg.norm(
                     selected_goal_odom_xy
                     - np.asarray([state.pose.x, state.pose.y], dtype=np.float64)
                 ))
-                forward, left = _odom_goal_to_local(selected_goal_odom_xy, state)
-                fine_goal_bearing = math.atan2(left, forward)
             if navigation_active and goal_distance <= float(
                 settings["execution"]["goal_reached_tolerance_m"]
             ):
                 navigation_active = False
                 tracker = None
                 tracker_mode = None
-                fine_heading_active = False
+                fine_guide_odom_xy = None
                 adapter.stop()
                 idle_status = f"GOAL REACHED: distance={goal_distance:.2f}m"
                 logger.info(
@@ -1133,23 +1223,6 @@ def _run(
                     generation_index,
                     goal_distance,
                 )
-
-            if (
-                navigation_active
-                and mode == "FINE_HYBRID_ASTAR"
-                and tracker is None
-                and not fine_worker.busy
-            ):
-                prepare_angle = math.radians(
-                    float(settings["execution"]["fine_heading_prepare_deg"])
-                )
-                stop_angle = math.radians(
-                    float(settings["execution"]["fine_heading_stop_deg"])
-                )
-                if fine_heading_active:
-                    fine_heading_active = abs(fine_goal_bearing) > stop_angle
-                elif abs(fine_goal_bearing) >= prepare_angle:
-                    fine_heading_active = True
 
             if tracker is not None:
                 tracking_config = (
@@ -1160,7 +1233,8 @@ def _run(
                 tracking = tracker.step(
                     (state.pose.x, state.pose.y, state.pose.yaw_rad), dt
                 )
-                applied = adapter.apply(tracking.command)
+                requested_command = tracking.command
+                applied = adapter.apply(requested_command)
                 tracker.feedback(applied)
                 steering = adapter.steering_diagnostics()
                 if (
@@ -1199,23 +1273,13 @@ def _run(
                     idle_status = (
                         f"TRACKER {tracking.status}; waiting for rolling replanning"
                     )
-            elif fine_heading_active:
-                angular = math.copysign(
-                    float(settings["execution"]["fine_heading_rate_radps"]),
-                    fine_goal_bearing,
-                )
-                applied = adapter.apply(VelocityCommand(0.0, angular))
-                status_text = (
-                    f"FINE HEADING PREP bearing={math.degrees(fine_goal_bearing):+.1f}deg "
-                    f"w={applied.angular_radps:+.3f}rad/s"
-                )
             else:
                 adapter.stop()
                 status_text = idle_status
 
             if (
                 navigation_active
-                and mode == "COARSE_NAVDP"
+                and mode in {"COARSE_NAVDP", "FINE_HYBRID_ASTAR"}
                 and selected_goal_odom_xy is not None
                 and not worker.busy
                 and now - last_coarse_request_time
@@ -1257,17 +1321,53 @@ def _run(
                 navigation_active
                 and mode == "FINE_HYBRID_ASTAR"
                 and selected_goal_odom_xy is not None
+                and fine_guide_odom_xy is not None
                 and latest_snapshot.version > 0
                 and not fine_worker.busy
-                and not fine_heading_active
                 and now - last_fine_request_time
                 >= float(settings["execution"]["fine_planning_period_sec"])
             ):
+                guide_world = _odom_path_to_world(fine_guide_odom_xy, state)
+                selected_subgoal = _select_fine_local_goal(
+                    guide_world,
+                    current_world_xy=np.asarray(position[:2], dtype=np.float64),
+                    grid=latest_planning_grid,
+                    collision_checker=collision_checker,
+                    lookahead_m=float(
+                        settings["execution"]["fine_local_goal_lookahead_m"]
+                    ),
+                )
+                if selected_subgoal is None:
+                    idle_status = "Fine guide has no locally feasible subgoal"
+                    status_text = idle_status
+                    world.step(render=frame_index % render_stride == 0)
+                    frame_index += 1
+                    continue
+                goal_world, goal_heading = selected_subgoal
+                failed_input_unchanged = (
+                    last_failed_fine_occupancy is not None
+                    and last_failed_fine_goal_pose is not None
+                    and np.array_equal(
+                        last_failed_fine_occupancy,
+                        latest_planning_grid.occupied_mask,
+                    )
+                    and np.linalg.norm(
+                        last_failed_fine_goal_pose
+                        - np.asarray(
+                            [goal_world[0], goal_world[1], goal_heading],
+                            dtype=np.float64,
+                        )
+                    )
+                    < 0.05
+                )
+                if failed_input_unchanged:
+                    idle_status = "Fine planning input unchanged after failure"
+                    status_text = idle_status
+                    world.step(render=frame_index % render_stride == 0)
+                    frame_index += 1
+                    continue
                 fine_request_id += 1
                 accepted_fine_request_id = fine_request_id
-                goal_world = _odom_path_to_world(
-                    selected_goal_odom_xy[None, :], state
-                )[0]
                 job = _FinePlanningJob(
                     request_id=fine_request_id,
                     snapshot=latest_snapshot,
@@ -1276,18 +1376,24 @@ def _run(
                         float(position[1]),
                         float(robot_yaw_world),
                     ),
-                    goal_world_xy=(float(goal_world[0]), float(goal_world[1])),
+                    goal_world_pose=(
+                        float(goal_world[0]),
+                        float(goal_world[1]),
+                        float(goal_heading),
+                    ),
                     submitted_sim_time_sec=now,
                     floor_z_m=float(position[2]) - float(profile.spawn_z_m),
                 )
                 if fine_worker.submit(job):
                     last_fine_request_time = now
                     logger.info(
-                        "[FineRequest] request=%d map_version=%d goal_world=[%.2f,%.2f]",
+                        "[FineRequest] request=%d map_version=%d "
+                        "goal_world=[%.2f,%.2f] heading=%.1fdeg",
                         fine_request_id,
                         latest_snapshot.version,
                         goal_world[0],
                         goal_world[1],
+                        math.degrees(goal_heading),
                     )
 
             if tracker is None:
@@ -1380,6 +1486,56 @@ def _world_path_to_odom(path_world_xy: np.ndarray, state: OdomState) -> np.ndarr
     cosine = math.cos(state.origin_world_yaw_rad)
     sine = math.sin(state.origin_world_yaw_rad)
     return delta @ np.asarray([[cosine, -sine], [sine, cosine]])
+
+
+def _world_yaw_to_odom(path_world_yaw_rad: np.ndarray, state: OdomState) -> np.ndarray:
+    yaw = np.asarray(path_world_yaw_rad, dtype=np.float64).reshape(-1)
+    converted = yaw - float(state.origin_world_yaw_rad)
+    return np.ascontiguousarray((converted + math.pi) % (2.0 * math.pi) - math.pi)
+
+
+def _select_fine_local_goal(
+    guide_world_xy: np.ndarray,
+    *,
+    current_world_xy: np.ndarray,
+    grid,
+    collision_checker: FootprintCollisionChecker,
+    lookahead_m: float,
+) -> tuple[np.ndarray, float] | None:
+    points = np.asarray(guide_world_xy, dtype=np.float64)
+    current = np.asarray(current_world_xy, dtype=np.float64).reshape(2)
+    if points.ndim != 2 or points.shape[1] != 2 or len(points) < 2:
+        return None
+    nearest_index = int(np.argmin(np.linalg.norm(points - current, axis=1)))
+    previous = current
+    travelled = 0.0
+    selected = None
+    for point in points[nearest_index:]:
+        delta = point - previous
+        segment_length = float(np.linalg.norm(delta))
+        if segment_length <= 1.0e-6:
+            continue
+        remaining = float(lookahead_m) - travelled
+        candidate = point
+        reached_limit = segment_length >= remaining
+        if reached_limit:
+            candidate = previous + delta * (remaining / segment_length)
+        heading = math.atan2(float(delta[1]), float(delta[0]))
+        metrics = collision_checker.metrics(
+            grid,
+            x_m=float(candidate[0]),
+            y_m=float(candidate[1]),
+            yaw_rad=heading,
+        )
+        if metrics.collision or metrics.outside_ratio > 0:
+            break
+        travelled += float(np.linalg.norm(candidate - previous))
+        if travelled >= 0.20:
+            selected = (np.asarray(candidate, dtype=np.float64), heading)
+        previous = candidate
+        if reached_limit:
+            break
+    return selected
 
 
 def _overlay_path_on_goal_map(

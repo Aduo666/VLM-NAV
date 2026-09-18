@@ -1,73 +1,183 @@
-# AGX 粗粒度 NavDP 与细粒度 Hybrid A* 独立模式测试。
+# AGX 粗粒度 NavDP 与细粒度 Hybrid A* 独立模式测试配置。
+
+# NavDP 推理服务连接与轨迹结果校验参数。
 server:
+  # NavDP HTTP 服务地址。
   base_url: "http://127.0.0.1:8889"
+  # 单次请求超时时间，单位为秒。
   timeout_sec: 30.0
+  # NavDP 返回值低于该阈值时视为停止候选。
   stop_threshold: -0.5
+  # 上传 RGB 图像的 JPEG 质量。
   jpeg_quality: 92
+  # 允许轨迹坐标出现的最大绝对值，单位为米。
   max_abs_coordinate_m: 12.0
+  # 相邻轨迹点允许的最大距离，单位为米。
   max_point_jump_m: 2.0
+  # 有效轨迹的最小长度，单位为米。
   min_path_length_m: 0.08
+  # 客户端与服务端模型信息的匹配容差，单位为米。
   model_match_tolerance_m: 0.02
 
+# 发送给 NavDP 的前视相机参数。
 camera:
+  # RGB-D 图像宽度，单位为像素。
   width: 640
+  # RGB-D 图像高度，单位为像素。
   height: 480
+  # 相机更新频率，单位为赫兹。
   frequency_hz: 15
+  # 导航开始前用于稳定传感器的渲染帧数。
   warmup_render_frames: 30
 
+# 手动选择导航目标的距离范围。
 goal:
-  # 目标点从机器人中心 BEV 地图中选择。
+  # 允许选择的最小目标距离，单位为米。
   min_distance_m: 0.25
+  # 允许选择的最大目标距离，单位为米。
   max_distance_m: 10.0
 
+# 粗粒度与细粒度规划任务的调度参数。
 execution:
+  # 程序启动后的默认导航模式。
   default_mode: "COARSE_NAVDP"
+  # NavDP 滚动推理周期，单位为秒。
   coarse_planning_period_sec: 0.50
+  # Hybrid A* 滚动规划周期，单位为秒。
   fine_planning_period_sec: 0.20
-  fine_heading_prepare_deg: 45.0
-  fine_heading_stop_deg: 15.0
-  fine_heading_rate_radps: 0.25
+  # 沿 NavDP 引导轨迹选择细粒度局部目标的前视距离，单位为米。
+  fine_local_goal_lookahead_m: 1.20
+  # 规划结果允许的最大时间延迟，单位为秒。
   max_result_age_sec: 1.00
+  # 新轨迹起点与机器人当前位置允许的最大连接误差，单位为米。
   max_path_join_error_m: 0.35
+  # 接受新轨迹所需的最小剩余长度，单位为米。
   min_remaining_path_m: 0.15
+  # 判定机器人到达最终目标的距离，单位为米。
   goal_reached_tolerance_m: 0.30
 
+# 细粒度轨迹跟踪速度与误差参数。
+fine_tracking:
+  # 细粒度模式最大前进或后退速度，单位为米每秒。
+  max_linear_mps: 0.60
+  # 细粒度模式最大旋转速度，单位为弧度每秒。
+  max_angular_radps: 0.35
+  # 轨迹跟踪前视距离，单位为米。
+  lookahead_m: 0.20
+  # 局部轨迹到达距离，单位为米。
+  arrival_distance_m: 0.05
+  # 允许的最大横向轨迹误差，单位为米。
+  max_path_error_m: 0.20
+
+# Hybrid A* 搜索、AGX 车体轮廓和路径代价参数。
 fine_planner:
+  # 用于碰撞检查的 AGX 平面组合轮廓。
   footprint:
-    front_m: 0.40
-    rear_m: 0.40
-    half_width_m: 0.32
+    # 车体轮廓由多个矩形部件的并集组成。
+    parts:
+      # 中央车体矩形，坐标使用机器人坐标系，正 X 向前，正 Y 向左。
+      - name: "chassis"
+        # 中央车体后边界，单位为米。
+        min_x_m: -0.33
+        # 中央车体前边界，单位为米。
+        max_x_m: 0.33
+        # 中央车体右边界，单位为米。
+        min_y_m: -0.25
+        # 中央车体左边界，单位为米。
+        max_y_m: 0.25
+      # 前轮区域矩形。
+      - name: "front_wheels"
+        # 前轮区域后边界，单位为米。
+        min_x_m: 0.24
+        # 前轮区域前边界，单位为米。
+        max_x_m: 0.40
+        # 前轮区域右边界，单位为米。
+        min_y_m: -0.32
+        # 前轮区域左边界，单位为米。
+        max_y_m: 0.32
+      # 后轮区域矩形。
+      - name: "rear_wheels"
+        # 后轮区域后边界，单位为米。
+        min_x_m: -0.40
+        # 后轮区域前边界，单位为米。
+        max_x_m: -0.24
+        # 后轮区域右边界，单位为米。
+        min_y_m: -0.32
+        # 后轮区域左边界，单位为米。
+        max_y_m: 0.32
+    # 车体轮廓外增加的安全余量，单位为米。
     margin_m: 0.03
+  # 计入二维障碍物的最低相对高度，单位为米。
   obstacle_min_height_m: 0.05
+  # 计入二维障碍物的最高相对高度，单位为米。
   obstacle_max_height_m: 1.50
+  # Hybrid A* 航向离散分辨率，单位为度。
   yaw_resolution_deg: 5.0
+  # 单个平移运动段长度，单位为米。
   step_length_m: 0.10
+  # 每个运动段进行碰撞检查的采样间隔，单位为米。
   collision_sample_step_m: 0.05
+  # 前进与后退运动段使用的曲率样本，单位为每米。
   curvature_samples_per_m: [-1.2, -0.6, 0.0, 0.6, 1.2]
+  # 局部目标位置容差，单位为米。
   goal_tolerance_m: 0.15
+  # 局部目标航向容差，单位为度。
+  goal_yaw_tolerance_deg: 15.0
+  # 单次细粒度规划允许的最大距离，单位为米。
   max_plan_distance_m: 4.0
+  # 单次搜索允许扩展的最大节点数量。
   max_expansions: 10000
+  # 机器人附近将未知区域视为硬约束的半径，单位为米。
   unknown_block_radius_m: 0.80
+  # 近场车体轮廓允许覆盖的最大未知栅格比例。
   max_near_unknown_ratio: 0.05
+  # 触发近场未知硬约束所需的最小未知面积，单位为平方米。
+  min_near_unknown_area_m2: 0.02
+  # 低余量路径的代价权重。
   clearance_weight: 0.01
+  # 未知区域的代价权重。
   unknown_weight: 2.0
+  # 大曲率运动段的代价权重。
   curvature_weight: 0.01
+  # 相邻运动段曲率变化的代价权重。
   curvature_change_weight: 0.01
+  # 后退运动相对于前进运动的代价倍率。
+  reverse_penalty: 1.25
+  # 前进与后退方向切换的代价倍率。
+  direction_change_penalty: 1.50
+  # 原地旋转运动段的单步角度，单位为度。
+  spin_step_deg: 10.0
+  # 原地旋转运动的代价倍率。
+  spin_penalty: 1.20
+  # 启发函数在搜索优先级中的权重。
   heuristic_weight: 8.0
 
+# 目标选择地图与局部体素地图来源。
 map_selector:
-  # 复用局部体素地图参数，导航模式只融合前视和下视相机。
+  # 复用局部三维体素地图的参数文件。
   source_config_path: "configs/agx_local_3d_map_test.yaml"
+  # 导航局部地图融合的相机名称。
   sources: ["front", "down"]
+  # 目标选择地图的图像边长，单位为像素。
   image_size_px: 420
+  # 目标选择地图显示的物理范围，单位为米。
   view_size_m: 10.0
+  # 目标选择地图显示的机器人后方范围，单位为米。
   rear_view_m: 1.5
+  # 目标选择地图刷新周期，单位为秒。
   render_period_sec: 0.25
+  # 地图显示障碍物的最低相对高度，单位为米。
   obstacle_min_relative_z_m: 0.05
+  # 地图显示障碍物的最高相对高度，单位为米。
   obstacle_max_relative_z_m: 1.50
 
+# 调试图片保存参数。
 debug:
+  # NavDP 候选轨迹图片的覆盖保存路径。
   candidate_image_path: "debug/local/agx_navdp_candidates.png"
+  # 细粒度三维几何图片的覆盖保存路径。
   fine_image_path: "debug/local/agx_fine_navigation.png"
+  # 细粒度三维几何图片刷新周期，单位为秒。
   fine_update_period_sec: 0.50
+  # NavDP 候选轨迹图片显示的物理范围，单位为米。
   view_size_m: 10.0

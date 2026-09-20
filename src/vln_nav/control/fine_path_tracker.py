@@ -149,8 +149,17 @@ class FinePathTracker:
                 segment_yaw_start + progress * segment_yaw_delta
             )
             yaw_error = _wrap_angle(reference_yaw - yaw)
+            planned_curvature = segment_yaw_delta / (
+                float(direction) * max(segment_norm, 1.0e-9)
+            )
             speed_limit = min(
                 self.config.max_linear_mps,
+                self.config.max_angular_radps
+                / max(abs(planned_curvature), 1.0e-9),
+                math.sqrt(
+                    self.config.max_lateral_acceleration_mps2
+                    / max(abs(planned_curvature), 1.0e-9)
+                ),
                 math.sqrt(2.0 * self.config.max_acceleration_mps2 * max(remaining, 0.0)),
             )
             speed = min(
@@ -158,9 +167,6 @@ class FinePathTracker:
                 self.speed + self.config.max_acceleration_mps2 * dt,
             )
             linear = float(direction) * speed
-            planned_curvature = segment_yaw_delta / (
-                float(direction) * max(segment_norm, 1.0e-9)
-            )
             angular = float(np.clip(
                 linear * planned_curvature + 1.5 * yaw_error,
                 -self.config.max_angular_radps,

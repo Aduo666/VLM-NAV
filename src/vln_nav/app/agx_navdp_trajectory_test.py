@@ -93,9 +93,47 @@ class _FinePlanningJob:
     request_id: int
     snapshot: LocalVoxelSnapshot
     start_pose_world: tuple[float, float, float]
-    goal_world_pose: tuple[float, float, float]
+    goal_world_xy: tuple[float, float]
+    lookahead_m: float
     submitted_sim_time_sec: float
     floor_z_m: float
+
+
+@dataclass(frozen=True)
+class _FineFailureInput:
+    occupied_mask: np.ndarray
+    unknown_mask: np.ndarray
+    origin_xy: tuple[float, float]
+    start_pose_world: tuple[float, float, float]
+    goal_world_xy: tuple[float, float]
+
+    @classmethod
+    def from_job(cls, grid, job: _FinePlanningJob) -> "_FineFailureInput":
+        return cls(
+            occupied_mask=grid.occupied_mask.copy(),
+            unknown_mask=grid.unknown_mask.copy(),
+            origin_xy=(grid.origin_x_m, grid.origin_y_m),
+            start_pose_world=job.start_pose_world,
+            goal_world_xy=job.goal_world_xy,
+        )
+
+    def matches(self, grid, start_pose_world, goal_world_xy) -> bool:
+        yaw_delta = (
+            float(start_pose_world[2]) - self.start_pose_world[2] + math.pi
+        ) % (2.0 * math.pi) - math.pi
+        return bool(
+            self.origin_xy == (grid.origin_x_m, grid.origin_y_m)
+            and np.array_equal(self.occupied_mask, grid.occupied_mask)
+            and np.array_equal(self.unknown_mask, grid.unknown_mask)
+            and np.linalg.norm(
+                np.asarray(start_pose_world[:2])
+                - np.asarray(self.start_pose_world[:2])
+            ) < grid.resolution_m
+            and abs(yaw_delta) < math.radians(5.0)
+            and np.linalg.norm(
+                np.asarray(goal_world_xy) - np.asarray(self.goal_world_xy)
+            ) < grid.resolution_m
+        )
 
 
 class _NavDPWorker:
@@ -194,10 +232,16 @@ class _FinePlanningWorker:
                 yaw_rad=job.start_pose_world[2],
                 collision_checker=self._planner.collision_checker,
             )
+            local_goal = self._planner.select_local_goal(
+                grid=grid,
+                start_pose_world=job.start_pose_world,
+                target_world_xy=job.goal_world_xy,
+                lookahead_m=job.lookahead_m,
+            )
             plan = self._planner.plan(
                 grid=grid,
                 start_pose_world=job.start_pose_world,
-                goal_world_pose=job.goal_world_pose,
+                goal_world_xy=local_goal,
             )
             self._results.put((job, grid, plan, None))
         except Exception as exc:
@@ -871,7 +915,6 @@ def _run(
     tracker = None
     tracker_mode: str | None = None
     display_path_odom_xy: np.ndarray | None = None
-    fine_guide_odom_xy: np.ndarray | None = None
     frozen_candidates: list[_FrozenCandidate] = []
     selected_index = 0
     request_id = 0
@@ -901,8 +944,7 @@ def _run(
     map_render_period = float(settings["map_selector"]["render_period_sec"])
     latest_snapshot = local_map.snapshot()
     latest_planning_grid = None
-    last_failed_fine_occupancy = None
-    last_failed_fine_goal_pose = None
+    last_failed_fine_input: _FineFailureInput | None = None
     logger.info("[NavigationMode] selected=%s", mode)
 
     try:
@@ -1051,7 +1093,7 @@ def _run(
                 job, result, error = completed
                 if (
                     job.request_id != accepted_request_id
-                    or mode not in {"COARSE", "FINE"}
+                    or mode != "COARSE"
                     or not navigation_active
                 ):
                     logger.info("[NavDPResult] ignored stale request=%d", job.request_id)
@@ -1084,7 +1126,7 @@ def _run(
                             join_error,
                             remaining_length,
                         )
-                    elif mode == "COARSE":
+                    else:
                         _save_candidate_debug(
                             debug_path,
                             result,
@@ -1116,20 +1158,6 @@ def _run(
                             remaining_length,
                             result.latency_sec,
                         )
-                    else:
-                        fine_guide_odom_xy = joined_path.copy()
-                        if tracker is None:
-                            display_path_odom_xy = joined_path.copy()
-                        logger.info(
-                            "[FineGuide] request=%d candidate=%d age=%.3fs "
-                            "join_error=%.3fm remaining=%.3fm",
-                            job.request_id,
-                            selected.source.index,
-                            result_age,
-                            join_error,
-                            remaining_length,
-                        )
-
             fine_completed = fine_worker.poll()
             if fine_completed is not None:
                 job, grid, plan, error = fine_completed
@@ -1141,13 +1169,16 @@ def _run(
                     logger.info("[FineResult] ignored stale request=%d", job.request_id)
                 elif error is not None:
                     if grid is not None:
-                        last_failed_fine_occupancy = grid.occupied_mask.copy()
-                        last_failed_fine_goal_pose = np.asarray(
-                            job.goal_world_pose,
-                            dtype=np.float64,
-                        )
+                        last_failed_fine_input = _FineFailureInput.from_job(grid, job)
                     idle_status = "Fine planning failed; inspect Fine Geometry and log"
-                    logger.error("[FineResult] request=%d failed: %s", job.request_id, error)
+                    logger.error(
+                        "[FineResult] request=%d map_version=%d target=[%.2f,%.2f] failed: %s",
+                        job.request_id,
+                        job.snapshot.version,
+                        job.goal_world_xy[0],
+                        job.goal_world_xy[1],
+                        error,
+                    )
                 else:
                     result_age = now - job.submitted_sim_time_sec
                     path_odom = _world_path_to_odom(plan.path_world_xy, state)
@@ -1169,6 +1200,13 @@ def _run(
                         plan.path_world_yaw_rad,
                         collision_checker=collision_checker,
                     )
+                    validation_grid = latest_planning_grid or grid
+                    latest_clearance = assess_path_clearance(
+                        validation_grid,
+                        plan.path_world_xy,
+                        plan.path_world_yaw_rad,
+                        collision_checker=collision_checker,
+                    )
                     rejection = _rolling_result_rejection(
                         result_age_sec=result_age,
                         join_error_m=join_error,
@@ -1177,15 +1215,35 @@ def _run(
                     )
                     if clearance.collision:
                         rejection = "fine_path_collision"
+                    elif latest_clearance.collision:
+                        rejection = "fine_path_new_collision"
+                    elif clearance.outside_ratio > 0 or latest_clearance.outside_ratio > 0:
+                        rejection = "fine_path_outside_map"
+                    elif (
+                        latest_clearance.unknown_ratio
+                        > clearance.unknown_ratio + fine_config.max_near_unknown_ratio
+                    ):
+                        rejection = "fine_path_new_unknown"
+                    elif rejection == "result_too_old":
+                        yaw_delta = (
+                            robot_yaw_world - job.start_pose_world[2] + math.pi
+                        ) % (2.0 * math.pi) - math.pi
+                        if (
+                            join_error <= validation_grid.resolution_m
+                            and abs(yaw_delta) <= math.radians(fine_config.yaw_resolution_deg)
+                            and remaining_length
+                            >= float(settings["execution"]["min_remaining_path_m"])
+                        ):
+                            rejection = None
                     if rejection is not None:
-                        last_failed_fine_occupancy = (
-                            grid.occupied_mask.copy()
-                            if rejection == "fine_path_collision"
-                            else None
-                        )
-                        last_failed_fine_goal_pose = (
-                            np.asarray(job.goal_world_pose, dtype=np.float64)
-                            if rejection == "fine_path_collision"
+                        last_failed_fine_input = (
+                            _FineFailureInput.from_job(validation_grid, job)
+                            if rejection in {
+                                "fine_path_collision",
+                                "fine_path_new_collision",
+                                "fine_path_outside_map",
+                                "fine_path_new_unknown",
+                            }
                             else None
                         )
                         logger.warning(
@@ -1197,9 +1255,23 @@ def _run(
                             join_error,
                             remaining_length,
                         )
+                        collision_report = (
+                            clearance
+                            if clearance.first_collision_world_xyyaw is not None
+                            else latest_clearance
+                        )
+                        if collision_report.first_collision_world_xyyaw is not None:
+                            logger.warning(
+                                "[FineCollision] request=%d pose_index=%d "
+                                "world_xyyaw=%s cell=%s map_version=%d",
+                                job.request_id,
+                                collision_report.first_collision_pose_index,
+                                collision_report.first_collision_world_xyyaw,
+                                collision_report.first_collision_cell,
+                                validation_grid.map_version,
+                            )
                     else:
-                        last_failed_fine_occupancy = None
-                        last_failed_fine_goal_pose = None
+                        last_failed_fine_input = None
                         tracker = FinePathTracker(
                             joined_path,
                             path_odom_yaw,
@@ -1215,7 +1287,8 @@ def _run(
                         logger.info(
                             "[FineSwitch] generation=%d request=%d nodes=%d cost=%.3f "
                             "age=%.3fs join_error=%.3fm remaining=%.3fm "
-                            "clearance=%.3fm unknown=%.3f rejected=[collision:%d,unknown:%d,outside:%d]",
+                            "local_goal=[%.2f,%.2f] clearance=%.3fm unknown=%.3f "
+                            "rejected=[collision:%d,unknown:%d,outside:%d]",
                             generation_index,
                             job.request_id,
                             plan.expanded_node_count,
@@ -1223,6 +1296,8 @@ def _run(
                             result_age,
                             join_error,
                             remaining_length,
+                            plan.local_goal_world_xy[0],
+                            plan.local_goal_world_xy[1],
                             clearance.min_clearance_m,
                             clearance.unknown_ratio,
                             plan.rejected_collision_count,
@@ -1237,15 +1312,13 @@ def _run(
                     tracker = None
                     tracker_mode = None
                     display_path_odom_xy = None
-                    fine_guide_odom_xy = None
                     navigation_active = False
                     request_id += 1
                     accepted_request_id = request_id
                     fine_request_id += 1
                     accepted_fine_request_id = fine_request_id
                     mode = str(action[1])
-                    last_failed_fine_occupancy = None
-                    last_failed_fine_goal_pose = None
+                    last_failed_fine_input = None
                     idle_status = f"MODE: {mode}; click a goal"
                     logger.info("[NavigationMode] selected=%s", mode)
                 elif isinstance(action, tuple) and action[0] == "GOAL_ERROR":
@@ -1271,11 +1344,9 @@ def _run(
                             accepted_fine_request_id = fine_request_id
                             frozen_candidates = []
                             display_path_odom_xy = None
-                            fine_guide_odom_xy = None
                             selected_index = 0
                             navigation_active = True
-                            last_failed_fine_occupancy = None
-                            last_failed_fine_goal_pose = None
+                            last_failed_fine_input = None
                             generation_index = 0
                             last_coarse_request_time = -float("inf")
                             last_fine_request_time = -float("inf")
@@ -1301,7 +1372,6 @@ def _run(
                     tracker = None
                     tracker_mode = None
                     display_path_odom_xy = None
-                    fine_guide_odom_xy = None
                     navigation_active = False
                     idle_status = "NAVIGATION STOPPED"
                     logger.info("[NavigationControl] STOP")
@@ -1318,7 +1388,6 @@ def _run(
                 navigation_active = False
                 tracker = None
                 tracker_mode = None
-                fine_guide_odom_xy = None
                 adapter.stop()
                 idle_status = f"GOAL REACHED: distance={goal_distance:.2f}m"
                 logger.info(
@@ -1335,7 +1404,6 @@ def _run(
                     tracker_mode = None
                     navigation_active = False
                     display_path_odom_xy = None
-                    fine_guide_odom_xy = None
                     request_id += 1
                     accepted_request_id = request_id
                     fine_request_id += 1
@@ -1422,7 +1490,7 @@ def _run(
 
             if (
                 navigation_active
-                and mode in {"COARSE", "FINE"}
+                and mode == "COARSE"
                 and selected_goal_odom_xy is not None
                 and not worker.busy
                 and now - last_coarse_request_time
@@ -1464,84 +1532,56 @@ def _run(
                 navigation_active
                 and mode == "FINE"
                 and selected_goal_odom_xy is not None
-                and fine_guide_odom_xy is not None
                 and latest_snapshot.version > 0
+                and latest_planning_grid is not None
                 and not fine_worker.busy
                 and now - last_fine_request_time
                 >= float(settings["execution"]["fine_planning_period_sec"])
             ):
-                guide_world = _odom_path_to_world(fine_guide_odom_xy, state)
-                selected_subgoal = _select_fine_local_goal(
-                    guide_world,
-                    current_world_xy=np.asarray(position[:2], dtype=np.float64),
-                    grid=latest_planning_grid,
-                    collision_checker=collision_checker,
-                    lookahead_m=float(
-                        settings["execution"]["fine_local_goal_lookahead_m"]
-                    ),
+                goal_world = _odom_path_to_world(
+                    selected_goal_odom_xy[None, :], state
+                )[0]
+                start_pose_world = (
+                    float(position[0]),
+                    float(position[1]),
+                    float(robot_yaw_world),
                 )
-                if selected_subgoal is None:
-                    idle_status = "Fine guide has no locally feasible subgoal"
-                    if idle_status != last_reported_idle_status:
-                        logger.warning("[NavigationStatus] %s", idle_status)
-                        last_reported_idle_status = idle_status
-                    world.step(render=frame_index % render_stride == 0)
-                    frame_index += 1
-                    continue
-                goal_world, goal_heading = selected_subgoal
+                target_world_xy = (float(goal_world[0]), float(goal_world[1]))
                 failed_input_unchanged = (
-                    last_failed_fine_occupancy is not None
-                    and last_failed_fine_goal_pose is not None
-                    and np.array_equal(
-                        last_failed_fine_occupancy,
-                        latest_planning_grid.occupied_mask,
+                    last_failed_fine_input is not None
+                    and last_failed_fine_input.matches(
+                        latest_planning_grid, start_pose_world, target_world_xy
                     )
-                    and np.linalg.norm(
-                        last_failed_fine_goal_pose
-                        - np.asarray(
-                            [goal_world[0], goal_world[1], goal_heading],
-                            dtype=np.float64,
-                        )
-                    )
-                    < 0.05
                 )
                 if failed_input_unchanged:
                     idle_status = "Fine planning input unchanged after failure"
                     if idle_status != last_reported_idle_status:
                         logger.warning("[NavigationStatus] %s", idle_status)
                         last_reported_idle_status = idle_status
-                    world.step(render=frame_index % render_stride == 0)
-                    frame_index += 1
-                    continue
-                fine_request_id += 1
-                accepted_fine_request_id = fine_request_id
-                job = _FinePlanningJob(
-                    request_id=fine_request_id,
-                    snapshot=latest_snapshot,
-                    start_pose_world=(
-                        float(position[0]),
-                        float(position[1]),
-                        float(robot_yaw_world),
-                    ),
-                    goal_world_pose=(
-                        float(goal_world[0]),
-                        float(goal_world[1]),
-                        float(goal_heading),
-                    ),
-                    submitted_sim_time_sec=now,
-                    floor_z_m=float(position[2]) - float(profile.spawn_z_m),
-                )
-                if fine_worker.submit(job):
-                    last_fine_request_time = now
-                    logger.info(
-                        "[FineRequest] request=%d map_version=%d "
-                        "goal_world=[%.2f,%.2f] heading=%.1fdeg",
-                        fine_request_id,
-                        latest_snapshot.version,
-                        goal_world[0],
-                        goal_world[1],
-                        math.degrees(goal_heading),
+                else:
+                    fine_request_id += 1
+                    accepted_fine_request_id = fine_request_id
+                    job = _FinePlanningJob(
+                        request_id=fine_request_id,
+                        snapshot=latest_snapshot,
+                        start_pose_world=start_pose_world,
+                        goal_world_xy=target_world_xy,
+                        lookahead_m=float(
+                            settings["execution"]["fine_local_goal_lookahead_m"]
+                        ),
+                        submitted_sim_time_sec=now,
+                        floor_z_m=float(position[2]) - float(profile.spawn_z_m),
                     )
+                    if fine_worker.submit(job):
+                        last_fine_request_time = now
+                        logger.info(
+                            "[FineRequest] request=%d map_version=%d "
+                            "target_world=[%.2f,%.2f]",
+                            fine_request_id,
+                            latest_snapshot.version,
+                            target_world_xy[0],
+                            target_world_xy[1],
+                        )
 
             if tracker is None and idle_status != last_reported_idle_status:
                 logger.info("[NavigationStatus] %s", idle_status)
@@ -1628,50 +1668,6 @@ def _world_yaw_to_odom(path_world_yaw_rad: np.ndarray, state: OdomState) -> np.n
     yaw = np.asarray(path_world_yaw_rad, dtype=np.float64).reshape(-1)
     converted = yaw - float(state.origin_world_yaw_rad)
     return np.ascontiguousarray((converted + math.pi) % (2.0 * math.pi) - math.pi)
-
-
-def _select_fine_local_goal(
-    guide_world_xy: np.ndarray,
-    *,
-    current_world_xy: np.ndarray,
-    grid,
-    collision_checker: FootprintCollisionChecker,
-    lookahead_m: float,
-) -> tuple[np.ndarray, float] | None:
-    points = np.asarray(guide_world_xy, dtype=np.float64)
-    current = np.asarray(current_world_xy, dtype=np.float64).reshape(2)
-    if points.ndim != 2 or points.shape[1] != 2 or len(points) < 2:
-        return None
-    nearest_index = int(np.argmin(np.linalg.norm(points - current, axis=1)))
-    previous = current
-    travelled = 0.0
-    selected = None
-    for point in points[nearest_index:]:
-        delta = point - previous
-        segment_length = float(np.linalg.norm(delta))
-        if segment_length <= 1.0e-6:
-            continue
-        remaining = float(lookahead_m) - travelled
-        candidate = point
-        reached_limit = segment_length >= remaining
-        if reached_limit:
-            candidate = previous + delta * (remaining / segment_length)
-        heading = math.atan2(float(delta[1]), float(delta[0]))
-        metrics = collision_checker.metrics(
-            grid,
-            x_m=float(candidate[0]),
-            y_m=float(candidate[1]),
-            yaw_rad=heading,
-        )
-        if metrics.collision or metrics.outside_ratio > 0:
-            break
-        travelled += float(np.linalg.norm(candidate - previous))
-        if travelled >= 0.20:
-            selected = (np.asarray(candidate, dtype=np.float64), heading)
-        previous = candidate
-        if reached_limit:
-            break
-    return selected
 
 
 def _overlay_path_on_goal_map(

@@ -98,6 +98,9 @@ class PathClearance:
     unknown_ratio: float
     outside_ratio: float
     checked_pose_count: int
+    first_collision_pose_index: int | None
+    first_collision_world_xyyaw: tuple[float, float, float] | None
+    first_collision_cell: tuple[int, int] | None
 
 
 @dataclass(frozen=True)
@@ -216,6 +219,29 @@ class FootprintCollisionChecker:
             resolution_m=grid.resolution_m,
             map_version=grid.map_version,
         )
+
+    def first_occupied_cell(
+        self,
+        grid: PlanningGrid,
+        *,
+        x_m: float,
+        y_m: float,
+        yaw_rad: float,
+    ) -> tuple[int, int] | None:
+        rows, columns, inside = self._indices(
+            grid,
+            x_m=x_m,
+            y_m=y_m,
+            yaw_rad=yaw_rad,
+            margin_m=self.footprint.margin_m,
+        )
+        valid_rows = rows[inside]
+        valid_columns = columns[inside]
+        hits = np.flatnonzero(grid.occupied_mask[valid_rows, valid_columns])
+        if hits.size == 0:
+            return None
+        index = int(hits[0])
+        return int(valid_rows[index]), int(valid_columns[index])
 
     def covered_linear_indices(
         self,
@@ -415,21 +441,41 @@ def assess_path_clearance(
     min_clearance = float("inf")
     unknown_sum = 0.0
     outside_sum = 0.0
-    for point, heading in zip(points, yaw):
+    first_collision_pose_index = None
+    first_collision_world_xyyaw = None
+    first_collision_cell = None
+    for index in range(1, len(points)):
+        point = points[index]
+        heading = float(yaw[index])
         metrics = collision_checker.metrics(
             grid,
             x_m=float(point[0]),
             y_m=float(point[1]),
-            yaw_rad=float(heading),
+            yaw_rad=heading,
         )
+        if metrics.collision and first_collision_pose_index is None:
+            first_collision_pose_index = index
+            first_collision_world_xyyaw = (
+                float(point[0]), float(point[1]), heading
+            )
+            first_collision_cell = collision_checker.first_occupied_cell(
+                grid,
+                x_m=float(point[0]),
+                y_m=float(point[1]),
+                yaw_rad=heading,
+            )
         collision = collision or metrics.collision
         min_clearance = min(min_clearance, metrics.min_clearance_m)
         unknown_sum += metrics.unknown_ratio
         outside_sum += metrics.outside_ratio
+    checked_count = len(points) - 1
     return PathClearance(
         collision=collision,
         min_clearance_m=0.0 if not math.isfinite(min_clearance) else min_clearance,
-        unknown_ratio=float(unknown_sum / len(points)),
-        outside_ratio=float(outside_sum / len(points)),
-        checked_pose_count=int(len(points)),
+        unknown_ratio=float(unknown_sum / checked_count),
+        outside_ratio=float(outside_sum / checked_count),
+        checked_pose_count=checked_count,
+        first_collision_pose_index=first_collision_pose_index,
+        first_collision_world_xyyaw=first_collision_world_xyyaw,
+        first_collision_cell=first_collision_cell,
     )

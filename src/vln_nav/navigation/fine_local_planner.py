@@ -19,7 +19,6 @@ class FinePlannerConfig:
     collision_sample_step_m: float
     curvature_samples_per_m: tuple[float, ...]
     goal_tolerance_m: float
-    goal_yaw_tolerance_deg: float
     max_plan_distance_m: float
     max_expansions: int
     unknown_block_radius_m: float
@@ -60,7 +59,6 @@ class FinePlannerConfig:
             self.step_length_m,
             self.collision_sample_step_m,
             self.goal_tolerance_m,
-            self.goal_yaw_tolerance_deg,
             self.max_plan_distance_m,
             self.unknown_block_radius_m,
             self.min_near_unknown_area_m2,
@@ -78,8 +76,6 @@ class FinePlannerConfig:
             raise ValueError("细粒度规划器数值配置必须为有限正数")
         if not 1.0 <= self.yaw_resolution_deg <= 30.0:
             raise ValueError("细粒度规划器朝向分辨率必须位于 1 至 30 度范围内")
-        if not 1.0 <= self.goal_yaw_tolerance_deg <= 90.0:
-            raise ValueError("细粒度目标航向容差必须位于 1 至 90 度范围内")
         if self.collision_sample_step_m > self.step_length_m:
             raise ValueError("碰撞采样间隔不能超过运动段长度")
         if self.max_expansions < 100:
@@ -100,7 +96,7 @@ class FinePlan:
     expanded_node_count: int
     path_cost: float
     map_version: int
-    local_goal_world_pose: tuple[float, float, float]
+    local_goal_world_xy: tuple[float, float]
     rejected_collision_count: int
     rejected_unknown_count: int
     rejected_outside_count: int
@@ -151,62 +147,214 @@ class FineLocalPlanner:
             ]
         )
 
+    def select_local_goal(
+        self,
+        *,
+        grid: PlanningGrid,
+        start_pose_world: tuple[float, float, float],
+        target_world_xy: tuple[float, float],
+        lookahead_m: float,
+    ) -> tuple[float, float]:
+        start = np.asarray(start_pose_world, dtype=np.float64)
+        target = np.asarray(target_world_xy, dtype=np.float64)
+        if start.shape != (3,) or target.shape != (2,) or not (
+            np.isfinite(start).all() and np.isfinite(target).all()
+        ):
+            raise ValueError("细粒度目标选择需要有效的机器人位姿和目标坐标")
+        if not math.isfinite(lookahead_m) or lookahead_m <= 0:
+            raise ValueError("细粒度局部目标前视距离必须为正数")
+        start_row, start_column, start_inside = grid.world_to_cell(
+            float(start[0]), float(start[1])
+        )
+        if not start_inside:
+            raise RuntimeError("机器人位于局部地图范围外")
+
+        minimum_clearance = (
+            self.footprint.half_width_m + self.footprint.margin_m
+        )
+        traversable = (
+            grid.free_mask
+            & ~grid.occupied_mask
+            & (grid.clearance_m >= minimum_clearance)
+        ).copy()
+        traversable[start_row, start_column] = True
+        start_cell = (start_row, start_column)
+        goal_row, goal_column, goal_inside = grid.world_to_cell(
+            float(target[0]), float(target[1])
+        )
+        goal_cell = (goal_row, goal_column) if goal_inside else None
+        goal_traversable = bool(
+            goal_cell is not None and traversable[goal_row, goal_column]
+        )
+
+        queue = [(0.0, start_row, start_column)]
+        distance = {start_cell: 0.0}
+        parent: dict[tuple[int, int], tuple[int, int] | None] = {
+            start_cell: None
+        }
+        best_cell = None
+        best_score = float("inf")
+        start_target_distance = float(np.linalg.norm(start[:2] - target))
+        search_radius = self.config.max_plan_distance_m
+        neighbors = (
+            (-1, 0), (1, 0), (0, -1), (0, 1),
+            (-1, -1), (-1, 1), (1, -1), (1, 1),
+        )
+        while queue:
+            cost, row, column = heapq.heappop(queue)
+            cell = (row, column)
+            if cost > distance[cell] + 1.0e-9:
+                continue
+            cell_xy = np.asarray(
+                [
+                    grid.origin_x_m + (column + 0.5) * grid.resolution_m,
+                    grid.origin_y_m + (row + 0.5) * grid.resolution_m,
+                ],
+                dtype=np.float64,
+            )
+            goal_distance = float(np.linalg.norm(cell_xy - target))
+            if goal_cell == cell and goal_traversable:
+                best_cell = cell
+                break
+            if (
+                cell != start_cell
+                and start_target_distance - goal_distance >= 0.20
+            ):
+                score = goal_distance + 0.15 * cost
+                if score < best_score:
+                    best_score = score
+                    best_cell = cell
+            for delta_row, delta_column in neighbors:
+                next_row = row + delta_row
+                next_column = column + delta_column
+                if not (
+                    0 <= next_row < grid.shape[0]
+                    and 0 <= next_column < grid.shape[1]
+                    and traversable[next_row, next_column]
+                ):
+                    continue
+                if delta_row and delta_column and not (
+                    traversable[row + delta_row, column]
+                    and traversable[row, column + delta_column]
+                ):
+                    continue
+                next_x = grid.origin_x_m + (next_column + 0.5) * grid.resolution_m
+                next_y = grid.origin_y_m + (next_row + 0.5) * grid.resolution_m
+                if math.hypot(next_x - start[0], next_y - start[1]) > search_radius:
+                    continue
+                step = grid.resolution_m * math.hypot(delta_row, delta_column)
+                next_cost = cost + step * (
+                    1.0 + 0.05 / max(float(grid.clearance_m[next_row, next_column]), 0.05)
+                )
+                next_cell = (next_row, next_column)
+                if next_cost >= distance.get(next_cell, float("inf")):
+                    continue
+                distance[next_cell] = next_cost
+                parent[next_cell] = cell
+                heapq.heappush(queue, (next_cost, next_row, next_column))
+
+        if best_cell is None:
+            raise RuntimeError("局部地图中没有朝目标可达的空闲区域")
+        cells = []
+        current = best_cell
+        while current is not None:
+            cells.append(current)
+            current = parent[current]
+        cells.reverse()
+        path = np.asarray(
+            [
+                [
+                    grid.origin_x_m + (column + 0.5) * grid.resolution_m,
+                    grid.origin_y_m + (row + 0.5) * grid.resolution_m,
+                ]
+                for row, column in cells
+            ],
+            dtype=np.float64,
+        )
+        path[0] = start[:2]
+        lengths = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(path, axis=0), axis=1))]
+        limit = min(float(lookahead_m), self.config.max_plan_distance_m)
+        for index in range(len(path) - 1, 0, -1):
+            if lengths[index] > limit:
+                continue
+            if lengths[index] < max(0.20, self.config.goal_tolerance_m):
+                break
+            candidate = path[index]
+            heading = math.atan2(
+                float(path[index, 1] - path[index - 1, 1]),
+                float(path[index, 0] - path[index - 1, 0]),
+            )
+            headings = (
+                heading,
+                float(start[2]),
+                heading + 0.5 * math.pi,
+                heading - 0.5 * math.pi,
+                heading + math.pi,
+            )
+            if any(
+                not metrics.collision and metrics.outside_ratio == 0.0
+                for yaw in headings
+                for metrics in [self.collision_checker.metrics(
+                    grid,
+                    x_m=float(candidate[0]),
+                    y_m=float(candidate[1]),
+                    yaw_rad=yaw,
+                )]
+            ):
+                return float(candidate[0]), float(candidate[1])
+        raise RuntimeError("局部路径内没有满足车体足迹的短程目标")
+
     def plan(
         self,
         *,
         grid: PlanningGrid,
         start_pose_world: tuple[float, float, float],
-        goal_world_pose: tuple[float, float, float],
+        goal_world_xy: tuple[float, float],
     ) -> FinePlan:
         start = np.asarray(start_pose_world, dtype=np.float64)
-        goal = np.asarray(goal_world_pose, dtype=np.float64)
-        if start.shape != (3,) or goal.shape != (3,) or not (
+        goal = np.asarray(goal_world_xy, dtype=np.float64)
+        if start.shape != (3,) or goal.shape != (2,) or not (
             np.isfinite(start).all() and np.isfinite(goal).all()
         ):
             raise ValueError("细粒度规划器需要有限的起始位姿和目标坐标")
-        goal_delta = goal[:2] - start[:2]
-        goal_distance = float(np.linalg.norm(goal_delta))
-        if goal_distance > self.config.max_plan_distance_m:
-            goal[:2] = (
-                start[:2]
-                + goal_delta / goal_distance * self.config.max_plan_distance_m
-            )
+        if float(np.linalg.norm(goal - start[:2])) > self.config.max_plan_distance_m:
+            raise ValueError("细粒度局部目标超出规划距离")
         start_key = self._state_key(grid, start[0], start[1], start[2], -1)
         if start_key is None:
             raise RuntimeError("细粒度规划器起始位姿位于局部地图外部")
 
-        queue: list[tuple[float, int, tuple[int, int, int, int]]] = []
+        queue: list[tuple[float, int, int]] = []
         counter = 0
-        g_score = {start_key: 0.0}
-        pose_by_key = {start_key: (float(start[0]), float(start[1]), float(start[2]))}
-        parent: dict[tuple[int, int, int, int], tuple[int, int, int, int] | None] = {
-            start_key: None
-        }
+        best_cost_by_key = {start_key: 0.0}
+        node_pose = {0: (float(start[0]), float(start[1]), float(start[2]))}
+        node_parent: dict[int, int | None] = {0: None}
+        node_action: dict[int, int | None] = {0: None}
+        node_cost = {0: 0.0}
+        node_key = {0: start_key}
         heapq.heappush(
             queue,
             (
-                self.config.heuristic_weight * self._heuristic(start, goal),
+                self.config.heuristic_weight * self._heuristic(start[:2], goal),
                 counter,
-                start_key,
+                0,
             ),
         )
-        goal_key = None
+        goal_node = None
         expanded = 0
         rejected_collision = 0
         rejected_unknown = 0
         rejected_outside = 0
 
         while queue and expanded < self.config.max_expansions:
-            _, _, key = heapq.heappop(queue)
-            pose = pose_by_key[key]
-            cost = g_score[key]
+            _, _, current_node = heapq.heappop(queue)
+            key = node_key[current_node]
+            cost = node_cost[current_node]
+            if cost > best_cost_by_key[key] + 1.0e-9:
+                continue
+            pose = node_pose[current_node]
             goal_position_error = math.hypot(pose[0] - goal[0], pose[1] - goal[1])
-            goal_yaw_error = abs(self._wrap_angle(pose[2] - goal[2]))
-            if (
-                goal_position_error <= self.config.goal_tolerance_m
-                and goal_yaw_error <= math.radians(self.config.goal_yaw_tolerance_deg)
-            ):
-                goal_key = key
+            if goal_position_error <= self.config.goal_tolerance_m:
+                goal_node = current_node
                 break
             expanded += 1
             previous_action = self._actions[key[3]] if key[3] >= 0 else None
@@ -298,44 +446,57 @@ class FineLocalPlanner:
                         )
                     )
                 new_cost = cost + transition_cost
-                if new_cost >= g_score.get(next_key, float("inf")):
+                if new_cost >= best_cost_by_key.get(next_key, float("inf")):
                     continue
-                g_score[next_key] = new_cost
-                pose_by_key[next_key] = tuple(map(float, endpoint))
-                parent[next_key] = key
+                best_cost_by_key[next_key] = new_cost
                 counter += 1
+                node_pose[counter] = tuple(map(float, endpoint))
+                node_parent[counter] = current_node
+                node_action[counter] = action_index
+                node_cost[counter] = new_cost
+                node_key[counter] = next_key
                 priority = new_cost + self.config.heuristic_weight * self._heuristic(
-                    endpoint, goal
+                    endpoint[:2], goal
                 )
-                heapq.heappush(queue, (priority, counter, next_key))
+                heapq.heappush(queue, (priority, counter, counter))
 
-        if goal_key is None:
+        if goal_node is None:
             raise RuntimeError(
                 f"细粒度规划器扩展 {expanded} 个节点后仍未找到路径；"
                 f"碰撞拒绝={rejected_collision}，未知拒绝={rejected_unknown}，"
                 f"地图外拒绝={rejected_outside}"
             )
-        keys = []
-        current = goal_key
+        node_ids = []
+        current = goal_node
         while current is not None:
-            keys.append(current)
-            current = parent[current]
-        keys.reverse()
-        poses = np.asarray([pose_by_key[key] for key in keys], dtype=np.float64)
-        motion_direction = np.asarray(
-            [0] + [self._actions[key[3]].direction for key in keys[1:]],
-            dtype=np.int8,
-        )
+            node_ids.append(current)
+            current = node_parent[current]
+        node_ids.reverse()
+        samples = [np.asarray(node_pose[0], dtype=np.float64)]
+        motion_direction = [0]
+        for node_id in node_ids[1:]:
+            parent_id = node_parent[node_id]
+            action_index = node_action[node_id]
+            if parent_id is None or action_index is None:
+                raise RuntimeError("细粒度路径父节点信息无效")
+            primitive = self._sample_primitive(
+                node_pose[parent_id], self._actions[action_index]
+            )
+            samples.extend(primitive[1:])
+            motion_direction.extend(
+                [self._actions[action_index].direction] * (len(primitive) - 1)
+            )
+        poses = np.asarray(samples, dtype=np.float64)
         if len(poses) < 2:
             raise RuntimeError("细粒度规划器返回了零长度路径")
         return FinePlan(
             path_world_xy=np.ascontiguousarray(poses[:, :2]),
             path_world_yaw_rad=np.ascontiguousarray(poses[:, 2]),
-            path_motion_direction=np.ascontiguousarray(motion_direction),
+            path_motion_direction=np.asarray(motion_direction, dtype=np.int8),
             expanded_node_count=int(expanded),
-            path_cost=float(g_score[goal_key]),
+            path_cost=float(node_cost[goal_node]),
             map_version=int(grid.map_version),
-            local_goal_world_pose=(float(goal[0]), float(goal[1]), float(goal[2])),
+            local_goal_world_xy=(float(goal[0]), float(goal[1])),
             rejected_collision_count=int(rejected_collision),
             rejected_unknown_count=int(rejected_unknown),
             rejected_outside_count=int(rejected_outside),
@@ -400,15 +561,5 @@ class FineLocalPlanner:
         return np.column_stack((sample_x, sample_y, sample_yaw))
 
     @staticmethod
-    def _heuristic(pose: np.ndarray, goal_pose: np.ndarray) -> float:
-        position_cost = float(
-            np.linalg.norm(np.asarray(pose[:2]) - np.asarray(goal_pose[:2]))
-        )
-        heading_cost = 0.10 * abs(
-            FineLocalPlanner._wrap_angle(float(pose[2]) - float(goal_pose[2]))
-        )
-        return position_cost + heading_cost
-
-    @staticmethod
-    def _wrap_angle(angle_rad: float) -> float:
-        return (float(angle_rad) + math.pi) % (2.0 * math.pi) - math.pi
+    def _heuristic(position_xy: np.ndarray, goal_xy: np.ndarray) -> float:
+        return float(np.linalg.norm(np.asarray(position_xy) - np.asarray(goal_xy)))

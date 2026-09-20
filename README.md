@@ -297,7 +297,8 @@ timeout, and swept envelope come from the selected profile.
 局部导航模式。`COARSE` 在机器人跟踪当前轨迹期间持续进行 NavDP 异步滚动推理。
 `FINE` 使用前视与下视 RGB-D 融合局部体素地图、AGX 多部件车体轮廓和 SE(2) 搜索。
 
-NavDP 按照官方 HTTP 接口作为独立进程运行。启动 Isaac Sim 前需要启动 NavDP 服务：
+`COARSE` 通过官方 HTTP 接口调用 NavDP。使用 `COARSE` 前需要启动 NavDP 服务；
+`FINE` 直接使用已知空闲地图和点击目标，无需 NavDP 服务：
 
 ```bash
 cd /path/to/NavDP/baselines/navdp
@@ -327,10 +328,11 @@ NavDP 候选编号、critic 数值和模型选择轨迹写入覆盖更新的
 `debug/local/agx_navdp_candidates.png`。critic 数值表示 NavDP 候选相对偏好。
 所有测试参数位于 `configs/agx_navdp_trajectory_test.yaml`。
 
-粗粒度轨迹根据观测时位姿转换到固定里程计坐标系。细粒度模式持续获取 NavDP 引导轨迹，
-沿引导轨迹选择局部地图中最远的可行位姿，再使用 Hybrid A* 规划到该位姿。Hybrid A* 支持
+粗粒度轨迹根据观测时位姿转换到固定里程计坐标系。细粒度模式独立使用点击的米制目标，
+从已知空闲地图路径选择可达的短程目标，再使用 Hybrid A* 规划到该位置。Hybrid A* 支持
 前进圆弧、后退圆弧和原地旋转，每个运动段都使用统一的 AGX 多部件足迹检查完整扫掠区域。
-路径生成和路径复检共享相同碰撞判定。调试轨迹和目标标记不会写入 USD Stage。
+路径生成和路径复检共享相同碰撞判定；规划失败后，地图、机器人位姿或目标变化才会再次请求规划。
+调试轨迹和目标标记不会写入 USD Stage。
 细粒度模式同时显示独立的 `Fine Geometry` 窗口，并覆盖更新
 `debug/local/agx_fine_navigation.png`。图像只包含局部 3D 占用体素、绿色规划路径、
 红色目标和机器人姿态，不叠加说明文字。主面板统一使用英文，兼容 Isaac Sim 默认字体。

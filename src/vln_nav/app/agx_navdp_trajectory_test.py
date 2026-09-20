@@ -29,7 +29,7 @@ from vln_nav.app.agx_local_3d_map_test import (
     _render_local_occupancy,
 )
 from vln_nav.control.locomotion import create_locomotion_controller
-from vln_nav.control.fine_path_tracker import FinePathTracker
+from vln_nav.control.fine_path_tracker import FinePathTracker, fit_agx_command
 from vln_nav.control.trajectory import (
     AgxVelocityAdapter,
     PathTracker,
@@ -208,10 +208,22 @@ class _FinePlanningWorker:
 
 
 class _GoalMapPanel:
+    _KEY_ACTIONS = {
+        "UP": "FORWARD",
+        "DOWN": "BACKWARD",
+        "LEFT": "TURN_LEFT",
+        "RIGHT": "TURN_RIGHT",
+    }
+
     def __init__(self, ui, *, image_size_px: int, command_sink) -> None:
-        self._ui = ui
+        import carb.input
+        import omni.appwindow
+
         self._command_sink = command_sink
         self._map: BevGoalMap | None = None
+        self._carb_input = carb.input
+        self._held_actions: dict[str, str] = {}
+        self._press_order: list[str] = []
         size = int(image_size_px)
         initial = np.empty((size, size, 4), dtype=np.uint8)
         initial[:, :, :3] = (108, 110, 112)
@@ -219,52 +231,103 @@ class _GoalMapPanel:
         self._provider = ui.ByteImageProvider()
         self._provider.set_data_array(initial.reshape(-1), [size, size])
         self.window = ui.Window(
-            "AGX Navigation Modes",
-            width=size + 34,
-            height=size + 195,
+            "AGX Navigation",
+            width=290,
+            height=105,
             visible=True,
         )
         with self.window.frame:
-            with ui.VStack(spacing=7):
-                self._image = ui.ImageWithProvider(
-                    self._provider,
-                    width=size,
-                    height=size,
-                    fill_policy=ui.IwpFillPolicy.IWP_STRETCH,
-                    pixel_aligned=True,
-                    opaque_for_mouse_events=True,
-                )
-                self._image.set_mouse_pressed_fn(self._on_map_pressed)
-                with ui.HStack(height=34):
+            with ui.VStack(spacing=5):
+                with ui.HStack(height=36):
                     ui.Button(
-                        "COARSE NAVDP",
-                        clicked_fn=lambda: command_sink(("SET_MODE", "COARSE_NAVDP")),
+                        "COARSE",
+                        clicked_fn=lambda: command_sink(("SET_MODE", "COARSE")),
                     )
                     ui.Button(
-                        "FINE HYBRID A*",
-                        clicked_fn=lambda: command_sink(("SET_MODE", "FINE_HYBRID_ASTAR")),
+                        "FINE",
+                        clicked_fn=lambda: command_sink(("SET_MODE", "FINE")),
                     )
-                self.mode_label = ui.Label("Mode: COARSE_NAVDP")
-                self.goal_label = ui.Label("Click known free space to select a goal")
-                ui.Button("STOP", height=34, clicked_fn=lambda: command_sink("STOP"))
-                self.candidate_label = ui.Label("Path: none")
-                self.status_label = ui.Label("Building local map", word_wrap=True)
+                ui.Button("STOP", height=34, clicked_fn=self._stop_all)
+        self.map_window = ui.Window(
+            "Goal Map",
+            width=max(size + 20, 600),
+            height=max(size + 20, 600),
+            visible=True,
+        )
+        with self.map_window.frame:
+            self._image = ui.ImageWithProvider(
+                self._provider,
+                width=ui.Fraction(1),
+                height=ui.Fraction(1),
+                fill_policy=ui.IwpFillPolicy.IWP_STRETCH,
+                pixel_aligned=True,
+                opaque_for_mouse_events=True,
+            )
+            self._image.set_mouse_pressed_fn(self._on_map_pressed)
+
+        app_window = omni.appwindow.get_default_app_window()
+        if app_window is None:
+            raise RuntimeError("Isaac Sim app window is unavailable")
+        self._keyboard = app_window.get_keyboard()
+        self._input = carb.input.acquire_input_interface()
+        self._keyboard_subscription = self._input.subscribe_to_keyboard_events(
+            self._keyboard,
+            self._on_keyboard_event,
+        )
+
+    @property
+    def manual_action(self) -> str:
+        if not self._press_order:
+            return "STOP"
+        return self._held_actions.get(self._press_order[-1], "STOP")
 
     def update_map(self, goal_map: BevGoalMap) -> None:
         self._map = goal_map
         height, width = goal_map.rgba.shape[:2]
         self._provider.set_data_array(goal_map.rgba.reshape(-1), [width, height])
 
-    def set_goal_text(self, forward_m: float, left_m: float) -> None:
-        self.goal_label.text = (
-            f"Goal: forward {forward_m:.2f} m, left {left_m:+.2f} m"
-        )
-
-    def set_goal_error(self, message: str) -> None:
-        self.goal_label.text = message
-
     def shutdown(self) -> None:
+        if self._keyboard_subscription is not None:
+            self._input.unsubscribe_to_keyboard_events(
+                self._keyboard,
+                self._keyboard_subscription,
+            )
+            self._keyboard_subscription = None
         self.window.visible = False
+        self.map_window.visible = False
+
+    def _stop_all(self) -> None:
+        self._held_actions.clear()
+        self._press_order.clear()
+        self._command_sink("STOP")
+
+    def _on_keyboard_event(self, event, *_args, **_kwargs) -> bool:
+        key_name = str(event.input.name)
+        action = self._KEY_ACTIONS.get(key_name)
+        if action is None:
+            return True
+        source = f"key:{key_name}"
+        if event.type == self._carb_input.KeyboardEventType.KEY_PRESS:
+            self._press(source, action)
+        elif (
+            event.type == self._carb_input.KeyboardEventType.KEY_REPEAT
+            and source not in self._held_actions
+        ):
+            self._press(source, action)
+        elif event.type == self._carb_input.KeyboardEventType.KEY_RELEASE:
+            self._release(source)
+        return True
+
+    def _press(self, source: str, action: str) -> None:
+        self._held_actions[source] = action
+        if source in self._press_order:
+            self._press_order.remove(source)
+        self._press_order.append(source)
+
+    def _release(self, source: str) -> None:
+        self._held_actions.pop(source, None)
+        if source in self._press_order:
+            self._press_order.remove(source)
 
     def _on_map_pressed(self, x: float, y: float, button: int, _modifiers) -> None:
         if button != 0 or self._map is None:
@@ -288,7 +351,7 @@ class _GoalMapPanel:
             )
         )
         if not bool(self._map.selectable_mask[row, column]):
-            self.set_goal_error("Select known free space")
+            self._command_sink(("GOAL_ERROR", "Select known free space"))
             return
         forward, left = self._map.pixel_to_local(column, row)
         self._command_sink(("SELECT_GOAL", forward, left))
@@ -309,8 +372,8 @@ class _FineGeometryPanel:
         with self.window.frame:
             ui.ImageWithProvider(
                 self._provider,
-                width=width,
-                height=height,
+                width=ui.Fraction(1),
+                height=ui.Fraction(1),
                 fill_policy=ui.IwpFillPolicy.IWP_STRETCH,
                 pixel_aligned=True,
             )
@@ -335,17 +398,25 @@ def _load_settings() -> tuple[
     with SETTINGS_PATH.open(encoding="utf-8") as handle:
         data = yaml.safe_load(handle) or {}
     expected = {
+        "scene",
         "server",
         "camera",
         "goal",
         "execution",
+        "coarse_tracking",
         "fine_tracking",
+        "manual_control",
         "fine_planner",
         "map_selector",
         "debug",
     }
     if set(data) != expected:
         raise ValueError(f"Navigation modes config requires exactly: {sorted(expected)}")
+    scene = data["scene"]
+    if not isinstance(scene, dict) or set(scene) != {"usd_path"}:
+        raise ValueError("Navigation modes scene requires usd_path")
+    if not str(scene["usd_path"]).strip():
+        raise ValueError("Navigation modes scene path is empty")
     server = NavDPClientConfig.from_mapping(data["server"])
 
     camera = data["camera"]
@@ -375,7 +446,7 @@ def _load_settings() -> tuple[
         "goal_reached_tolerance_m",
     }:
         raise ValueError("Invalid navigation modes execution fields")
-    if execution["default_mode"] not in {"COARSE_NAVDP", "FINE_HYBRID_ASTAR"}:
+    if execution["default_mode"] not in {"COARSE", "FINE"}:
         raise ValueError("Invalid default navigation mode")
     if any(
         float(value) <= 0
@@ -383,6 +454,18 @@ def _load_settings() -> tuple[
         if name != "default_mode"
     ):
         raise ValueError("NavDP execution tolerances must be positive")
+
+    coarse_tracking = data["coarse_tracking"]
+    coarse_tracking_fields = {"max_linear_mps", "max_angular_radps"}
+    if (
+        not isinstance(coarse_tracking, dict)
+        or set(coarse_tracking) != coarse_tracking_fields
+        or any(float(value) <= 0 for value in coarse_tracking.values())
+    ):
+        raise ValueError(
+            f"coarse_tracking requires positive values for: "
+            f"{sorted(coarse_tracking_fields)}"
+        )
 
     fine_tracking = data["fine_tracking"]
     fine_tracking_fields = {
@@ -405,6 +488,18 @@ def _load_settings() -> tuple[
     ):
         raise ValueError(
             "Fine tracking requires arrival_distance < lookahead <= max_path_error"
+        )
+
+    manual_control = data["manual_control"]
+    manual_control_fields = {"linear_mps", "angular_radps"}
+    if (
+        not isinstance(manual_control, dict)
+        or set(manual_control) != manual_control_fields
+        or any(float(value) <= 0 for value in manual_control.values())
+    ):
+        raise ValueError(
+            f"manual_control requires positive values for: "
+            f"{sorted(manual_control_fields)}"
         )
     fine = data["fine_planner"]
     fine_fields = {
@@ -584,7 +679,7 @@ def _run(
         stage_units_in_meters=1.0,
     )
     stage = get_current_stage()
-    scene_path = Path(str(config.scene.usd_path))
+    scene_path = Path(str(settings["scene"]["usd_path"]))
     if not scene_path.is_absolute():
         scene_path = PROJECT_ROOT / scene_path
     if not scene_path.is_file():
@@ -592,8 +687,11 @@ def _run(
     add_reference_to_stage(str(scene_path), config.scene.prim_path)
     if config.scene.add_default_ground_plane:
         world.scene.add_default_ground_plane()
-    if config.scene.add_dome_light:
-        UsdLux.DomeLight.Define(stage, "/World/NavDPTestLight").CreateIntensityAttr(1500.0)
+    dome = UsdLux.DomeLight.Define(stage, "/World/NavDPTestLight")
+    dome.CreateIntensityAttr().Set(3000.0)
+    dome.CreateExposureAttr().Set(2.0)
+    shadow_api = UsdLux.ShadowAPI.Apply(dome.GetPrim())
+    shadow_api.CreateShadowEnableAttr().Set(False)
     add_reference_to_stage(str(profile.asset.usd_path), profile.asset.prim_path)
     wait_for_stage_assets(
         simulation_app=app,
@@ -610,7 +708,11 @@ def _run(
             float(config.scene.robot_start_xy_m[1]),
             float(profile.spawn_z_m),
         ],
-        rotation_deg=config.scene.robot_start_orientation_deg,
+        rotation_deg=[
+            float(config.scene.robot_start_orientation_deg[0]),
+            float(config.scene.robot_start_orientation_deg[1]),
+            float(config.scene.robot_start_orientation_deg[2]) - 90.0,
+        ],
     )
     articulation_path = resolve_robot_relative_prim_path(
         robot_root_path=profile.asset.prim_path,
@@ -709,6 +811,12 @@ def _run(
         yaw_resolution_deg=fine_config.yaw_resolution_deg,
     )
     fine_planner = FineLocalPlanner(fine_config, collision_checker)
+    coarse_tracking = settings["coarse_tracking"]
+    coarse_tracking_config = replace(
+        profile.agx_controller.continuous,
+        max_linear_mps=float(coarse_tracking["max_linear_mps"]),
+        max_angular_radps=float(coarse_tracking["max_angular_radps"]),
+    )
     fine_tracking = settings["fine_tracking"]
     for curvature in fine_config.curvature_samples_per_m:
         wheel_targets(
@@ -772,9 +880,11 @@ def _run(
     accepted_fine_request_id = 0
     selected_goal_odom_xy: np.ndarray | None = None
     navigation_active = False
+    manual_active = False
     mode = str(settings["execution"]["default_mode"])
     generation_index = 0
     idle_status = "Click known free space to select a goal"
+    last_reported_idle_status = None
     previous_tracking_status = None
     previous_adapter_status = None
     last_steering_log_time = -float("inf")
@@ -793,8 +903,7 @@ def _run(
     latest_planning_grid = None
     last_failed_fine_occupancy = None
     last_failed_fine_goal_pose = None
-    fine_summary = "Fine path: none"
-    panel.mode_label.text = f"Mode: {mode}"
+    logger.info("[NavigationMode] selected=%s", mode)
 
     try:
         while app.is_running():
@@ -807,7 +916,6 @@ def _run(
                 accepted_request_id = request_id
                 fine_request_id += 1
                 accepted_fine_request_id = fine_request_id
-                panel.status_label.text = "PAUSED: resume and select a new goal"
                 app.update()
                 continue
 
@@ -902,16 +1010,14 @@ def _run(
                         goal_map,
                         path_local,
                         color=(34, 177, 76, 255)
-                        if tracker_mode == "FINE_HYBRID_ASTAR"
+                        if tracker_mode == "FINE"
                         else (238, 184, 45, 255),
                     )
                 panel.update_map(goal_map)
-                if displayed_goal is not None:
-                    panel.set_goal_text(*displayed_goal)
                 last_map_render_time = now
 
             if (
-                mode == "FINE_HYBRID_ASTAR"
+                mode == "FINE"
                 and now - last_fine_debug_time
                 >= float(settings["debug"]["fine_update_period_sec"])
             ):
@@ -945,7 +1051,7 @@ def _run(
                 job, result, error = completed
                 if (
                     job.request_id != accepted_request_id
-                    or mode not in {"COARSE_NAVDP", "FINE_HYBRID_ASTAR"}
+                    or mode not in {"COARSE", "FINE"}
                     or not navigation_active
                 ):
                     logger.info("[NavDPResult] ignored stale request=%d", job.request_id)
@@ -978,7 +1084,7 @@ def _run(
                             join_error,
                             remaining_length,
                         )
-                    elif mode == "COARSE_NAVDP":
+                    elif mode == "COARSE":
                         _save_candidate_debug(
                             debug_path,
                             result,
@@ -988,7 +1094,7 @@ def _run(
                         )
                         tracker = PathTracker(
                             joined_path,
-                            profile.agx_controller.continuous,
+                            coarse_tracking_config,
                             initial_speed_mps=state.linear_velocity_mps,
                         )
                         display_path_odom_xy = joined_path.copy()
@@ -997,11 +1103,14 @@ def _run(
                         previous_tracking_status = None
                         previous_adapter_status = None
                         logger.info(
-                            "[NavDPSwitch] generation=%d request=%d candidate=%d "
-                            "age=%.3fs join_error=%.3fm remaining=%.3fm latency=%.3fs",
+                            "[CoarseSwitch] generation=%d request=%d candidate=%d "
+                            "rank=%s value=%s age=%.3fs join_error=%.3fm "
+                            "remaining=%.3fm latency=%.3fs",
                             generation_index,
                             job.request_id,
                             selected.source.index,
+                            selected.rank if selected.rank is not None else "N/A",
+                            _format_value(selected.source.value),
                             result_age,
                             join_error,
                             remaining_length,
@@ -1026,7 +1135,7 @@ def _run(
                 job, grid, plan, error = fine_completed
                 if (
                     job.request_id != accepted_fine_request_id
-                    or mode != "FINE_HYBRID_ASTAR"
+                    or mode != "FINE"
                     or not navigation_active
                 ):
                     logger.info("[FineResult] ignored stale request=%d", job.request_id)
@@ -1103,11 +1212,6 @@ def _run(
                         generation_index += 1
                         previous_tracking_status = None
                         previous_adapter_status = None
-                        fine_summary = (
-                            f"Fine nodes={plan.expanded_node_count} "
-                            f"clearance={clearance.min_clearance_m:.2f}m "
-                            f"unknown={100.0 * clearance.unknown_ratio:.1f}%"
-                        )
                         logger.info(
                             "[FineSwitch] generation=%d request=%d nodes=%d cost=%.3f "
                             "age=%.3fs join_error=%.3fm remaining=%.3fm "
@@ -1142,13 +1246,14 @@ def _run(
                     mode = str(action[1])
                     last_failed_fine_occupancy = None
                     last_failed_fine_goal_pose = None
-                    panel.mode_label.text = f"Mode: {mode}"
                     idle_status = f"MODE: {mode}; click a goal"
                     logger.info("[NavigationMode] selected=%s", mode)
+                elif isinstance(action, tuple) and action[0] == "GOAL_ERROR":
+                    logger.warning("[NavigationGoal] rejected: %s", action[1])
                 elif isinstance(action, tuple) and action[0] == "SELECT_GOAL":
                     if tracker is not None or not _is_stopped(state):
                         idle_status = "Stop the robot before selecting a new goal"
-                        panel.set_goal_error("Stop the robot before selecting a new goal")
+                        logger.warning("[NavigationGoal] Stop the robot before selecting a new goal")
                     else:
                         try:
                             forward, left = _validate_goal_values(
@@ -1174,7 +1279,6 @@ def _run(
                             generation_index = 0
                             last_coarse_request_time = -float("inf")
                             last_fine_request_time = -float("inf")
-                            panel.set_goal_text(forward, left)
                             idle_status = f"GOAL ACTIVE: {mode}"
                             logger.info(
                                 "[NavigationGoal] mode=%s forward=%.2fm left=%+.2fm "
@@ -1186,7 +1290,7 @@ def _run(
                                 float(selected_goal_odom_xy[1]),
                             )
                         except ValueError as exc:
-                            panel.set_goal_error(str(exc))
+                            logger.warning("[NavigationGoal] rejected: %s", exc)
                             idle_status = "Goal rejected; see log"
                 elif action == "STOP":
                     request_id += 1
@@ -1224,16 +1328,56 @@ def _run(
                     goal_distance,
                 )
 
-            if tracker is not None:
+            manual_action = panel.manual_action
+            if manual_action != "STOP":
+                if not manual_active:
+                    tracker = None
+                    tracker_mode = None
+                    navigation_active = False
+                    display_path_odom_xy = None
+                    fine_guide_odom_xy = None
+                    request_id += 1
+                    accepted_request_id = request_id
+                    fine_request_id += 1
+                    accepted_fine_request_id = fine_request_id
+                    logger.info("[ManualControl] started action=%s", manual_action)
+                manual_active = True
+                manual_config = settings["manual_control"]
+                manual_commands = {
+                    "FORWARD": VelocityCommand(
+                        float(manual_config["linear_mps"]), 0.0
+                    ),
+                    "BACKWARD": VelocityCommand(
+                        -float(manual_config["linear_mps"]), 0.0
+                    ),
+                    "TURN_LEFT": VelocityCommand(
+                        0.0, float(manual_config["angular_radps"])
+                    ),
+                    "TURN_RIGHT": VelocityCommand(
+                        0.0, -float(manual_config["angular_radps"])
+                    ),
+                }
+                applied = adapter.apply(manual_commands[manual_action])
+            elif manual_active:
+                adapter.stop()
+                manual_active = False
+                idle_status = "MANUAL STOPPED"
+                logger.info("[ManualControl] stopped")
+            elif tracker is not None:
                 tracking_config = (
                     fine_tracking_config
-                    if tracker_mode == "FINE_HYBRID_ASTAR"
-                    else profile.agx_controller.continuous
+                    if tracker_mode == "FINE"
+                    else coarse_tracking_config
                 )
                 tracking = tracker.step(
                     (state.pose.x, state.pose.y, state.pose.yaw_rad), dt
                 )
                 requested_command = tracking.command
+                if tracker_mode == "COARSE":
+                    requested_command = fit_agx_command(
+                        requested_command,
+                        profile.agx_controller.continuous,
+                    )
                 applied = adapter.apply(requested_command)
                 tracker.feedback(applied)
                 steering = adapter.steering_diagnostics()
@@ -1275,11 +1419,10 @@ def _run(
                     )
             else:
                 adapter.stop()
-                status_text = idle_status
 
             if (
                 navigation_active
-                and mode in {"COARSE_NAVDP", "FINE_HYBRID_ASTAR"}
+                and mode in {"COARSE", "FINE"}
                 and selected_goal_odom_xy is not None
                 and not worker.busy
                 and now - last_coarse_request_time
@@ -1319,7 +1462,7 @@ def _run(
 
             if (
                 navigation_active
-                and mode == "FINE_HYBRID_ASTAR"
+                and mode == "FINE"
                 and selected_goal_odom_xy is not None
                 and fine_guide_odom_xy is not None
                 and latest_snapshot.version > 0
@@ -1339,7 +1482,9 @@ def _run(
                 )
                 if selected_subgoal is None:
                     idle_status = "Fine guide has no locally feasible subgoal"
-                    status_text = idle_status
+                    if idle_status != last_reported_idle_status:
+                        logger.warning("[NavigationStatus] %s", idle_status)
+                        last_reported_idle_status = idle_status
                     world.step(render=frame_index % render_stride == 0)
                     frame_index += 1
                     continue
@@ -1362,7 +1507,9 @@ def _run(
                 )
                 if failed_input_unchanged:
                     idle_status = "Fine planning input unchanged after failure"
-                    status_text = idle_status
+                    if idle_status != last_reported_idle_status:
+                        logger.warning("[NavigationStatus] %s", idle_status)
+                        last_reported_idle_status = idle_status
                     world.step(render=frame_index % render_stride == 0)
                     frame_index += 1
                     continue
@@ -1396,20 +1543,9 @@ def _run(
                         math.degrees(goal_heading),
                     )
 
-            if tracker is None:
-                status_text = idle_status
-            if mode == "COARSE_NAVDP" and frozen_candidates:
-                selected = frozen_candidates[selected_index]
-                panel.candidate_label.text = (
-                    f"Candidate #{selected.source.index} | rank={selected.rank or 'N/A'} | "
-                    f"value={_format_value(selected.source.value)}"
-                )
-            elif mode == "FINE_HYBRID_ASTAR":
-                panel.candidate_label.text = fine_summary
-            else:
-                panel.candidate_label.text = "Path: none"
-            if frame_index % render_stride == 0:
-                panel.status_label.text = status_text
+            if tracker is None and idle_status != last_reported_idle_status:
+                logger.info("[NavigationStatus] %s", idle_status)
+                last_reported_idle_status = idle_status
             world.step(render=frame_index % render_stride == 0)
             frame_index += 1
     finally:

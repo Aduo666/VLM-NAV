@@ -294,8 +294,8 @@ timeout, and swept envelope come from the selected profile.
 #### 粗粒度与细粒度导航模式
 
 这个入口在相同的 RGB-D、里程计、目标点和连续轮式控制器下测试两种 AGX
-局部导航模式。`COARSE_NAVDP` 在机器人跟踪当前轨迹期间持续进行 NavDP 异步滚动推理。
-`FINE_HYBRID_ASTAR` 使用前视与下视 RGB-D 融合局部体素地图、AGX 多部件车体轮廓和 SE(2) 搜索。
+局部导航模式。`COARSE` 在机器人跟踪当前轨迹期间持续进行 NavDP 异步滚动推理。
+`FINE` 使用前视与下视 RGB-D 融合局部体素地图、AGX 多部件车体轮廓和 SE(2) 搜索。
 
 NavDP 按照官方 HTTP 接口作为独立进程运行。启动 Isaac Sim 前需要启动 NavDP 服务：
 
@@ -311,13 +311,17 @@ conda activate vlmnav
 bash scripts/run_agx_navdp_trajectory_test.sh
 ```
 
-`AGX Navigation Modes` 面板中的 BEV 使用白色表示已知空闲区域，黑色表示障碍物，
+`Goal Map` 独立窗口中的 BEV 使用白色表示已知空闲区域，黑色表示障碍物，
 灰色表示未知区域，蓝色表示机器人，红色表示目标点。操作顺序如下：
 
-1. 在机器人停止时选择 `COARSE NAVDP` 或 `FINE HYBRID A*`。
-2. 点击 BEV 中的已知空闲区域，目标点会固定在里程计坐标系中。
+1. 在机器人停止时，在控制面板选择 `COARSE` 或 `FINE`。
+2. 点击 `Goal Map` 中的已知空闲区域，目标点会固定在里程计坐标系中。
 3. 机器人持续跟踪当前轨迹，同时所选模式在后台重新规划。
 4. `STOP` 会废弃尚未处理的结果并停止机器人。
+
+控制面板只显示模式按钮和 `STOP`；状态信息输出到控制台。键盘方向键用于手动控制。按下方向键会
+终止当前自动导航，松开后停止。粗粒度、细粒度和手动控制速度统一配置在
+`configs/agx_navdp_trajectory_test.yaml`。
 
 NavDP 候选编号、critic 数值和模型选择轨迹写入覆盖更新的
 `debug/local/agx_navdp_candidates.png`。critic 数值表示 NavDP 候选相对偏好。

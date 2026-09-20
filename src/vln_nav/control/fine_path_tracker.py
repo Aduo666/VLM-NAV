@@ -166,7 +166,7 @@ class FinePathTracker:
                 -self.config.max_angular_radps,
                 self.config.max_angular_radps,
             ))
-            command = _fit_agx_command(
+            command = fit_agx_command(
                 VelocityCommand(linear, angular),
                 self.config,
             )
@@ -184,7 +184,7 @@ def _wrap_angle(angle_rad: float) -> float:
     return (float(angle_rad) + math.pi) % (2.0 * math.pi) - math.pi
 
 
-def _fit_agx_command(
+def fit_agx_command(
     command: VelocityCommand,
     config: TrajectoryConfig,
 ) -> VelocityCommand:

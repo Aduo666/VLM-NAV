@@ -3,8 +3,10 @@
 # 测试使用的室内场景。
 scene:
   # 场景 USD 文件路径。
-  usd_path: "/Data/qiang/interiornav_data/scene_data/kujiale_0067/kujiale_0067.usda"
-
+  usd_path: "/Data/qiang/interiornav_data/scene_data/kujiale_0009/kujiale_0009.usda"
+  #usd_path: "/home/Lab/qiangsibin/VLM-NAV-active/usd/hospital.usd"
+  # 是否调用公共室内灯光接口，在当前仿真场景中添加顶灯。
+  add_indoor_lighting: true
 # NavDP 推理服务连接与轨迹结果校验参数。
 server:
   # NavDP HTTP 服务地址。
@@ -84,9 +86,9 @@ fine_tracking:
 # 键盘方向键的手动控制速度。
 manual_control:
   # 手动前进或后退速度，单位为米每秒。
-  linear_mps: 0.40
+  linear_mps: 1.00
   # 手动左转或右转速度，单位为弧度每秒。
-  angular_radps: 0.40
+  angular_radps: 0.50
 
 # Hybrid A* 搜索、AGX 车体轮廓和路径代价参数。
 fine_planner:

@@ -65,6 +65,7 @@ from vln_nav.runtime.isaac_runtime_utils import (
     wait_for_stage_assets,
 )
 from vln_nav.runtime.robot_profile import load_robot_profile
+from vln_nav.runtime.scene_lighting import add_indoor_lighting
 
 
 SETTINGS_PATH = PROJECT_ROOT / "configs/agx_navdp_trajectory_test.yaml"
@@ -457,10 +458,12 @@ def _load_settings() -> tuple[
     if set(data) != expected:
         raise ValueError(f"Navigation modes config requires exactly: {sorted(expected)}")
     scene = data["scene"]
-    if not isinstance(scene, dict) or set(scene) != {"usd_path"}:
-        raise ValueError("Navigation modes scene requires usd_path")
+    if not isinstance(scene, dict) or set(scene) != {"usd_path", "add_indoor_lighting"}:
+        raise ValueError("Navigation modes scene requires usd_path and add_indoor_lighting")
     if not str(scene["usd_path"]).strip():
         raise ValueError("Navigation modes scene path is empty")
+    if not isinstance(scene["add_indoor_lighting"], bool):
+        raise ValueError("scene.add_indoor_lighting must be true or false")
     server = NavDPClientConfig.from_mapping(data["server"])
 
     camera = data["camera"]
@@ -714,7 +717,7 @@ def _run(
     from isaacsim.core.prims import SingleArticulation
     from isaacsim.core.utils.stage import add_reference_to_stage, get_current_stage, is_stage_loading
     from isaacsim.sensors.camera import Camera
-    from pxr import UsdGeom, UsdLux
+    from pxr import UsdGeom
 
     dt = float(profile.simulation.physics_dt)
     world = World(
@@ -731,11 +734,6 @@ def _run(
     add_reference_to_stage(str(scene_path), config.scene.prim_path)
     if config.scene.add_default_ground_plane:
         world.scene.add_default_ground_plane()
-    dome = UsdLux.DomeLight.Define(stage, "/World/NavDPTestLight")
-    dome.CreateIntensityAttr().Set(3000.0)
-    dome.CreateExposureAttr().Set(2.0)
-    shadow_api = UsdLux.ShadowAPI.Apply(dome.GetPrim())
-    shadow_api.CreateShadowEnableAttr().Set(False)
     add_reference_to_stage(str(profile.asset.usd_path), profile.asset.prim_path)
     wait_for_stage_assets(
         simulation_app=app,
@@ -744,6 +742,15 @@ def _run(
         logger=logger,
         label="AGX navigation modes scene",
     )
+    if settings["scene"]["add_indoor_lighting"]:
+        try:
+            add_indoor_lighting(
+                stage=stage,
+                environment_prim_path=config.scene.prim_path,
+                logger=logger,
+            )
+        except Exception:
+            logger.exception("[InteriorLighting] failed to add scene lights")
     set_local_xform(
         stage=stage,
         prim_path=profile.asset.prim_path,

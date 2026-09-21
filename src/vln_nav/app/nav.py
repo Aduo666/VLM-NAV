@@ -45,6 +45,7 @@ from ..navigation.vln_policy import ExecutionFeedback, PolicyStepResult, VLNPoli
 from ..navigation.vln_reasoner import VLNReasoner
 from ..runtime.config import DEFAULT_CONFIG_PATH, PROJECT_ROOT, AppConfig, load_config, setup_logging
 from ..runtime.debug_video import DebugVideoRecorder
+from ..runtime.scene_lighting import add_indoor_lighting
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="CAPTAINav Isaac Sim VLN runtime")
@@ -890,6 +891,16 @@ def run_navigation(
             )
         except Exception as exc:
             logger.warning("Failed to add Dome Light: %s", exc)
+
+    if has_environment:
+        try:
+            add_indoor_lighting(
+                stage=stage,
+                environment_prim_path=config.scene.prim_path,
+                logger=logger,
+            )
+        except Exception:
+            logger.exception("[InteriorLighting] failed to add scene lights")
 
     add_reference_to_stage(str(config.robot.asset.usd_path), config.robot.asset.prim_path)
     _wait_for_stage_assets(

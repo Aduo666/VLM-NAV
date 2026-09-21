@@ -1,8 +1,3 @@
-"""Continuous AGX acceptance path, independent of the VLN primitive policy.
-
-All poses are meters/radians in one fixed frame. Body +X is forward, +Y is
-left, and positive yaw is counterclockwise. Wheel joint signs are explicit.
-"""
 from __future__ import annotations
 
 from dataclasses import dataclass, fields

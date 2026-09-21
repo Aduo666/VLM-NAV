@@ -11,8 +11,7 @@ from vln_nav.control.controller import (
     resolve_hold_joint_names,
     resolve_wheel_joint_groups,
 )
-from vln_nav.control.g1_policy_controller import G1PolicyController
-from vln_nav.runtime.robot_profile import RobotProfile
+from vln_nav.runtime.agx_profile import AgxProfile
 
 
 class LocomotionController(Protocol):
@@ -23,28 +22,14 @@ class LocomotionController(Protocol):
 
 def create_locomotion_controller(
     *,
-    profile: RobotProfile,
+    profile: AgxProfile,
     robot: Any,
     stage: Any,
     articulation_path: str,
     available_joint_names: list[str],
     logger: logging.Logger,
 ) -> LocomotionController:
-    if profile.is_g1:
-        if profile.g1_controller is None:
-            raise RuntimeError("G1 robot profile is missing its controller section")
-        return G1PolicyController(
-            robot=robot,
-            available_joint_names=available_joint_names,
-            controller_profile=profile.g1_controller,
-            primitive_profile=profile.primitives,
-            policy_decimation=profile.simulation.policy_decimation,
-            logger=logger,
-        )
-
     agx = profile.agx_controller
-    if agx is None:
-        raise RuntimeError("AGX robot profile is missing its controller section")
     left_names, right_names, steering_names, error_message = resolve_wheel_joint_groups(
         available_joint_names=available_joint_names,
         configured_left=list(agx.left_wheel_joint_names),

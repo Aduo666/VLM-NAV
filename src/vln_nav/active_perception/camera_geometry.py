@@ -1,9 +1,3 @@
-"""Coordinate contracts for synchronised RGB-D observations.
-
-Robot/base coordinates are +X forward, +Y left, +Z up. Camera pixels use
-the optical convention consumed by Isaac's ROS view matrix: +X image right,
-+Y image down, +Z optical forward. Transforms are named ``target_from_source``.
-"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -11,7 +5,40 @@ import math
 
 import numpy as np
 
-from vln_nav.navigation.rgbd_geometry_map import backproject_depth_pixels_to_world
+
+def backproject_depth_pixels_to_world(
+    *,
+    pixel_u: np.ndarray,
+    pixel_v: np.ndarray,
+    depth_m: np.ndarray,
+    camera_intrinsics: np.ndarray,
+    camera_to_world: np.ndarray,
+) -> np.ndarray:
+    u_values, v_values, depth_values = np.broadcast_arrays(
+        np.asarray(pixel_u, dtype=np.float64),
+        np.asarray(pixel_v, dtype=np.float64),
+        np.asarray(depth_m, dtype=np.float64),
+    )
+    intrinsics = np.asarray(camera_intrinsics, dtype=np.float64).reshape(3, 3)
+    transform = np.asarray(camera_to_world, dtype=np.float64).reshape(4, 4)
+    fx = float(intrinsics[0, 0])
+    fy = float(intrinsics[1, 1])
+    cx = float(intrinsics[0, 2])
+    cy = float(intrinsics[1, 2])
+    if abs(fx) < 1.0e-9 or abs(fy) < 1.0e-9:
+        raise ValueError("Camera intrinsics contain a zero focal length")
+    points_camera = np.stack(
+        [
+            (u_values - cx) * depth_values / fx,
+            (v_values - cy) * depth_values / fy,
+            depth_values,
+            np.ones_like(depth_values),
+        ],
+        axis=-1,
+    )
+    points_world_h = points_camera @ transform.T
+    scale = np.maximum(np.abs(points_world_h[..., 3]), 1.0e-9)
+    return points_world_h[..., :3] / scale[..., None]
 
 
 @dataclass(frozen=True)
@@ -56,17 +83,6 @@ class CameraFrameGeometry:
             ("world_from_base", self.world_from_base),
         ):
             _validate_transform(transform, f"{self.source}.{name}")
-
-
-@dataclass(frozen=True)
-class CameraGeometryDiagnostics:
-    source: str
-    valid_depth_ratio: float
-    camera_origin_base_xyz: tuple[float, float, float]
-    optical_forward_base_xyz: tuple[float, float, float]
-    image_left_delta_base_y_m: float
-    rotation_determinant: float
-    points_base_xyz: np.ndarray
 
 
 def camera_rgb_to_uint8(value) -> np.ndarray | None:
@@ -170,54 +186,6 @@ def transforms_from_ros_view(
     return base_from_camera, world_from_camera
 
 
-def diagnose_camera_frame(
-    frame: CameraFrameGeometry,
-    *,
-    min_depth_m: float,
-    max_depth_m: float,
-    point_stride: int,
-) -> CameraGeometryDiagnostics:
-    frame.validate()
-    if not 0 < float(min_depth_m) < float(max_depth_m):
-        raise ValueError("Depth range must be finite, positive, and ordered")
-    if int(point_stride) < 1:
-        raise ValueError("Point stride must be positive")
-    depth = np.asarray(frame.depth_m, dtype=np.float64)
-    valid_full = np.isfinite(depth) & (depth >= min_depth_m) & (depth <= max_depth_m)
-    ratio = float(np.mean(valid_full))
-    stride = int(point_stride)
-    rows = np.arange(stride // 2, depth.shape[0], stride, dtype=np.intp)
-    cols = np.arange(stride // 2, depth.shape[1], stride, dtype=np.intp)
-    sampled = depth[np.ix_(rows, cols)]
-    valid = np.isfinite(sampled) & (sampled >= min_depth_m) & (sampled <= max_depth_m)
-    if np.any(valid):
-        uu, vv = np.meshgrid(cols.astype(np.float64), rows.astype(np.float64))
-        points = backproject_depth_pixels_to_world(
-            pixel_u=uu[valid],
-            pixel_v=vv[valid],
-            depth_m=sampled[valid],
-            camera_intrinsics=frame.intrinsics,
-            camera_to_world=frame.base_from_camera,
-        ).reshape(-1, 3)
-        points = points[np.isfinite(points).all(axis=1)]
-    else:
-        points = np.empty((0, 3), dtype=np.float64)
-
-    rotation = np.asarray(frame.base_from_camera, dtype=np.float64)[:3, :3]
-    forward = _unit(rotation[:, 2])
-    image_left_optical = np.asarray([-1.0, 0.0, 0.0], dtype=np.float64)
-    image_left_base = rotation @ image_left_optical
-    return CameraGeometryDiagnostics(
-        source=frame.source,
-        valid_depth_ratio=ratio,
-        camera_origin_base_xyz=tuple(map(float, frame.base_from_camera[:3, 3])),
-        optical_forward_base_xyz=tuple(map(float, forward)),
-        image_left_delta_base_y_m=float(image_left_base[1]),
-        rotation_determinant=float(np.linalg.det(rotation)),
-        points_base_xyz=points,
-    )
-
-
 def _validate_transform(transform: np.ndarray, name: str) -> None:
     matrix = np.asarray(transform, dtype=np.float64)
     if matrix.shape != (4, 4) or not np.isfinite(matrix).all():
@@ -227,11 +195,3 @@ def _validate_transform(transform: np.ndarray, name: str) -> None:
     rotation = matrix[:3, :3]
     if not np.allclose(rotation.T @ rotation, np.eye(3), atol=2.0e-3):
         raise ValueError(f"{name} rotation is not orthonormal")
-
-
-def _unit(vector: np.ndarray) -> np.ndarray:
-    values = np.asarray(vector, dtype=np.float64).reshape(3)
-    norm = float(np.linalg.norm(values))
-    if norm <= 1.0e-9:
-        raise ValueError("Cannot normalise a zero vector")
-    return values / norm

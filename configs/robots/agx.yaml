@@ -1,9 +1,3 @@
-schema_version: "2.0"
-
-identity:
-  name: "agx"
-  type: "agx_4ws"
-
 asset:
   usd_path: "src/ros2_car_model_ws/src/1557/urdf/1557_all/1557_all.usd"
   prim_path: "/World/Robot"
@@ -15,25 +9,10 @@ spawn:
 simulation:
   physics_dt: 0.0166667
   rendering_dt: 0.0166667
-  policy_decimation: 1
 
 sensors:
-  camera:
-    front_prim_path: "pan_tilt_pitch_link/pan_tilt_surface/camera_mount/camera_body/camera_base/PanCamera"
-    observer_enabled: true
-    observer_prim_path: "dummy_base_link/observeCamera"
-    width: 1280
-    height: 960
-    frequency_hz: 15
-    horizontal_fov_deg: 90.0
-    follow_front_in_gui: false
-    follow_observer_in_gui: true
-    depth_roi_vertical_range: [0.45, 0.85]
-    valid_depth_range_m: [0.20, 10.0]
-    obstacle_roi_vertical_range: [0.50, 0.95]
-    obstacle_center_width_ratio: 0.34
-    obstacle_side_width_ratio: 0.30
-    depth_eval_period_sec: 0.12
+  front_prim_path: "pan_tilt_pitch_link/pan_tilt_surface/camera_mount/camera_body/camera_base/PanCamera"
+  observer_prim_path: "dummy_base_link/observeCamera"
 controller:
   left_wheel_joint_names: ["fl_wheel", "rl_wheel"]
   right_wheel_joint_names: ["fr_wheel", "rr_wheel"]
@@ -49,10 +28,8 @@ controller:
   steering_damping: 1000.0
   hold_joint_stiffness: 20000.0
   hold_joint_damping: 2000.0
-  # Continuous trajectory acceptance only; existing VLN primitives are unchanged.
   continuous:
-    # Nominal 1557_all.urdf collision radius and steering joint origins.
-    # Body: +X forward, +Y left. Steering axes are -Z; drive axes are +Y.
+    # 车体坐标系中正 X 向前，正 Y 向左；转向轴为负 Z，驱动轴为正 Y。
     wheels:
       - {drive_joint: fl_wheel, steering_joint: fl_steering_joint, x_m: 0.25, y_m: 0.19, radius_m: 0.09, steering_sign: -1, drive_sign: 1}
       - {drive_joint: fr_wheel, steering_joint: fr_steering_joint, x_m: 0.25, y_m: -0.19, radius_m: 0.09, steering_sign: -1, drive_sign: 1}
@@ -69,28 +46,3 @@ controller:
     arrival_distance_m: 0.06
     max_path_error_m: 0.8
     timeout_sec: 60.0
-
-primitives:
-  forward_distance_m: 0.55
-  turn_angle_deg: 15.0
-  distance_tolerance_m: 0.04
-  turn_tolerance_deg: 1.5
-  forward_timeout_sec: 0.80
-  turn_timeout_sec: 0.30
-  forward_command: 14.0
-  turn_command: 6.0
-  settle_max_wait_sec: 0.0
-  settle_linear_speed_threshold_mps: 0.0
-  settle_angular_speed_threshold_radps: 0.0
-  settle_stable_duration_sec: 0.0
-
-geometry:
-  obstacle_stop_distance_m: 0.65
-  map_inflation_radius_m: 0.26
-  path_corridor_radius_m: 0.30
-
-safety:
-  fall_detection_enabled: false
-  max_roll_pitch_deg: 28.0
-  min_base_height_m: 0.0
-  confirmation_sec: 0.0

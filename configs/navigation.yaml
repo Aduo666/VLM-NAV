@@ -1,10 +1,29 @@
-# AGX 粗粒度 NavDP 与细粒度 Hybrid A* 独立模式测试配置。
+# AGX 点目标导航配置。
+
+# Isaac Sim 仿真设备。
+simulation:
+  # 渲染使用的 GPU 编号；null 表示由 Isaac Sim 选择。
+  active_gpu: null
+  # 物理计算使用的 GPU 编号。
+  physics_gpu: 0
+  # 是否启用多 GPU 渲染。
+  multi_gpu: false
 
 # 测试使用的室内场景。
 scene:
   # 场景 USD 文件路径。
-  usd_path: "/Data/qiang/interiornav_data/scene_data/kujiale_0009/kujiale_0009.usda"
+  usd_path: "/Data/qiang/interiornav_data/scene_data/kujiale_0067/kujiale_0067.usda"
   #usd_path: "/home/Lab/qiangsibin/VLM-NAV-active/usd/hospital.usd"
+  # 场景加载到仿真 Stage 的路径。
+  prim_path: "/World/Environment"
+  # 场景没有地面时可开启默认地面。
+  add_default_ground_plane: false
+  # 等待场景资源加载的最长时间，单位为秒。
+  stage_load_timeout_sec: 120.0
+  # AGX 的世界坐标起点，切换场景时需要同步设置。
+  start_xy_m: [1.5, 4.0]
+  # AGX 的世界坐标朝向，单位为度；高度由机器人配置决定。
+  start_yaw_deg: -90.0
   # 是否调用公共室内灯光接口，在当前仿真场景中添加顶灯。
   add_indoor_lighting: true
 # NavDP 推理服务连接与轨迹结果校验参数。
@@ -173,8 +192,6 @@ fine_planner:
 
 # 目标选择地图与局部体素地图来源。
 map_selector:
-  # 复用局部三维体素地图的参数文件。
-  source_config_path: "configs/agx_local_3d_map_test.yaml"
   # 导航局部地图融合的相机名称。
   sources: ["front", "down"]
   # 目标选择地图的图像边长，单位为像素。
@@ -190,12 +207,64 @@ map_selector:
   # 地图显示障碍物的最高相对高度，单位为米。
   obstacle_max_relative_z_m: 1.50
 
+# RGB-D 局部三维地图的传感器与融合参数。
+mapping:
+  sensors:
+    # 前视 RGB-D 相机在 AGX 根节点下的相对路径。
+    front_prim_path: "pan_tilt_pitch_link/pan_tilt_surface/camera_mount/camera_body/camera_base/PanCamera"
+    # 近场 RGB-D 相机在 AGX 根节点下的相对路径。
+    down_prim_path: "dummy_base_link/DownCamera"
+  camera:
+    # 地图相机图像宽度，单位为像素。
+    width: 640
+    # 地图相机图像高度，单位为像素。
+    height: 480
+    # 地图相机更新频率，单位为赫兹。
+    frequency_hz: 15
+  map:
+    # 局部地图的前后物理尺寸，单位为米。
+    size_x_m: 10.0
+    # 局部地图的左右物理尺寸，单位为米。
+    size_y_m: 10.0
+    # 相对机器人基座的最低高度，单位为米。
+    min_z_m: -0.20
+    # 相对机器人基座的最高高度，单位为米。
+    max_z_m: 2.80
+    # 体素边长，单位为米。
+    resolution_m: 0.05
+    # 局部地图平移阈值，单位为米。
+    slide_threshold_m: 0.20
+    # 最小有效深度，单位为米。
+    min_depth_m: 0.12
+    # 最大有效深度，单位为米。
+    max_depth_m: 5.0
+    # 单条射线的最大长度，单位为米。
+    max_ray_length_m: 5.0
+    # 深度图采样像素间隔。
+    pixel_stride: 10
+    # 射线终点为障碍时的更新概率。
+    probability_hit: 0.85
+    # 射线穿过空闲空间时的更新概率。
+    probability_miss: 0.30
+    # 体素占用概率下限。
+    probability_min: 0.12
+    # 体素占用概率上限。
+    probability_max: 0.98
+    # 判为障碍的占用概率阈值。
+    probability_occupied: 0.80
+    # 判为空闲的占用概率阈值。
+    probability_free: 0.45
+    # 地图融合周期，单位为秒。
+    integration_period_sec: 0.25
+  # 两路 RGB-D 帧允许的最大时间差，单位为秒。
+  max_frame_skew_sec: 0.08
+
 # 调试图片保存参数。
 debug:
   # NavDP 候选轨迹图片的覆盖保存路径。
-  candidate_image_path: "debug/local/agx_navdp_candidates.png"
+  candidate_image_path: "debug/local/navdp_candidates.png"
   # 细粒度三维几何图片的覆盖保存路径。
-  fine_image_path: "debug/local/agx_fine_navigation.png"
+  fine_image_path: "debug/local/fine_geometry.png"
   # 细粒度三维几何图片刷新周期，单位为秒。
   fine_update_period_sec: 0.50
   # NavDP 候选轨迹图片显示的物理范围，单位为米。

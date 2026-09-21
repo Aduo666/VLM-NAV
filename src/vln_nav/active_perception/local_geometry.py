@@ -1,4 +1,3 @@
-"""Robot-centered, world-aligned probabilistic 3-D occupancy memory."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -7,7 +6,7 @@ import math
 import numpy as np
 
 from vln_nav.active_perception.contracts import TimedDepthObservation
-from vln_nav.navigation.rgbd_geometry_map import backproject_depth_pixels_to_world
+from vln_nav.active_perception.camera_geometry import backproject_depth_pixels_to_world
 
 
 UNKNOWN = np.int8(-1)

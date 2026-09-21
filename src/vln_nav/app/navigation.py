@@ -23,10 +23,9 @@ from vln_nav.active_perception.local_geometry import (
     LocalVoxelMapConfig,
     LocalVoxelSnapshot,
 )
-from vln_nav.app.agx_trajectory_test import _validate_geometry
-from vln_nav.app.agx_local_3d_map_test import (
-    _project_local_points,
-    _render_local_occupancy,
+from vln_nav.active_perception.map_visualization import (
+    project_local_points,
+    render_local_occupancy,
 )
 from vln_nav.control.locomotion import create_locomotion_controller
 from vln_nav.control.fine_path_tracker import FinePathTracker, fit_agx_command
@@ -54,7 +53,6 @@ from vln_nav.navigation.trajectory_clearance import (
     clear_current_footprint,
     planning_grid_from_snapshot,
 )
-from vln_nav.runtime.config import DEFAULT_CONFIG_PATH, PROJECT_ROOT, load_config
 from vln_nav.runtime.isaac_runtime_utils import (
     bind_viewport_to_camera,
     get_joint_names,
@@ -64,11 +62,13 @@ from vln_nav.runtime.isaac_runtime_utils import (
     set_local_xform,
     wait_for_stage_assets,
 )
-from vln_nav.runtime.robot_profile import load_robot_profile
+from vln_nav.runtime.agx_profile import load_agx_profile
 from vln_nav.runtime.scene_lighting import add_indoor_lighting
+from vln_nav.runtime.agx_geometry import validate_agx_geometry
 
 
-SETTINGS_PATH = PROJECT_ROOT / "configs/agx_navdp_trajectory_test.yaml"
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+SETTINGS_PATH = PROJECT_ROOT / "configs/navigation.yaml"
 
 
 @dataclass(frozen=True)
@@ -443,6 +443,7 @@ def _load_settings() -> tuple[
     with SETTINGS_PATH.open(encoding="utf-8") as handle:
         data = yaml.safe_load(handle) or {}
     expected = {
+        "simulation",
         "scene",
         "server",
         "camera",
@@ -453,17 +454,43 @@ def _load_settings() -> tuple[
         "manual_control",
         "fine_planner",
         "map_selector",
+        "mapping",
         "debug",
     }
     if set(data) != expected:
         raise ValueError(f"Navigation modes config requires exactly: {sorted(expected)}")
+    simulation = data["simulation"]
+    if not isinstance(simulation, dict) or set(simulation) != {
+        "active_gpu", "physics_gpu", "multi_gpu"
+    }:
+        raise ValueError("Invalid simulation settings")
+    if not isinstance(simulation["multi_gpu"], bool):
+        raise ValueError("simulation.multi_gpu must be true or false")
+    for name in ("active_gpu", "physics_gpu"):
+        if simulation[name] is not None and int(simulation[name]) < 0:
+            raise ValueError(f"simulation.{name} must be null or nonnegative")
+
     scene = data["scene"]
-    if not isinstance(scene, dict) or set(scene) != {"usd_path", "add_indoor_lighting"}:
-        raise ValueError("Navigation modes scene requires usd_path and add_indoor_lighting")
+    scene_fields = {
+        "usd_path", "prim_path", "add_default_ground_plane",
+        "stage_load_timeout_sec", "start_xy_m", "start_yaw_deg",
+        "add_indoor_lighting",
+    }
+    if not isinstance(scene, dict) or set(scene) != scene_fields:
+        raise ValueError(f"Navigation scene requires exactly: {sorted(scene_fields)}")
     if not str(scene["usd_path"]).strip():
         raise ValueError("Navigation modes scene path is empty")
-    if not isinstance(scene["add_indoor_lighting"], bool):
-        raise ValueError("scene.add_indoor_lighting must be true or false")
+    if not str(scene["prim_path"]).startswith("/"):
+        raise ValueError("scene.prim_path must be an absolute USD path")
+    if len(scene["start_xy_m"]) != 2 or not all(
+        math.isfinite(float(value)) for value in (*scene["start_xy_m"], scene["start_yaw_deg"])
+    ):
+        raise ValueError("scene start pose must contain finite XY and yaw values")
+    if float(scene["stage_load_timeout_sec"]) <= 0:
+        raise ValueError("scene.stage_load_timeout_sec must be positive")
+    for name in ("add_default_ground_plane", "add_indoor_lighting"):
+        if not isinstance(scene[name], bool):
+            raise ValueError(f"scene.{name} must be true or false")
     server = NavDPClientConfig.from_mapping(data["server"])
 
     camera = data["camera"]
@@ -567,7 +594,6 @@ def _load_settings() -> tuple[
     })
     selector = data["map_selector"]
     selector_fields = {
-        "source_config_path",
         "sources",
         "image_size_px",
         "view_size_m",
@@ -592,18 +618,17 @@ def _load_settings() -> tuple[
     ):
         raise ValueError("map_selector obstacle height interval is invalid")
 
-    map_settings_path = Path(str(selector["source_config_path"]))
-    if not map_settings_path.is_absolute():
-        map_settings_path = PROJECT_ROOT / map_settings_path
-    if not map_settings_path.is_file():
-        raise FileNotFoundError(f"map selector source config does not exist: {map_settings_path}")
-    with map_settings_path.open(encoding="utf-8") as handle:
-        map_settings = yaml.safe_load(handle) or {}
-    required_map_sections = {"sensors", "camera", "map", "validation"}
-    if not required_map_sections.issubset(map_settings):
-        raise ValueError(
-            f"map selector source config requires sections: {sorted(required_map_sections)}"
-        )
+    map_settings = data["mapping"]
+    if not isinstance(map_settings, dict) or set(map_settings) != {
+        "sensors", "camera", "map", "max_frame_skew_sec"
+    }:
+        raise ValueError("Invalid RGB-D mapping sections")
+    if set(map_settings["sensors"]) != {"front_prim_path", "down_prim_path"}:
+        raise ValueError("RGB-D mapping requires front and down camera paths")
+    if set(map_settings["camera"]) != {"width", "height", "frequency_hz"}:
+        raise ValueError("Invalid RGB-D mapping camera settings")
+    if float(map_settings["max_frame_skew_sec"]) <= 0:
+        raise ValueError("mapping.max_frame_skew_sec must be positive")
     map_fields = {item.name for item in fields(LocalVoxelMapConfig)}
     map_values = map_settings["map"]
     if set(map_values) != map_fields | {"integration_period_sec"}:
@@ -640,8 +665,7 @@ def _load_settings() -> tuple[
 
 
 def main() -> int:
-    config = load_config(DEFAULT_CONFIG_PATH)
-    profile = load_robot_profile(profile_name="agx", project_root=PROJECT_ROOT)
+    profile = load_agx_profile(project_root=PROJECT_ROOT)
     (
         settings,
         client_config,
@@ -657,16 +681,15 @@ def main() -> int:
     app = SimulationApp(
         {
             "headless": False,
-            "active_gpu": config.simulation.active_gpu,
-            "physics_gpu": config.simulation.physics_gpu,
-            "multi_gpu": bool(config.simulation.multi_gpu),
+            "active_gpu": settings["simulation"]["active_gpu"],
+            "physics_gpu": settings["simulation"]["physics_gpu"],
+            "multi_gpu": settings["simulation"]["multi_gpu"],
         }
     )
     try:
         try:
             return _run(
                 app,
-                config,
                 profile,
                 settings,
                 client_config,
@@ -677,21 +700,21 @@ def main() -> int:
                 logger,
             )
         except Exception:
-            logger.exception("[NavigationModesFatal] test crashed")
+            logger.exception("[NavigationFatal] navigation crashed")
             return 1
     finally:
         app.close()
 
 
 def _make_logger() -> logging.Logger:
-    logger = logging.getLogger("agx_navigation_modes")
+    logger = logging.getLogger("agx_navigation")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
     formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
     console = logging.StreamHandler(sys.stdout)
     console.setFormatter(formatter)
     logger.addHandler(console)
-    log_path = PROJECT_ROOT / "logs/agx_navigation_modes_test.log"
+    log_path = PROJECT_ROOT / "logs/nav_latest.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     file_handler = logging.FileHandler(log_path, mode="w", encoding="utf-8")
     file_handler.setFormatter(formatter)
@@ -702,7 +725,6 @@ def _make_logger() -> logging.Logger:
 
 def _run(
     app,
-    config,
     profile,
     settings,
     client_config,
@@ -726,19 +748,20 @@ def _run(
         stage_units_in_meters=1.0,
     )
     stage = get_current_stage()
+    scene_settings = settings["scene"]
     scene_path = Path(str(settings["scene"]["usd_path"]))
     if not scene_path.is_absolute():
         scene_path = PROJECT_ROOT / scene_path
     if not scene_path.is_file():
         raise FileNotFoundError(f"Navigation modes scene USD does not exist: {scene_path}")
-    add_reference_to_stage(str(scene_path), config.scene.prim_path)
-    if config.scene.add_default_ground_plane:
+    add_reference_to_stage(str(scene_path), scene_settings["prim_path"])
+    if scene_settings["add_default_ground_plane"]:
         world.scene.add_default_ground_plane()
     add_reference_to_stage(str(profile.asset.usd_path), profile.asset.prim_path)
     wait_for_stage_assets(
         simulation_app=app,
         is_stage_loading=is_stage_loading,
-        timeout_sec=config.scene.stage_load_timeout_sec,
+        timeout_sec=float(scene_settings["stage_load_timeout_sec"]),
         logger=logger,
         label="AGX navigation modes scene",
     )
@@ -746,7 +769,7 @@ def _run(
         try:
             add_indoor_lighting(
                 stage=stage,
-                environment_prim_path=config.scene.prim_path,
+                environment_prim_path=scene_settings["prim_path"],
                 logger=logger,
             )
         except Exception:
@@ -755,21 +778,21 @@ def _run(
         stage=stage,
         prim_path=profile.asset.prim_path,
         translation=[
-            float(config.scene.robot_start_xy_m[0]),
-            float(config.scene.robot_start_xy_m[1]),
+            float(scene_settings["start_xy_m"][0]),
+            float(scene_settings["start_xy_m"][1]),
             float(profile.spawn_z_m),
         ],
         rotation_deg=[
-            float(config.scene.robot_start_orientation_deg[0]),
-            float(config.scene.robot_start_orientation_deg[1]),
-            float(config.scene.robot_start_orientation_deg[2]) - 90.0,
+            0.0,
+            0.0,
+            float(scene_settings["start_yaw_deg"]),
         ],
     )
     articulation_path = resolve_robot_relative_prim_path(
         robot_root_path=profile.asset.prim_path,
         prim_path=profile.asset.articulation_path,
     )
-    _validate_geometry(stage, profile, articulation_path)
+    validate_agx_geometry(stage, profile, articulation_path)
     robot = world.scene.add(
         SingleArticulation(
             prim_path=articulation_path,
@@ -997,7 +1020,7 @@ def _run(
                 if len(captured) == len(map_cameras):
                     timestamps = [sample.timestamp_sec for sample in captured.values()]
                     if max(timestamps) - min(timestamps) <= float(
-                        map_settings["validation"]["max_frame_skew_sec"]
+                        map_settings["max_frame_skew_sec"]
                     ):
                         local_map.integrate_batch(
                             [
@@ -1716,7 +1739,7 @@ def _render_fine_geometry(
     goal_world_xy: np.ndarray | None,
     image_size: tuple[int, int] = (800, 560),
 ) -> Image.Image:
-    image = _render_local_occupancy(
+    image = render_local_occupancy(
         snapshot,
         robot_pose=robot_pose,
         image_size=image_size,
@@ -1726,7 +1749,7 @@ def _render_fine_geometry(
     if path_world_xy is not None and len(path_world_xy) >= 2:
         path = np.asarray(path_world_xy, dtype=np.float64)
         path_xyz = np.column_stack((path, np.full(len(path), robot_z)))
-        u, v, _, _ = _project_local_points(
+        u, v, _, _ = project_local_points(
             path_xyz,
             robot_pose=robot_pose,
             image_size=image_size,
@@ -1739,7 +1762,7 @@ def _render_fine_geometry(
             [[float(goal_world_xy[0]), float(goal_world_xy[1]), robot_z]],
             dtype=np.float64,
         )
-        u, v, _, _ = _project_local_points(
+        u, v, _, _ = project_local_points(
             goal,
             robot_pose=robot_pose,
             image_size=image_size,

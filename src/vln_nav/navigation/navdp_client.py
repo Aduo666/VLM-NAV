@@ -1,9 +1,3 @@
-"""Strict HTTP client for the official NavDP point-goal server.
-
-NavDP coordinates follow the public benchmark contract: +X is forward and +Y
-is left, in metres.  The returned critic values are relative model preferences;
-they are deliberately not interpreted as collision or safety probabilities.
-"""
 from __future__ import annotations
 
 from dataclasses import dataclass, fields

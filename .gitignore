@@ -7,7 +7,6 @@ weights/
 .codex
 third_party/
 tests/
-training/artifacts/
 流程.txt
 .agents
 .claude

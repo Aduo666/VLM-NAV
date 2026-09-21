@@ -1,4 +1,3 @@
-"""Minimal robot-centric BEV for selecting a local navigation goal."""
 from __future__ import annotations
 
 from dataclasses import dataclass

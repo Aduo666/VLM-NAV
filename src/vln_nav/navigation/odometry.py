@@ -4,8 +4,39 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .observation_adapter import Pose2D
-from .spatial_transform import transform_world_xy_to_odom
+
+
+@dataclass
+class Pose2D:
+    x: float
+    y: float
+    yaw_rad: float
+
+
+def transform_world_xy_to_odom(
+    world_xy: np.ndarray,
+    *,
+    origin_world_xy,
+    origin_world_yaw_rad: float,
+) -> np.ndarray:
+    points = np.asarray(world_xy, dtype=np.float64)
+    if points.ndim == 0 or points.shape[-1] != 2:
+        raise ValueError(f"world_xy must end in dimension 2, got shape={points.shape}")
+    origin = np.asarray(origin_world_xy, dtype=np.float64).reshape(-1)
+    if origin.size < 2 or not np.all(np.isfinite(origin[:2])):
+        raise ValueError("origin_world_xy must contain two finite values")
+    if not np.all(np.isfinite(points)) or not np.isfinite(float(origin_world_yaw_rad)):
+        raise ValueError("world-to-odom transform contains non-finite values")
+    delta = points - origin[:2]
+    cosine = float(np.cos(float(origin_world_yaw_rad)))
+    sine = float(np.sin(float(origin_world_yaw_rad)))
+    return np.stack(
+        [
+            cosine * delta[..., 0] + sine * delta[..., 1],
+            -sine * delta[..., 0] + cosine * delta[..., 1],
+        ],
+        axis=-1,
+    )
 
 
 @dataclass
@@ -24,12 +55,7 @@ class OdomState:
 
 
 class SimOdometrySensor:
-    """Truth-backed odometry adapter for Isaac Sim.
-
-    This exposes an odom-like interface while we are still in simulation. It is
-    intentionally isolated so a future ROS2 `/odom` or `/tf` provider can replace
-    it without touching the VLN policy, tracker, or visualizer.
-    """
+    """提供 Isaac Sim 世界位姿对应的局部里程计状态。"""
 
     def __init__(
         self,

@@ -1,0 +1,6 @@
+flask
+requests
+pillow
+numpy
+accelerate==1.7.0
+transformers==4.51.0

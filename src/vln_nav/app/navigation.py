@@ -36,7 +36,9 @@ from vln_nav.control.trajectory import (
     wheel_targets,
 )
 from vln_nav.navigation.fine_local_planner import (
+    FinePlan,
     FineLocalPlanner,
+    FinePlanningConstraint,
     FinePlannerConfig,
 )
 from vln_nav.navigation.navdp_client import (
@@ -46,12 +48,25 @@ from vln_nav.navigation.navdp_client import (
     NavDPResult,
 )
 from vln_nav.navigation.odometry import OdomState, SimOdometrySensor
+from vln_nav.navigation.restricted_space import (
+    RestrictedSpaceAnalysis,
+    RestrictedSpaceAnalyzer,
+)
+from vln_nav.navigation.route_corridor import RouteCorridorConfig
+from vln_nav.navigation.trajectory_refiner import (
+    TrajectoryRefiner,
+    TrajectoryRefinerConfig,
+)
 from vln_nav.navigation.trajectory_clearance import (
     FootprintConfig,
     FootprintCollisionChecker,
     assess_path_clearance,
     clear_current_footprint,
     planning_grid_from_snapshot,
+)
+from vln_nav.navigation.traversability_graph import (
+    TraversabilityGraphBuilder,
+    TraversabilityGraphConfig,
 )
 from vln_nav.runtime.isaac_runtime_utils import (
     bind_viewport_to_camera,
@@ -95,9 +110,17 @@ class _FinePlanningJob:
     snapshot: LocalVoxelSnapshot
     start_pose_world: tuple[float, float, float]
     goal_world_xy: tuple[float, float]
+    route_hint_world_xy: np.ndarray | None
+    use_restricted_analysis: bool
     lookahead_m: float
     submitted_sim_time_sec: float
     floor_z_m: float
+
+
+@dataclass(frozen=True)
+class _FinePlanningOutcome:
+    plan: FinePlan | None
+    analysis: RestrictedSpaceAnalysis | None
 
 
 @dataclass(frozen=True)
@@ -188,10 +211,14 @@ class _FinePlanningWorker:
         self,
         *,
         planner: FineLocalPlanner,
+        restricted_analyzer: RestrictedSpaceAnalyzer,
+        trajectory_refiner: TrajectoryRefiner,
         obstacle_min_height_m: float,
         obstacle_max_height_m: float,
     ) -> None:
         self._planner = planner
+        self._restricted_analyzer = restricted_analyzer
+        self._trajectory_refiner = trajectory_refiner
         self._obstacle_min_height_m = float(obstacle_min_height_m)
         self._obstacle_max_height_m = float(obstacle_max_height_m)
         self._busy = False
@@ -233,18 +260,86 @@ class _FinePlanningWorker:
                 yaw_rad=job.start_pose_world[2],
                 collision_checker=self._planner.collision_checker,
             )
-            local_goal = self._planner.select_local_goal(
-                grid=grid,
-                start_pose_world=job.start_pose_world,
-                target_world_xy=job.goal_world_xy,
-                lookahead_m=job.lookahead_m,
-            )
+            analysis = None
+            constraint = None
+            if job.use_restricted_analysis:
+                analysis = self._restricted_analyzer.analyze(
+                    grid=grid,
+                    start_pose_world=job.start_pose_world,
+                    target_world_xy=job.goal_world_xy,
+                    route_hint_world_xy=job.route_hint_world_xy,
+                )
+                if not analysis.requires_fine_planning:
+                    self._results.put((
+                        job,
+                        grid,
+                        _FinePlanningOutcome(plan=None, analysis=analysis),
+                        None,
+                    ))
+                    return
+                if analysis.tube is None:
+                    self._results.put((
+                        job,
+                        grid,
+                        _FinePlanningOutcome(plan=None, analysis=analysis),
+                        None,
+                    ))
+                    return
+                graph = analysis.graph
+                robust_indices = np.flatnonzero(analysis.tube.robust_node_mask)
+                robust_poses = np.asarray(
+                    [graph.nodes[int(index)].world_pose for index in robust_indices],
+                    dtype=np.float64,
+                )
+                robust_layers = np.asarray(
+                    [graph.nodes[int(index)].layer_index for index in robust_indices],
+                    dtype=np.int64,
+                )
+                constraint = FinePlanningConstraint(
+                    robust_world_poses=robust_poses,
+                    robust_layer_indices=robust_layers,
+                    restricted_start_layer=analysis.tube.restricted_start_layer,
+                    restricted_end_layer=analysis.tube.restricted_end_layer,
+                    position_tolerance_m=max(
+                        1.6 * graph.lateral_step_m,
+                        1.5 * grid.resolution_m,
+                    ),
+                    heading_tolerance_deg=1.5 * graph.heading_step_deg,
+                    corridor=graph.corridor,
+                )
+                local_goal = analysis.tube.goal_world_pose[:2]
+                local_goal_yaw = analysis.tube.goal_world_pose[2]
+            else:
+                local_goal = self._planner.select_local_goal(
+                    grid=grid,
+                    start_pose_world=job.start_pose_world,
+                    target_world_xy=job.goal_world_xy,
+                    lookahead_m=job.lookahead_m,
+                )
+                local_goal_yaw = None
             plan = self._planner.plan(
                 grid=grid,
                 start_pose_world=job.start_pose_world,
                 goal_world_xy=local_goal,
+                goal_world_yaw_rad=local_goal_yaw,
+                constraint=constraint,
             )
-            self._results.put((job, grid, plan, None))
+            refined = self._trajectory_refiner.refine(
+                grid=grid,
+                path_world_xy=plan.path_world_xy,
+                path_world_yaw_rad=plan.path_world_yaw_rad,
+                motion_direction=plan.path_motion_direction,
+                pose_allowed=(None if constraint is None else constraint.allows),
+            )
+            plan = replace(
+                plan,
+                path_world_xy=refined.path_world_xy,
+                path_world_yaw_rad=refined.path_world_yaw_rad,
+                refinement_applied=refined.applied,
+                refinement_iterations=refined.accepted_iterations,
+            )
+            outcome = _FinePlanningOutcome(plan=plan, analysis=analysis)
+            self._results.put((job, grid, outcome, None))
         except Exception as exc:
             self._results.put((job, grid, None, exc))
         finally:
@@ -284,6 +379,10 @@ class _GoalMapPanel:
         with self.window.frame:
             with ui.VStack(spacing=5):
                 with ui.HStack(height=36):
+                    ui.Button(
+                        "AUTO",
+                        clicked_fn=lambda: command_sink(("SET_MODE", "AUTO")),
+                    )
                     ui.Button(
                         "COARSE",
                         clicked_fn=lambda: command_sink(("SET_MODE", "COARSE")),
@@ -439,6 +538,9 @@ def _load_settings() -> tuple[
     LocalVoxelMapConfig,
     FinePlannerConfig,
     FootprintConfig,
+    RouteCorridorConfig,
+    TraversabilityGraphConfig,
+    TrajectoryRefinerConfig,
 ]:
     with SETTINGS_PATH.open(encoding="utf-8") as handle:
         data = yaml.safe_load(handle) or {}
@@ -453,6 +555,8 @@ def _load_settings() -> tuple[
         "fine_tracking",
         "manual_control",
         "fine_planner",
+        "restricted_space",
+        "trajectory_refiner",
         "map_selector",
         "mapping",
         "debug",
@@ -520,7 +624,7 @@ def _load_settings() -> tuple[
         "goal_reached_tolerance_m",
     }:
         raise ValueError("Invalid navigation modes execution fields")
-    if execution["default_mode"] not in {"COARSE", "FINE"}:
+    if execution["default_mode"] not in {"AUTO", "COARSE", "FINE"}:
         raise ValueError("Invalid default navigation mode")
     if any(
         float(value) <= 0
@@ -592,6 +696,22 @@ def _load_settings() -> tuple[
     fine_config = FinePlannerConfig.from_mapping({
         item.name: fine[item.name] for item in fields(FinePlannerConfig)
     })
+    restricted = data["restricted_space"]
+    if not isinstance(restricted, dict) or set(restricted) != {
+        "route_corridor", "traversability_graph"
+    }:
+        raise ValueError(
+            "restricted_space 必须包含 route_corridor 和 traversability_graph"
+        )
+    corridor_config = RouteCorridorConfig.from_mapping(
+        restricted["route_corridor"]
+    )
+    graph_config = TraversabilityGraphConfig.from_mapping(
+        restricted["traversability_graph"]
+    )
+    refiner_config = TrajectoryRefinerConfig.from_mapping(
+        data["trajectory_refiner"]
+    )
     selector = data["map_selector"]
     selector_fields = {
         "sources",
@@ -661,6 +781,9 @@ def _load_settings() -> tuple[
         map_config,
         fine_config,
         footprint,
+        corridor_config,
+        graph_config,
+        refiner_config,
     )
 
 
@@ -673,6 +796,9 @@ def main() -> int:
         map_config,
         fine_config,
         footprint,
+        corridor_config,
+        graph_config,
+        refiner_config,
     ) = _load_settings()
     logger = _make_logger()
 
@@ -697,6 +823,9 @@ def main() -> int:
                 map_config,
                 fine_config,
                 footprint,
+                corridor_config,
+                graph_config,
+                refiner_config,
                 logger,
             )
         except Exception:
@@ -732,6 +861,9 @@ def _run(
     map_config,
     fine_config,
     footprint,
+    corridor_config,
+    graph_config,
+    refiner_config,
     logger,
 ) -> int:
     import omni.ui as ui
@@ -885,6 +1017,20 @@ def _run(
         yaw_resolution_deg=fine_config.yaw_resolution_deg,
     )
     fine_planner = FineLocalPlanner(fine_config, collision_checker)
+    graph_builder = TraversabilityGraphBuilder(
+        config=graph_config,
+        planner_config=fine_config,
+        collision_checker=collision_checker,
+    )
+    restricted_analyzer = RestrictedSpaceAnalyzer(
+        corridor_config=corridor_config,
+        graph_config=graph_config,
+        graph_builder=graph_builder,
+    )
+    trajectory_refiner = TrajectoryRefiner(
+        refiner_config,
+        collision_checker,
+    )
     coarse_tracking = settings["coarse_tracking"]
     coarse_tracking_config = replace(
         profile.agx_controller.continuous,
@@ -902,6 +1048,8 @@ def _run(
         )
     fine_worker = _FinePlanningWorker(
         planner=fine_planner,
+        restricted_analyzer=restricted_analyzer,
+        trajectory_refiner=trajectory_refiner,
         obstacle_min_height_m=float(settings["fine_planner"]["obstacle_min_height_m"]),
         obstacle_max_height_m=float(settings["fine_planner"]["obstacle_max_height_m"]),
     )

@@ -66,7 +66,7 @@ goal:
 # 粗粒度与细粒度规划任务的调度参数。
 execution:
   # 程序启动后的默认导航模式。
-  default_mode: "COARSE"
+  default_mode: "AUTO"
   # NavDP 滚动推理周期，单位为秒。
   coarse_planning_period_sec: 0.50
   # Hybrid A* 滚动规划周期，单位为秒。
@@ -189,6 +189,76 @@ fine_planner:
   spin_penalty: 1.20
   # 启发函数在搜索优先级中的权重。
   heuristic_weight: 8.0
+
+# 面向局部瓶颈和持续受限通道的状态转移图参数。
+restricted_space:
+  route_corridor:
+    # 从机器人当前位置向目标方向分析的最大通路长度，单位为米。
+    horizon_m: 4.0
+    # 相邻横截面的距离，单位为米。
+    cross_section_step_m: 0.10
+    # 参考通路两侧参与分析的宽度，单位为米。
+    half_width_m: 1.00
+    # 搜索高余量参考线时的横向采样间隔，单位为米。
+    center_search_step_m: 0.05
+    # 参考线偏离 NavDP 通路的代价权重。
+    center_deviation_weight: 0.20
+    # 参考线平滑迭代次数。
+    smoothing_iterations: 2
+  traversability_graph:
+    # 粗分辨率横向状态采样间隔，单位为米。
+    lateral_step_m: 0.10
+    # 相对通路方向允许采样的最大航向差，单位为度。
+    heading_limit_deg: 60.0
+    # 粗分辨率航向采样间隔，单位为度。
+    heading_step_deg: 20.0
+    # 计算局部容量时使用的前后窗口半径，单位为米。
+    local_window_half_m: 0.60
+    # motion primitive 末端与离散状态允许的位置误差，单位为米。
+    endpoint_position_tolerance_m: 0.09
+    # motion primitive 末端与离散状态允许的航向误差，单位为度。
+    endpoint_heading_tolerance_deg: 12.0
+    # 容量接近阈值时使用的横向细化间隔，单位为米。
+    refined_lateral_step_m: 0.05
+    # 容量接近阈值时使用的航向细化间隔，单位为度。
+    refined_heading_step_deg: 10.0
+    # 截面状态达到该观测比例后才允许判定受限结构。
+    observation_threshold: 0.75
+    # 截面连接达到该观测比例后才允许判定受限结构。
+    edge_observation_threshold: 0.70
+    # 相对局部基线低于该比例时判为容量收缩。
+    local_contraction_threshold: 0.55
+    # 计算局部容量基线的通路半径，单位为米。
+    local_baseline_radius_m: 0.80
+    # 状态容量持续低于该值时判为持续受限。
+    state_capacity_threshold: 0.40
+    # 连接容量持续低于该值时判为持续受限。
+    transition_capacity_threshold: 0.50
+    # 持续受限区间的最小长度，单位为米。
+    constrained_min_length_m: 0.80
+    # 机器人前方参与自动切换判断的距离，单位为米。
+    trigger_lookahead_m: 2.50
+    # 鲁棒穿越状态需要保留的最小几何余量，单位为米。
+    robust_node_clearance_m: 0.05
+    # 鲁棒运动连接需要保留的最小几何余量，单位为米。
+    robust_edge_clearance_m: 0.05
+    # 受限区域入口前保留的姿态调整距离，单位为米。
+    pre_distance_m: 0.80
+    # 受限区域出口后要求恢复的空间长度，单位为米。
+    post_distance_m: 0.80
+    # 容量与阈值相差不超过该值时触发分辨率细化。
+    refinement_threshold_band: 0.10
+
+# Hybrid A* 路径的连续平滑与复核参数。
+trajectory_refiner:
+  # 最大平滑迭代次数。
+  iterations: 8
+  # 每次迭代向相邻点中值移动的比例。
+  smoothing_gain: 0.25
+  # 平滑结果需要保留的最小障碍余量，单位为米。
+  minimum_clearance_m: 0.04
+  # 平滑结果允许的最大曲率，单位为每米。
+  maximum_curvature_per_m: 1.20
 
 # 目标选择地图与局部体素地图来源。
 map_selector:

@@ -13,6 +13,42 @@ from vln_nav.navigation.trajectory_clearance import (
 
 
 @dataclass(frozen=True)
+class FinePlanningConstraint:
+    robust_world_poses: np.ndarray
+    robust_layer_indices: np.ndarray
+    restricted_start_layer: int
+    restricted_end_layer: int
+    position_tolerance_m: float
+    heading_tolerance_deg: float
+    corridor: object
+
+    def allows(self, x_m: float, y_m: float, yaw_rad: float) -> bool:
+        layer, _, _ = self.corridor.coordinates(
+            np.asarray([x_m, y_m], dtype=np.float64),
+            float(yaw_rad),
+        )
+        if not self.restricted_start_layer <= layer <= self.restricted_end_layer:
+            return True
+        candidates = np.flatnonzero(
+            np.abs(self.robust_layer_indices - layer) <= 1
+        )
+        if candidates.size == 0:
+            return False
+        poses = self.robust_world_poses[candidates]
+        position_error = np.linalg.norm(
+            poses[:, :2] - np.asarray([x_m, y_m], dtype=np.float64),
+            axis=1,
+        )
+        yaw_error = np.abs(np.asarray([
+            _wrap_angle(float(value) - float(yaw_rad)) for value in poses[:, 2]
+        ]))
+        return bool(np.any(
+            (position_error <= self.position_tolerance_m)
+            & (yaw_error <= math.radians(self.heading_tolerance_deg))
+        ))
+
+
+@dataclass(frozen=True)
 class FinePlannerConfig:
     yaw_resolution_deg: float
     step_length_m: float
@@ -100,6 +136,9 @@ class FinePlan:
     rejected_collision_count: int
     rejected_unknown_count: int
     rejected_outside_count: int
+    rejected_constraint_count: int
+    refinement_applied: bool = False
+    refinement_iterations: int = 0
 
 
 @dataclass(frozen=True)
@@ -310,6 +349,8 @@ class FineLocalPlanner:
         grid: PlanningGrid,
         start_pose_world: tuple[float, float, float],
         goal_world_xy: tuple[float, float],
+        goal_world_yaw_rad: float | None = None,
+        constraint: FinePlanningConstraint | None = None,
     ) -> FinePlan:
         start = np.asarray(start_pose_world, dtype=np.float64)
         goal = np.asarray(goal_world_xy, dtype=np.float64)
@@ -344,6 +385,7 @@ class FineLocalPlanner:
         rejected_collision = 0
         rejected_unknown = 0
         rejected_outside = 0
+        rejected_constraint = 0
 
         while queue and expanded < self.config.max_expansions:
             _, _, current_node = heapq.heappop(queue)
@@ -353,13 +395,29 @@ class FineLocalPlanner:
                 continue
             pose = node_pose[current_node]
             goal_position_error = math.hypot(pose[0] - goal[0], pose[1] - goal[1])
-            if goal_position_error <= self.config.goal_tolerance_m:
+            goal_yaw_error = (
+                0.0
+                if goal_world_yaw_rad is None
+                else abs(_wrap_angle(pose[2] - float(goal_world_yaw_rad)))
+            )
+            if (
+                goal_position_error <= self.config.goal_tolerance_m
+                and goal_yaw_error <= 2.0 * self._yaw_step
+            ):
                 goal_node = current_node
                 break
             expanded += 1
             previous_action = self._actions[key[3]] if key[3] >= 0 else None
             for action_index, action in enumerate(self._actions):
                 primitive = self._sample_primitive(pose, action)
+                if constraint is not None and any(
+                    not constraint.allows(
+                        float(sample[0]), float(sample[1]), float(sample[2])
+                    )
+                    for sample in primitive[1:]
+                ):
+                    rejected_constraint += 1
+                    continue
                 metrics = [
                     self.collision_checker.metrics(
                         grid,
@@ -464,7 +522,7 @@ class FineLocalPlanner:
             raise RuntimeError(
                 f"细粒度规划器扩展 {expanded} 个节点后仍未找到路径；"
                 f"碰撞拒绝={rejected_collision}，未知拒绝={rejected_unknown}，"
-                f"地图外拒绝={rejected_outside}"
+                f"地图外拒绝={rejected_outside}，管道拒绝={rejected_constraint}"
             )
         node_ids = []
         current = goal_node
@@ -500,6 +558,7 @@ class FineLocalPlanner:
             rejected_collision_count=int(rejected_collision),
             rejected_unknown_count=int(rejected_unknown),
             rejected_outside_count=int(rejected_outside),
+            rejected_constraint_count=int(rejected_constraint),
         )
 
     def _state_key(
@@ -563,3 +622,7 @@ class FineLocalPlanner:
     @staticmethod
     def _heuristic(position_xy: np.ndarray, goal_xy: np.ndarray) -> float:
         return float(np.linalg.norm(np.asarray(position_xy) - np.asarray(goal_xy)))
+
+
+def _wrap_angle(angle_rad: float) -> float:
+    return (float(angle_rad) + math.pi) % (2.0 * math.pi) - math.pi

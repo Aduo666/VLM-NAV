@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 import math
 
 import numpy as np
 from scipy.ndimage import distance_transform_edt
 
 from vln_nav.active_perception.local_geometry import FREE, OCCUPIED, LocalVoxelSnapshot
+
+
+class GeometryStatus(str, Enum):
+    SAFE = "SAFE"
+    BLOCKED = "BLOCKED"
+    UNRESOLVED = "UNRESOLVED"
 
 
 @dataclass(frozen=True)
@@ -111,6 +118,15 @@ class IncrementalUnknownMetrics:
 
 
 @dataclass(frozen=True)
+class GeometryAssessment:
+    status: GeometryStatus
+    min_clearance_m: float
+    unknown_ratio: float
+    outside_ratio: float
+    checked_pose_count: int
+
+
+@dataclass(frozen=True)
 class PlanningGrid:
     occupied_mask: np.ndarray
     free_mask: np.ndarray
@@ -182,6 +198,68 @@ class FootprintCollisionChecker:
             min_clearance_m=float(np.min(clearances)) if clearances.size else 0.0,
             unknown_ratio=float(unknown_count / max(len(inside), 1)),
             outside_ratio=outside_ratio,
+        )
+
+    def classify_pose(
+        self,
+        grid: PlanningGrid,
+        *,
+        x_m: float,
+        y_m: float,
+        yaw_rad: float,
+    ) -> GeometryAssessment:
+        metrics = self.metrics(
+            grid,
+            x_m=float(x_m),
+            y_m=float(y_m),
+            yaw_rad=float(yaw_rad),
+        )
+        return GeometryAssessment(
+            status=_geometry_status(metrics),
+            min_clearance_m=metrics.min_clearance_m,
+            unknown_ratio=metrics.unknown_ratio,
+            outside_ratio=metrics.outside_ratio,
+            checked_pose_count=1,
+        )
+
+    def classify_swept_poses(
+        self,
+        grid: PlanningGrid,
+        swept_poses: np.ndarray,
+    ) -> GeometryAssessment:
+        poses = np.asarray(swept_poses, dtype=np.float64).reshape(-1, 3)
+        if len(poses) == 0 or not np.isfinite(poses).all():
+            raise ValueError("运动包络检查需要至少一个有效位姿")
+        status = GeometryStatus.SAFE
+        min_clearance = float("inf")
+        unknown_sum = 0.0
+        outside_sum = 0.0
+        for pose in poses:
+            metrics = self.metrics(
+                grid,
+                x_m=float(pose[0]),
+                y_m=float(pose[1]),
+                yaw_rad=float(pose[2]),
+            )
+            pose_status = _geometry_status(metrics)
+            if pose_status is GeometryStatus.BLOCKED:
+                status = GeometryStatus.BLOCKED
+            elif (
+                pose_status is GeometryStatus.UNRESOLVED
+                and status is GeometryStatus.SAFE
+            ):
+                status = GeometryStatus.UNRESOLVED
+            min_clearance = min(min_clearance, metrics.min_clearance_m)
+            unknown_sum += metrics.unknown_ratio
+            outside_sum += metrics.outside_ratio
+        return GeometryAssessment(
+            status=status,
+            min_clearance_m=(
+                0.0 if not math.isfinite(min_clearance) else float(min_clearance)
+            ),
+            unknown_ratio=float(unknown_sum / len(poses)),
+            outside_ratio=float(outside_sum / len(poses)),
+            checked_pose_count=int(len(poses)),
         )
 
     def clear_pose(
@@ -479,3 +557,11 @@ def assess_path_clearance(
         first_collision_world_xyyaw=first_collision_world_xyyaw,
         first_collision_cell=first_collision_cell,
     )
+
+
+def _geometry_status(metrics: FootprintMetrics) -> GeometryStatus:
+    if metrics.collision:
+        return GeometryStatus.BLOCKED
+    if metrics.outside_ratio > 0.0 or metrics.unknown_ratio > 0.0:
+        return GeometryStatus.UNRESOLVED
+    return GeometryStatus.SAFE

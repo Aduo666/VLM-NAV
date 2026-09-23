@@ -162,12 +162,18 @@ class System2Service:
                     f"request_id 必须递增，上一请求为 {state.last_request_id}"
                 )
             if look_down:
-                messages, images, step = self._prepare_lookdown_turn(state, image)
+                messages, images, step, pixel_space_hw = self._prepare_lookdown_turn(
+                    state,
+                    image,
+                )
             else:
-                messages, images, step = self._prepare_front_turn(state, image)
+                messages, images, step, pixel_space_hw = self._prepare_front_turn(
+                    state,
+                    image,
+                )
 
             raw_output, latency_ms = self._generate(messages, images)
-            parsed = self._parse_output(raw_output)
+            parsed = self._parse_output(raw_output, pixel_space_hw=pixel_space_hw)
             state.last_raw_output = raw_output
             state.last_request_id = request_id
             state.updated_at_sec = time.monotonic()
@@ -184,6 +190,7 @@ class System2Service:
             look_down=look_down,
             step=step,
             latency_ms=latency_ms,
+            pixel_space_hw=pixel_space_hw,
         )
 
     def infer_once(self, *, image: Image.Image, instruction: str) -> dict:
@@ -192,9 +199,12 @@ class System2Service:
             raise ValueError("instruction 不能为空")
         source_size = [int(image.width), int(image.height)]
         temporary = SessionState(instruction=instruction)
-        messages, images, step = self._prepare_front_turn(temporary, image)
+        messages, images, step, pixel_space_hw = self._prepare_front_turn(
+            temporary,
+            image,
+        )
         raw_output, latency_ms = self._generate(messages, images)
-        parsed = self._parse_output(raw_output)
+        parsed = self._parse_output(raw_output, pixel_space_hw=pixel_space_hw)
         return self._build_response(
             parsed=parsed,
             raw_output=raw_output,
@@ -205,6 +215,7 @@ class System2Service:
             look_down=False,
             step=step,
             latency_ms=latency_ms,
+            pixel_space_hw=pixel_space_hw,
         )
 
     def _build_response(
@@ -219,6 +230,7 @@ class System2Service:
         look_down: bool,
         step: int,
         latency_ms: float,
+        pixel_space_hw: tuple[int, int],
     ) -> dict:
         response = {
             "session_id": session_id,
@@ -229,7 +241,7 @@ class System2Service:
             "raw_output": raw_output,
             "source_image_size_wh": source_size,
             "model_input_size_wh": [self.resize_w, self.resize_h],
-            "pixel_space_hw": [self.resize_h, self.resize_w],
+            "pixel_space_hw": [int(pixel_space_hw[0]), int(pixel_space_hw[1])],
             "latency_ms": round(latency_ms, 2),
         }
         if parsed["type"] == "pixel_goal":
@@ -264,7 +276,7 @@ class System2Service:
         self,
         state: SessionState,
         image: Image.Image,
-    ) -> tuple[list[dict], list[Image.Image], int]:
+    ) -> tuple[list[dict], list[Image.Image], int, tuple[int, int]]:
         current_image = self._resize_image(image)
         state.rgb_history.append(current_image)
         current_index = len(state.rgb_history) - 1
@@ -296,13 +308,13 @@ class System2Service:
         state.lookdown_turns = 0
         step = state.step
         state.step += 1
-        return messages, images, step
+        return messages, images, step, (self.resize_h, self.resize_w)
 
     def _prepare_lookdown_turn(
         self,
         state: SessionState,
         image: Image.Image,
-    ) -> tuple[list[dict], list[Image.Image], int]:
+    ) -> tuple[list[dict], list[Image.Image], int, tuple[int, int]]:
         if not state.last_raw_output or not state.conversation_history:
             raise RuntimeError("LOOKDOWN 缺少上一轮前视对话")
         if "↓" not in state.last_raw_output:
@@ -333,6 +345,7 @@ class System2Service:
             copy.deepcopy(state.conversation_history),
             list(state.input_images),
             state.step,
+            (int(down_image.height), int(down_image.width)),
         )
 
     def _generate(
@@ -389,17 +402,23 @@ class System2Service:
             raise RuntimeError("图像数量与 prompt 中的图像标记不一致")
         return content
 
-    def _parse_output(self, raw_output: str) -> dict:
+    def _parse_output(
+        self,
+        raw_output: str,
+        *,
+        pixel_space_hw: tuple[int, int],
+    ) -> dict:
         coords = [int(value) for value in re.findall(r"\d+", raw_output)]
         if len(coords) >= 2:
             pixel_goal = [coords[1], coords[0]]
+            pixel_height, pixel_width = pixel_space_hw
             if not (
-                0 <= pixel_goal[0] < self.resize_h
-                and 0 <= pixel_goal[1] < self.resize_w
+                0 <= pixel_goal[0] < pixel_height
+                and 0 <= pixel_goal[1] < pixel_width
             ):
                 raise RuntimeError(
                     f"S2 pixel_goal {pixel_goal} 超出模型图像范围 "
-                    f"{self.resize_h}x{self.resize_w}"
+                    f"{pixel_height}x{pixel_width}"
                 )
             return {
                 "type": "pixel_goal",

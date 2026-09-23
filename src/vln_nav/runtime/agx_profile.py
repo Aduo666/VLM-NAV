@@ -24,6 +24,8 @@ class AgxSimulation:
 @dataclass(frozen=True)
 class AgxCamera:
     front_prim_path: str
+    s2_down_prim_path: str
+    mapping_down_prim_path: str
 
 
 @dataclass(frozen=True)
@@ -93,7 +95,12 @@ def load_agx_profile(*, project_root: Path) -> AgxProfile:
         float(value) <= 0 for value in simulation.values()
     ):
         raise ValueError("Invalid AGX simulation timing")
-    if set(sensors) != {"front_prim_path", "observer_prim_path"}:
+    if set(sensors) != {
+        "front_prim_path",
+        "s2_down_prim_path",
+        "mapping_down_prim_path",
+        "observer_prim_path",
+    }:
         raise ValueError("Invalid AGX sensor paths")
     controller_keys = {
         "left_wheel_joint_names", "right_wheel_joint_names", "steering_joint_names",
@@ -142,7 +149,11 @@ def load_agx_profile(*, project_root: Path) -> AgxProfile:
             rendering_dt=float(simulation["rendering_dt"]),
         ),
         sensors=AgxSensors(
-            camera=AgxCamera(str(sensors["front_prim_path"])),
+            camera=AgxCamera(
+                front_prim_path=str(sensors["front_prim_path"]),
+                s2_down_prim_path=str(sensors["s2_down_prim_path"]),
+                mapping_down_prim_path=str(sensors["mapping_down_prim_path"]),
+            ),
             observer_camera_prim_path=str(sensors["observer_prim_path"]),
         ),
         agx_controller=agx_controller,

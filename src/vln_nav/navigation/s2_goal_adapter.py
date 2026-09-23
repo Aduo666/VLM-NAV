@@ -9,9 +9,6 @@ from vln_nav.active_perception.camera_geometry import (
     CameraFrameGeometry,
     backproject_depth_pixels_to_world,
 )
-from vln_nav.navigation.trajectory_clearance import PlanningGrid
-
-
 @dataclass(frozen=True)
 class S2GoalAdapterConfig:
     depth_patch_radius_px: int
@@ -19,8 +16,6 @@ class S2GoalAdapterConfig:
     max_depth_m: float
     min_goal_distance_m: float
     max_goal_distance_m: float
-    minimum_map_clearance_m: float
-    ray_sample_step_m: float
 
     @classmethod
     def from_mapping(cls, data: dict) -> "S2GoalAdapterConfig":
@@ -33,8 +28,6 @@ class S2GoalAdapterConfig:
             max_depth_m=float(data["max_depth_m"]),
             min_goal_distance_m=float(data["min_goal_distance_m"]),
             max_goal_distance_m=float(data["max_goal_distance_m"]),
-            minimum_map_clearance_m=float(data["minimum_map_clearance_m"]),
-            ray_sample_step_m=float(data["ray_sample_step_m"]),
         )
         config.validate()
         return config
@@ -47,8 +40,6 @@ class S2GoalAdapterConfig:
             self.max_depth_m,
             self.min_goal_distance_m,
             self.max_goal_distance_m,
-            self.minimum_map_clearance_m,
-            self.ray_sample_step_m,
         )
         if not all(math.isfinite(value) and value > 0 for value in values):
             raise ValueError("S2 goal adapter 数值配置必须为有限正数")
@@ -80,7 +71,6 @@ class S2GoalAdapter:
         frame: CameraFrameGeometry,
         pixel_vu: tuple[float, float],
         pixel_space_hw: tuple[int, int],
-        planning_grid: PlanningGrid | None,
     ) -> S2MetricGoal:
         frame.validate()
         model_height, model_width = map(int, pixel_space_hw)
@@ -128,14 +118,6 @@ class S2GoalAdapter:
             world_xy = _body_xy_to_world(body_xy, frame.world_from_base)
         else:
             world_xy = np.asarray(world_point[:2], dtype=np.float64)
-        if planning_grid is not None:
-            world_xy = self._nearest_safe_point_on_ray(
-                start_world_xy=np.asarray(frame.world_from_base[:2, 3], dtype=np.float64),
-                target_world_xy=world_xy,
-                grid=planning_grid,
-            )
-            world_h = np.asarray([world_xy[0], world_xy[1], world_point[2], 1.0])
-            body_xy = (base_from_world @ world_h)[:2]
         final_distance = float(np.linalg.norm(body_xy))
         if not self.config.min_goal_distance_m <= final_distance <= self.config.max_goal_distance_m:
             raise RuntimeError(f"S2 安全目标距离无效：{final_distance:.3f}m")
@@ -147,46 +129,6 @@ class S2GoalAdapter:
             body_xy=(float(body_xy[0]), float(body_xy[1])),
             world_xy=(float(world_xy[0]), float(world_xy[1])),
         )
-
-    def _nearest_safe_point_on_ray(
-        self,
-        *,
-        start_world_xy: np.ndarray,
-        target_world_xy: np.ndarray,
-        grid: PlanningGrid,
-    ) -> np.ndarray:
-        delta = np.asarray(target_world_xy, dtype=np.float64) - np.asarray(
-            start_world_xy, dtype=np.float64
-        )
-        distance = float(np.linalg.norm(delta))
-        if distance < 1.0e-6:
-            raise RuntimeError("S2 metric goal 与机器人位置重合")
-        direction = delta / distance
-        maximum = min(distance, self.config.max_goal_distance_m)
-        samples = np.arange(
-            self.config.min_goal_distance_m,
-            maximum + 0.5 * self.config.ray_sample_step_m,
-            self.config.ray_sample_step_m,
-        )
-        safe_points = []
-        for sample_distance in samples:
-            point = start_world_xy + min(float(sample_distance), maximum) * direction
-            row, column, inside = grid.world_to_cell(float(point[0]), float(point[1]))
-            safe = bool(
-                inside
-                and grid.free_mask[row, column]
-                and not grid.occupied_mask[row, column]
-                and not grid.unknown_mask[row, column]
-                and grid.clearance_m[row, column]
-                >= self.config.minimum_map_clearance_m
-            ) if inside else False
-            if safe:
-                safe_points.append(point.copy())
-            else:
-                break
-        if not safe_points:
-            raise RuntimeError("S2 pixel 方向上没有已确认安全的 metric goal")
-        return np.asarray(safe_points[-1], dtype=np.float64)
 
 
 def _body_xy_to_world(body_xy: np.ndarray, world_from_base: np.ndarray) -> np.ndarray:

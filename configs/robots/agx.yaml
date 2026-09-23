@@ -11,7 +11,10 @@ simulation:
   rendering_dt: 0.0166667
 
 sensors:
+  #front_prim_path: "/World/Robot/pan_tilt_pitch_link/pan_tilt_surface/camera_mount/camera_body/camera_base/PanCamera"
   front_prim_path: "link6/Camera"
+  s2_down_prim_path: "link6/DownCamera"
+  mapping_down_prim_path: "dummy_base_link/DownCamera"
   observer_prim_path: "dummy_base_link/observeCamera"
 controller:
   left_wheel_joint_names: ["fl_wheel", "rl_wheel"]

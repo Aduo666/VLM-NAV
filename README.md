@@ -56,7 +56,7 @@ Isaac Sim 中只保留 `S2 Decision` 和 `Goal Map` 两个导航窗口。任务�
 | [navigation.yaml](configs/navigation.yaml) | 场景、相机、地图、规划和跟踪参数 |
 | [navdp_client.py](src/vln_nav/navigation/navdp_client.py) | NavDP 请求与轨迹校验 |
 | [internnav_s2_client.py](src/vln_nav/navigation/internnav_s2_client.py) | 远程 S2 请求与输出校验 |
-| [s2_goal_adapter.py](src/vln_nav/navigation/s2_goal_adapter.py) | pixel-goal 深度反投影与安全目标选择 |
+| [s2_goal_adapter.py](src/vln_nav/navigation/s2_goal_adapter.py) | pixel-goal 深度反投影与 metric goal 转换 |
 | [local_geometry.py](src/vln_nav/active_perception/local_geometry.py) | RGB-D 局部体素地图 |
 | [fine_local_planner.py](src/vln_nav/navigation/fine_local_planner.py) | 细粒度局部轨迹搜索 |
 | [trajectory.py](src/vln_nav/control/trajectory.py) | AGX 连续轨迹跟踪与轮组速度转换 |

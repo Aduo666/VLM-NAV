@@ -79,10 +79,6 @@ internnav_s2:
     min_goal_distance_m: 0.25
     # metric goal 最大距离，单位为米。
     max_goal_distance_m: 5.0
-    # metric goal 在局部地图中要求的最小障碍余量，单位为米。
-    minimum_map_clearance_m: 0.35
-    # 沿 pixel 射线搜索安全目标的采样间隔，单位为米。
-    ray_sample_step_m: 0.05
   # FORWARD 动作对应的局部目标距离，单位为米。
   forward_action_distance_m: 0.25
   # S2 局部目标到达距离，单位为米。
@@ -334,11 +330,6 @@ map_selector:
 
 # RGB-D 局部三维地图的传感器与融合参数。
 mapping:
-  sensors:
-    # 机械臂末端前视 RGB-D 相机在 AGX 根节点下的相对路径。
-    front_prim_path: "link6/Camera"
-    # 近场 RGB-D 相机在 AGX 根节点下的相对路径。
-    down_prim_path: "dummy_base_link/DownCamera"
   camera:
     # 地图相机图像宽度，单位为像素。
     width: 640

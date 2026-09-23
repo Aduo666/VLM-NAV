@@ -852,11 +852,9 @@ def _load_settings() -> tuple[
 
     map_settings = data["mapping"]
     if not isinstance(map_settings, dict) or set(map_settings) != {
-        "sensors", "camera", "map", "max_frame_skew_sec"
+        "camera", "map", "max_frame_skew_sec"
     }:
         raise ValueError("Invalid RGB-D mapping sections")
-    if set(map_settings["sensors"]) != {"front_prim_path", "down_prim_path"}:
-        raise ValueError("RGB-D mapping requires front and down camera paths")
     if set(map_settings["camera"]) != {"width", "height", "frequency_hz"}:
         raise ValueError("Invalid RGB-D mapping camera settings")
     if float(map_settings["max_frame_skew_sec"]) <= 0:
@@ -1069,17 +1067,29 @@ def _run(
         kind="NavDP observer camera",
     )
     map_sources = tuple(map(str, settings["map_selector"]["sources"]))
+    camera_roles = {
+        "front": profile.sensors.camera.front_prim_path,
+        "down": profile.sensors.camera.mapping_down_prim_path,
+    }
     map_role_paths = {
         source: resolve_existing_prim_path(
             stage=stage,
             prim_path=resolve_robot_relative_prim_path(
                 robot_root_path=profile.asset.prim_path,
-                prim_path=map_settings["sensors"][f"{source}_prim_path"],
+                prim_path=camera_roles[source],
             ),
             kind=f"NavDP goal-map {source} camera",
         )
         for source in map_sources
     }
+    s2_down_path = resolve_existing_prim_path(
+        stage=stage,
+        prim_path=resolve_robot_relative_prim_path(
+            robot_root_path=profile.asset.prim_path,
+            prim_path=profile.sensors.camera.s2_down_prim_path,
+        ),
+        kind="S2 look-down camera",
+    )
     if map_role_paths["front"] != camera_path:
         raise RuntimeError(
             "NavDP front camera and goal-map front camera must reference the same prim: "
@@ -1091,6 +1101,8 @@ def _run(
         raise RuntimeError(f"NavDP front prim is not a Camera: {camera_path}")
     if not stage.GetPrimAtPath(observer_path).IsA(UsdGeom.Camera):
         raise RuntimeError(f"NavDP observer prim is not a Camera: {observer_path}")
+    if not stage.GetPrimAtPath(s2_down_path).IsA(UsdGeom.Camera):
+        raise RuntimeError(f"S2 look-down prim is not a Camera: {s2_down_path}")
     camera_config = settings["camera"]
     camera = Camera(
         prim_path=camera_path,
@@ -1115,11 +1127,20 @@ def _run(
                 int(map_camera_config["height"]),
             ),
         )
+    s2_down_camera = Camera(
+        prim_path=s2_down_path,
+        name="agx_s2_down_rgbd",
+        frequency=int(map_camera_config["frequency_hz"]),
+        resolution=(
+            int(map_camera_config["width"]),
+            int(map_camera_config["height"]),
+        ),
+    )
     world.reset()
     robot.initialize()
-    for map_camera in map_cameras.values():
-        map_camera.initialize()
-        map_camera.add_distance_to_image_plane_to_frame()
+    for sensor_camera in (*map_cameras.values(), s2_down_camera):
+        sensor_camera.initialize()
+        sensor_camera.add_distance_to_image_plane_to_frame()
     bind_viewport_to_camera(camera_prim_path=observer_path, logger=logger, enabled=True)
     drive = create_locomotion_controller(
         profile=profile,
@@ -1198,6 +1219,11 @@ def _run(
         map_role_paths,
         float(settings["map_selector"]["view_size_m"]),
         float(map_config.resolution_m),
+    )
+    logger.info(
+        "[S2Cameras] front=%s down=%s",
+        camera_path,
+        s2_down_path,
     )
 
     command = [None]
@@ -1309,8 +1335,17 @@ def _run(
                     )
                     is not None
                 }
+                if "front" in captured:
+                    latest_camera_frames["front"] = captured["front"]
+                s2_down_frame = capture_camera_frame(
+                    source="down",
+                    camera=s2_down_camera,
+                    frame_index=frame_index,
+                    world_from_base=world_from_base,
+                )
+                if s2_down_frame is not None:
+                    latest_camera_frames["down"] = s2_down_frame
                 if len(captured) == len(map_cameras):
-                    latest_camera_frames.update(captured)
                     timestamps = [sample.timestamp_sec for sample in captured.values()]
                     if max(timestamps) - min(timestamps) <= float(
                         map_settings["max_frame_skew_sec"]
@@ -1426,7 +1461,6 @@ def _run(
                                 frame=s2_job.frame,
                                 pixel_vu=s2_result.pixel_vu,
                                 pixel_space_hw=s2_result.pixel_space_hw,
-                                planning_grid=latest_planning_grid,
                             )
                             selected_goal_odom_xy = _world_path_to_odom(
                                 np.asarray([metric_goal.world_xy], dtype=np.float64),

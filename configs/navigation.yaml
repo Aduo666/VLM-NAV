@@ -49,15 +49,17 @@ server:
 internnav_s2:
   # 是否启用 S2 高层规划。
   enabled: true
-  # 程序启动并获得有效前视帧后是否自动开始当前指令。
-  auto_start: true
   # 当前视觉语言导航指令。
   instruction: "Leave the kitchen and turn right into the bedroom on the left."
   server:
     # 远程 S2 服务地址。
     base_url: "http://10.4.113.176:5801"
-    # 单帧推断接口。
-    endpoint: "/infer_once"
+    # 无历史单帧测试接口。
+    infer_once_endpoint: "/infer_once"
+    # 导航会话重置接口。
+    reset_endpoint: "/reset"
+    # 有历史连续导航接口。
+    infer_endpoint: "/infer"
     # 单次 S2 请求超时时间，单位为秒。
     timeout_sec: 180.0
     # 上传图像 JPEG 质量。
@@ -333,8 +335,8 @@ map_selector:
 # RGB-D 局部三维地图的传感器与融合参数。
 mapping:
   sensors:
-    # 前视 RGB-D 相机在 AGX 根节点下的相对路径。
-    front_prim_path: "pan_tilt_pitch_link/pan_tilt_surface/camera_mount/camera_body/camera_base/PanCamera"
+    # 机械臂末端前视 RGB-D 相机在 AGX 根节点下的相对路径。
+    front_prim_path: "link6/Camera"
     # 近场 RGB-D 相机在 AGX 根节点下的相对路径。
     down_prim_path: "dummy_base_link/DownCamera"
   camera:

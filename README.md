@@ -28,7 +28,7 @@
                            AGX 连续轨迹跟踪
 ```
 
-默认模式为 `COARSE`，使用独立运行的 NavDP point-goal 服务。`FINE` 使用局部 RGB-D 几何地图、AGX 轮组运动约束和碰撞检查，由用户手动选择。当前不启用自动粗细粒度切换。
+当前固定使用 `COARSE`，通过独立运行的 NavDP point-goal 服务生成轨迹。细粒度规划代码仍保留，界面暂时不显示模式选择按钮和 Fine Geometry 窗口。
 
 ## 环境与运行
 
@@ -42,9 +42,9 @@ conda activate vlmnav
 bash scripts/run_nav.sh
 ```
 
-完整导航需要先启动远程 S2 服务和 NavDP 服务，再运行主程序。`auto_start` 开启时，主程序获得有效前视帧后自动执行配置中的指令；也可以点击 `START S2` 创建新会话。S2 输出 `LOOKDOWN` 时，程序停车并将固定下视相机的新图像发回同一会话。
+完整导航需要先启动远程 S2 服务和 NavDP 服务，再运行主程序。主程序获得有效前视帧后自动调用 `/reset` 创建会话，随后通过 `/infer` 执行配置中的指令。S2 输出 `LOOKDOWN` 时，程序停车并将固定下视相机的新图像发回同一会话。
 
-在 Isaac Sim 界面可以选择 `COARSE` 或 `FINE`，也可以点击目标地图中的已知空闲位置执行手动点目标导航。`STOP` 停止当前任务；方向键可手动控制 AGX。
+Isaac Sim 中只保留 `S2 Decision` 和 `Goal Map` 两个导航窗口。任务开始、局部目标切换和最终停止均由主导航自动处理。点击 Goal Map 中的已知空闲位置仍可执行手动点目标导航，方向键可以手动控制 AGX。
 
 切换场景时，在 [导航配置](configs/navigation.yaml) 的 `scene` 段一起修改 `usd_path`、`start_xy_m` 与 `start_yaw_deg`。XY 和朝向使用场景世界坐标，初始高度由 AGX 配置决定。`add_indoor_lighting` 控制运行时室内灯光；原始场景 USD 不会被修改。
 

@@ -258,13 +258,16 @@ class _S2Worker:
 
     def _run(self, job: _S2InferenceJob) -> None:
         try:
-            result = self._client.infer_once(
+            if job.reset:
+                self._client.reset_session(
+                    session_id=job.session_id,
+                    instruction=job.instruction,
+                )
+            result = self._client.infer_session(
                 rgb=job.frame.rgb,
-                instruction=job.instruction,
                 session_id=job.session_id,
                 request_id=job.request_id,
                 view=job.view,
-                reset=job.reset,
                 look_down=job.look_down,
                 timestamp_sec=job.frame.timestamp_sec,
             )
@@ -440,28 +443,6 @@ class _GoalMapPanel:
         initial[:, :, 3] = 255
         self._provider = ui.ByteImageProvider()
         self._provider.set_data_array(initial.reshape(-1), [size, size])
-        self.window = ui.Window(
-            "AGX Navigation",
-            width=290,
-            height=105,
-            visible=True,
-        )
-        with self.window.frame:
-            with ui.VStack(spacing=5):
-                with ui.HStack(height=36):
-                    ui.Button(
-                        "START S2",
-                        clicked_fn=lambda: command_sink("START_S2"),
-                    )
-                    ui.Button(
-                        "COARSE",
-                        clicked_fn=lambda: command_sink(("SET_MODE", "COARSE")),
-                    )
-                    ui.Button(
-                        "FINE",
-                        clicked_fn=lambda: command_sink(("SET_MODE", "FINE")),
-                    )
-                ui.Button("STOP", height=34, clicked_fn=self._stop_all)
         self.map_window = ui.Window(
             "Goal Map",
             width=max(size + 20, 600),
@@ -507,13 +488,7 @@ class _GoalMapPanel:
                 self._keyboard_subscription,
             )
             self._keyboard_subscription = None
-        self.window.visible = False
         self.map_window.visible = False
-
-    def _stop_all(self) -> None:
-        self._held_actions.clear()
-        self._press_order.clear()
-        self._command_sink("STOP")
 
     def _on_keyboard_event(self, event, *_args, **_kwargs) -> bool:
         key_name = str(event.input.name)
@@ -701,7 +676,6 @@ def _load_settings() -> tuple[
     s2 = data["internnav_s2"]
     s2_fields = {
         "enabled",
-        "auto_start",
         "instruction",
         "server",
         "goal_adapter",
@@ -716,8 +690,8 @@ def _load_settings() -> tuple[
     }
     if not isinstance(s2, dict) or set(s2) != s2_fields:
         raise ValueError(f"internnav_s2 必须包含这些字段：{sorted(s2_fields)}")
-    if not isinstance(s2["enabled"], bool) or not isinstance(s2["auto_start"], bool):
-        raise ValueError("internnav_s2 enabled/auto_start 必须为布尔值")
+    if not isinstance(s2["enabled"], bool):
+        raise ValueError("internnav_s2.enabled 必须为布尔值")
     if s2["enabled"] and not str(s2["instruction"]).strip():
         raise ValueError("启用 S2 时 instruction 不能为空")
     for name in (
@@ -1232,7 +1206,6 @@ def _run(
         image_size_px=int(settings["map_selector"]["image_size_px"]),
         command_sink=lambda value: command.__setitem__(0, value),
     )
-    fine_panel = _FineGeometryPanel(ui)
     s2_panel = _S2DecisionPanel(ui)
 
     for _ in range(int(camera_config["warmup_render_frames"])):
@@ -1265,12 +1238,10 @@ def _run(
     render_stride = max(1, round(float(profile.simulation.rendering_dt) / dt))
     frame_index = 0
     debug_path = PROJECT_ROOT / settings["debug"]["candidate_image_path"]
-    fine_debug_path = PROJECT_ROOT / settings["debug"]["fine_image_path"]
     last_map_integration_time = -float("inf")
     last_map_render_time = -float("inf")
     last_coarse_request_time = -float("inf")
     last_fine_request_time = -float("inf")
-    last_fine_debug_time = -float("inf")
     map_integration_period = float(map_settings["map"]["integration_period_sec"])
     map_render_period = float(settings["map_selector"]["render_period_sec"])
     latest_snapshot = local_map.snapshot()
@@ -1278,7 +1249,7 @@ def _run(
     last_failed_fine_input: _FineFailureInput | None = None
     latest_camera_frames: dict[str, CameraFrameGeometry] = {}
     s2_settings = settings["internnav_s2"]
-    s2_active = bool(s2_worker is not None and s2_settings["auto_start"])
+    s2_active = s2_worker is not None
     s2_session_id = uuid.uuid4().hex
     s2_request_id = 0
     accepted_s2_request_id = 0
@@ -1293,7 +1264,7 @@ def _run(
     if s2_active:
         idle_status = "S2 waiting for first front frame"
         logger.info(
-            "[S2Session] auto_start session=%s instruction=%s",
+            "[S2Session] automatic session=%s instruction=%s",
             s2_session_id,
             s2_settings["instruction"],
         )
@@ -1410,36 +1381,6 @@ def _run(
                 panel.update_map(goal_map)
                 last_map_render_time = now
 
-            if (
-                mode == "FINE"
-                and now - last_fine_debug_time
-                >= float(settings["debug"]["fine_update_period_sec"])
-            ):
-                debug_path_world = (
-                    None
-                    if display_path_odom_xy is None
-                    else _odom_path_to_world(display_path_odom_xy, state)
-                )
-                debug_goal_world = (
-                    None
-                    if selected_goal_odom_xy is None
-                    else _odom_path_to_world(selected_goal_odom_xy[None, :], state)[0]
-                )
-                geometry_image = _render_fine_geometry(
-                    latest_snapshot,
-                    robot_pose=(
-                        float(position[0]),
-                        float(position[1]),
-                        float(position[2]),
-                        float(robot_yaw_world),
-                    ),
-                    path_world_xy=debug_path_world,
-                    goal_world_xy=debug_goal_world,
-                )
-                fine_panel.update(geometry_image)
-                _save_image(fine_debug_path, geometry_image)
-                last_fine_debug_time = now
-
             s2_completed = None if s2_worker is None else s2_worker.poll()
             if s2_completed is not None:
                 s2_job, s2_result, s2_error = s2_completed
@@ -1458,7 +1399,7 @@ def _run(
                     tracker_mode = None
                     navigation_active = False
                     s2_need_request = False
-                    idle_status = "S2 request failed; press START S2 to retry"
+                    idle_status = "S2 request failed; navigation stopped"
                     logger.error(
                         "[S2Result] request=%d view=%s failed: %s",
                         s2_job.request_id,
@@ -1809,61 +1750,7 @@ def _run(
 
             if command[0] is not None:
                 action, command[0] = command[0], None
-                if action == "START_S2":
-                    if s2_worker is None:
-                        idle_status = "S2 is disabled in navigation.yaml"
-                    else:
-                        adapter.stop()
-                        tracker = None
-                        tracker_mode = None
-                        display_path_odom_xy = None
-                        selected_goal_odom_xy = None
-                        navigation_active = False
-                        request_id += 1
-                        accepted_request_id = request_id
-                        fine_request_id += 1
-                        accepted_fine_request_id = fine_request_id
-                        s2_request_id += 1
-                        accepted_s2_request_id = s2_request_id
-                        s2_session_id = uuid.uuid4().hex
-                        s2_active = True
-                        s2_need_request = True
-                        s2_next_view = "front"
-                        s2_reset_pending = True
-                        s2_min_frame_index = frame_index + 1
-                        s2_actions.clear()
-                        s2_turn_target_yaw_odom = None
-                        s2_stop_count = 0
-                        idle_status = "S2 waiting for a fresh front frame"
-                        logger.info(
-                            "[S2Session] start session=%s instruction=%s",
-                            s2_session_id,
-                            s2_settings["instruction"],
-                        )
-                elif isinstance(action, tuple) and action[0] == "SET_MODE":
-                    adapter.stop()
-                    tracker = None
-                    tracker_mode = None
-                    display_path_odom_xy = None
-                    navigation_active = False
-                    request_id += 1
-                    accepted_request_id = request_id
-                    fine_request_id += 1
-                    accepted_fine_request_id = fine_request_id
-                    mode = str(action[1])
-                    last_failed_fine_input = None
-                    s2_actions.clear()
-                    s2_turn_target_yaw_odom = None
-                    if s2_active:
-                        selected_goal_odom_xy = None
-                        s2_need_request = True
-                        s2_next_view = "front"
-                        s2_min_frame_index = frame_index + 1
-                        idle_status = f"MODE: {mode}; S2 requesting a new goal"
-                    else:
-                        idle_status = f"MODE: {mode}; click a goal"
-                    logger.info("[NavigationMode] selected=%s", mode)
-                elif isinstance(action, tuple) and action[0] == "GOAL_ERROR":
+                if isinstance(action, tuple) and action[0] == "GOAL_ERROR":
                     logger.warning("[NavigationGoal] rejected: %s", action[1])
                 elif isinstance(action, tuple) and action[0] == "SELECT_GOAL":
                     if tracker is not None or not _is_stopped(state):
@@ -1911,25 +1798,6 @@ def _run(
                         except ValueError as exc:
                             logger.warning("[NavigationGoal] rejected: %s", exc)
                             idle_status = "Goal rejected; see log"
-                elif action == "STOP":
-                    request_id += 1
-                    accepted_request_id = request_id
-                    fine_request_id += 1
-                    accepted_fine_request_id = fine_request_id
-                    adapter.stop()
-                    tracker = None
-                    tracker_mode = None
-                    display_path_odom_xy = None
-                    navigation_active = False
-                    selected_goal_odom_xy = None
-                    s2_active = False
-                    s2_need_request = False
-                    s2_actions.clear()
-                    s2_turn_target_yaw_odom = None
-                    s2_request_id += 1
-                    accepted_s2_request_id = s2_request_id
-                    idle_status = "NAVIGATION STOPPED"
-                    logger.info("[NavigationControl] STOP")
 
             goal_distance = float("inf")
             if selected_goal_odom_xy is not None:
@@ -2314,7 +2182,6 @@ def _run(
     finally:
         adapter.stop()
         panel.shutdown()
-        fine_panel.shutdown()
         s2_panel.shutdown()
     return 0
 

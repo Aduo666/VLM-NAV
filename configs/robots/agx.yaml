@@ -11,7 +11,7 @@ simulation:
   rendering_dt: 0.0166667
 
 sensors:
-  front_prim_path: "pan_tilt_pitch_link/pan_tilt_surface/camera_mount/camera_body/camera_base/PanCamera"
+  front_prim_path: "link6/Camera"
   observer_prim_path: "dummy_base_link/observeCamera"
 controller:
   left_wheel_joint_names: ["fl_wheel", "rl_wheel"]

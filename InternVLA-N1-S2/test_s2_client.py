@@ -1,52 +1,74 @@
+from __future__ import annotations
+
 import argparse
 import json
 from pathlib import Path
+import time
+import uuid
 
-import requests
+import numpy as np
+from PIL import Image
+
+from vln_nav.navigation.internnav_s2_client import (
+    InternNavS2Client,
+    InternNavS2Config,
+)
 
 
-def parse_args():
-    parser = argparse.ArgumentParser()
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="测试远程 InternVLA-N1 S2 服务")
     parser.add_argument("--server", default="http://127.0.0.1:5801")
-    parser.add_argument("--image", required=True)
+    parser.add_argument("--endpoint", default="/infer_once")
+    parser.add_argument("--image", required=True, type=Path)
     parser.add_argument("--instruction", required=True)
+    parser.add_argument("--view", choices=("front", "down"), default="front")
+    parser.add_argument("--look-down", action="store_true")
+    parser.add_argument("--reset", action="store_true")
+    parser.add_argument("--session-id", default=None)
+    parser.add_argument("--request-id", type=int, default=1)
     parser.add_argument("--timeout", type=float, default=180.0)
+    parser.add_argument("--model-width", type=int, default=384)
+    parser.add_argument("--model-height", type=int, default=384)
     return parser.parse_args()
 
 
-def main():
+def main() -> int:
     args = parse_args()
-    image_path = Path(args.image)
-
+    image_path = args.image.expanduser().resolve()
     if not image_path.is_file():
-        raise FileNotFoundError(f"图片不存在: {image_path}")
-
-    with image_path.open("rb") as f:
-        response = requests.post(
-            f"{args.server.rstrip('/')}/infer_once",
-            files={
-                "image": (
-                    image_path.name,
-                    f,
-                    "image/jpeg",
-                )
-            },
-            data={
-                "instruction": args.instruction,
-            },
-            timeout=args.timeout,
+        raise FileNotFoundError(f"图片不存在：{image_path}")
+    with Image.open(image_path) as image:
+        rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    client = InternNavS2Client(
+        InternNavS2Config(
+            base_url=str(args.server),
+            endpoint=str(args.endpoint),
+            timeout_sec=float(args.timeout),
+            jpeg_quality=92,
+            model_image_width=int(args.model_width),
+            model_image_height=int(args.model_height),
         )
-
-    print("HTTP status:", response.status_code)
-
-    try:
-        data = response.json()
-        print(json.dumps(data, ensure_ascii=False, indent=2))
-    except Exception:
-        print(response.text)
-
-    response.raise_for_status()
+    )
+    result = client.infer_once(
+        rgb=rgb,
+        instruction=str(args.instruction),
+        session_id=str(args.session_id or uuid.uuid4().hex),
+        request_id=int(args.request_id),
+        view=str(args.view),
+        reset=bool(args.reset),
+        look_down=bool(args.look_down),
+        timestamp_sec=time.time(),
+    )
+    print(json.dumps({
+        "kind": result.kind,
+        "pixel_vu": result.pixel_vu,
+        "actions": result.actions,
+        "pixel_space_hw": result.pixel_space_hw,
+        "latency_sec": result.latency_sec,
+        "raw_response": result.raw_response,
+    }, ensure_ascii=False, indent=2))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

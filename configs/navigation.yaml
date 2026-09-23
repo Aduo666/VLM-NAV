@@ -45,6 +45,59 @@ server:
   # 客户端与服务端模型信息的匹配容差，单位为米。
   model_match_tolerance_m: 0.02
 
+# 远程 InternVLA-N1 System 2 高层语义规划。
+internnav_s2:
+  # 是否启用 S2 高层规划。
+  enabled: true
+  # 程序启动并获得有效前视帧后是否自动开始当前指令。
+  auto_start: true
+  # 当前视觉语言导航指令。
+  instruction: "Leave the kitchen and turn right into the bedroom on the left."
+  server:
+    # 远程 S2 服务地址。
+    base_url: "http://10.4.113.176:5801"
+    # 单帧推断接口。
+    endpoint: "/infer_once"
+    # 单次 S2 请求超时时间，单位为秒。
+    timeout_sec: 180.0
+    # 上传图像 JPEG 质量。
+    jpeg_quality: 92
+    # S2 输出像素所在的模型图像宽度。
+    model_image_width: 384
+    # S2 输出像素所在的模型图像高度。
+    model_image_height: 384
+  goal_adapter:
+    # pixel-goal 深度中值使用的像素邻域半径。
+    depth_patch_radius_px: 3
+    # 有效深度下限，单位为米。
+    min_depth_m: 0.12
+    # 有效深度上限，单位为米。
+    max_depth_m: 5.0
+    # metric goal 最小距离，单位为米。
+    min_goal_distance_m: 0.25
+    # metric goal 最大距离，单位为米。
+    max_goal_distance_m: 5.0
+    # metric goal 在局部地图中要求的最小障碍余量，单位为米。
+    minimum_map_clearance_m: 0.35
+    # 沿 pixel 射线搜索安全目标的采样间隔，单位为米。
+    ray_sample_step_m: 0.05
+  # FORWARD 动作对应的局部目标距离，单位为米。
+  forward_action_distance_m: 0.25
+  # S2 局部目标到达距离，单位为米。
+  goal_reached_tolerance_m: 0.10
+  # LEFT/RIGHT 动作对应的航向变化，单位为度。
+  turn_action_deg: 15.0
+  # 离散转向完成容差，单位为度。
+  turn_tolerance_deg: 2.0
+  # 离散转向比例控制增益。
+  turn_gain: 2.0
+  # 离散转向最大角速度，单位为弧度每秒。
+  turn_max_angular_radps: 0.50
+  # 连续 STOP 达到该次数后结束任务。
+  stop_confirmations: 2
+  # 固定下视相机请求前等待的渲染帧数。
+  lookdown_settle_frames: 1
+
 # 发送给 NavDP 的前视相机参数。
 camera:
   # RGB-D 图像宽度，单位为像素。
@@ -66,7 +119,7 @@ goal:
 # 粗粒度与细粒度规划任务的调度参数。
 execution:
   # 程序启动后的默认导航模式。
-  default_mode: "AUTO"
+  default_mode: "COARSE"
   # NavDP 滚动推理周期，单位为秒。
   coarse_planning_period_sec: 0.50
   # Hybrid A* 滚动规划周期，单位为秒。

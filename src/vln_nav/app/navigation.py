@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, fields, replace
 import logging
 import math
@@ -7,6 +8,7 @@ from pathlib import Path
 import queue
 import sys
 import threading
+import uuid
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
@@ -14,6 +16,7 @@ import yaml
 
 from vln_nav.active_perception.bev_goal_map import BevGoalMap, render_bev_goal_map
 from vln_nav.active_perception.camera_geometry import (
+    CameraFrameGeometry,
     capture_camera_frame,
     world_from_pose_wxyz,
 )
@@ -47,12 +50,21 @@ from vln_nav.navigation.navdp_client import (
     NavDPClientConfig,
     NavDPResult,
 )
+from vln_nav.navigation.internnav_s2_client import (
+    InternNavS2Client,
+    InternNavS2Config,
+    InternNavS2Result,
+)
 from vln_nav.navigation.odometry import OdomState, SimOdometrySensor
 from vln_nav.navigation.restricted_space import (
     RestrictedSpaceAnalysis,
     RestrictedSpaceAnalyzer,
 )
 from vln_nav.navigation.route_corridor import RouteCorridorConfig
+from vln_nav.navigation.s2_goal_adapter import (
+    S2GoalAdapter,
+    S2GoalAdapterConfig,
+)
 from vln_nav.navigation.trajectory_refiner import (
     TrajectoryRefiner,
     TrajectoryRefinerConfig,
@@ -102,6 +114,18 @@ class _InferenceJob:
     goal_forward_m: float
     goal_left_m: float
     odom_state: OdomState
+
+
+@dataclass(frozen=True)
+class _S2InferenceJob:
+    request_id: int
+    session_id: str
+    instruction: str
+    view: str
+    reset: bool
+    look_down: bool
+    frame: CameraFrameGeometry
+    submitted_sim_time_sec: float
 
 
 @dataclass(frozen=True)
@@ -197,6 +221,52 @@ class _NavDPWorker:
                 depth_m=job.depth_m,
                 goal_forward_m=job.goal_forward_m,
                 goal_left_m=job.goal_left_m,
+            )
+            self._results.put((job, result, None))
+        except Exception as exc:
+            self._results.put((job, None, exc))
+        finally:
+            with self._lock:
+                self._busy = False
+
+
+class _S2Worker:
+    def __init__(self, client: InternNavS2Client) -> None:
+        self._client = client
+        self._busy = False
+        self._lock = threading.Lock()
+        self._results: queue.Queue = queue.Queue()
+
+    @property
+    def busy(self) -> bool:
+        with self._lock:
+            return self._busy
+
+    def submit(self, job: _S2InferenceJob) -> bool:
+        with self._lock:
+            if self._busy:
+                return False
+            self._busy = True
+        threading.Thread(target=self._run, args=(job,), daemon=True).start()
+        return True
+
+    def poll(self):
+        try:
+            return self._results.get_nowait()
+        except queue.Empty:
+            return None
+
+    def _run(self, job: _S2InferenceJob) -> None:
+        try:
+            result = self._client.infer_once(
+                rgb=job.frame.rgb,
+                instruction=job.instruction,
+                session_id=job.session_id,
+                request_id=job.request_id,
+                view=job.view,
+                reset=job.reset,
+                look_down=job.look_down,
+                timestamp_sec=job.frame.timestamp_sec,
             )
             self._results.put((job, result, None))
         except Exception as exc:
@@ -380,8 +450,8 @@ class _GoalMapPanel:
             with ui.VStack(spacing=5):
                 with ui.HStack(height=36):
                     ui.Button(
-                        "AUTO",
-                        clicked_fn=lambda: command_sink(("SET_MODE", "AUTO")),
+                        "START S2",
+                        clicked_fn=lambda: command_sink("START_S2"),
                     )
                     ui.Button(
                         "COARSE",
@@ -531,9 +601,40 @@ class _FineGeometryPanel:
         self.window.visible = False
 
 
+class _S2DecisionPanel:
+    def __init__(self, ui, *, width: int = 640, height: int = 480) -> None:
+        initial = np.zeros((height, width, 4), dtype=np.uint8)
+        initial[:, :, 3] = 255
+        self._provider = ui.ByteImageProvider()
+        self._provider.set_data_array(initial.reshape(-1), [width, height])
+        self.window = ui.Window(
+            "S2 Decision",
+            width=width + 20,
+            height=height + 20,
+            visible=True,
+        )
+        with self.window.frame:
+            ui.ImageWithProvider(
+                self._provider,
+                width=ui.Fraction(1),
+                height=ui.Fraction(1),
+                fill_policy=ui.IwpFillPolicy.IWP_PRESERVE_ASPECT_FIT,
+            )
+
+    def update(self, image: Image.Image) -> None:
+        rgba = np.ascontiguousarray(np.asarray(image.convert("RGBA"), dtype=np.uint8))
+        height, width = rgba.shape[:2]
+        self._provider.set_data_array(rgba.reshape(-1), [width, height])
+
+    def shutdown(self) -> None:
+        self.window.visible = False
+
+
 def _load_settings() -> tuple[
     dict,
     NavDPClientConfig,
+    InternNavS2Config,
+    S2GoalAdapterConfig,
     dict,
     LocalVoxelMapConfig,
     FinePlannerConfig,
@@ -548,6 +649,7 @@ def _load_settings() -> tuple[
         "simulation",
         "scene",
         "server",
+        "internnav_s2",
         "camera",
         "goal",
         "execution",
@@ -596,6 +698,42 @@ def _load_settings() -> tuple[
         if not isinstance(scene[name], bool):
             raise ValueError(f"scene.{name} must be true or false")
     server = NavDPClientConfig.from_mapping(data["server"])
+    s2 = data["internnav_s2"]
+    s2_fields = {
+        "enabled",
+        "auto_start",
+        "instruction",
+        "server",
+        "goal_adapter",
+        "forward_action_distance_m",
+        "goal_reached_tolerance_m",
+        "turn_action_deg",
+        "turn_tolerance_deg",
+        "turn_gain",
+        "turn_max_angular_radps",
+        "stop_confirmations",
+        "lookdown_settle_frames",
+    }
+    if not isinstance(s2, dict) or set(s2) != s2_fields:
+        raise ValueError(f"internnav_s2 必须包含这些字段：{sorted(s2_fields)}")
+    if not isinstance(s2["enabled"], bool) or not isinstance(s2["auto_start"], bool):
+        raise ValueError("internnav_s2 enabled/auto_start 必须为布尔值")
+    if s2["enabled"] and not str(s2["instruction"]).strip():
+        raise ValueError("启用 S2 时 instruction 不能为空")
+    for name in (
+        "forward_action_distance_m",
+        "goal_reached_tolerance_m",
+        "turn_action_deg",
+        "turn_tolerance_deg",
+        "turn_gain",
+        "turn_max_angular_radps",
+    ):
+        if not math.isfinite(float(s2[name])) or float(s2[name]) <= 0:
+            raise ValueError(f"internnav_s2.{name} 必须为有限正数")
+    if int(s2["stop_confirmations"]) <= 0 or int(s2["lookdown_settle_frames"]) < 0:
+        raise ValueError("S2 stop_confirmations/lookdown_settle_frames 无效")
+    s2_client_config = InternNavS2Config.from_mapping(s2["server"])
+    s2_goal_config = S2GoalAdapterConfig.from_mapping(s2["goal_adapter"])
 
     camera = data["camera"]
     if set(camera) != {"width", "height", "frequency_hz", "warmup_render_frames"}:
@@ -624,7 +762,7 @@ def _load_settings() -> tuple[
         "goal_reached_tolerance_m",
     }:
         raise ValueError("Invalid navigation modes execution fields")
-    if execution["default_mode"] not in {"AUTO", "COARSE", "FINE"}:
+    if execution["default_mode"] not in {"COARSE", "FINE"}:
         raise ValueError("Invalid default navigation mode")
     if any(
         float(value) <= 0
@@ -777,6 +915,8 @@ def _load_settings() -> tuple[
     return (
         data,
         server,
+        s2_client_config,
+        s2_goal_config,
         map_settings,
         map_config,
         fine_config,
@@ -792,6 +932,8 @@ def main() -> int:
     (
         settings,
         client_config,
+        s2_client_config,
+        s2_goal_config,
         map_settings,
         map_config,
         fine_config,
@@ -819,6 +961,8 @@ def main() -> int:
                 profile,
                 settings,
                 client_config,
+                s2_client_config,
+                s2_goal_config,
                 map_settings,
                 map_config,
                 fine_config,
@@ -857,6 +1001,8 @@ def _run(
     profile,
     settings,
     client_config,
+    s2_client_config,
+    s2_goal_config,
     map_settings,
     map_config,
     fine_config,
@@ -1012,6 +1158,12 @@ def _run(
     adapter = AgxVelocityAdapter(drive, profile.agx_controller.continuous)
     odom = SimOdometrySensor(logger=logger)
     worker = _NavDPWorker(NavDPClient(client_config))
+    s2_worker = (
+        _S2Worker(InternNavS2Client(s2_client_config))
+        if bool(settings["internnav_s2"]["enabled"])
+        else None
+    )
+    s2_goal_adapter = S2GoalAdapter(s2_goal_config)
     collision_checker = FootprintCollisionChecker(
         footprint,
         yaw_resolution_deg=fine_config.yaw_resolution_deg,
@@ -1081,6 +1233,7 @@ def _run(
         command_sink=lambda value: command.__setitem__(0, value),
     )
     fine_panel = _FineGeometryPanel(ui)
+    s2_panel = _S2DecisionPanel(ui)
 
     for _ in range(int(camera_config["warmup_render_frames"])):
         adapter.stop()
@@ -1123,7 +1276,27 @@ def _run(
     latest_snapshot = local_map.snapshot()
     latest_planning_grid = None
     last_failed_fine_input: _FineFailureInput | None = None
+    latest_camera_frames: dict[str, CameraFrameGeometry] = {}
+    s2_settings = settings["internnav_s2"]
+    s2_active = bool(s2_worker is not None and s2_settings["auto_start"])
+    s2_session_id = uuid.uuid4().hex
+    s2_request_id = 0
+    accepted_s2_request_id = 0
+    s2_need_request = s2_active
+    s2_next_view = "front"
+    s2_reset_pending = s2_active
+    s2_min_frame_index = 0
+    s2_actions: deque[int] = deque()
+    s2_turn_target_yaw_odom: float | None = None
+    s2_stop_count = 0
     logger.info("[NavigationMode] selected=%s", mode)
+    if s2_active:
+        idle_status = "S2 waiting for first front frame"
+        logger.info(
+            "[S2Session] auto_start session=%s instruction=%s",
+            s2_session_id,
+            s2_settings["instruction"],
+        )
 
     try:
         while app.is_running():
@@ -1166,6 +1339,7 @@ def _run(
                     is not None
                 }
                 if len(captured) == len(map_cameras):
+                    latest_camera_frames.update(captured)
                     timestamps = [sample.timestamp_sec for sample in captured.values()]
                     if max(timestamps) - min(timestamps) <= float(
                         map_settings["max_frame_skew_sec"]
@@ -1266,6 +1440,153 @@ def _run(
                 _save_image(fine_debug_path, geometry_image)
                 last_fine_debug_time = now
 
+            s2_completed = None if s2_worker is None else s2_worker.poll()
+            if s2_completed is not None:
+                s2_job, s2_result, s2_error = s2_completed
+                if (
+                    s2_job.request_id != accepted_s2_request_id
+                    or s2_job.session_id != s2_session_id
+                    or not s2_active
+                ):
+                    logger.info(
+                        "[S2Result] ignored stale request=%d",
+                        s2_job.request_id,
+                    )
+                elif s2_error is not None:
+                    adapter.stop()
+                    tracker = None
+                    tracker_mode = None
+                    navigation_active = False
+                    s2_need_request = False
+                    idle_status = "S2 request failed; press START S2 to retry"
+                    logger.error(
+                        "[S2Result] request=%d view=%s failed: %s",
+                        s2_job.request_id,
+                        s2_job.view,
+                        s2_error,
+                    )
+                else:
+                    logger.info(
+                        "[S2Result] request=%d view=%s type=%s latency=%.3fs",
+                        s2_job.request_id,
+                        s2_job.view,
+                        s2_result.kind,
+                        s2_result.latency_sec,
+                    )
+                    if s2_result.kind == "pixel_goal":
+                        original_pixel = _pixel_to_original_image(
+                            s2_result.pixel_vu,
+                            s2_result.pixel_space_hw,
+                            s2_job.frame.rgb.shape,
+                        )
+                        try:
+                            metric_goal = s2_goal_adapter.convert(
+                                request_id=s2_job.request_id,
+                                frame=s2_job.frame,
+                                pixel_vu=s2_result.pixel_vu,
+                                pixel_space_hw=s2_result.pixel_space_hw,
+                                planning_grid=latest_planning_grid,
+                            )
+                            selected_goal_odom_xy = _world_path_to_odom(
+                                np.asarray([metric_goal.world_xy], dtype=np.float64),
+                                state,
+                            )[0]
+                            request_id += 1
+                            accepted_request_id = request_id
+                            fine_request_id += 1
+                            accepted_fine_request_id = fine_request_id
+                            tracker = None
+                            tracker_mode = None
+                            display_path_odom_xy = None
+                            navigation_active = True
+                            last_failed_fine_input = None
+                            last_coarse_request_time = -float("inf")
+                            last_fine_request_time = -float("inf")
+                            s2_stop_count = 0
+                            idle_status = f"S2 GOAL ACTIVE: {mode}"
+                            decision_image = _render_s2_decision(
+                                s2_job.frame.rgb,
+                                label=(
+                                    f"{s2_job.view.upper()} PIXEL -> "
+                                    f"goal [{metric_goal.body_xy[0]:.2f},"
+                                    f"{metric_goal.body_xy[1]:+.2f}] m"
+                                ),
+                                pixel_vu=metric_goal.pixel_original_vu,
+                            )
+                            s2_panel.update(decision_image)
+                            _save_image(
+                                PROJECT_ROOT / "debug/local/s2_debug.png",
+                                decision_image,
+                            )
+                            logger.info(
+                                "[S2Goal] request=%d view=%s pixel_vu=[%.1f,%.1f] "
+                                "depth=%.2fm body_xy=[%.2f,%+.2f] world_xy=[%.2f,%.2f]",
+                                s2_job.request_id,
+                                metric_goal.view,
+                                metric_goal.pixel_original_vu[0],
+                                metric_goal.pixel_original_vu[1],
+                                metric_goal.depth_m,
+                                metric_goal.body_xy[0],
+                                metric_goal.body_xy[1],
+                                metric_goal.world_xy[0],
+                                metric_goal.world_xy[1],
+                            )
+                        except Exception as exc:
+                            adapter.stop()
+                            tracker = None
+                            tracker_mode = None
+                            navigation_active = False
+                            s2_need_request = True
+                            s2_next_view = "front"
+                            s2_min_frame_index = frame_index + 1
+                            idle_status = "S2 pixel goal rejected; requesting a new decision"
+                            decision_image = _render_s2_decision(
+                                s2_job.frame.rgb,
+                                label=f"{s2_job.view.upper()} PIXEL REJECTED",
+                                pixel_vu=original_pixel,
+                            )
+                            s2_panel.update(decision_image)
+                            _save_image(
+                                PROJECT_ROOT / "debug/local/s2_debug.png",
+                                decision_image,
+                            )
+                            logger.warning(
+                                "[S2GoalReject] request=%d reason=%s",
+                                s2_job.request_id,
+                                exc,
+                            )
+                    else:
+                        s2_actions.extend(s2_result.actions)
+                        s2_stop_count = (
+                            s2_stop_count
+                            if all(action == 0 for action in s2_result.actions)
+                            else 0
+                        )
+                        logger.info(
+                            "[S2Actions] request=%d actions=%s",
+                            s2_job.request_id,
+                            list(s2_result.actions),
+                        )
+                        action_names = {
+                            0: "STOP",
+                            1: "FORWARD",
+                            2: "LEFT",
+                            3: "RIGHT",
+                            5: "LOOKDOWN",
+                        }
+                        label = "ACTIONS: " + " ".join(
+                            action_names[action] for action in s2_result.actions
+                        )
+                        decision_image = _render_s2_decision(
+                            s2_job.frame.rgb,
+                            label=f"{s2_job.view.upper()} {label}",
+                        )
+                        s2_panel.update(decision_image)
+                        _save_image(
+                            PROJECT_ROOT / "debug/local/s2_debug.png",
+                            decision_image,
+                        )
+
             completed = worker.poll()
             if completed is not None:
                 job, result, error = completed
@@ -1338,7 +1659,7 @@ def _run(
                         )
             fine_completed = fine_worker.poll()
             if fine_completed is not None:
-                job, grid, plan, error = fine_completed
+                job, grid, outcome, error = fine_completed
                 if (
                     job.request_id != accepted_fine_request_id
                     or mode != "FINE"
@@ -1358,6 +1679,9 @@ def _run(
                         error,
                     )
                 else:
+                    if outcome is None or outcome.plan is None:
+                        raise RuntimeError("FINE worker 未返回可执行轨迹")
+                    plan = outcome.plan
                     result_age = now - job.submitted_sim_time_sec
                     path_odom = _world_path_to_odom(plan.path_world_xy, state)
                     joined_path = np.ascontiguousarray(path_odom)
@@ -1485,7 +1809,38 @@ def _run(
 
             if command[0] is not None:
                 action, command[0] = command[0], None
-                if isinstance(action, tuple) and action[0] == "SET_MODE":
+                if action == "START_S2":
+                    if s2_worker is None:
+                        idle_status = "S2 is disabled in navigation.yaml"
+                    else:
+                        adapter.stop()
+                        tracker = None
+                        tracker_mode = None
+                        display_path_odom_xy = None
+                        selected_goal_odom_xy = None
+                        navigation_active = False
+                        request_id += 1
+                        accepted_request_id = request_id
+                        fine_request_id += 1
+                        accepted_fine_request_id = fine_request_id
+                        s2_request_id += 1
+                        accepted_s2_request_id = s2_request_id
+                        s2_session_id = uuid.uuid4().hex
+                        s2_active = True
+                        s2_need_request = True
+                        s2_next_view = "front"
+                        s2_reset_pending = True
+                        s2_min_frame_index = frame_index + 1
+                        s2_actions.clear()
+                        s2_turn_target_yaw_odom = None
+                        s2_stop_count = 0
+                        idle_status = "S2 waiting for a fresh front frame"
+                        logger.info(
+                            "[S2Session] start session=%s instruction=%s",
+                            s2_session_id,
+                            s2_settings["instruction"],
+                        )
+                elif isinstance(action, tuple) and action[0] == "SET_MODE":
                     adapter.stop()
                     tracker = None
                     tracker_mode = None
@@ -1497,7 +1852,16 @@ def _run(
                     accepted_fine_request_id = fine_request_id
                     mode = str(action[1])
                     last_failed_fine_input = None
-                    idle_status = f"MODE: {mode}; click a goal"
+                    s2_actions.clear()
+                    s2_turn_target_yaw_odom = None
+                    if s2_active:
+                        selected_goal_odom_xy = None
+                        s2_need_request = True
+                        s2_next_view = "front"
+                        s2_min_frame_index = frame_index + 1
+                        idle_status = f"MODE: {mode}; S2 requesting a new goal"
+                    else:
+                        idle_status = f"MODE: {mode}; click a goal"
                     logger.info("[NavigationMode] selected=%s", mode)
                 elif isinstance(action, tuple) and action[0] == "GOAL_ERROR":
                     logger.warning("[NavigationGoal] rejected: %s", action[1])
@@ -1516,6 +1880,12 @@ def _run(
                                 state.pose.y,
                                 state.pose.yaw_rad,
                             )[0]
+                            s2_active = False
+                            s2_need_request = False
+                            s2_actions.clear()
+                            s2_turn_target_yaw_odom = None
+                            s2_request_id += 1
+                            accepted_s2_request_id = s2_request_id
                             request_id += 1
                             accepted_request_id = request_id
                             fine_request_id += 1
@@ -1551,6 +1921,13 @@ def _run(
                     tracker_mode = None
                     display_path_odom_xy = None
                     navigation_active = False
+                    selected_goal_odom_xy = None
+                    s2_active = False
+                    s2_need_request = False
+                    s2_actions.clear()
+                    s2_turn_target_yaw_odom = None
+                    s2_request_id += 1
+                    accepted_s2_request_id = s2_request_id
                     idle_status = "NAVIGATION STOPPED"
                     logger.info("[NavigationControl] STOP")
 
@@ -1560,9 +1937,12 @@ def _run(
                     selected_goal_odom_xy
                     - np.asarray([state.pose.x, state.pose.y], dtype=np.float64)
                 ))
-            if navigation_active and goal_distance <= float(
-                settings["execution"]["goal_reached_tolerance_m"]
-            ):
+            goal_tolerance = float(
+                s2_settings["goal_reached_tolerance_m"]
+                if s2_active
+                else settings["execution"]["goal_reached_tolerance_m"]
+            )
+            if navigation_active and goal_distance <= goal_tolerance:
                 navigation_active = False
                 tracker = None
                 tracker_mode = None
@@ -1574,6 +1954,93 @@ def _run(
                     generation_index,
                     goal_distance,
                 )
+                selected_goal_odom_xy = None
+                if s2_active:
+                    if not s2_actions:
+                        s2_need_request = True
+                        s2_next_view = "front"
+                        s2_min_frame_index = frame_index + 1
+                    idle_status = "S2 local goal reached"
+
+            if (
+                s2_active
+                and not navigation_active
+                and tracker is None
+                and s2_turn_target_yaw_odom is None
+                and s2_actions
+            ):
+                action_code = int(s2_actions.popleft())
+                if action_code == 0:
+                    s2_stop_count += 1
+                    s2_actions.clear()
+                    adapter.stop()
+                    if s2_stop_count >= int(s2_settings["stop_confirmations"]):
+                        s2_active = False
+                        s2_need_request = False
+                        idle_status = "S2 TASK COMPLETE"
+                        logger.info(
+                            "[S2Stop] task complete confirmations=%d",
+                            s2_stop_count,
+                        )
+                    else:
+                        s2_need_request = True
+                        s2_next_view = "front"
+                        s2_min_frame_index = frame_index + 1
+                        idle_status = "S2 STOP awaiting confirmation"
+                        logger.info(
+                            "[S2Stop] confirmation=%d/%d",
+                            s2_stop_count,
+                            int(s2_settings["stop_confirmations"]),
+                        )
+                elif action_code == 1:
+                    s2_stop_count = 0
+                    distance = float(s2_settings["forward_action_distance_m"])
+                    selected_goal_odom_xy = _transform_xy(
+                        np.asarray([[distance, 0.0]], dtype=np.float64),
+                        state.pose.x,
+                        state.pose.y,
+                        state.pose.yaw_rad,
+                    )[0]
+                    request_id += 1
+                    accepted_request_id = request_id
+                    fine_request_id += 1
+                    accepted_fine_request_id = fine_request_id
+                    navigation_active = True
+                    last_coarse_request_time = -float("inf")
+                    last_fine_request_time = -float("inf")
+                    idle_status = f"S2 FORWARD: {mode}"
+                    logger.info(
+                        "[S2Action] FORWARD distance=%.2fm remaining_actions=%s",
+                        distance,
+                        list(s2_actions),
+                    )
+                elif action_code in {2, 3}:
+                    s2_stop_count = 0
+                    signed_angle = math.radians(float(s2_settings["turn_action_deg"]))
+                    if action_code == 3:
+                        signed_angle = -signed_angle
+                    s2_turn_target_yaw_odom = _wrap_angle(
+                        state.pose.yaw_rad + signed_angle
+                    )
+                    display_path_odom_xy = None
+                    idle_status = "S2 TURNING LEFT" if action_code == 2 else "S2 TURNING RIGHT"
+                    logger.info(
+                        "[S2Action] %s target_yaw_deg=%.1f remaining_actions=%s",
+                        "LEFT" if action_code == 2 else "RIGHT",
+                        math.degrees(s2_turn_target_yaw_odom),
+                        list(s2_actions),
+                    )
+                elif action_code == 5:
+                    s2_stop_count = 0
+                    s2_actions.clear()
+                    adapter.stop()
+                    s2_need_request = True
+                    s2_next_view = "down"
+                    s2_min_frame_index = frame_index + int(
+                        s2_settings["lookdown_settle_frames"]
+                    )
+                    idle_status = "S2 LOOKDOWN waiting for down-camera frame"
+                    logger.info("[S2LookDown] requested down-camera continuation")
 
             manual_action = panel.manual_action
             if manual_action != "STOP":
@@ -1586,6 +2053,12 @@ def _run(
                     accepted_request_id = request_id
                     fine_request_id += 1
                     accepted_fine_request_id = fine_request_id
+                    s2_active = False
+                    s2_need_request = False
+                    s2_actions.clear()
+                    s2_turn_target_yaw_odom = None
+                    s2_request_id += 1
+                    accepted_s2_request_id = s2_request_id
                     logger.info("[ManualControl] started action=%s", manual_action)
                 manual_active = True
                 manual_config = settings["manual_control"]
@@ -1609,6 +2082,33 @@ def _run(
                 manual_active = False
                 idle_status = "MANUAL STOPPED"
                 logger.info("[ManualControl] stopped")
+            elif s2_turn_target_yaw_odom is not None:
+                yaw_error = _wrap_angle(
+                    s2_turn_target_yaw_odom - state.pose.yaw_rad
+                )
+                tolerance = math.radians(float(s2_settings["turn_tolerance_deg"]))
+                if abs(yaw_error) <= tolerance:
+                    adapter.stop()
+                    if abs(state.angular_velocity_radps) < 0.05:
+                        completed_yaw = s2_turn_target_yaw_odom
+                        s2_turn_target_yaw_odom = None
+                        if not s2_actions:
+                            s2_need_request = True
+                            s2_next_view = "front"
+                            s2_min_frame_index = frame_index + 1
+                        idle_status = "S2 turn complete"
+                        logger.info(
+                            "[S2Turn] complete target_deg=%.1f error_deg=%.2f",
+                            math.degrees(completed_yaw),
+                            math.degrees(yaw_error),
+                        )
+                else:
+                    angular = float(np.clip(
+                        float(s2_settings["turn_gain"]) * yaw_error,
+                        -float(s2_settings["turn_max_angular_radps"]),
+                        float(s2_settings["turn_max_angular_radps"]),
+                    ))
+                    applied = adapter.apply(VelocityCommand(0.0, angular))
             elif tracker is not None:
                 tracking_config = (
                     fine_tracking_config
@@ -1665,6 +2165,49 @@ def _run(
                     )
             else:
                 adapter.stop()
+
+            if (
+                s2_active
+                and s2_need_request
+                and s2_worker is not None
+                and not s2_worker.busy
+                and not navigation_active
+                and tracker is None
+                and s2_turn_target_yaw_odom is None
+                and not s2_actions
+            ):
+                s2_frame = latest_camera_frames.get(s2_next_view)
+                if (
+                    s2_frame is not None
+                    and s2_frame.frame_index >= s2_min_frame_index
+                ):
+                    s2_request_id += 1
+                    accepted_s2_request_id = s2_request_id
+                    reset_request = bool(s2_reset_pending)
+                    s2_job = _S2InferenceJob(
+                        request_id=s2_request_id,
+                        session_id=s2_session_id,
+                        instruction=str(s2_settings["instruction"]),
+                        view=s2_next_view,
+                        reset=reset_request,
+                        look_down=s2_next_view == "down",
+                        frame=s2_frame,
+                        submitted_sim_time_sec=now,
+                    )
+                    if s2_worker.submit(s2_job):
+                        s2_need_request = False
+                        s2_reset_pending = False
+                        idle_status = f"S2 inferring from {s2_next_view} view"
+                        logger.info(
+                            "[S2Request] request=%d session=%s view=%s reset=%s "
+                            "frame=%d instruction=%s",
+                            s2_request_id,
+                            s2_session_id,
+                            s2_next_view,
+                            reset_request,
+                            s2_frame.frame_index,
+                            s2_settings["instruction"],
+                        )
 
             if (
                 navigation_active
@@ -1744,6 +2287,8 @@ def _run(
                         snapshot=latest_snapshot,
                         start_pose_world=start_pose_world,
                         goal_world_xy=target_world_xy,
+                        route_hint_world_xy=None,
+                        use_restricted_analysis=False,
                         lookahead_m=float(
                             settings["execution"]["fine_local_goal_lookahead_m"]
                         ),
@@ -1770,6 +2315,7 @@ def _run(
         adapter.stop()
         panel.shutdown()
         fine_panel.shutdown()
+        s2_panel.shutdown()
     return 0
 
 
@@ -1926,6 +2472,42 @@ def _save_image(path: Path, image: Image.Image) -> None:
     temporary = path.with_name(f".{path.name}.tmp")
     image.save(temporary, format="PNG")
     temporary.replace(path)
+
+
+def _render_s2_decision(
+    rgb: np.ndarray,
+    *,
+    label: str,
+    pixel_vu: tuple[float, float] | None = None,
+) -> Image.Image:
+    image = Image.fromarray(np.asarray(rgb, dtype=np.uint8)[:, :, :3], mode="RGB")
+    draw = ImageDraw.Draw(image)
+    if pixel_vu is not None:
+        v, u = map(float, pixel_vu)
+        radius = max(6, int(round(min(image.size) * 0.015)))
+        draw.ellipse(
+            (u - radius, v - radius, u + radius, v + radius),
+            outline=(255, 45, 35),
+            width=max(2, radius // 3),
+        )
+    text_box_height = 34
+    draw.rectangle((0, 0, image.width, text_box_height), fill=(0, 0, 0))
+    draw.text((10, 9), label, fill=(255, 255, 255))
+    return image
+
+
+def _pixel_to_original_image(
+    pixel_vu: tuple[float, float],
+    pixel_space_hw: tuple[int, int],
+    image_shape: tuple[int, ...],
+) -> tuple[float, float]:
+    model_height, model_width = pixel_space_hw
+    image_height, image_width = image_shape[:2]
+    model_v, model_u = pixel_vu
+    return (
+        (float(model_v) + 0.5) * image_height / model_height - 0.5,
+        (float(model_u) + 0.5) * image_width / model_width - 0.5,
+    )
 
 
 def _join_path_from_current(
@@ -2097,6 +2679,10 @@ def _degree_map(values: dict[str, float]) -> dict[str, float]:
 
 def _is_stopped(state: OdomState) -> bool:
     return state.linear_velocity_mps < 0.03 and abs(state.angular_velocity_radps) < 0.05
+
+
+def _wrap_angle(angle_rad: float) -> float:
+    return (float(angle_rad) + math.pi) % (2.0 * math.pi) - math.pi
 
 
 if __name__ == "__main__":

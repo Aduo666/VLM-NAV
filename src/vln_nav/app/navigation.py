@@ -48,6 +48,7 @@ from vln_nav.navigation.navdp_client import (
     NavDPCandidate,
     NavDPClient,
     NavDPClientConfig,
+    NavDPPathTooShortError,
     NavDPResult,
 )
 from vln_nav.navigation.internnav_s2_client import (
@@ -210,6 +211,36 @@ class _NavDPWorker:
             return self._results.get_nowait()
         except queue.Empty:
             return None
+
+    def warm_up(
+        self,
+        *,
+        intrinsics: np.ndarray,
+        rgb: np.ndarray,
+        depth_m: np.ndarray,
+    ) -> NavDPResult | None:
+        with self._lock:
+            if self._busy:
+                raise RuntimeError("NavDP worker 正忙，无法执行预热")
+            self._busy = True
+        try:
+            self._client.reset(intrinsics)
+            try:
+                try:
+                    return self._client.pointgoal_step(
+                        rgb=rgb,
+                        depth_m=depth_m,
+                        goal_forward_m=1.0,
+                        goal_left_m=0.0,
+                    )
+                except NavDPPathTooShortError:
+                    return None
+            finally:
+                self._client.reset(intrinsics)
+                self._initialized = True
+        finally:
+            with self._lock:
+                self._busy = False
 
     def _run(self, job: _InferenceJob) -> None:
         try:
@@ -1238,6 +1269,23 @@ def _run(
         adapter.stop()
         world.step(render=True)
 
+    if str(settings["execution"]["default_mode"]) == "COARSE":
+        warmup_rgb, warmup_depth = _capture_rgbd(camera)
+        warmup_result = worker.warm_up(
+            intrinsics=np.asarray(camera.get_intrinsics_matrix(), dtype=np.float64),
+            rgb=warmup_rgb,
+            depth_m=warmup_depth,
+        )
+        if warmup_result is None:
+            logger.info("[NavDPWarmup] complete result=short_trajectory reset=2")
+        else:
+            logger.info(
+                "[NavDPWarmup] complete candidates=%d dropped=%d latency=%.3fs reset=2",
+                len(warmup_result.candidates),
+                len(warmup_result.dropped_candidates),
+                warmup_result.latency_sec,
+            )
+
     position, orientation = get_world_pose(robot)
     local_map = LocalVoxelMap(map_config)
     local_map.reset(np.asarray(position[:3], dtype=np.float64))
@@ -1265,6 +1313,7 @@ def _run(
     frame_index = 0
     debug_path = PROJECT_ROOT / settings["debug"]["candidate_image_path"]
     last_map_integration_time = -float("inf")
+    last_map_diagnostic_time = -float("inf")
     last_map_render_time = -float("inf")
     last_coarse_request_time = -float("inf")
     last_fine_request_time = -float("inf")
@@ -1286,6 +1335,10 @@ def _run(
     s2_actions: deque[int] = deque()
     s2_turn_target_yaw_odom: float | None = None
     s2_stop_count = 0
+    coarse_goal_tolerance = max(
+        float(s2_settings["goal_reached_tolerance_m"]),
+        float(settings["goal"]["min_distance_m"]),
+    )
     logger.info("[NavigationMode] selected=%s", mode)
     if s2_active:
         idle_status = "S2 waiting for first front frame"
@@ -1350,7 +1403,7 @@ def _run(
                     if max(timestamps) - min(timestamps) <= float(
                         map_settings["max_frame_skew_sec"]
                     ):
-                        local_map.integrate_batch(
+                        map_update = local_map.integrate_batch(
                             [
                                 TimedDepthObservation(
                                     source=source,
@@ -1381,7 +1434,47 @@ def _run(
                             yaw_rad=float(robot_yaw_world),
                             collision_checker=collision_checker,
                         )
+                        if now - last_map_diagnostic_time >= 1.0:
+                            ray_counts = dict(map_update.source_ray_counts)
+                            source_updates = {
+                                source: {
+                                    "rays": int(ray_counts.get(source, 0)),
+                                    "free": int(free_count),
+                                    "occupied": int(occupied_count),
+                                }
+                                for source, free_count, occupied_count
+                                in map_update.source_voxel_update_counts
+                            }
+                            cell_count = latest_planning_grid.unknown_mask.size
+                            logger.info(
+                                "[MapUpdate] version=%d shifted=%s sources=%s "
+                                "grid=[free:%.3f occupied:%.3f unknown:%.3f]",
+                                map_update.version,
+                                map_update.shifted,
+                                source_updates,
+                                np.count_nonzero(latest_planning_grid.free_mask)
+                                / cell_count,
+                                np.count_nonzero(latest_planning_grid.occupied_mask)
+                                / cell_count,
+                                np.count_nonzero(latest_planning_grid.unknown_mask)
+                                / cell_count,
+                            )
+                            last_map_diagnostic_time = now
                         last_map_integration_time = now
+                    elif now - last_map_diagnostic_time >= 1.0:
+                        logger.warning(
+                            "[MapUpdate] skipped reason=frame_skew skew=%.3fs limit=%.3fs",
+                            max(timestamps) - min(timestamps),
+                            float(map_settings["max_frame_skew_sec"]),
+                        )
+                        last_map_diagnostic_time = now
+                elif now - last_map_diagnostic_time >= 1.0:
+                    logger.warning(
+                        "[MapUpdate] skipped reason=missing_camera captured=%s expected=%s",
+                        sorted(captured),
+                        sorted(map_cameras),
+                    )
+                    last_map_diagnostic_time = now
 
             if now - last_map_render_time >= map_render_period:
                 displayed_goal = (
@@ -1449,6 +1542,11 @@ def _run(
                         s2_result.kind,
                         s2_result.latency_sec,
                     )
+                    logger.info(
+                        "[S2Raw] request=%d output=%r",
+                        s2_job.request_id,
+                        str(s2_result.raw_response.get("raw_output", "")).strip(),
+                    )
                     if s2_result.kind == "pixel_goal":
                         original_pixel = _pixel_to_original_image(
                             s2_result.pixel_vu,
@@ -1484,7 +1582,9 @@ def _run(
                                 label=(
                                     f"{s2_job.view.upper()} PIXEL -> "
                                     f"goal [{metric_goal.body_xy[0]:.2f},"
-                                    f"{metric_goal.body_xy[1]:+.2f}] m"
+                                    f"{metric_goal.body_xy[1]:+.2f}] m "
+                                    f"depth={metric_goal.depth_m:.2f}m "
+                                    f"spread={metric_goal.depth_spread_m:.2f}m"
                                 ),
                                 pixel_vu=metric_goal.pixel_original_vu,
                             )
@@ -1495,12 +1595,15 @@ def _run(
                             )
                             logger.info(
                                 "[S2Goal] request=%d view=%s pixel_vu=[%.1f,%.1f] "
-                                "depth=%.2fm body_xy=[%.2f,%+.2f] world_xy=[%.2f,%.2f]",
+                                "depth=%.2fm valid=%.3f spread=%.3fm "
+                                "body_xy=[%.2f,%+.2f] world_xy=[%.2f,%.2f]",
                                 s2_job.request_id,
                                 metric_goal.view,
                                 metric_goal.pixel_original_vu[0],
                                 metric_goal.pixel_original_vu[1],
                                 metric_goal.depth_m,
+                                metric_goal.depth_valid_fraction,
+                                metric_goal.depth_spread_m,
                                 metric_goal.body_xy[0],
                                 metric_goal.body_xy[1],
                                 metric_goal.world_xy[0],
@@ -1531,16 +1634,29 @@ def _run(
                                 exc,
                             )
                     else:
-                        s2_actions.extend(s2_result.actions)
+                        actions = tuple(s2_result.actions)
+                        repeated_lookdown = s2_job.view == "down" and 5 in actions
+                        if repeated_lookdown:
+                            actions = tuple(action for action in actions if action != 5)
+                            logger.warning(
+                                "[S2LookDown] repeated request from down view ignored; "
+                                "next_view=front"
+                            )
+                            if not actions:
+                                s2_need_request = True
+                                s2_next_view = "front"
+                                s2_min_frame_index = frame_index + 1
+                                idle_status = "S2 repeated LOOKDOWN; requesting front view"
+                        s2_actions.extend(actions)
                         s2_stop_count = (
                             s2_stop_count
-                            if all(action == 0 for action in s2_result.actions)
+                            if actions and all(action == 0 for action in actions)
                             else 0
                         )
                         logger.info(
                             "[S2Actions] request=%d actions=%s",
                             s2_job.request_id,
-                            list(s2_result.actions),
+                            list(actions),
                         )
                         action_names = {
                             0: "STOP",
@@ -1549,8 +1665,12 @@ def _run(
                             3: "RIGHT",
                             5: "LOOKDOWN",
                         }
-                        label = "ACTIONS: " + " ".join(
-                            action_names[action] for action in s2_result.actions
+                        label = (
+                            "ACTIONS: " + " ".join(
+                                action_names[action] for action in actions
+                            )
+                            if actions
+                            else "FRONT REDECISION"
                         )
                         decision_image = _render_s2_decision(
                             s2_job.frame.rgb,
@@ -1572,10 +1692,73 @@ def _run(
                 ):
                     logger.info("[NavDPResult] ignored stale request=%d", job.request_id)
                 elif error is not None:
-                    idle_status = "NavDP inference failed; see log"
-                    logger.error("[NavDPResult] request=%d failed: %s", job.request_id, error)
+                    if isinstance(error, NavDPPathTooShortError):
+                        current_goal_distance = float(np.linalg.norm(
+                            selected_goal_odom_xy
+                            - np.asarray([state.pose.x, state.pose.y], dtype=np.float64)
+                        ))
+                        if current_goal_distance > coarse_goal_tolerance and s2_active:
+                            adapter.stop()
+                            tracker = None
+                            tracker_mode = None
+                            navigation_active = False
+                            selected_goal_odom_xy = None
+                            display_path_odom_xy = None
+                            frozen_candidates = []
+                            s2_actions.clear()
+                            s2_turn_target_yaw_odom = None
+                            s2_stop_count = 0
+                            s2_need_request = True
+                            s2_next_view = "front"
+                            s2_min_frame_index = frame_index + 1
+                            idle_status = (
+                                "NavDP short trajectory; requesting new S2 decision"
+                            )
+                            logger.warning(
+                                "[NavDPShortTrajectory] request=%d path=%s "
+                                "length=%.3fm minimum=%.3fm goal_distance=%.3fm "
+                                "action=s2_front_redecision",
+                                job.request_id,
+                                error.path_name,
+                                error.length_m,
+                                error.minimum_length_m,
+                                current_goal_distance,
+                            )
+                        else:
+                            idle_status = "NavDP short trajectory near local goal"
+                            logger.info(
+                                "[NavDPShortTrajectory] request=%d path=%s "
+                                "length=%.3fm goal_distance=%.3fm action=goal_check",
+                                job.request_id,
+                                error.path_name,
+                                error.length_m,
+                                current_goal_distance,
+                            )
+                    else:
+                        idle_status = "NavDP inference failed; see log"
+                        logger.error(
+                            "[NavDPResult] request=%d failed: %s",
+                            job.request_id,
+                            error,
+                        )
                 else:
                     result_age = now - float(job.odom_state.timestamp_sec)
+                    model_choice = result.model_choice
+                    logger.info(
+                        "[NavDPResult] request=%d candidates=%d selected=%d "
+                        "value=%s latency=%.3fs",
+                        job.request_id,
+                        len(result.candidates),
+                        result.model_choice_index,
+                        _format_value(model_choice.value),
+                        result.latency_sec,
+                    )
+                    if result.dropped_candidates:
+                        logger.warning(
+                            "[NavDPCandidatesDropped] request=%d indices=%s",
+                            job.request_id,
+                            [index for index, _ in result.dropped_candidates],
+                        )
                     frozen_candidates = _freeze_candidates(result, job)
                     selected_index = result.model_choice_index
                     selected = frozen_candidates[selected_index]
@@ -1765,6 +1948,7 @@ def _run(
                             "[FineSwitch] generation=%d request=%d nodes=%d cost=%.3f "
                             "age=%.3fs join_error=%.3fm remaining=%.3fm "
                             "local_goal=[%.2f,%.2f] clearance=%.3fm unknown=%.3f "
+                            "path_unknown=[ratio:%.3f area:%.3fm2] "
                             "rejected=[collision:%d,unknown:%d,outside:%d]",
                             generation_index,
                             job.request_id,
@@ -1777,6 +1961,8 @@ def _run(
                             plan.local_goal_world_xy[1],
                             clearance.min_clearance_m,
                             clearance.unknown_ratio,
+                            plan.max_unknown_ratio,
+                            plan.max_unknown_area_m2,
                             plan.rejected_collision_count,
                             plan.rejected_unknown_count,
                             plan.rejected_outside_count,
@@ -1839,10 +2025,14 @@ def _run(
                     selected_goal_odom_xy
                     - np.asarray([state.pose.x, state.pose.y], dtype=np.float64)
                 ))
-            goal_tolerance = float(
-                s2_settings["goal_reached_tolerance_m"]
-                if s2_active
-                else settings["execution"]["goal_reached_tolerance_m"]
+            goal_tolerance = (
+                coarse_goal_tolerance
+                if s2_active and mode == "COARSE"
+                else float(
+                    s2_settings["goal_reached_tolerance_m"]
+                    if s2_active
+                    else settings["execution"]["goal_reached_tolerance_m"]
+                )
             )
             if navigation_active and goal_distance <= goal_tolerance:
                 navigation_active = False
@@ -2119,11 +2309,16 @@ def _run(
                 and now - last_coarse_request_time
                 >= float(settings["execution"]["coarse_planning_period_sec"])
             ):
+                last_coarse_request_time = now
                 try:
                     forward, left = _validate_goal_values(
                         *_odom_goal_to_local(selected_goal_odom_xy, state), settings
                     )
                     rgb, depth = _capture_rgbd(camera)
+                    valid_depth = np.isfinite(depth) & (depth > 0.0)
+                    depth_valid_fraction = float(
+                        np.count_nonzero(valid_depth) / depth.size
+                    )
                     request_id += 1
                     accepted_request_id = request_id
                     job = _InferenceJob(
@@ -2139,13 +2334,16 @@ def _run(
                     )
                     if not worker.submit(job):
                         raise RuntimeError("NavDP worker rejected a concurrent request")
-                    last_coarse_request_time = now
                     logger.info(
-                        "[NavDPRequest] request=%d goal=[%.2f,%.2f] moving=%s",
+                        "[NavDPRequest] request=%d goal=[%.2f,%.2f] moving=%s "
+                        "image=%dx%d depth_valid=%.3f",
                         request_id,
                         forward,
                         left,
                         not _is_stopped(state),
+                        rgb.shape[1],
+                        rgb.shape[0],
+                        depth_valid_fraction,
                     )
                 except Exception as exc:
                     idle_status = "NavDP request failed; see log"

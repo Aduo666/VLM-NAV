@@ -36,7 +36,16 @@ class TeleopConfig:
 class ContinuousTeleop:
     """WASD -> smooth body-frame velocity command."""
 
-    _KEYS = {"W", "S", "A", "D"}
+    _KEY_ACTIONS = {
+        "W": "W",
+        "UP": "W",
+        "S": "S",
+        "DOWN": "S",
+        "A": "A",
+        "LEFT": "A",
+        "D": "D",
+        "RIGHT": "D",
+    }
 
     def __init__(self, config: TeleopConfig) -> None:
         self.config = config
@@ -106,15 +115,16 @@ class ContinuousTeleop:
     def _on_keyboard_event(self, event, *_args, **_kwargs) -> bool:
         key_input = event.input
         key_name = str(getattr(key_input, "name", key_input))
-        if key_name not in self._KEYS:
+        action = self._KEY_ACTIONS.get(key_name)
+        if action is None:
             return True
         if event.type in {
             self._carb_input.KeyboardEventType.KEY_PRESS,
             self._carb_input.KeyboardEventType.KEY_REPEAT,
         }:
-            self._pressed.add(key_name)
+            self._pressed.add(action)
         elif event.type == self._carb_input.KeyboardEventType.KEY_RELEASE:
-            self._pressed.discard(key_name)
+            self._pressed.discard(action)
         return True
 
 

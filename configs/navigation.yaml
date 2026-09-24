@@ -12,8 +12,8 @@ simulation:
 # 测试使用的室内场景。
 scene:
   # 场景 USD 文件路径。
-  usd_path: "/Data/qiang/interiornav_data/scene_data/kujiale_0067/kujiale_0067.usda"
-  #usd_path: "/home/Lab/qiangsibin/VLM-NAV-active/usd/hospital.usd"
+  #usd_path: "/Data/qiang/interiornav_data/scene_data/kujiale_0067/kujiale_0067.usda"
+  usd_path: "/home/Lab/qiangsibin/VLM-NAV-active/usd/hospital.usd"
   # 场景加载到仿真 Stage 的路径。
   prim_path: "/World/Environment"
   # 场景没有地面时可开启默认地面。
@@ -50,7 +50,8 @@ internnav_s2:
   # 是否启用 S2 高层规划。
   enabled: true
   # 当前视觉语言导航指令。
-  instruction: "Leave the kitchen and turn right into the bedroom on the left."
+  #instruction: "Leave the kitchen and turn right into the bedroom on the left."
+  instruction: "Right now you're in the hospital lobby. Go forward until you see the wheelchair, then turn left. After that, turn right in front of the stairs, keep going forward, and stop in front of the yellow notice board.."
   server:
     # 远程 S2 服务地址。
     base_url: "http://10.4.113.176:5801"
@@ -79,6 +80,10 @@ internnav_s2:
     min_goal_distance_m: 0.25
     # metric goal 最大距离，单位为米。
     max_goal_distance_m: 5.0
+    # pixel-goal 邻域内有效深度像素的最小比例。
+    minimum_valid_depth_fraction: 0.60
+    # pixel-goal 邻域允许的最大 10% 至 90% 深度跨度，单位为米。
+    maximum_depth_spread_m: 0.50
   # FORWARD 动作对应的局部目标距离，单位为米。
   forward_action_distance_m: 0.25
   # S2 局部目标到达距离，单位为米。
@@ -129,7 +134,7 @@ execution:
   # 新轨迹起点与机器人当前位置允许的最大连接误差，单位为米。
   max_path_join_error_m: 0.35
   # 接受新轨迹所需的最小剩余长度，单位为米。
-  min_remaining_path_m: 0.15
+  min_remaining_path_m: 0.05
   # 判定机器人到达最终目标的距离，单位为米。
   goal_reached_tolerance_m: 0.30
 
@@ -211,7 +216,7 @@ fine_planner:
   # 前进与后退运动段使用的曲率样本，单位为每米。
   curvature_samples_per_m: [-1.2, -0.6, 0.0, 0.6, 1.2]
   # 局部目标位置容差，单位为米。
-  goal_tolerance_m: 0.15
+  goal_tolerance_m: 0.05
   # 单次细粒度规划允许的最大距离，单位为米。
   max_plan_distance_m: 4.0
   # 单次搜索允许扩展的最大节点数量。

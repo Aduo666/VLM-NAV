@@ -137,6 +137,8 @@ class FinePlan:
     rejected_unknown_count: int
     rejected_outside_count: int
     rejected_constraint_count: int
+    max_unknown_ratio: float
+    max_unknown_area_m2: float
     refinement_applied: bool = False
     refinement_iterations: int = 0
 
@@ -257,7 +259,8 @@ class FineLocalPlanner:
                 break
             if (
                 cell != start_cell
-                and start_target_distance - goal_distance >= 0.20
+                and start_target_distance - goal_distance
+                >= self.config.goal_tolerance_m
             ):
                 score = goal_distance + 0.15 * cost
                 if score < best_score:
@@ -316,7 +319,7 @@ class FineLocalPlanner:
         for index in range(len(path) - 1, 0, -1):
             if lengths[index] > limit:
                 continue
-            if lengths[index] < max(0.20, self.config.goal_tolerance_m):
+            if lengths[index] < self.config.goal_tolerance_m:
                 break
             candidate = path[index]
             heading = math.atan2(
@@ -372,6 +375,8 @@ class FineLocalPlanner:
         node_action: dict[int, int | None] = {0: None}
         node_cost = {0: 0.0}
         node_key = {0: start_key}
+        node_max_unknown_ratio = {0: 0.0}
+        node_max_unknown_area_m2 = {0: 0.0}
         heapq.heappush(
             queue,
             (
@@ -386,6 +391,8 @@ class FineLocalPlanner:
         rejected_unknown = 0
         rejected_outside = 0
         rejected_constraint = 0
+        observed_max_unknown_ratio = 0.0
+        observed_max_unknown_area_m2 = 0.0
 
         while queue and expanded < self.config.max_expansions:
             _, _, current_node = heapq.heappop(queue)
@@ -439,15 +446,22 @@ class FineLocalPlanner:
                     swept_poses=primitive[1:],
                 )
                 unknown_ratio = unknown_metrics.ratio
+                observed_max_unknown_ratio = max(
+                    observed_max_unknown_ratio, unknown_ratio
+                )
+                observed_max_unknown_area_m2 = max(
+                    observed_max_unknown_area_m2, unknown_metrics.area_m2
+                )
                 distance_from_start = math.hypot(
                     primitive[-1, 0] - start[0], primitive[-1, 1] - start[1]
                 )
-                if (
+                near_unknown_blocked = (
                     distance_from_start <= self.config.unknown_block_radius_m
                     and unknown_ratio > self.config.max_near_unknown_ratio
                     and unknown_metrics.area_m2
                     >= self.config.min_near_unknown_area_m2
-                ):
+                )
+                if near_unknown_blocked:
                     rejected_unknown += 1
                     continue
                 endpoint = primitive[-1]
@@ -513,6 +527,12 @@ class FineLocalPlanner:
                 node_action[counter] = action_index
                 node_cost[counter] = new_cost
                 node_key[counter] = next_key
+                node_max_unknown_ratio[counter] = max(
+                    node_max_unknown_ratio[current_node], unknown_ratio
+                )
+                node_max_unknown_area_m2[counter] = max(
+                    node_max_unknown_area_m2[current_node], unknown_metrics.area_m2
+                )
                 priority = new_cost + self.config.heuristic_weight * self._heuristic(
                     endpoint[:2], goal
                 )
@@ -522,7 +542,9 @@ class FineLocalPlanner:
             raise RuntimeError(
                 f"细粒度规划器扩展 {expanded} 个节点后仍未找到路径；"
                 f"碰撞拒绝={rejected_collision}，未知拒绝={rejected_unknown}，"
-                f"地图外拒绝={rejected_outside}，管道拒绝={rejected_constraint}"
+                f"地图外拒绝={rejected_outside}，管道拒绝={rejected_constraint}，"
+                f"未知最大比例={observed_max_unknown_ratio:.3f}，"
+                f"未知最大面积={observed_max_unknown_area_m2:.3f}m2"
             )
         node_ids = []
         current = goal_node
@@ -559,6 +581,8 @@ class FineLocalPlanner:
             rejected_unknown_count=int(rejected_unknown),
             rejected_outside_count=int(rejected_outside),
             rejected_constraint_count=int(rejected_constraint),
+            max_unknown_ratio=float(node_max_unknown_ratio[goal_node]),
+            max_unknown_area_m2=float(node_max_unknown_area_m2[goal_node]),
         )
 
     def _state_key(

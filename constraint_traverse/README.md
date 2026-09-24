@@ -12,7 +12,7 @@
 - 世界位姿、实测速度、人工控制量和实际执行控制量；
 - 转向关节与车轮速度；
 - 相机内参和当前外参；
-- SUCCESS 时确定的世界目标和每帧相对目标。
+- 采集开始前确定的世界目标和每帧相对目标。
 
 ## 启动
 
@@ -27,35 +27,27 @@ python -m constraint_traverse.collect.collect \
   --output /Data/qiang/data/constraint_traverse
 ```
 
-程序会通过 PhysX 地面查询自动寻找无碰撞出生位置。指定位置时使用：
-
-```bash
-python -m constraint_traverse.collect.collect \
-  --usd /absolute/path/to/scene.usda \
-  --output /Data/qiang/data/constraint_traverse \
-  --spawn-x 1.5 \
-  --spawn-y 4.0 \
-  --spawn-yaw -90
-```
-
-`--spawn-x` 和 `--spawn-y` 必须同时提供。`--spawn-yaw` 可以单独使用。
+场景加载完成后，程序暂停物理计算并等待手动设置机器人出生位置。
 
 ## 操作
 
 | 按键 | 动作 |
 | --- | --- |
-| `W` | 前进 |
-| `S` | 后退 |
-| `A` | 左转 |
-| `D` | 右转 |
+| `W` 或 `↑` | 前进 |
+| `S` 或 `↓` | 后退 |
+| `A` 或 `←` | 左转 |
+| `D` 或 `→` | 右转 |
 
 组合按键可以生成前进转弯和后退转弯。
 
 采集流程：
 
 ```text
-IDLE 下驾驶到起点
-→ 停稳
+点击 BORN
+→ 使用 Isaac Sim 移动和旋转工具放置机器人
+→ 再次点击 BORN
+→ 等待 Goal Map 建立可通行区域
+→ 在 Goal Map 的已知自由区域点击目标
 → START DEMO
 → 地图预热
 → 人工穿越受限空间
@@ -63,11 +55,15 @@ IDLE 下驾驶到起点
 → SUCCESS
 ```
 
-- `START DEMO`：记录起点、清空 episode 地图并开始采集。
-- `SUCCESS`：记录当前静止位姿作为目标并保存成功示范。
-- `FAILURE`：保存失败示范。
+- `BORN`：第一次点击暂停物理并选中机器人，第二次点击恢复物理并确认出生位姿。
+- `Goal Map`：`IDLE` 状态持续使用主导航的前视、下视 RGB-D 和 `LocalVoxelMap` 建图。点击已知自由区域后，红色圆点表示目标；场景中不创建任何目标几何或标记。
+- `RESET MAP`：在 `IDLE` 状态清空当前局部地图。
+- `START DEMO`：锁定已确认目标、记录起点、清空 episode 地图并开始采集。
+- `SUCCESS`：保存成功示范，保存的目标保持为采集开始前确认的目标。
 - `DISCARD`：删除当前示范。
 - `RESET TO START`：删除当前未完成示范并回到最近一次起点。
+
+`Collector Controls` 面板显示 `State`、`Episode`、`Samples`、`Time`、当前操作步骤和键盘说明，提供 `BORN`、`RESET MAP`、`START DEMO`、`SUCCESS`、`DISCARD` 和 `RESET TO START` 按钮。
 
 ## 数据目录
 
@@ -111,4 +107,4 @@ python -m constraint_traverse.collect.replay \
 
 ## 配置
 
-采集配置位于 [`configs/collect.yaml`](configs/collect.yaml)，包括仿真设备、自动出生、相机同步、体素地图、BEV、连续控制速度、episode 时长和数据质量阈值。
+采集配置位于 [`configs/collect.yaml`](configs/collect.yaml)，包括仿真设备、手动放置、BEV、连续控制速度、episode 时长和数据质量阈值。前视与下视相机路径读取 `configs/robots/agx.yaml`，相机分辨率、频率、帧同步阈值、地图融合周期和 `LocalVoxelMap` 参数读取 `configs/navigation.yaml`，与主导航保持一致。

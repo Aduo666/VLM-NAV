@@ -61,6 +61,17 @@ class NavDPClientConfig:
                 raise ValueError(f"NavDP {name} must be finite and positive")
 
 
+class NavDPPathTooShortError(RuntimeError):
+    def __init__(self, path_name: str, length_m: float, minimum_length_m: float) -> None:
+        self.path_name = str(path_name)
+        self.length_m = float(length_m)
+        self.minimum_length_m = float(minimum_length_m)
+        super().__init__(
+            f"NavDP {self.path_name} length {self.length_m:.3f}m is below "
+            f"the configured minimum {self.minimum_length_m:.3f}m"
+        )
+
+
 @dataclass(frozen=True)
 class NavDPCandidate:
     index: int
@@ -75,6 +86,7 @@ class NavDPResult:
     candidates: tuple[NavDPCandidate, ...]
     model_choice_index: int
     latency_sec: float
+    dropped_candidates: tuple[tuple[int, str], ...] = ()
 
     @property
     def model_choice(self) -> NavDPCandidate:
@@ -248,27 +260,40 @@ def normalize_navdp_response(
         )
 
     selected_xy = _validate_path(selected, "trajectory", config)
-    paths_xy = [
-        _validate_path(path, f"all_trajectory[{index}]", config)
-        for index, path in enumerate(all_paths)
-    ]
-    errors = np.asarray(
-        [_trajectory_distance(selected_xy, path) for path in paths_xy],
-        dtype=np.float64,
-    )
-    model_index = int(np.argmin(errors))
-    selected_only = bool(errors[model_index] > config.model_match_tolerance_m)
+    paths_xy = []
+    original_indices = []
+    candidate_values = []
+    dropped_candidates = []
+    for index, (path, value) in enumerate(zip(all_paths, values)):
+        try:
+            validated = _validate_path(path, f"all_trajectory[{index}]", config)
+        except RuntimeError as exc:
+            dropped_candidates.append((index, str(exc)))
+            continue
+        paths_xy.append(validated)
+        original_indices.append(index)
+        candidate_values.append(float(value))
+
+    if paths_xy:
+        errors = np.asarray(
+            [_trajectory_distance(selected_xy, path) for path in paths_xy],
+            dtype=np.float64,
+        )
+        model_index = int(np.argmin(errors))
+        selected_only = bool(errors[model_index] > config.model_match_tolerance_m)
+    else:
+        errors = np.empty((0,), dtype=np.float64)
+        model_index = 0
+        selected_only = True
     if selected_only:
         model_index = len(paths_xy)
         paths_xy.append(selected_xy)
-        candidate_values: list[float | None] = [float(value) for value in values]
+        original_indices.append(len(all_paths))
         candidate_values.append(None)
-    else:
-        candidate_values = [float(value) for value in values]
 
     candidates = tuple(
         NavDPCandidate(
-            index=index,
+            index=original_indices[index],
             trajectory_xy=np.ascontiguousarray(path, dtype=np.float64),
             value=candidate_values[index],
             is_model_choice=index == model_index,
@@ -280,6 +305,7 @@ def normalize_navdp_response(
         candidates=candidates,
         model_choice_index=model_index,
         latency_sec=float(latency_sec),
+        dropped_candidates=tuple(dropped_candidates),
     )
 
 
@@ -303,8 +329,9 @@ def _validate_path(path: np.ndarray, name: str, config: NavDPClientConfig) -> np
     segments = np.linalg.norm(np.diff(values, axis=0), axis=1)
     if float(np.max(segments)) > config.max_point_jump_m:
         raise RuntimeError(f"NavDP {name} contains an implausible point jump")
-    if float(np.sum(segments)) < config.min_path_length_m:
-        raise RuntimeError(f"NavDP {name} is shorter than the configured minimum")
+    path_length = float(np.sum(segments))
+    if path_length < config.min_path_length_m:
+        raise NavDPPathTooShortError(name, path_length, config.min_path_length_m)
     return values
 
 

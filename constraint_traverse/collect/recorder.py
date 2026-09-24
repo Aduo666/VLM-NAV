@@ -13,9 +13,6 @@ import cv2
 import numpy as np
 from PIL import Image
 
-from .transforms import relative_goal_xyyaw
-
-
 DEPTH_INVALID_MM = np.uint16(0)
 DEPTH_NO_RETURN_MM = np.uint16(65535)
 DEPTH_MAX_FINITE_MM = 65534
@@ -44,6 +41,7 @@ class SampleRecord:
     front_base_from_camera: np.ndarray
     down_base_from_camera: np.ndarray
     map_version: int
+    goal_body_xyyaw: np.ndarray
 
 
 class EpisodeRecorder:
@@ -89,6 +87,7 @@ class EpisodeRecorder:
         *,
         start_pose_world: np.ndarray,
         start_position_world_xyz: np.ndarray,
+        goal_pose_world: np.ndarray,
         start_time_sec: float,
         extra_meta: dict | None = None,
     ) -> Path:
@@ -125,6 +124,7 @@ class EpisodeRecorder:
             "front_base_from_camera": [],
             "down_base_from_camera": [],
             "map_version": [],
+            "goal_body_xyyaw": [],
         }
         self._meta_seed = {
             "episode_id": f"{index:06d}",
@@ -134,6 +134,7 @@ class EpisodeRecorder:
             "repository_revision": _repository_revision(),
             "start_pose_world_xyyaw": _json_vector(start_pose_world),
             "start_position_world_xyz": _json_vector(start_position_world_xyz),
+            "goal_pose_world_xyyaw": _json_vector(goal_pose_world),
             "start_time_sec": float(start_time_sec),
             "depth_encoding": {
                 "format": "uint16_png_millimeters",
@@ -192,6 +193,7 @@ class EpisodeRecorder:
             "front_base_from_camera": np.asarray(sample.front_base_from_camera, dtype=np.float32),
             "down_base_from_camera": np.asarray(sample.down_base_from_camera, dtype=np.float32),
             "map_version": int(sample.map_version),
+            "goal_body_xyyaw": np.asarray(sample.goal_body_xyyaw, dtype=np.float32),
         }
         for key, value in values.items():
             self._state[key].append(value)
@@ -209,14 +211,14 @@ class EpisodeRecorder:
             raise RuntimeError("Recorder is not active")
         self._flush_pending()
         count = len(self._state["sample_time_sec"])
-        poses = np.asarray(self._state["pose_world_xyyaw"], dtype=np.float32).reshape(count, 3)
         end_pose = np.asarray(end_pose_world, dtype=np.float32).reshape(3)
         if success:
             goal_body = np.asarray(
-                [relative_goal_xyyaw(pose, end_pose) for pose in poses],
-                dtype=np.float32,
+                self._state["goal_body_xyyaw"], dtype=np.float32
             ).reshape(count, 3)
-            goal_world = end_pose
+            goal_world = np.asarray(
+                self._meta_seed["goal_pose_world_xyyaw"], dtype=np.float32
+            ).reshape(3)
         else:
             goal_body = np.full((count, 3), np.nan, dtype=np.float32)
             goal_world = None

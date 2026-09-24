@@ -9,62 +9,15 @@ scene:
   stage_load_timeout_sec: 120.0
   add_indoor_lighting: true
 
-# Automatic initial placement. The collector searches for an upward-facing,
-# collision-free floor patch inside the loaded scene. Explicit --spawn-x and
-# --spawn-y override the automatic XY search; --spawn-yaw may be used alone.
+# 手动放置期间机器人停留高度，以及恢复物理后的稳定帧数。
 spawn:
-  sample_step_m: 0.60
-  max_attempts: 600
-  random_seed: 17
-  bounds_margin_m: 0.60
   holding_height_m: 5.0
-  # 自动地面查询前用于建立 PhysX 碰撞场景的仿真帧数。
   query_warmup_frames: 8
   settle_frames: 12
 
-  # Floor height is estimated from repeated downward PhysX raycasts.
-  floor_estimation_samples: 96
-  floor_probe_height_m: 2.20
-  floor_probe_depth_m: 1.50
-  floor_height_bin_m: 0.10
-  floor_height_tolerance_m: 0.18
-  max_slope_deg: 10.0
-
-  # AGX footprint used only for initial-spawn overlap checking.
-  robot_half_length_m: 0.43
-  robot_half_width_m: 0.35
-  clearance_m: 0.20
-  collision_check_height_m: 0.65
-  collision_bottom_offset_m: 0.06
-
+# 相机路径、分辨率、频率、地图参数和帧同步阈值读取主导航配置。
 cameras:
-  front_prim_path: "pan_tilt_pitch_link/pan_tilt_surface/camera_mount/camera_body/camera_base/PanCamera"
-  down_prim_path: "dummy_base_link/DownCamera"
-  width: 640
-  height: 480
-  frequency_hz: 15
   warmup_render_frames: 30
-  max_frame_skew_sec: 0.03
-
-# Same causal rolling voxel representation used by the current navigation stack.
-# The map is reset for every START DEMO.
-voxel_map:
-  size_x_m: 10.0
-  size_y_m: 10.0
-  min_z_m: -0.20
-  max_z_m: 2.80
-  resolution_m: 0.05
-  slide_threshold_m: 0.20
-  min_depth_m: 0.12
-  max_depth_m: 5.0
-  max_ray_length_m: 5.0
-  pixel_stride: 10
-  probability_hit: 0.85
-  probability_miss: 0.30
-  probability_min: 0.12
-  probability_max: 0.98
-  probability_occupied: 0.80
-  probability_free: 0.45
 
 # Robot-centric policy input candidate saved with every sample.
 bev:

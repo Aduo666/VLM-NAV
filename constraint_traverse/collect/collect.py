@@ -34,9 +34,6 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_OUTPUT_ROOT,
         help="Dataset output root",
     )
-    parser.add_argument("--spawn-x", type=float)
-    parser.add_argument("--spawn-y", type=float)
-    parser.add_argument("--spawn-yaw", type=float)
     return parser.parse_args()
 
 
@@ -48,9 +45,6 @@ def main() -> int:
         overrides = RuntimeOverrides(
             usd_path=args.usd,
             output_root=args.output.expanduser().resolve(),
-            spawn_x_m=args.spawn_x,
-            spawn_y_m=args.spawn_y,
-            spawn_yaw_deg=args.spawn_yaw,
         )
     except Exception:
         logger.exception("[CollectorConfig] invalid collector arguments or configuration")
@@ -94,7 +88,6 @@ def _load_config(path: Path) -> dict:
         "scene",
         "spawn",
         "cameras",
-        "voxel_map",
         "bev",
         "teleop",
         "collection",
@@ -131,49 +124,20 @@ def _validate_top_level_config(data: dict) -> None:
 
     spawn = data["spawn"]
     required_spawn = {
-        "sample_step_m",
-        "max_attempts",
-        "random_seed",
-        "bounds_margin_m",
         "holding_height_m",
         "query_warmup_frames",
         "settle_frames",
-        "floor_estimation_samples",
-        "floor_probe_height_m",
-        "floor_probe_depth_m",
-        "floor_height_bin_m",
-        "floor_height_tolerance_m",
-        "max_slope_deg",
-        "robot_half_length_m",
-        "robot_half_width_m",
-        "clearance_m",
-        "collision_check_height_m",
-        "collision_bottom_offset_m",
     }
     if set(spawn) != required_spawn:
         raise ValueError(f"spawn 必须包含这些字段：{sorted(required_spawn)}")
-    positive_spawn = required_spawn - {"random_seed", "collision_bottom_offset_m"}
-    if any(float(spawn[name]) <= 0 for name in positive_spawn):
+    if any(float(spawn[name]) <= 0 for name in required_spawn):
         raise ValueError("spawn 数值配置必须为正数")
-    if float(spawn["collision_bottom_offset_m"]) < 0:
-        raise ValueError("spawn.collision_bottom_offset_m 不能为负数")
 
     cameras = data["cameras"]
-    if set(cameras) != {
-        "front_prim_path",
-        "down_prim_path",
-        "width",
-        "height",
-        "frequency_hz",
-        "warmup_render_frames",
-        "max_frame_skew_sec",
-    }:
+    if set(cameras) != {"warmup_render_frames"}:
         raise ValueError("cameras 配置字段不完整")
-    for name in ("width", "height", "frequency_hz", "warmup_render_frames"):
-        if int(cameras[name]) <= 0:
-            raise ValueError(f"cameras.{name} 必须为正整数")
-    if float(cameras["max_frame_skew_sec"]) <= 0:
-        raise ValueError("cameras.max_frame_skew_sec 必须为正数")
+    if int(cameras["warmup_render_frames"]) <= 0:
+        raise ValueError("cameras.warmup_render_frames 必须为正整数")
 
     collection = data["collection"]
     required_collection = {

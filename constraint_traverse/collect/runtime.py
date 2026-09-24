@@ -1,20 +1,20 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 import logging
 import math
 from pathlib import Path
-import random
 import time
 
 import numpy as np
+import yaml
 
 from vln_nav.active_perception.camera_geometry import (
     capture_camera_frame,
     world_from_pose_wxyz,
 )
 from vln_nav.active_perception.contracts import TimedDepthObservation
-from vln_nav.active_perception.local_geometry import LocalVoxelMap
+from vln_nav.active_perception.local_geometry import LocalVoxelMap, LocalVoxelMapConfig
 from vln_nav.control.locomotion import create_locomotion_controller
 from vln_nav.control.trajectory import AgxVelocityAdapter, VelocityCommand
 from vln_nav.runtime.agx_geometry import validate_agx_geometry
@@ -31,13 +31,14 @@ from vln_nav.runtime.isaac_runtime_utils import (
 from vln_nav.runtime.scene_lighting import add_indoor_lighting
 
 from .bev import BevConfig, local_voxel_config_from_mapping, snapshot_to_robot_bev
-from .episode import EpisodeSession
+from .episode import EpisodeMode, EpisodeSession
 from .recorder import EpisodeRecorder, SampleRecord
 from .teleop import ContinuousTeleop, TeleopConfig
 from .transforms import (
     BodyMotionEstimator,
     pose_xyyaw,
     quaternion_wxyz_from_yaw,
+    relative_goal_xyyaw,
     world_xy_to_body,
 )
 from .ui import CollectorPanel, PanelStatus
@@ -47,9 +48,36 @@ from .ui import CollectorPanel, PanelStatus
 class RuntimeOverrides:
     usd_path: Path
     output_root: Path
-    spawn_x_m: float | None = None
-    spawn_y_m: float | None = None
-    spawn_yaw_deg: float | None = None
+
+
+def _load_navigation_mapping(
+    project_root: Path,
+) -> tuple[dict, LocalVoxelMapConfig]:
+    config_path = Path(project_root) / "configs/navigation.yaml"
+    with config_path.open(encoding="utf-8") as handle:
+        navigation = yaml.safe_load(handle) or {}
+    mapping = navigation.get("mapping")
+    if not isinstance(mapping, dict) or set(mapping) != {
+        "camera",
+        "map",
+        "max_frame_skew_sec",
+    }:
+        raise ValueError("主导航 mapping 配置字段不完整")
+    camera = mapping["camera"]
+    if not isinstance(camera, dict) or set(camera) != {
+        "width",
+        "height",
+        "frequency_hz",
+    }:
+        raise ValueError("主导航 mapping.camera 配置字段不完整")
+    if any(int(camera[name]) <= 0 for name in camera):
+        raise ValueError("主导航 mapping.camera 配置必须为正整数")
+    map_values = dict(mapping["map"])
+    integration_period = float(map_values.pop("integration_period_sec"))
+    if integration_period <= 0 or float(mapping["max_frame_skew_sec"]) <= 0:
+        raise ValueError("主导航地图周期和帧同步阈值必须为正数")
+    map_config = local_voxel_config_from_mapping(map_values)
+    return mapping, map_config
 
 
 class ConstraintTraverseCollector:
@@ -81,10 +109,11 @@ class ConstraintTraverseCollector:
         from pxr import UsdGeom
 
         profile = load_agx_profile(project_root=self.project_root)
-        simulation = self.config["simulation"]
         scene = self.config["scene"]
         cameras_cfg = self.config["cameras"]
-        map_cfg = local_voxel_config_from_mapping(self.config["voxel_map"])
+        mapping_cfg, map_cfg = _load_navigation_mapping(self.project_root)
+        map_camera_cfg = mapping_cfg["camera"]
+        map_runtime_cfg = mapping_cfg["map"]
         bev_cfg = BevConfig.from_mapping(self.config["bev"])
         teleop_cfg = TeleopConfig.from_mapping(self.config["teleop"])
         collection = self.config["collection"]
@@ -149,7 +178,7 @@ class ConstraintTraverseCollector:
             stage=stage,
             prim_path=resolve_robot_relative_prim_path(
                 robot_root_path=profile.asset.prim_path,
-                prim_path=str(cameras_cfg["front_prim_path"]),
+                prim_path=profile.sensors.camera.front_prim_path,
             ),
             kind="constraint-traverse front camera",
         )
@@ -157,7 +186,7 @@ class ConstraintTraverseCollector:
             stage=stage,
             prim_path=resolve_robot_relative_prim_path(
                 robot_root_path=profile.asset.prim_path,
-                prim_path=str(cameras_cfg["down_prim_path"]),
+                prim_path=profile.sensors.camera.mapping_down_prim_path,
             ),
             kind="constraint-traverse down camera",
         )
@@ -174,10 +203,10 @@ class ConstraintTraverseCollector:
                 raise RuntimeError(f"{name} prim is not a Camera: {path}")
 
         resolution = (
-            int(cameras_cfg["width"]),
-            int(cameras_cfg["height"]),
+            int(map_camera_cfg["width"]),
+            int(map_camera_cfg["height"]),
         )
-        frequency = int(cameras_cfg["frequency_hz"])
+        frequency = int(map_camera_cfg["frequency_hz"])
         front_camera = Camera(
             prim_path=front_path,
             name="constraint_traverse_front",
@@ -213,32 +242,10 @@ class ConstraintTraverseCollector:
                 robot.set_angular_velocity(np.zeros(3, dtype=np.float32))
             world.step(render=True)
 
-        spawn_x, spawn_y, floor_z, spawn_yaw_deg = _resolve_initial_spawn(
-            stage=stage,
-            scene_prim_path=str(scene["prim_path"]),
-            robot_prim_path=profile.asset.prim_path,
-            scene_bounds=scene_bounds,
-            config=spawn,
-            override_x_m=self.overrides.spawn_x_m,
-            override_y_m=self.overrides.spawn_y_m,
-            override_yaw_deg=self.overrides.spawn_yaw_deg,
-            logger=self.logger,
-        )
-        _place_robot_on_floor(
-            robot,
-            x_m=spawn_x,
-            y_m=spawn_y,
-            floor_z_m=floor_z,
-            base_height_m=float(profile.spawn_z_m),
-            yaw_deg=spawn_yaw_deg,
-        )
-        for _ in range(int(spawn["settle_frames"])):
-            world.step(render=True)
-
         bind_viewport_to_camera(
             camera_prim_path=observer_path,
             logger=self.logger,
-            enabled=True,
+            enabled=False,
         )
 
         drive = create_locomotion_controller(
@@ -253,7 +260,7 @@ class ConstraintTraverseCollector:
         teleop = ContinuousTeleop(teleop_cfg)
         teleop.bind_keyboard()
 
-        command_queue: list[str] = []
+        command_queue: list[object] = []
         panel = CollectorPanel(
             ui,
             image_size_px=int(self.config["ui"]["bev_image_size_px"]),
@@ -261,6 +268,11 @@ class ConstraintTraverseCollector:
         )
 
         for _ in range(int(cameras_cfg["warmup_render_frames"])):
+            robot.set_world_pose(
+                position=holding_position,
+                orientation=holding_orientation,
+            )
+            _zero_robot_velocity(robot)
             adapter.stop()
             world.step(render=True)
 
@@ -285,40 +297,41 @@ class ConstraintTraverseCollector:
         last_bev = np.zeros((3, bev_cfg.height, bev_cfg.width), dtype=np.uint8)
         last_bev[2] = 255
         last_ui_update = -float("inf")
-        last_message = "IDLE: drive to a start pose, then press START DEMO"
         current_episode_id = ""
         render_stride = max(
             1,
             round(float(profile.simulation.rendering_dt) / dt),
         )
         frame_index = 0
+        mapping_state = {"last_integration_time": -float("inf")}
 
         self.logger.info(
-            "[Collector] scene=%s output=%s spawn=[%.2f,%.2f,z_floor=%.2f,%.1fdeg]",
+            "[Collector] scene=%s output=%s placement=manual map_config=%s",
             scene_path,
             self.overrides.output_root,
-            spawn_x,
-            spawn_y,
-            floor_z,
-            spawn_yaw_deg,
+            self.project_root / "configs/navigation.yaml",
         )
+        world.pause()
 
         try:
             while self.app.is_running():
-                if not world.is_playing():
-                    adapter.stop()
-                    teleop.reset()
-                    self.app.update()
-                    continue
-
                 now = float(world.current_time)
-                position, orientation = get_world_pose(robot)
+                if world.is_playing():
+                    position, orientation = get_world_pose(robot)
+                else:
+                    position, orientation = _world_pose_from_prim(
+                        stage,
+                        articulation_path,
+                    )
                 pose = pose_xyyaw(position, orientation)
-                measured_v, measured_w = motion.update(pose, now)
+                if world.is_playing():
+                    measured_v, measured_w = motion.update(pose, now)
+                else:
+                    measured_v, measured_w = 0.0, 0.0
 
                 while command_queue:
                     command = command_queue.pop(0)
-                    last_message, current_episode_id = self._handle_ui_command(
+                    _, current_episode_id = self._handle_ui_command(
                         command=command,
                         session=session,
                         recorder=recorder,
@@ -335,9 +348,58 @@ class ConstraintTraverseCollector:
                         current_episode_id=current_episode_id,
                         scene_path=scene_path,
                         profile=profile,
+                        world=world,
+                        stage=stage,
+                        articulation_path=articulation_path,
+                        mapping_state=mapping_state,
+                        mapping_cfg=mapping_cfg,
+                        front_path=front_path,
+                        down_path=down_path,
+                        last_bev=last_bev,
                     )
-                    position, orientation = get_world_pose(robot)
+                    if world.is_playing():
+                        position, orientation = get_world_pose(robot)
+                    else:
+                        position, orientation = _world_pose_from_prim(
+                            stage,
+                            articulation_path,
+                        )
                     pose = pose_xyyaw(position, orientation)
+
+                ui_now = time.monotonic()
+                if not world.is_playing():
+                    adapter.stop()
+                    teleop.reset()
+                    if ui_now - last_ui_update >= float(
+                        self.config["ui"]["update_period_sec"]
+                    ):
+                        start_body, goal_body, trajectory_body = _body_overlay(
+                            session=session,
+                            pose=pose,
+                        )
+                        panel.update_bev(
+                            last_bev,
+                            config=bev_cfg,
+                            start_body_xy=start_body,
+                            goal_body_xy=goal_body,
+                            trajectory_body_xy=trajectory_body,
+                        )
+                        panel.update_status(
+                            PanelStatus(
+                                mode=session.mode.value,
+                                episode_id=current_episode_id,
+                                sample_count=session.sample_count,
+                                elapsed_sec=session.elapsed(now),
+                                robot_placed=session.robot_placed,
+                                goal_selected=session.goal_pose_world is not None,
+                                can_reset_start=(
+                                    session.last_start_pose_world is not None
+                                ),
+                            )
+                        )
+                        last_ui_update = ui_now
+                    self.app.update()
+                    continue
 
                 desired = teleop.step(dt)
                 if session.recording and session.warmup_pairs_remaining > 0:
@@ -351,7 +413,6 @@ class ConstraintTraverseCollector:
                     adapter.stop()
                     desired = VelocityCommand()
                     applied = VelocityCommand()
-                    last_message = f"Control rejected: {exc}"
 
                 world_from_base = world_from_pose_wxyz(position, orientation)
                 front = capture_camera_frame(
@@ -372,31 +433,45 @@ class ConstraintTraverseCollector:
                     and front.timestamp_sec > last_front_timestamp + 1.0e-9
                     and down.timestamp_sec > last_down_timestamp + 1.0e-9
                 )
+                map_active = session.robot_placed and session.mode in {
+                    EpisodeMode.IDLE,
+                    EpisodeMode.RECORDING,
+                }
                 if new_pair:
                     skew = abs(float(front.timestamp_sec - down.timestamp_sec))
-                    if skew <= float(cameras_cfg["max_frame_skew_sec"]):
+                    if skew <= float(mapping_cfg["max_frame_skew_sec"]):
                         last_front_timestamp = float(front.timestamp_sec)
                         last_down_timestamp = float(down.timestamp_sec)
-                        if session.recording:
-                            episode_map.integrate_batch(
-                                [
-                                    TimedDepthObservation(
-                                        source="front",
-                                        timestamp_sec=front.timestamp_sec,
-                                        depth_m=front.depth_m,
-                                        intrinsics=front.intrinsics,
-                                        camera_to_world=front.world_from_camera,
-                                    ),
-                                    TimedDepthObservation(
-                                        source="down",
-                                        timestamp_sec=down.timestamp_sec,
-                                        depth_m=down.depth_m,
-                                        intrinsics=down.intrinsics,
-                                        camera_to_world=down.world_from_camera,
-                                    ),
-                                ],
-                                center_world_xyz=np.asarray(position[:3], dtype=np.float64),
+                        if map_active:
+                            integration_period = float(
+                                map_runtime_cfg["integration_period_sec"]
                             )
+                            if (
+                                now - mapping_state["last_integration_time"]
+                                >= integration_period
+                            ):
+                                episode_map.integrate_batch(
+                                    [
+                                        TimedDepthObservation(
+                                            source="front",
+                                            timestamp_sec=front.timestamp_sec,
+                                            depth_m=front.depth_m,
+                                            intrinsics=front.intrinsics,
+                                            camera_to_world=front.world_from_camera,
+                                        ),
+                                        TimedDepthObservation(
+                                            source="down",
+                                            timestamp_sec=down.timestamp_sec,
+                                            depth_m=down.depth_m,
+                                            intrinsics=down.intrinsics,
+                                            camera_to_world=down.world_from_camera,
+                                        ),
+                                    ],
+                                    center_world_xyz=np.asarray(
+                                        position[:3], dtype=np.float64
+                                    ),
+                                )
+                                mapping_state["last_integration_time"] = now
                             snapshot = episode_map.snapshot()
                             last_bev = snapshot_to_robot_bev(
                                 snapshot,
@@ -404,62 +479,64 @@ class ConstraintTraverseCollector:
                                 floor_z_m=float(position[2]) - float(profile.spawn_z_m),
                                 config=bev_cfg,
                             )
-                            readback = drive.readback()
-                            sample = SampleRecord(
-                                sample_time_sec=max(
-                                    float(front.timestamp_sec),
-                                    float(down.timestamp_sec),
-                                ),
-                                front_timestamp_sec=float(front.timestamp_sec),
-                                down_timestamp_sec=float(down.timestamp_sec),
-                                front_rgb=front.rgb,
-                                front_depth_m=front.depth_m,
-                                down_depth_m=down.depth_m,
-                                bev=last_bev,
-                                pose_world_xyyaw=pose,
-                                world_position_xyz=position,
-                                world_orientation_wxyz=orientation,
-                                measured_velocity_vw=np.asarray(
-                                    [measured_v, measured_w],
-                                    dtype=np.float32,
-                                ),
-                                human_action_vw=np.asarray(
-                                    [desired.linear_mps, desired.angular_radps],
-                                    dtype=np.float32,
-                                ),
-                                applied_action_vw=np.asarray(
-                                    [applied.linear_mps, applied.angular_radps],
-                                    dtype=np.float32,
-                                ),
-                                steering_position=_ordered_readback(
-                                    readback["steering_position"], steering_names
-                                ),
-                                steering_velocity=_ordered_readback(
-                                    readback["steering_velocity"], steering_names
-                                ),
-                                wheel_velocity=_ordered_readback(
-                                    readback["wheel_velocity"], wheel_names
-                                ),
-                                front_intrinsics=front.intrinsics,
-                                down_intrinsics=down.intrinsics,
-                                front_base_from_camera=front.base_from_camera,
-                                down_base_from_camera=down.base_from_camera,
-                                map_version=int(snapshot.version),
-                            )
-                            if session.consume_warmup_pair():
-                                last_message = (
-                                    "RECORDING: initializing episode map "
-                                    f"({session.warmup_pairs_remaining} pairs remaining)"
+                            if session.recording:
+                                readback = drive.readback()
+                                sample = SampleRecord(
+                                    sample_time_sec=max(
+                                        float(front.timestamp_sec),
+                                        float(down.timestamp_sec),
+                                    ),
+                                    front_timestamp_sec=float(front.timestamp_sec),
+                                    down_timestamp_sec=float(down.timestamp_sec),
+                                    front_rgb=front.rgb,
+                                    front_depth_m=front.depth_m,
+                                    down_depth_m=down.depth_m,
+                                    bev=last_bev,
+                                    pose_world_xyyaw=pose,
+                                    world_position_xyz=position,
+                                    world_orientation_wxyz=orientation,
+                                    measured_velocity_vw=np.asarray(
+                                        [measured_v, measured_w],
+                                        dtype=np.float32,
+                                    ),
+                                    human_action_vw=np.asarray(
+                                        [desired.linear_mps, desired.angular_radps],
+                                        dtype=np.float32,
+                                    ),
+                                    applied_action_vw=np.asarray(
+                                        [applied.linear_mps, applied.angular_radps],
+                                        dtype=np.float32,
+                                    ),
+                                    steering_position=_ordered_readback(
+                                        readback["steering_position"], steering_names
+                                    ),
+                                    steering_velocity=_ordered_readback(
+                                        readback["steering_velocity"], steering_names
+                                    ),
+                                    wheel_velocity=_ordered_readback(
+                                        readback["wheel_velocity"], wheel_names
+                                    ),
+                                    front_intrinsics=front.intrinsics,
+                                    down_intrinsics=down.intrinsics,
+                                    front_base_from_camera=front.base_from_camera,
+                                    down_base_from_camera=down.base_from_camera,
+                                    map_version=int(snapshot.version),
+                                    goal_body_xyyaw=relative_goal_xyyaw(
+                                        pose,
+                                        session.goal_pose_world,
+                                    ),
                                 )
-                            else:
-                                recorder.append(sample)
-                                session.note_sample(pose)
-                    elif session.recording:
-                        last_message = (
-                            f"Skipped RGB-D pair: frame skew {skew:.3f}s exceeds limit"
+                                if not session.consume_warmup_pair():
+                                    recorder.append(sample)
+                                    session.note_sample(pose)
+                    elif map_active:
+                        self.logger.warning(
+                            "[CollectorMap] skipped RGB-D pair skew=%.3fs limit=%.3fs",
+                            skew,
+                            float(mapping_cfg["max_frame_skew_sec"]),
                         )
 
-                if now - last_ui_update >= float(self.config["ui"]["update_period_sec"]):
+                if ui_now - last_ui_update >= float(self.config["ui"]["update_period_sec"]):
                     start_body, goal_body, trajectory_body = _body_overlay(
                         session=session,
                         pose=pose,
@@ -477,25 +554,20 @@ class ConstraintTraverseCollector:
                             episode_id=current_episode_id,
                             sample_count=session.sample_count,
                             elapsed_sec=session.elapsed(now),
-                            message=last_message,
+                            robot_placed=session.robot_placed,
+                            goal_selected=session.goal_pose_world is not None,
+                            can_reset_start=session.last_start_pose_world is not None,
                         )
                     )
-                    last_ui_update = now
+                    last_ui_update = ui_now
 
                 max_duration = float(collection["max_episode_duration_sec"])
                 if session.recording and session.elapsed(now) > max_duration:
                     adapter.stop()
                     teleop.reset()
-                    end_pose = pose_xyyaw(*get_world_pose(robot))
-                    path = recorder.finish(
-                        success=False,
-                        end_pose_world=end_pose,
-                        end_time_sec=now,
-                        failure_reason="timeout",
-                    )
-                    session.complete(goal_pose_world=end_pose)
-                    session.last_goal_pose_world = None
-                    last_message = f"FAILURE(timeout) saved: {path.name}"
+                    recorder.discard()
+                    session.abort()
+                    self.logger.info("[Collector] timed-out episode discarded")
                     current_episode_id = ""
 
                 world.step(render=(frame_index % render_stride == 0))
@@ -515,7 +587,7 @@ class ConstraintTraverseCollector:
     def _handle_ui_command(
         self,
         *,
-        command: str,
+        command: object,
         session: EpisodeSession,
         recorder: EpisodeRecorder,
         episode_map: LocalVoxelMap,
@@ -531,21 +603,105 @@ class ConstraintTraverseCollector:
         current_episode_id: str,
         scene_path: Path,
         profile,
+        world,
+        stage,
+        articulation_path: str,
+        mapping_state: dict[str, float],
+        mapping_cfg: dict,
+        front_path: str,
+        down_path: str,
+        last_bev: np.ndarray,
     ) -> tuple[str, str]:
         collection = self.config["collection"]
 
+        if command == "BORN":
+            if session.mode is EpisodeMode.IDLE:
+                teleop.reset()
+                adapter.stop()
+                session.begin_born_placement()
+                _select_prim(articulation_path)
+                world.pause()
+                self.logger.info("[CollectorPlacement] robot placement started")
+                return "", current_episode_id
+            if session.mode is EpisodeMode.PLACING_BORN:
+                placed_position, placed_orientation = _world_pose_from_prim(
+                    stage,
+                    articulation_path,
+                )
+                robot.set_world_pose(
+                    position=placed_position,
+                    orientation=placed_orientation,
+                )
+                _zero_robot_velocity(robot)
+                session.confirm_born_placement()
+                _clear_selection()
+                motion.reset()
+                world.play()
+                for _ in range(int(self.config["spawn"]["settle_frames"])):
+                    adapter.stop()
+                    world.step(render=True)
+                settled_position, _ = get_world_pose(robot)
+                _zero_robot_velocity(robot)
+                episode_map.reset(
+                    np.asarray(settled_position[:3], dtype=np.float64)
+                )
+                _clear_bev(last_bev)
+                mapping_state["last_integration_time"] = -float("inf")
+                self.logger.info(
+                    "[CollectorPlacement] robot placement confirmed position=%s",
+                    np.asarray(settled_position, dtype=np.float64).tolist(),
+                )
+                return "", current_episode_id
+            return "", current_episode_id
+
+        if (
+            isinstance(command, tuple)
+            and len(command) == 3
+            and command[0] == "SET_GOAL_BODY"
+        ):
+            if session.mode is not EpisodeMode.IDLE or not session.robot_placed:
+                return "", current_episode_id
+            forward = float(command[1])
+            left = float(command[2])
+            cosine = math.cos(float(pose[2]))
+            sine = math.sin(float(pose[2]))
+            goal_x = float(pose[0]) + cosine * forward - sine * left
+            goal_y = float(pose[1]) + sine * forward + cosine * left
+            if math.hypot(forward, left) > 1.0e-6:
+                goal_yaw = float(pose[2]) + math.atan2(left, forward)
+            else:
+                goal_yaw = float(pose[2])
+            goal_yaw = math.atan2(math.sin(goal_yaw), math.cos(goal_yaw))
+            goal_pose = np.asarray([goal_x, goal_y, goal_yaw], dtype=np.float64)
+            session.set_goal(goal_pose)
+            self.logger.info("[CollectorGoal] map goal selected pose=%s", goal_pose.tolist())
+            return "", current_episode_id
+
+        if command == "RESET_MAP":
+            if session.mode is not EpisodeMode.IDLE or not session.robot_placed:
+                return "", current_episode_id
+            episode_map.reset(np.asarray(position[:3], dtype=np.float64))
+            _clear_bev(last_bev)
+            mapping_state["last_integration_time"] = -float("inf")
+            self.logger.info("[CollectorMap] map reset")
+            return "", current_episode_id
+
         if command == "START":
-            if session.recording:
-                return "Already recording", current_episode_id
+            if session.mode is not EpisodeMode.IDLE:
+                return "", current_episode_id
+            if not session.robot_placed or session.goal_pose_world is None:
+                return "", current_episode_id
             if (
                 abs(float(measured_v)) > float(collection["start_max_linear_mps"])
                 or abs(float(measured_w)) > float(collection["start_max_angular_radps"])
             ):
-                return "Stop the robot before START DEMO", current_episode_id
+                return "", current_episode_id
             teleop.reset()
             adapter.stop()
             motion.reset()
             episode_map.reset(np.asarray(position[:3], dtype=np.float64))
+            _clear_bev(last_bev)
+            mapping_state["last_integration_time"] = -float("inf")
             session.begin(
                 start_pose_world=pose,
                 start_position_world_xyz=position,
@@ -555,12 +711,29 @@ class ConstraintTraverseCollector:
             temp_dir = recorder.begin(
                 start_pose_world=pose,
                 start_position_world_xyz=position,
+                goal_pose_world=session.goal_pose_world,
                 start_time_sec=now,
                 extra_meta={
                     "teleop": dict(self.config["teleop"]),
-                    "cameras": dict(self.config["cameras"]),
+                    "cameras": {
+                        "front_prim_path": front_path,
+                        "down_prim_path": down_path,
+                        "width": int(mapping_cfg["camera"]["width"]),
+                        "height": int(mapping_cfg["camera"]["height"]),
+                        "frequency_hz": int(mapping_cfg["camera"]["frequency_hz"]),
+                        "max_frame_skew_sec": float(
+                            mapping_cfg["max_frame_skew_sec"]
+                        ),
+                    },
                     "bev": dict(self.config["bev"]),
-                    "voxel_map": dict(self.config["voxel_map"]),
+                    "voxel_map": {
+                        name: value
+                        for name, value in mapping_cfg["map"].items()
+                        if name != "integration_period_sec"
+                    },
+                    "map_integration_period_sec": float(
+                        mapping_cfg["map"]["integration_period_sec"]
+                    ),
                     "collection": dict(self.config["collection"]),
                     "applied_action_limits": {
                         "max_linear_mps": float(
@@ -581,22 +754,19 @@ class ConstraintTraverseCollector:
                 },
             )
             episode_id = temp_dir.name.removeprefix(".episode_").removesuffix(".tmp")
-            return "RECORDING: manually traverse the constrained space", episode_id
+            return "", episode_id
 
         if command == "SUCCESS":
             if not session.recording:
-                return "No active episode", current_episode_id
+                return "", current_episode_id
             if session.sample_count < int(collection["min_success_samples"]):
-                return (
-                    f"Need at least {int(collection['min_success_samples'])} samples",
-                    current_episode_id,
-                )
+                return "", current_episode_id
             if (
                 abs(float(measured_v)) > float(collection["start_max_linear_mps"])
                 or abs(float(measured_w))
                 > float(collection["start_max_angular_radps"])
             ):
-                return "Stop the robot before SUCCESS", current_episode_id
+                return "", current_episode_id
             teleop.reset()
             adapter.stop()
             end_pose = pose.copy()
@@ -605,33 +775,19 @@ class ConstraintTraverseCollector:
                 end_pose_world=end_pose,
                 end_time_sec=now,
             )
-            session.complete(goal_pose_world=end_pose)
-            return f"SUCCESS saved: {path.name}", ""
-
-        if command == "FAILURE":
-            if not session.recording:
-                return "No active episode", current_episode_id
-            teleop.reset()
-            adapter.stop()
-            end_pose = pose.copy()
-            path = recorder.finish(
-                success=False,
-                end_pose_world=end_pose,
-                end_time_sec=now,
-                failure_reason="manual_failure",
-            )
-            session.complete(goal_pose_world=end_pose)
-            session.last_goal_pose_world = None
-            return f"FAILURE saved: {path.name}", ""
+            session.complete()
+            self.logger.info("[Collector] success saved path=%s", path)
+            return "", ""
 
         if command == "DISCARD":
             if not session.recording:
-                return "No active episode", current_episode_id
+                return "", current_episode_id
             teleop.reset()
             adapter.stop()
             recorder.discard()
             session.abort()
-            return "Episode discarded", ""
+            self.logger.info("[Collector] episode discarded")
+            return "", ""
 
         if command == "RESET_TO_START":
             if session.recording:
@@ -641,9 +797,8 @@ class ConstraintTraverseCollector:
                 session.last_start_pose_world is None
                 or session.last_start_position_world_xyz is None
             ):
-                return "No recorded START pose available", current_episode_id
+                return "", current_episode_id
             session.abort()
-            session.last_goal_pose_world = None
             teleop.reset()
             adapter.stop()
             _teleport_robot(
@@ -662,9 +817,13 @@ class ConstraintTraverseCollector:
                     dtype=np.float64,
                 )
             )
-            return "Reset to previous START; press START DEMO when ready", ""
+            _clear_bev(last_bev)
+            mapping_state["last_integration_time"] = -float("inf")
+            self.logger.info("[Collector] reset to recorded start")
+            return "", ""
 
-        return f"Unknown UI command: {command}", current_episode_id
+        self.logger.warning("[CollectorUI] unknown command=%s", command)
+        return "", current_episode_id
 
 
 def _teleport_robot(
@@ -684,25 +843,57 @@ def _teleport_robot(
         robot.set_angular_velocity(np.zeros(3, dtype=np.float32))
 
 
-def _place_robot_on_floor(
-    robot,
-    *,
-    x_m: float,
-    y_m: float,
-    floor_z_m: float,
-    base_height_m: float,
-    yaw_deg: float,
-) -> None:
-    position = np.asarray(
-        [float(x_m), float(y_m), float(floor_z_m) + float(base_height_m)],
-        dtype=np.float32,
-    )
-    orientation = quaternion_wxyz_from_yaw(math.radians(float(yaw_deg)))
-    robot.set_world_pose(position=position, orientation=orientation)
+def _zero_robot_velocity(robot) -> None:
     if hasattr(robot, "set_linear_velocity"):
         robot.set_linear_velocity(np.zeros(3, dtype=np.float32))
     if hasattr(robot, "set_angular_velocity"):
         robot.set_angular_velocity(np.zeros(3, dtype=np.float32))
+
+
+def _clear_bev(bev: np.ndarray) -> None:
+    bev.fill(0)
+    bev[2] = 255
+
+
+def _world_pose_from_prim(stage, prim_path: str) -> tuple[np.ndarray, np.ndarray]:
+    from pxr import UsdGeom
+
+    prim = stage.GetPrimAtPath(str(prim_path))
+    if not prim or not prim.IsValid():
+        raise RuntimeError(f"Invalid pose prim: {prim_path}")
+    transform = UsdGeom.XformCache().GetLocalToWorldTransform(prim)
+    translation = transform.ExtractTranslation()
+    quaternion = transform.ExtractRotationQuat()
+    imaginary = quaternion.GetImaginary()
+    position = np.asarray(
+        [float(translation[0]), float(translation[1]), float(translation[2])],
+        dtype=np.float32,
+    )
+    orientation = np.asarray(
+        [
+            float(quaternion.GetReal()),
+            float(imaginary[0]),
+            float(imaginary[1]),
+            float(imaginary[2]),
+        ],
+        dtype=np.float32,
+    )
+    return position, orientation
+
+
+def _select_prim(prim_path: str) -> None:
+    import omni.usd
+
+    omni.usd.get_context().get_selection().set_selected_prim_paths(
+        [str(prim_path)],
+        True,
+    )
+
+
+def _clear_selection() -> None:
+    import omni.usd
+
+    omni.usd.get_context().get_selection().set_selected_prim_paths([], True)
 
 
 def _scene_world_bounds(stage, scene_prim_path: str) -> tuple[np.ndarray, np.ndarray]:
@@ -723,329 +914,10 @@ def _scene_world_bounds(stage, scene_prim_path: str) -> tuple[np.ndarray, np.nda
     if minimum.shape != (3,) or maximum.shape != (3,) or not (
         np.isfinite(minimum).all() and np.isfinite(maximum).all()
     ):
-        raise RuntimeError("Unable to determine finite scene bounds for auto spawn")
+        raise RuntimeError("Unable to determine finite scene bounds")
     if np.any(maximum <= minimum):
         raise RuntimeError(f"Invalid scene bounds: min={minimum}, max={maximum}")
     return minimum, maximum
-
-
-def _resolve_initial_spawn(
-    *,
-    stage,
-    scene_prim_path: str,
-    robot_prim_path: str,
-    scene_bounds: tuple[np.ndarray, np.ndarray],
-    config: dict,
-    override_x_m: float | None,
-    override_y_m: float | None,
-    override_yaw_deg: float | None,
-    logger: logging.Logger,
-) -> tuple[float, float, float, float]:
-    if (override_x_m is None) != (override_y_m is None):
-        raise ValueError("--spawn-x and --spawn-y must be provided together")
-
-    query = _physx_scene_query_interface()
-    if override_x_m is not None and override_y_m is not None:
-        yaw_deg = 0.0 if override_yaw_deg is None else float(override_yaw_deg)
-        hit = _downward_floor_hit(
-            query=query,
-            x_m=float(override_x_m),
-            y_m=float(override_y_m),
-            scene_bounds=scene_bounds,
-            config=config,
-            robot_prim_path=robot_prim_path,
-        )
-        if hit is None or not _spawn_volume_is_clear(
-            query=query,
-            x_m=float(override_x_m),
-            y_m=float(override_y_m),
-            floor_z_m=float(hit[0]) if hit is not None else 0.0,
-            yaw_deg=yaw_deg,
-            config=config,
-            robot_prim_path=robot_prim_path,
-        ):
-            raise RuntimeError(
-                "Manual spawn XY is not a collision-free floor location; "
-                "omit --spawn-x/--spawn-y to use automatic placement"
-            )
-        return (
-            float(override_x_m),
-            float(override_y_m),
-            float(hit[0]),
-            yaw_deg,
-        )
-
-    floor_level = _estimate_floor_level(
-        query=query,
-        scene_bounds=scene_bounds,
-        config=config,
-        robot_prim_path=robot_prim_path,
-        logger=logger,
-    )
-    logger.info("[AutoSpawn] estimated floor_z=%.3fm", floor_level)
-
-    minimum, maximum = scene_bounds
-    margin = float(config["bounds_margin_m"])
-    x_min, x_max = float(minimum[0] + margin), float(maximum[0] - margin)
-    y_min, y_max = float(minimum[1] + margin), float(maximum[1] - margin)
-    if x_max <= x_min or y_max <= y_min:
-        raise RuntimeError("Scene XY extent is too small for configured auto-spawn margin")
-
-    step = float(config["sample_step_m"])
-    xs = np.arange(x_min, x_max + 0.5 * step, step, dtype=np.float64)
-    ys = np.arange(y_min, y_max + 0.5 * step, step, dtype=np.float64)
-    candidates = [(float(x), float(y)) for x in xs for y in ys]
-    rng = random.Random(int(config["random_seed"]))
-    rng.shuffle(candidates)
-    candidates = candidates[: int(config["max_attempts"])]
-
-    for attempt, (x_m, y_m) in enumerate(candidates, start=1):
-        yaw_deg = (
-            float(override_yaw_deg)
-            if override_yaw_deg is not None
-            else rng.uniform(-180.0, 180.0)
-        )
-        result = _evaluate_spawn_candidate(
-            query=query,
-            x_m=x_m,
-            y_m=y_m,
-            yaw_deg=yaw_deg,
-            floor_level_m=floor_level,
-            scene_bounds=scene_bounds,
-            config=config,
-            robot_prim_path=robot_prim_path,
-        )
-        if result is not None:
-            logger.info(
-                "[AutoSpawn] selected attempt=%d/%d xy=[%.2f,%.2f] floor_z=%.2f yaw=%.1fdeg",
-                attempt,
-                len(candidates),
-                result[0],
-                result[1],
-                result[2],
-                result[3],
-            )
-            return result
-
-    raise RuntimeError(
-        "Auto spawn could not find a collision-free floor location. "
-        "Increase spawn.max_attempts, reduce clearance, or pass --spawn-x/--spawn-y."
-    )
-
-
-def _physx_scene_query_interface():
-    try:
-        from omni.physx import get_physx_scene_query_interface
-    except ImportError as exc:
-        raise RuntimeError("PhysX scene-query API is unavailable") from exc
-    return get_physx_scene_query_interface()
-
-
-def _estimate_floor_level(
-    *,
-    query,
-    scene_bounds: tuple[np.ndarray, np.ndarray],
-    config: dict,
-    robot_prim_path: str,
-    logger: logging.Logger,
-) -> float:
-    minimum, maximum = scene_bounds
-    margin = float(config["bounds_margin_m"])
-    x_min, x_max = float(minimum[0] + margin), float(maximum[0] - margin)
-    y_min, y_max = float(minimum[1] + margin), float(maximum[1] - margin)
-    rng = random.Random(int(config["random_seed"]) + 1777)
-    samples = []
-    count = int(config["floor_estimation_samples"])
-    for _ in range(count):
-        x_m = rng.uniform(x_min, x_max)
-        y_m = rng.uniform(y_min, y_max)
-        hit = _downward_floor_hit(
-            query=query,
-            x_m=x_m,
-            y_m=y_m,
-            scene_bounds=scene_bounds,
-            config=config,
-            robot_prim_path=robot_prim_path,
-        )
-        if hit is not None:
-            samples.append(float(hit[0]))
-    if not samples:
-        grid_side = max(6, int(math.ceil(math.sqrt(count))))
-        xs = np.linspace(x_min, x_max, grid_side, dtype=np.float64)
-        ys = np.linspace(y_min, y_max, grid_side, dtype=np.float64)
-        for x_m in xs:
-            for y_m in ys:
-                hit = _downward_floor_hit(
-                    query=query,
-                    x_m=float(x_m),
-                    y_m=float(y_m),
-                    scene_bounds=scene_bounds,
-                    config=config,
-                    robot_prim_path=robot_prim_path,
-                )
-                if hit is not None:
-                    samples.append(float(hit[0]))
-        if samples:
-            logger.warning(
-                "[AutoSpawn] random probes found no floor; grid probes found %d hits",
-                len(samples),
-            )
-
-    if not samples:
-        raise RuntimeError(
-            "Auto spawn found no horizontal collidable floor. "
-            "Check scene collision geometry or provide --spawn-x and --spawn-y."
-        )
-
-    logger.info("[AutoSpawn] accepted floor probe hits=%d", len(samples))
-    bin_size = float(config["floor_height_bin_m"])
-    bins: dict[int, list[float]] = {}
-    for value in samples:
-        key = int(round(value / bin_size))
-        bins.setdefault(key, []).append(value)
-    best_key, values = max(
-        bins.items(),
-        key=lambda item: (len(item[1]), -float(np.mean(item[1]))),
-    )
-    floor_level = float(np.median(np.asarray(values, dtype=np.float64)))
-    logger.info(
-        "[AutoSpawn] floor bin=%d hits=%d floor_z=%.3f",
-        best_key,
-        len(values),
-        floor_level,
-    )
-    return floor_level
-
-
-def _evaluate_spawn_candidate(
-    *,
-    query,
-    x_m: float,
-    y_m: float,
-    yaw_deg: float,
-    floor_level_m: float,
-    scene_bounds: tuple[np.ndarray, np.ndarray],
-    config: dict,
-    robot_prim_path: str,
-) -> tuple[float, float, float, float] | None:
-    hit = _downward_floor_hit(
-        query=query,
-        x_m=x_m,
-        y_m=y_m,
-        scene_bounds=scene_bounds,
-        config=config,
-        robot_prim_path=robot_prim_path,
-    )
-    if hit is None:
-        return None
-    floor_z, _normal_z = hit
-    if abs(float(floor_z) - float(floor_level_m)) > float(
-        config["floor_height_tolerance_m"]
-    ):
-        return None
-    if not _spawn_volume_is_clear(
-        query=query,
-        x_m=x_m,
-        y_m=y_m,
-        floor_z_m=floor_z,
-        yaw_deg=yaw_deg,
-        config=config,
-        robot_prim_path=robot_prim_path,
-    ):
-        return None
-    return float(x_m), float(y_m), float(floor_z), float(yaw_deg)
-
-
-def _downward_floor_hit(
-    *,
-    query,
-    x_m: float,
-    y_m: float,
-    scene_bounds: tuple[np.ndarray, np.ndarray],
-    config: dict,
-    robot_prim_path: str,
-) -> tuple[float, float] | None:
-    import carb
-
-    minimum, maximum = scene_bounds
-    min_z = float(minimum[2])
-    max_z = float(maximum[2])
-    configured_height = float(config["floor_probe_height_m"])
-    probe_depth = float(config["floor_probe_depth_m"])
-    probe_heights = sorted({
-        float(np.clip(value, min_z + 0.05, max_z + 0.25))
-        for value in (
-            min_z + 0.75,
-            min_z + 1.25,
-            min_z + configured_height,
-            min_z + configured_height + 1.5,
-            max_z + 0.25,
-        )
-    })
-    minimum_normal_z = math.cos(math.radians(float(config["max_slope_deg"])))
-    for probe_z in probe_heights:
-        distance = max(0.10, probe_z - min_z + probe_depth)
-        hit = query.raycast_closest(
-            carb.Float3(float(x_m), float(y_m), float(probe_z)),
-            carb.Float3(0.0, 0.0, -1.0),
-            float(distance),
-        )
-        if not hit or not bool(hit.get("hit", False)):
-            continue
-        hit_path = str(hit.get("rigidBody", ""))
-        if hit_path.startswith(str(robot_prim_path)):
-            continue
-        position = hit.get("position")
-        normal = hit.get("normal")
-        if position is None or normal is None:
-            continue
-        floor_z = float(position[2])
-        normal_z = float(normal[2])
-        if abs(normal_z) < minimum_normal_z:
-            continue
-        return floor_z, normal_z
-    return None
-
-
-def _spawn_volume_is_clear(
-    *,
-    query,
-    x_m: float,
-    y_m: float,
-    floor_z_m: float,
-    yaw_deg: float,
-    config: dict,
-    robot_prim_path: str,
-) -> bool:
-    import carb
-
-    half_length = float(config["robot_half_length_m"]) + float(config["clearance_m"])
-    half_width = float(config["robot_half_width_m"]) + float(config["clearance_m"])
-    height = float(config["collision_check_height_m"])
-    bottom = float(floor_z_m) + float(config["collision_bottom_offset_m"])
-    origin = carb.Float3(
-        float(x_m),
-        float(y_m),
-        bottom + 0.5 * height,
-    )
-    yaw = math.radians(float(yaw_deg))
-    rotation = carb.Float4(0.0, 0.0, math.sin(0.5 * yaw), math.cos(0.5 * yaw))
-    extent = carb.Float3(half_length, half_width, 0.5 * height)
-    blocked = False
-
-    def report_hit(hit) -> bool:
-        nonlocal blocked
-        rigid_body = str(getattr(hit, "rigid_body", ""))
-        collision = str(getattr(hit, "collision", ""))
-        if rigid_body.startswith(str(robot_prim_path)) or collision.startswith(
-            str(robot_prim_path)
-        ):
-            return True
-        blocked = True
-        return False
-
-    query.overlap_box(extent, origin, rotation, report_hit, False)
-    return not blocked
 
 
 def _ordered_readback(values: dict[str, float], names: tuple[str, ...]) -> np.ndarray:
@@ -1071,9 +943,9 @@ def _body_overlay(
             robot_world_xy=current_xy,
             robot_yaw_rad=yaw,
         )[0]
-    if session.last_goal_pose_world is not None:
+    if session.goal_pose_world is not None:
         goal = world_xy_to_body(
-            session.last_goal_pose_world[:2],
+            session.goal_pose_world[:2],
             robot_world_xy=current_xy,
             robot_yaw_rad=yaw,
         )[0]

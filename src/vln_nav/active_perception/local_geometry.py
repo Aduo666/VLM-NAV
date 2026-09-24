@@ -85,6 +85,7 @@ class VoxelMapUpdate:
     version: int
     shifted: bool
     source_ray_counts: tuple[tuple[str, int], ...]
+    source_voxel_update_counts: tuple[tuple[str, int, int], ...]
     hit_endpoint_count: int
     free_voxel_update_count: int
     occupied_voxel_update_count: int
@@ -201,6 +202,7 @@ class LocalVoxelMap:
             self.reset(center)
         shifted = self._slide_if_needed(center)
         source_counts: list[tuple[str, int]] = []
+        source_voxel_counts: list[tuple[str, int, int]] = []
         hit_count = free_count = occupied_count = 0
         newest_timestamp = self._timestamp
         for observation in observations:
@@ -213,6 +215,11 @@ class LocalVoxelMap:
                 observation
             )
             source_counts.append((observation.source, ray_count))
+            source_voxel_counts.append((
+                observation.source,
+                int(free_indices.size),
+                int(occupied_indices.size),
+            ))
             source_bit = SOURCE_BITS[observation.source]
             timestamp = float(observation.timestamp_sec)
             if free_indices.size:
@@ -240,6 +247,7 @@ class LocalVoxelMap:
             version=int(self._version),
             shifted=bool(shifted),
             source_ray_counts=tuple(source_counts),
+            source_voxel_update_counts=tuple(source_voxel_counts),
             hit_endpoint_count=int(hit_count),
             free_voxel_update_count=int(free_count),
             occupied_voxel_update_count=int(occupied_count),

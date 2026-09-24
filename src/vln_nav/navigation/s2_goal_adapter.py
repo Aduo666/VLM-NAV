@@ -9,6 +9,8 @@ from vln_nav.active_perception.camera_geometry import (
     CameraFrameGeometry,
     backproject_depth_pixels_to_world,
 )
+
+
 @dataclass(frozen=True)
 class S2GoalAdapterConfig:
     depth_patch_radius_px: int
@@ -16,6 +18,8 @@ class S2GoalAdapterConfig:
     max_depth_m: float
     min_goal_distance_m: float
     max_goal_distance_m: float
+    minimum_valid_depth_fraction: float
+    maximum_depth_spread_m: float
 
     @classmethod
     def from_mapping(cls, data: dict) -> "S2GoalAdapterConfig":
@@ -28,6 +32,8 @@ class S2GoalAdapterConfig:
             max_depth_m=float(data["max_depth_m"]),
             min_goal_distance_m=float(data["min_goal_distance_m"]),
             max_goal_distance_m=float(data["max_goal_distance_m"]),
+            minimum_valid_depth_fraction=float(data["minimum_valid_depth_fraction"]),
+            maximum_depth_spread_m=float(data["maximum_depth_spread_m"]),
         )
         config.validate()
         return config
@@ -40,6 +46,7 @@ class S2GoalAdapterConfig:
             self.max_depth_m,
             self.min_goal_distance_m,
             self.max_goal_distance_m,
+            self.maximum_depth_spread_m,
         )
         if not all(math.isfinite(value) and value > 0 for value in values):
             raise ValueError("S2 goal adapter 数值配置必须为有限正数")
@@ -47,6 +54,8 @@ class S2GoalAdapterConfig:
             raise ValueError("S2 depth 范围无效")
         if self.min_goal_distance_m >= self.max_goal_distance_m:
             raise ValueError("S2 goal 距离范围无效")
+        if not 0.0 < self.minimum_valid_depth_fraction <= 1.0:
+            raise ValueError("S2 goal adapter 有效深度比例必须位于 0 至 1 范围内")
 
 
 @dataclass(frozen=True)
@@ -55,6 +64,8 @@ class S2MetricGoal:
     view: str
     pixel_original_vu: tuple[float, float]
     depth_m: float
+    depth_valid_fraction: float
+    depth_spread_m: float
     body_xy: tuple[float, float]
     world_xy: tuple[float, float]
 
@@ -95,7 +106,24 @@ class S2GoalAdapter:
             raise RuntimeError(
                 f"S2 pixel 周围没有有效深度 view={frame.source} pixel={[center_v, center_u]}"
             )
-        depth_m = float(np.median(patch[valid]))
+        depth_valid_fraction = float(np.count_nonzero(valid) / patch.size)
+        if depth_valid_fraction < self.config.minimum_valid_depth_fraction:
+            raise RuntimeError(
+                "S2 pixel 深度覆盖不足 "
+                f"view={frame.source} pixel={[center_v, center_u]} "
+                f"valid={depth_valid_fraction:.3f}"
+            )
+        valid_depth = patch[valid]
+        depth_m = float(np.median(valid_depth))
+        depth_spread_m = float(
+            np.percentile(valid_depth, 90.0) - np.percentile(valid_depth, 10.0)
+        )
+        if depth_spread_m > self.config.maximum_depth_spread_m:
+            raise RuntimeError(
+                "S2 pixel 位于深度不连续区域 "
+                f"view={frame.source} pixel={[center_v, center_u]} "
+                f"spread={depth_spread_m:.3f}m"
+            )
         world_point = backproject_depth_pixels_to_world(
             pixel_u=np.asarray(original_u),
             pixel_v=np.asarray(original_v),
@@ -126,6 +154,8 @@ class S2GoalAdapter:
             view=str(frame.source),
             pixel_original_vu=(float(original_v), float(original_u)),
             depth_m=depth_m,
+            depth_valid_fraction=depth_valid_fraction,
+            depth_spread_m=depth_spread_m,
             body_xy=(float(body_xy[0]), float(body_xy[1])),
             world_xy=(float(world_xy[0]), float(world_xy[1])),
         )

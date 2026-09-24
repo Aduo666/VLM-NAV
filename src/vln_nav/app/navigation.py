@@ -91,12 +91,14 @@ from vln_nav.runtime.isaac_runtime_utils import (
     wait_for_stage_assets,
 )
 from vln_nav.runtime.agx_profile import load_agx_profile
+from vln_nav.runtime.episode import NavigationEpisode, load_episodes, select_episode
 from vln_nav.runtime.scene_lighting import add_indoor_lighting
 from vln_nav.runtime.agx_geometry import validate_agx_geometry
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 SETTINGS_PATH = PROJECT_ROOT / "configs/navigation.yaml"
+EPISODES_PATH = PROJECT_ROOT / "configs/episodes.json"
 
 
 @dataclass(frozen=True)
@@ -684,20 +686,13 @@ def _load_settings() -> tuple[
 
     scene = data["scene"]
     scene_fields = {
-        "usd_path", "prim_path", "add_default_ground_plane",
-        "stage_load_timeout_sec", "start_xy_m", "start_yaw_deg",
+        "prim_path", "add_default_ground_plane", "stage_load_timeout_sec",
         "add_indoor_lighting",
     }
     if not isinstance(scene, dict) or set(scene) != scene_fields:
         raise ValueError(f"Navigation scene requires exactly: {sorted(scene_fields)}")
-    if not str(scene["usd_path"]).strip():
-        raise ValueError("Navigation modes scene path is empty")
     if not str(scene["prim_path"]).startswith("/"):
         raise ValueError("scene.prim_path must be an absolute USD path")
-    if len(scene["start_xy_m"]) != 2 or not all(
-        math.isfinite(float(value)) for value in (*scene["start_xy_m"], scene["start_yaw_deg"])
-    ):
-        raise ValueError("scene start pose must contain finite XY and yaw values")
     if float(scene["stage_load_timeout_sec"]) <= 0:
         raise ValueError("scene.stage_load_timeout_sec must be positive")
     for name in ("add_default_ground_plane", "add_indoor_lighting"):
@@ -707,7 +702,6 @@ def _load_settings() -> tuple[
     s2 = data["internnav_s2"]
     s2_fields = {
         "enabled",
-        "instruction",
         "server",
         "goal_adapter",
         "forward_action_distance_m",
@@ -723,8 +717,6 @@ def _load_settings() -> tuple[
         raise ValueError(f"internnav_s2 必须包含这些字段：{sorted(s2_fields)}")
     if not isinstance(s2["enabled"], bool):
         raise ValueError("internnav_s2.enabled 必须为布尔值")
-    if s2["enabled"] and not str(s2["instruction"]).strip():
-        raise ValueError("启用 S2 时 instruction 不能为空")
     for name in (
         "forward_action_distance_m",
         "goal_reached_tolerance_m",
@@ -946,6 +938,23 @@ def main() -> int:
         refiner_config,
     ) = _load_settings()
     logger = _make_logger()
+    try:
+        episodes = load_episodes(EPISODES_PATH, project_root=PROJECT_ROOT)
+        episode = select_episode(episodes)
+    except (OSError, ValueError, RuntimeError) as exc:
+        logger.error("[EpisodeSelection] failed: %s", exc)
+        return 1
+    logger.info(
+        "[EpisodeSelected] id=%s name=%s scene=%s start=[%.2f,%.2f,%.1fdeg] "
+        "instruction=%s",
+        episode.episode_id,
+        episode.name,
+        episode.usd_path,
+        episode.start_x_m,
+        episode.start_y_m,
+        episode.start_yaw_deg,
+        episode.instruction,
+    )
 
     from isaacsim import SimulationApp
 
@@ -962,6 +971,7 @@ def main() -> int:
             return _run(
                 app,
                 profile,
+                episode,
                 settings,
                 client_config,
                 s2_client_config,
@@ -1002,6 +1012,7 @@ def _make_logger() -> logging.Logger:
 def _run(
     app,
     profile,
+    episode: NavigationEpisode,
     settings,
     client_config,
     s2_client_config,
@@ -1030,11 +1041,7 @@ def _run(
     )
     stage = get_current_stage()
     scene_settings = settings["scene"]
-    scene_path = Path(str(settings["scene"]["usd_path"]))
-    if not scene_path.is_absolute():
-        scene_path = PROJECT_ROOT / scene_path
-    if not scene_path.is_file():
-        raise FileNotFoundError(f"Navigation modes scene USD does not exist: {scene_path}")
+    scene_path = episode.usd_path
     add_reference_to_stage(str(scene_path), scene_settings["prim_path"])
     if scene_settings["add_default_ground_plane"]:
         world.scene.add_default_ground_plane()
@@ -1059,14 +1066,14 @@ def _run(
         stage=stage,
         prim_path=profile.asset.prim_path,
         translation=[
-            float(scene_settings["start_xy_m"][0]),
-            float(scene_settings["start_xy_m"][1]),
+            episode.start_x_m,
+            episode.start_y_m,
             float(profile.spawn_z_m),
         ],
         rotation_deg=[
             0.0,
             0.0,
-            float(scene_settings["start_yaw_deg"]),
+            episode.start_yaw_deg,
         ],
     )
     articulation_path = resolve_robot_relative_prim_path(
@@ -1345,7 +1352,7 @@ def _run(
         logger.info(
             "[S2Session] automatic session=%s instruction=%s",
             s2_session_id,
-            s2_settings["instruction"],
+            episode.instruction,
         )
 
     try:
@@ -2279,7 +2286,7 @@ def _run(
                     s2_job = _S2InferenceJob(
                         request_id=s2_request_id,
                         session_id=s2_session_id,
-                        instruction=str(s2_settings["instruction"]),
+                        instruction=episode.instruction,
                         view=s2_next_view,
                         reset=reset_request,
                         look_down=s2_next_view == "down",
@@ -2298,7 +2305,7 @@ def _run(
                             s2_next_view,
                             reset_request,
                             s2_frame.frame_index,
-                            s2_settings["instruction"],
+                            episode.instruction,
                         )
 
             if (

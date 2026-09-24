@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "episodes": [
+    {
+      "id": "hospital_notice_board_001",
+      "name": "医院大厅到黄色告示牌",
+      "usd_path": "usd/hospital.usd",
+      "start_pose": {
+        "x_m": 1.5,
+        "y_m": 4.0,
+        "yaw_deg": -90.0
+      },
+      "instruction": "Right now you're in the hospital lobby. Go forward until you see the wheelchair, then turn left. After that, turn right in front of the stairs, keep going forward, and stop in front of the yellow notice board."
+    },
+    {
+      "id": "kujiale_0067_bedroom_001",
+      "name": "厨房到左侧卧室",
+      "usd_path": "/Data/qiang/interiornav_data/scene_data/kujiale_0067/kujiale_0067.usda",
+      "start_pose": {
+        "x_m": 1.5,
+        "y_m": 4.0,
+        "yaw_deg": -90.0
+      },
+      "instruction": "Leave the kitchen and turn right into the bedroom on the left."
+    }
+  ]
+}

@@ -9,21 +9,14 @@ simulation:
   # 是否启用多 GPU 渲染。
   multi_gpu: false
 
-# 测试使用的室内场景。
+# 场景加载公共参数；场景文件和初始位姿由 episodes.json 提供。
 scene:
-  # 场景 USD 文件路径。
-  #usd_path: "/Data/qiang/interiornav_data/scene_data/kujiale_0067/kujiale_0067.usda"
-  usd_path: "/home/Lab/qiangsibin/VLM-NAV-active/usd/hospital.usd"
   # 场景加载到仿真 Stage 的路径。
   prim_path: "/World/Environment"
   # 场景没有地面时可开启默认地面。
   add_default_ground_plane: false
   # 等待场景资源加载的最长时间，单位为秒。
   stage_load_timeout_sec: 120.0
-  # AGX 的世界坐标起点，切换场景时需要同步设置。
-  start_xy_m: [1.5, 4.0]
-  # AGX 的世界坐标朝向，单位为度；高度由机器人配置决定。
-  start_yaw_deg: -90.0
   # 是否调用公共室内灯光接口，在当前仿真场景中添加顶灯。
   add_indoor_lighting: true
 # NavDP 推理服务连接与轨迹结果校验参数。
@@ -49,9 +42,6 @@ server:
 internnav_s2:
   # 是否启用 S2 高层规划。
   enabled: true
-  # 当前视觉语言导航指令。
-  #instruction: "Leave the kitchen and turn right into the bedroom on the left."
-  instruction: "Right now you're in the hospital lobby. Go forward until you see the wheelchair, then turn left. After that, turn right in front of the stairs, keep going forward, and stop in front of the yellow notice board.."
   server:
     # 远程 S2 服务地址。
     base_url: "http://10.4.113.176:5801"

@@ -81,7 +81,12 @@ def _parse_episode(row: object, *, project_root: Path) -> NavigationEpisode:
     instruction = str(row["instruction"]).strip()
     if not episode_id or not name or not instruction:
         raise ValueError("任务 id、name 和 instruction 不能为空")
-    pose_values = tuple(float(pose[key]) for key in ("x_m", "y_m", "yaw_deg"))
+    try:
+        pose_values = tuple(
+            float(pose[key]) for key in ("x_m", "y_m", "yaw_deg")
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"任务 {episode_id} 的初始位姿必须是数值") from exc
     if not all(math.isfinite(value) for value in pose_values):
         raise ValueError(f"任务 {episode_id} 的初始位姿必须是有限数值")
 

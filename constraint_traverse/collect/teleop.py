@@ -34,22 +34,17 @@ class TeleopConfig:
 
 
 class ContinuousTeleop:
-    """WASD -> smooth body-frame velocity command."""
+    """方向键或 WASD 生成平滑的车体线速度与角速度。"""
 
-    _KEY_ACTIONS = {
-        "W": "W",
-        "UP": "W",
-        "S": "S",
-        "DOWN": "S",
-        "A": "A",
-        "LEFT": "A",
-        "D": "D",
-        "RIGHT": "D",
-    }
+    _FORWARD_KEYS = {"W", "UP"}
+    _BACKWARD_KEYS = {"S", "DOWN"}
+    _LEFT_KEYS = {"A", "LEFT"}
+    _RIGHT_KEYS = {"D", "RIGHT"}
+    _KEYS = _FORWARD_KEYS | _BACKWARD_KEYS | _LEFT_KEYS | _RIGHT_KEYS
 
     def __init__(self, config: TeleopConfig) -> None:
         self.config = config
-        self._pressed: set[str] = set()
+        self._pressed_keys: set[str] = set()
         self._linear = 0.0
         self._angular = 0.0
         self._subscription = None
@@ -86,7 +81,7 @@ class ContinuousTeleop:
         self._keyboard = None
 
     def reset(self) -> None:
-        self._pressed.clear()
+        self._pressed_keys.clear()
         self._linear = 0.0
         self._angular = 0.0
 
@@ -96,8 +91,12 @@ class ContinuousTeleop:
 
     def step(self, dt: float) -> VelocityCommand:
         dt = max(float(dt), 0.0)
-        forward = int("W" in self._pressed) - int("S" in self._pressed)
-        turn = int("A" in self._pressed) - int("D" in self._pressed)
+        forward = int(bool(self._pressed_keys & self._FORWARD_KEYS)) - int(
+            bool(self._pressed_keys & self._BACKWARD_KEYS)
+        )
+        turn = int(bool(self._pressed_keys & self._LEFT_KEYS)) - int(
+            bool(self._pressed_keys & self._RIGHT_KEYS)
+        )
         target_linear = float(forward) * self.config.max_linear_mps
         target_angular = float(turn) * self.config.max_angular_radps
         self._linear = _approach(
@@ -115,16 +114,15 @@ class ContinuousTeleop:
     def _on_keyboard_event(self, event, *_args, **_kwargs) -> bool:
         key_input = event.input
         key_name = str(getattr(key_input, "name", key_input))
-        action = self._KEY_ACTIONS.get(key_name)
-        if action is None:
+        if key_name not in self._KEYS:
             return True
         if event.type in {
             self._carb_input.KeyboardEventType.KEY_PRESS,
             self._carb_input.KeyboardEventType.KEY_REPEAT,
         }:
-            self._pressed.add(action)
+            self._pressed_keys.add(key_name)
         elif event.type == self._carb_input.KeyboardEventType.KEY_RELEASE:
-            self._pressed.discard(action)
+            self._pressed_keys.discard(key_name)
         return True
 
 

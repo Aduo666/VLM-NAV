@@ -39,6 +39,7 @@ def _resolve_project_path(path_text: str) -> Path:
 
 
 def _json_scene_path(scene_path: Path) -> str:
+    """Store project-local scenes as relative paths, external scenes as absolute paths."""
     scene_path = scene_path.resolve()
     try:
         return scene_path.relative_to(PROJECT_ROOT.resolve()).as_posix()
@@ -49,29 +50,55 @@ def _json_scene_path(scene_path: Path) -> str:
 def _load_navigation_settings() -> dict:
     with SETTINGS_PATH.open(encoding="utf-8") as handle:
         data = yaml.safe_load(handle) or {}
+
     if not isinstance(data, dict):
         raise ValueError(f"Invalid navigation config: {SETTINGS_PATH}")
-    for section in ("simulation", "scene"):
-        if section not in data or not isinstance(data[section], dict):
-            raise ValueError(f"navigation.yaml 缺少 {section} 配置")
+
+    simulation = data.get("simulation")
+    scene = data.get("scene")
+    if not isinstance(simulation, dict):
+        raise ValueError("navigation.yaml 缺少 simulation 配置")
+    if not isinstance(scene, dict):
+        raise ValueError("navigation.yaml 缺少 scene 配置")
+
+    required_scene_fields = {
+        "prim_path",
+        "add_default_ground_plane",
+        "stage_load_timeout_sec",
+        "add_indoor_lighting",
+    }
+    missing = required_scene_fields - set(scene)
+    if missing:
+        raise ValueError(
+            f"navigation.yaml scene 缺少字段：{sorted(missing)}"
+        )
+
     return data
 
 
 def _load_episode_database(path: Path) -> dict:
     if not path.exists():
-        return {"schema_version": 1, "episodes": []}
+        return {
+            "schema_version": 1,
+            "episodes": [],
+        }
 
     with path.open(encoding="utf-8") as handle:
         data = json.load(handle)
 
-    if not isinstance(data, dict):
-        raise ValueError("Episode JSON 顶层必须是对象")
-    if data.get("schema_version") != 1:
+    if not isinstance(data, dict) or set(data) != {"schema_version", "episodes"}:
         raise ValueError(
-            f"不支持的 schema_version={data.get('schema_version')!r}，当前只支持 1"
+            "episodes.json 顶层必须且只能包含 schema_version 和 episodes"
         )
-    if not isinstance(data.get("episodes"), list):
-        raise ValueError("Episode JSON 的 episodes 必须是数组")
+
+    if data["schema_version"] != 1:
+        raise ValueError(
+            f"不支持的 schema_version={data['schema_version']!r}，当前只支持 1"
+        )
+
+    if not isinstance(data["episodes"], list):
+        raise ValueError("episodes.json 的 episodes 必须是数组")
+
     return data
 
 
@@ -85,24 +112,29 @@ def _atomic_write_episode_database(path: Path, data: dict) -> None:
     temporary.replace(path)
 
 
-def _world_pose_from_stage(stage, robot_root_path: str) -> tuple[float, float, float]:
+def _world_pose_from_stage(
+    stage,
+    robot_root_path: str,
+) -> tuple[float, float, float]:
+    """Read robot-root world X/Y/yaw directly from USD, including manual gizmo edits."""
     from pxr import Gf, Usd, UsdGeom
 
     prim = stage.GetPrimAtPath(robot_root_path)
     if not prim or not prim.IsValid():
         raise RuntimeError(f"机器人根 Prim 不存在：{robot_root_path}")
 
-    cache = UsdGeom.XformCache(Usd.TimeCode.Default())
-    world_matrix = cache.GetLocalToWorldTransform(prim)
+    xform_cache = UsdGeom.XformCache(Usd.TimeCode.Default())
+    world_matrix = xform_cache.GetLocalToWorldTransform(prim)
     translation = world_matrix.ExtractTranslation()
 
     transform = Gf.Transform(world_matrix)
-    quaternion = transform.GetRotation().GetQuat()
-    w = float(quaternion.GetReal())
-    imaginary = quaternion.GetImaginary()
-    x = float(imaginary[0])
-    y = float(imaginary[1])
-    z = float(imaginary[2])
+    quat = transform.GetRotation().GetQuat()
+
+    w = float(quat.GetReal())
+    imag = quat.GetImaginary()
+    x = float(imag[0])
+    y = float(imag[1])
+    z = float(imag[2])
 
     yaw_rad = math.atan2(
         2.0 * (w * z + x * y),
@@ -111,7 +143,11 @@ def _world_pose_from_stage(stage, robot_root_path: str) -> tuple[float, float, f
     yaw_deg = math.degrees(yaw_rad)
     yaw_deg = (yaw_deg + 180.0) % 360.0 - 180.0
 
-    return float(translation[0]), float(translation[1]), float(yaw_deg)
+    return (
+        float(translation[0]),
+        float(translation[1]),
+        float(yaw_deg),
+    )
 
 
 class EpisodeRecorderPanel:
@@ -141,10 +177,11 @@ class EpisodeRecorderPanel:
 
         self.window = ui.Window(
             "Navigation Episode Recorder",
-            width=560,
+            width=620,
             height=430,
             visible=True,
         )
+
         with self.window.frame:
             with ui.VStack(spacing=8):
                 ui.Label("Scene")
@@ -156,15 +193,19 @@ class EpisodeRecorderPanel:
                 ui.Separator()
 
                 ui.Label("Episode ID")
-                ui.StringField(self._episode_id_model)
+                ui.StringField(model=self._episode_id_model)
 
                 ui.Label("Name")
-                ui.StringField(self._name_model)
+                ui.StringField(model=self._name_model)
 
                 ui.Label("Instruction")
-                ui.StringField(self._instruction_model, height=60)
+                ui.StringField(
+                    model=self._instruction_model,
+                    height=60,
+                )
 
                 ui.Separator()
+
                 self._pose_label = ui.Label("Pose: waiting...")
                 self._status_label = ui.Label(
                     "拖拽机器人后点击 Record Current Pose。"
@@ -179,6 +220,10 @@ class EpisodeRecorderPanel:
                         "Record Current Pose",
                         clicked_fn=self._record_current_pose,
                     )
+                    ui.Button(
+                        "Refresh Pose",
+                        clicked_fn=self.refresh_pose,
+                    )
 
         self._select_robot()
         self.refresh_pose()
@@ -190,7 +235,9 @@ class EpisodeRecorderPanel:
                 self._robot_root_path,
             )
             self._pose_label.text = (
-                f"Pose: x={x_m:.3f} m, y={y_m:.3f} m, yaw={yaw_deg:.2f} deg"
+                f"Pose: x={x_m:.3f} m, "
+                f"y={y_m:.3f} m, "
+                f"yaw={yaw_deg:.2f} deg"
             )
         except Exception as exc:
             self._pose_label.text = f"Pose unavailable: {exc}"
@@ -204,19 +251,29 @@ class EpisodeRecorderPanel:
 
             context = omni.usd.get_context()
             selection = context.get_selection()
-            selection.set_selected_prim_paths([self._robot_root_path], True)
+            selection.set_selected_prim_paths(
+                [self._robot_root_path],
+                True,
+            )
             self._status_label.text = (
-                f"已选择 {self._robot_root_path}；可使用 Transform gizmo 拖拽。"
+                f"已选择 {self._robot_root_path}，"
+                "可使用 Transform gizmo 拖拽/旋转机器人。"
             )
         except Exception as exc:
             self._status_label.text = f"选择机器人失败：{exc}"
-            self._logger.exception("[EpisodeRecorder] failed to select robot")
+            self._logger.exception(
+                "[EpisodeRecorder] failed to select robot"
+            )
 
     def _record_current_pose(self) -> None:
         try:
-            episode_id = self._episode_id_model.get_value_as_string().strip()
+            episode_id = (
+                self._episode_id_model.get_value_as_string().strip()
+            )
             name = self._name_model.get_value_as_string().strip()
-            instruction = self._instruction_model.get_value_as_string().strip()
+            instruction = (
+                self._instruction_model.get_value_as_string().strip()
+            )
 
             if not episode_id:
                 raise ValueError("Episode ID 不能为空")
@@ -231,6 +288,7 @@ class EpisodeRecorderPanel:
             )
 
             database = _load_episode_database(self._output_path)
+
             duplicate = next(
                 (
                     episode
@@ -241,7 +299,9 @@ class EpisodeRecorderPanel:
                 None,
             )
             if duplicate is not None:
-                raise ValueError(f"Episode ID 已存在：{episode_id}")
+                raise ValueError(
+                    f"Episode ID 已存在：{episode_id}"
+                )
 
             episode = {
                 "id": episode_id,
@@ -254,15 +314,24 @@ class EpisodeRecorderPanel:
                 },
                 "instruction": instruction,
             }
+
             database["episodes"].append(episode)
-            _atomic_write_episode_database(self._output_path, database)
+            _atomic_write_episode_database(
+                self._output_path,
+                database,
+            )
 
             self._status_label.text = (
                 f"已追加 {episode_id}: "
-                f"x={x_m:.3f}, y={y_m:.3f}, yaw={yaw_deg:.2f}°"
+                f"x={x_m:.3f}, "
+                f"y={y_m:.3f}, "
+                f"yaw={yaw_deg:.2f}°"
             )
+
             self._logger.info(
-                "[EpisodeRecorder] saved id=%s scene=%s pose=[%.3f,%.3f,%.2f] output=%s",
+                "[EpisodeRecorder] saved "
+                "id=%s scene=%s "
+                "pose=[%.3f,%.3f,%.2f] output=%s",
                 episode_id,
                 self._scene_json_path,
                 x_m,
@@ -270,43 +339,92 @@ class EpisodeRecorderPanel:
                 yaw_deg,
                 self._output_path,
             )
+
         except Exception as exc:
             self._status_label.text = f"记录失败：{exc}"
-            self._logger.exception("[EpisodeRecorder] record failed")
+            self._logger.exception(
+                "[EpisodeRecorder] record failed"
+            )
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="加载场景和 AGX，并通过 Isaac Sim UI 记录 VLN episode 起点。"
+        description=(
+            "加载指定场景和 AGX，"
+            "通过 Isaac Sim UI 手动摆放机器人并记录 VLN episode。"
+        )
     )
+
     parser.add_argument(
         "--scene",
-        default=None,
-        help="场景 USD/USDA 路径；省略时使用 configs/navigation.yaml 的 scene.usd_path。",
+        required=True,
+        help=(
+            "要记录的场景 USD/USDA 路径。"
+            "相对路径按工程根目录解析。"
+        ),
     )
+
     parser.add_argument(
         "--output",
         default=str(DEFAULT_OUTPUT_PATH),
-        help="Episode JSON 输出路径；默认 configs/episodes.json。",
+        help=(
+            "Episode JSON 输出路径；"
+            "默认 configs/episodes.json。"
+        ),
     )
-    parser.add_argument("--episode-id", default="", help="预填 Episode ID。")
-    parser.add_argument("--name", default="", help="预填 Episode 名称。")
-    parser.add_argument("--instruction", default="", help="预填导航指令。")
+
+    parser.add_argument(
+        "--episode-id",
+        default="",
+        help="预填 Episode ID。",
+    )
+    parser.add_argument(
+        "--name",
+        default="",
+        help="预填 Episode 名称。",
+    )
+    parser.add_argument(
+        "--instruction",
+        default="",
+        help="预填导航指令。",
+    )
+
+    parser.add_argument(
+        "--initial-x",
+        type=float,
+        default=0.0,
+        help="机器人加载后的初始 X，仅用于方便拖拽，默认 0。",
+    )
+    parser.add_argument(
+        "--initial-y",
+        type=float,
+        default=0.0,
+        help="机器人加载后的初始 Y，仅用于方便拖拽，默认 0。",
+    )
+    parser.add_argument(
+        "--initial-yaw",
+        type=float,
+        default=0.0,
+        help="机器人加载后的初始 yaw，仅用于方便拖拽，默认 0 度。",
+    )
+
     return parser.parse_args()
 
 
 def main() -> int:
     args = _parse_args()
+
     settings = _load_navigation_settings()
     profile = load_agx_profile(project_root=PROJECT_ROOT)
     logger = _make_logger()
 
     scene_settings = settings["scene"]
-    scene_path = _resolve_project_path(
-        args.scene if args.scene is not None else scene_settings["usd_path"]
-    )
+
+    scene_path = _resolve_project_path(args.scene)
     if not scene_path.is_file():
-        raise FileNotFoundError(f"Scene USD 不存在：{scene_path}")
+        raise FileNotFoundError(
+            f"Scene USD 不存在：{scene_path}"
+        )
 
     output_path = _resolve_project_path(args.output)
     scene_json_path = _json_scene_path(scene_path)
@@ -317,13 +435,16 @@ def main() -> int:
     app = SimulationApp(
         {
             "headless": False,
-            "active_gpu": simulation_settings["active_gpu"],
-            "physics_gpu": simulation_settings["physics_gpu"],
-            "multi_gpu": simulation_settings["multi_gpu"],
+            "active_gpu": simulation_settings.get("active_gpu"),
+            "physics_gpu": simulation_settings.get("physics_gpu"),
+            "multi_gpu": bool(
+                simulation_settings.get("multi_gpu", False)
+            ),
         }
     )
 
     panel = None
+
     try:
         import omni.ui as ui
         from isaacsim.core.api import World
@@ -333,14 +454,21 @@ def main() -> int:
             is_stage_loading,
         )
 
+        # World 只用于保持与主导航一致的 stage/unit 配置。
+        # Recorder 不启动导航，也不需要播放物理仿真。
         world = World(
             physics_dt=float(profile.simulation.physics_dt),
             rendering_dt=float(profile.simulation.rendering_dt),
             stage_units_in_meters=1.0,
         )
+
         stage = get_current_stage()
 
-        add_reference_to_stage(str(scene_path), str(scene_settings["prim_path"]))
+        add_reference_to_stage(
+            str(scene_path),
+            str(scene_settings["prim_path"]),
+        )
+
         if bool(scene_settings["add_default_ground_plane"]):
             world.scene.add_default_ground_plane()
 
@@ -352,7 +480,9 @@ def main() -> int:
         wait_for_stage_assets(
             simulation_app=app,
             is_stage_loading=is_stage_loading,
-            timeout_sec=float(scene_settings["stage_load_timeout_sec"]),
+            timeout_sec=float(
+                scene_settings["stage_load_timeout_sec"]
+            ),
             logger=logger,
             label="episode recorder scene",
         )
@@ -361,24 +491,32 @@ def main() -> int:
             try:
                 add_indoor_lighting(
                     stage=stage,
-                    environment_prim_path=str(scene_settings["prim_path"]),
+                    environment_prim_path=str(
+                        scene_settings["prim_path"]
+                    ),
                     logger=logger,
                 )
             except Exception:
-                logger.exception("[EpisodeRecorder] failed to add indoor lighting")
+                logger.exception(
+                    "[EpisodeRecorder] "
+                    "failed to add indoor lighting"
+                )
 
+        # 最新 navigation.yaml 已不再保存 start pose。
+        # Recorder 只给机器人一个方便手动摆放的初始位姿，
+        # 真正写入 episodes.json 的位姿来自点击按钮时的当前 USD world pose。
         set_local_xform(
             stage=stage,
             prim_path=profile.asset.prim_path,
             translation=[
-                float(scene_settings["start_xy_m"][0]),
-                float(scene_settings["start_xy_m"][1]),
+                float(args.initial_x),
+                float(args.initial_y),
                 float(profile.spawn_z_m),
             ],
             rotation_deg=[
                 0.0,
                 0.0,
-                float(scene_settings["start_yaw_deg"]),
+                float(args.initial_yaw),
             ],
         )
 
@@ -394,14 +532,25 @@ def main() -> int:
             logger=logger,
         )
 
-        logger.info("[EpisodeRecorder] scene=%s", scene_path)
-        logger.info("[EpisodeRecorder] robot=%s", profile.asset.prim_path)
-        logger.info("[EpisodeRecorder] output=%s", output_path)
         logger.info(
-            "[EpisodeRecorder] Isaac Sim 保持暂停状态；拖拽机器人后点击 Record Current Pose。"
+            "[EpisodeRecorder] scene=%s",
+            scene_path,
+        )
+        logger.info(
+            "[EpisodeRecorder] robot=%s",
+            profile.asset.prim_path,
+        )
+        logger.info(
+            "[EpisodeRecorder] output=%s",
+            output_path,
+        )
+        logger.info(
+            "[EpisodeRecorder] "
+            "保持仿真暂停；手动拖拽机器人后点击 "
+            "Record Current Pose。"
         )
 
-        # 先刷新一帧，确保窗口已经真正提交给 Kit UI。
+        # 先提交一次 UI。
         app.update()
 
         while app.is_running():
@@ -409,11 +558,10 @@ def main() -> int:
             app.update()
 
     except BaseException:
-        # Isaac/Kit 有时会在 app.close() 后吞掉 Python 异常输出；
-        # 在关闭 SimulationApp 之前显式打印 traceback，便于定位。
         import traceback
         traceback.print_exc()
         raise
+
     finally:
         if panel is not None:
             panel.shutdown()

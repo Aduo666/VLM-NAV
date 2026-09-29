@@ -12,7 +12,7 @@
 - 世界位姿、实测速度、人工控制量和实际执行控制量；
 - 转向关节与车轮速度；
 - 相机内参和当前外参；
-- 采集开始前确定的世界目标和每帧相对目标。
+- 采集开始前确定的二维世界目标坐标。
 
 ## 启动
 
@@ -38,7 +38,7 @@ python -m constraint_traverse.collect.collect \
 | `A` 或 `←` | 左转 |
 | `D` 或 `→` | 右转 |
 
-组合按键可以生成前进转弯和后退转弯。
+按住 `↑+←/→` 或 `W+A/D` 可以边前进边转弯；按住 `↓+←/→` 或 `S+A/D` 可以边后退边转弯；单独按 `←/→` 或 `A/D` 原地转向。
 
 采集流程：
 
@@ -49,21 +49,22 @@ python -m constraint_traverse.collect.collect \
 → 等待 Goal Map 建立可通行区域
 → 在 Goal Map 的已知自由区域点击目标
 → START DEMO
-→ 地图预热
 → 人工穿越受限空间
 → 在终点停稳
 → SUCCESS
 ```
 
 - `BORN`：第一次点击暂停物理并选中机器人，第二次点击恢复物理并确认出生位姿。
-- `Goal Map`：`IDLE` 状态持续使用主导航的前视、下视 RGB-D 和 `LocalVoxelMap` 建图。点击已知自由区域后，红色圆点表示目标；场景中不创建任何目标几何或标记。
+- `Goal Map`：`IDLE` 状态持续使用主导航的前视、下视 RGB-D、`LocalVoxelMap` 和 `render_bev_goal_map` 建图。显示范围、分辨率和刷新周期读取主导航 `map_selector`，当前为 `10 m` 视野、`1.5 m` 后方范围和 `420×420` 像素。点击已知自由区域后，红色圆点表示目标；场景中不创建任何目标几何或标记。
 - `RESET MAP`：在 `IDLE` 状态清空当前局部地图。
-- `START DEMO`：锁定已确认目标、记录起点、清空 episode 地图并开始采集。
+- `START DEMO`：锁定已确认目标、记录起点并立即开始采集，继续使用当前地图。
 - `SUCCESS`：保存成功示范，保存的目标保持为采集开始前确认的目标。
 - `DISCARD`：删除当前示范。
 - `RESET TO START`：删除当前未完成示范并回到最近一次起点。
 
 `Collector Controls` 面板显示 `State`、`Episode`、`Samples`、`Time`、当前操作步骤和键盘说明，提供 `BORN`、`RESET MAP`、`START DEMO`、`SUCCESS`、`DISCARD` 和 `RESET TO START` 按钮。
+
+目标只在 `meta.json` 中保存为 `goal_world_xy: [x, y]`。`state.npz` 不保存目标航向，也不重复保存目标坐标。训练和回放需要机器人坐标目标时，根据 `goal_world_xy` 与每帧 `pose_world_xyyaw` 临时计算。`SUCCESS` 的位置容差为 `0.30 m`，不检查目标航向。
 
 ## 数据目录
 
@@ -104,6 +105,15 @@ python -m constraint_traverse.collect.replay \
 ```
 
 回放窗口同步显示前视 RGB、两路深度、BEV、世界位姿、相对目标、人工控制量和实际执行控制量。
+
+当 OpenCV 缺少 GUI 后端时，回放器自动在场景数据目录生成 `<episode_name>_replay.mp4`。也可以指定输出位置：
+
+```bash
+python -m constraint_traverse.collect.replay \
+  /Data/qiang/data/constraint_traverse/<scene_name>/episode_000001 \
+  --fps 10 \
+  --output /tmp/episode_000001_replay.mp4
+```
 
 ## 配置
 

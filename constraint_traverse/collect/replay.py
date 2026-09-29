@@ -14,6 +14,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Replay a collected traversal episode")
     parser.add_argument("episode", type=Path)
     parser.add_argument("--fps", type=float, default=10.0)
+    parser.add_argument("--output", type=Path)
     return parser.parse_args()
 
 
@@ -25,7 +26,6 @@ def main() -> int:
         count = int(len(data["sample_time_sec"]))
         human = np.asarray(data["human_action_vw"], dtype=np.float32)
         applied = np.asarray(data["applied_action_vw"], dtype=np.float32)
-        goal = np.asarray(data["goal_body_xyyaw"], dtype=np.float32)
         pose = np.asarray(data["pose_world_xyyaw"], dtype=np.float32)
 
     delay_ms = max(1, int(round(1000.0 / max(args.fps, 0.1))))
@@ -36,54 +36,114 @@ def main() -> int:
     start_world = np.asarray(
         meta.get("start_pose_world_xyyaw", pose[0]), dtype=np.float64
     )
-    goal_world_value = meta.get("goal_pose_world_xyyaw")
+    goal_world_value = meta.get("goal_world_xy")
+    if goal_world_value is None:
+        legacy_goal = meta.get("goal_pose_world_xyyaw")
+        goal_world_value = None if legacy_goal is None else legacy_goal[:2]
     goal_world = (
         None
         if goal_world_value is None
         else np.asarray(goal_world_value, dtype=np.float64)
     )
     bev_config = meta.get("bev", {})
+    gui_available = _opencv_gui_available()
+    output_path = None
+    if args.output is not None:
+        output_path = args.output.expanduser().resolve()
+    elif not gui_available:
+        output_path = episode.parent / f"{episode.name}_replay.mp4"
+    writer = None
+    if output_path is not None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        print(f"mode=video output={output_path}")
+    else:
+        print("mode=interactive")
 
-    for index in range(count):
-        stem = f"{index:06d}"
-        rgb = cv2.imread(str(episode / "front_rgb" / f"{stem}.jpg"), cv2.IMREAD_COLOR)
-        front_depth = decode_depth_png(episode / "front_depth" / f"{stem}.png")
-        down_depth = decode_depth_png(episode / "down_depth" / f"{stem}.png")
-        bev = np.load(episode / "bev" / f"{stem}.npy", allow_pickle=False)
+    try:
+        for index in range(count):
+            stem = f"{index:06d}"
+            rgb = cv2.imread(
+                str(episode / "front_rgb" / f"{stem}.jpg"),
+                cv2.IMREAD_COLOR,
+            )
+            front_depth = decode_depth_png(
+                episode / "front_depth" / f"{stem}.png"
+            )
+            down_depth = decode_depth_png(
+                episode / "down_depth" / f"{stem}.png"
+            )
+            bev = np.load(
+                episode / "bev" / f"{stem}.npy",
+                allow_pickle=False,
+            )
 
-        if rgb is None:
-            raise RuntimeError(f"Missing RGB frame {stem}")
-        start_body = _world_xy_to_body(start_world[:2], pose[index])
-        trajectory_body = _world_xy_to_body(pose[:, :2], pose[index])
-        goal_body = (
-            None
-            if goal_world is None
-            else _world_xy_to_body(goal_world[:2], pose[index])
-        )
-        canvas = _compose(
-            rgb=rgb,
-            front_depth=front_depth,
-            down_depth=down_depth,
-            bev=bev,
-            index=index,
-            pose=pose[index],
-            goal=goal[index],
-            human=human[index],
-            applied=applied[index],
-            bev_config=bev_config,
-            start_body_xy=start_body,
-            goal_body_xy=goal_body,
-            trajectory_body_xy=trajectory_body,
-        )
-        cv2.imshow("Constraint Traverse Replay", canvas)
-        key = cv2.waitKey(delay_ms) & 0xFF
-        if key in (27, ord("q")):
-            break
-        if key == ord(" "):
-            cv2.waitKey(0)
+            if rgb is None:
+                raise RuntimeError(f"Missing RGB frame {stem}")
+            start_body = _world_xy_to_body(start_world[:2], pose[index])
+            trajectory_body = _world_xy_to_body(pose[:, :2], pose[index])
+            goal_body = (
+                None
+                if goal_world is None
+                else _world_xy_to_body(goal_world[:2], pose[index])
+            )
+            canvas = _compose(
+                rgb=rgb,
+                front_depth=front_depth,
+                down_depth=down_depth,
+                bev=bev,
+                index=index,
+                pose=pose[index],
+                goal=(
+                    np.full(2, np.nan, dtype=np.float32)
+                    if goal_body is None
+                    else goal_body
+                ),
+                human=human[index],
+                applied=applied[index],
+                bev_config=bev_config,
+                start_body_xy=start_body,
+                goal_body_xy=goal_body,
+                trajectory_body_xy=trajectory_body,
+            )
+            if output_path is not None:
+                if writer is None:
+                    height, width = canvas.shape[:2]
+                    writer = cv2.VideoWriter(
+                        str(output_path),
+                        cv2.VideoWriter_fourcc(*"mp4v"),
+                        max(float(args.fps), 0.1),
+                        (width, height),
+                    )
+                    if not writer.isOpened():
+                        raise RuntimeError(
+                            f"Unable to create replay video: {output_path}"
+                        )
+                writer.write(canvas)
+                continue
 
-    cv2.destroyAllWindows()
+            cv2.imshow("Constraint Traverse Replay", canvas)
+            key = cv2.waitKey(delay_ms) & 0xFF
+            if key in (27, ord("q")):
+                break
+            if key == ord(" "):
+                cv2.waitKey(0)
+    finally:
+        if writer is not None:
+            writer.release()
+        if gui_available and output_path is None:
+            cv2.destroyAllWindows()
+
+    if output_path is not None:
+        print(f"saved={output_path}")
     return 0
+
+
+def _opencv_gui_available() -> bool:
+    for line in cv2.getBuildInformation().splitlines():
+        stripped = line.strip()
+        if stripped.startswith("GUI:"):
+            return stripped.split(":", 1)[1].strip().upper() != "NONE"
+    return False
 
 
 def _compose(
@@ -120,7 +180,7 @@ def _compose(
     lines = [
         f"frame={index}",
         f"pose=({pose[0]:.2f}, {pose[1]:.2f}, {np.degrees(pose[2]):.1f}deg)",
-        f"goal_body=({goal[0]:.2f}, {goal[1]:.2f}, {np.degrees(goal[2]):.1f}deg)",
+        f"goal_body=({goal[0]:.2f}, {goal[1]:.2f})",
         f"human=(v={human[0]:.2f}, w={human[1]:.2f})",
         f"applied=(v={applied[0]:.2f}, w={applied[1]:.2f})",
     ]

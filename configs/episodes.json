@@ -22,6 +22,39 @@
         "yaw_deg": -90.0
       },
       "instruction": "Leave the kitchen and turn right into the bedroom on the left."
+    },
+    {
+      "id": "kujiale_0004_001",
+      "name": "3",
+      "usd_path": "/Data/qiang/interiornav_data/scene_data/kujiale_0004/kujiale_0004.usda",
+      "start_pose": {
+        "x_m": 5.4009,
+        "y_m": -1.4496,
+        "yaw_deg": 179.18
+      },
+      "instruction": "Walk forward through the living room, turn left at the table, then go right into the bedroom."
+    },
+    {
+      "id": "kujiale_0004_002",
+      "name": "4",
+      "usd_path": "/Data/qiang/interiornav_data/scene_data/kujiale_0004/kujiale_0004.usda",
+      "start_pose": {
+        "x_m": -3.3598,
+        "y_m": 4.9056,
+        "yaw_deg": 14.68
+      },
+      "instruction": "离开房间，向右转穿过走廊，然后向右进入厨房"
+    },
+    {
+      "id": "kujiale_0008_001",
+      "name": "5",
+      "usd_path": "/Data/qiang/interiornav_data/scene_data/kujiale_0008/kujiale_0008.usda",
+      "start_pose": {
+        "x_m": 0.1994,
+        "y_m": 3.3818,
+        "yaw_deg": 88.64
+      },
+      "instruction": "Go into the room in front."
     }
   ]
 }

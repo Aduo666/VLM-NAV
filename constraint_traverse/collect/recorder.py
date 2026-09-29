@@ -41,7 +41,6 @@ class SampleRecord:
     front_base_from_camera: np.ndarray
     down_base_from_camera: np.ndarray
     map_version: int
-    goal_body_xyyaw: np.ndarray
 
 
 class EpisodeRecorder:
@@ -87,7 +86,7 @@ class EpisodeRecorder:
         *,
         start_pose_world: np.ndarray,
         start_position_world_xyz: np.ndarray,
-        goal_pose_world: np.ndarray,
+        goal_world_xy: np.ndarray,
         start_time_sec: float,
         extra_meta: dict | None = None,
     ) -> Path:
@@ -124,7 +123,6 @@ class EpisodeRecorder:
             "front_base_from_camera": [],
             "down_base_from_camera": [],
             "map_version": [],
-            "goal_body_xyyaw": [],
         }
         self._meta_seed = {
             "episode_id": f"{index:06d}",
@@ -134,7 +132,7 @@ class EpisodeRecorder:
             "repository_revision": _repository_revision(),
             "start_pose_world_xyyaw": _json_vector(start_pose_world),
             "start_position_world_xyz": _json_vector(start_position_world_xyz),
-            "goal_pose_world_xyyaw": _json_vector(goal_pose_world),
+            "goal_world_xy": _json_vector(goal_world_xy),
             "start_time_sec": float(start_time_sec),
             "depth_encoding": {
                 "format": "uint16_png_millimeters",
@@ -193,7 +191,6 @@ class EpisodeRecorder:
             "front_base_from_camera": np.asarray(sample.front_base_from_camera, dtype=np.float32),
             "down_base_from_camera": np.asarray(sample.down_base_from_camera, dtype=np.float32),
             "map_version": int(sample.map_version),
-            "goal_body_xyyaw": np.asarray(sample.goal_body_xyyaw, dtype=np.float32),
         }
         for key, value in values.items():
             self._state[key].append(value)
@@ -212,22 +209,11 @@ class EpisodeRecorder:
         self._flush_pending()
         count = len(self._state["sample_time_sec"])
         end_pose = np.asarray(end_pose_world, dtype=np.float32).reshape(3)
-        if success:
-            goal_body = np.asarray(
-                self._state["goal_body_xyyaw"], dtype=np.float32
-            ).reshape(count, 3)
-            goal_world = np.asarray(
-                self._meta_seed["goal_pose_world_xyyaw"], dtype=np.float32
-            ).reshape(3)
-        else:
-            goal_body = np.full((count, 3), np.nan, dtype=np.float32)
-            goal_world = None
 
         arrays = {
             key: np.asarray(values)
             for key, values in self._state.items()
         }
-        arrays["goal_body_xyyaw"] = goal_body
         arrays["front_intrinsics"] = (
             np.asarray(self._front_intrinsics, dtype=np.float64)
             if self._front_intrinsics is not None
@@ -245,7 +231,6 @@ class EpisodeRecorder:
             **self._meta_seed,
             "success": bool(success),
             "failure_reason": None if success else str(failure_reason or "unspecified"),
-            "goal_pose_world_xyyaw": None if goal_world is None else _json_vector(goal_world),
             "end_pose_world_xyyaw": _json_vector(end_pose),
             "end_time_sec": float(end_time_sec),
             "duration_sec": max(0.0, float(end_time_sec) - start_time),
@@ -331,7 +316,6 @@ def validate_episode_directory(path: Path) -> list[str]:
                 "front_base_from_camera",
                 "down_base_from_camera",
                 "map_version",
-                "goal_body_xyyaw",
                 "front_intrinsics",
                 "down_intrinsics",
             }
@@ -362,7 +346,6 @@ def validate_episode_directory(path: Path) -> list[str]:
                     "front_base_from_camera": (count, 4, 4),
                     "down_base_from_camera": (count, 4, 4),
                     "map_version": (count,),
-                    "goal_body_xyyaw": (count, 3),
                     "front_intrinsics": (3, 3),
                     "down_intrinsics": (3, 3),
                 }
@@ -374,31 +357,31 @@ def validate_episode_directory(path: Path) -> list[str]:
                 ts = np.asarray(data["sample_time_sec"], dtype=np.float64)
                 if not np.isfinite(ts).all() or np.any(np.diff(ts) <= 0):
                     errors.append("sample timestamps are not finite and strictly increasing")
-                finite_keys = sequence_keys - {"goal_body_xyyaw"}
-                finite_keys |= {"front_intrinsics", "down_intrinsics"}
+                finite_keys = sequence_keys | {"front_intrinsics", "down_intrinsics"}
                 for key in sorted(finite_keys):
                     if not np.isfinite(np.asarray(data[key], dtype=np.float64)).all():
                         errors.append(f"{key} contains non-finite values")
                 if bool(meta.get("success")):
-                    goal = np.asarray(data["goal_body_xyyaw"], dtype=np.float64)
-                    if not np.isfinite(goal).all():
-                        errors.append("successful episode contains non-finite relative goal labels")
-                    collection = meta.get("collection", {})
-                    if isinstance(collection, dict) and len(goal):
-                        position_tolerance = float(
-                            collection.get("success_goal_position_tolerance_m", 0.15)
+                    goal_value = meta.get("goal_world_xy")
+                    if goal_value is None:
+                        legacy_goal = meta.get("goal_pose_world_xyyaw")
+                        goal_value = (
+                            None if legacy_goal is None else legacy_goal[:2]
                         )
-                        yaw_tolerance = np.radians(float(
-                            collection.get("success_goal_yaw_tolerance_deg", 10.0)
-                        ))
-                        if np.linalg.norm(goal[-1, :2]) > position_tolerance:
-                            errors.append("last relative goal position exceeds tolerance")
-                        if abs(float(goal[-1, 2])) > yaw_tolerance:
-                            errors.append("last relative goal yaw exceeds tolerance")
-                else:
-                    goal = np.asarray(data["goal_body_xyyaw"], dtype=np.float64)
-                    if not np.isnan(goal).all():
-                        errors.append("failed episode relative goal labels must be NaN")
+                    goal_world_xy = np.asarray(goal_value, dtype=np.float64)
+                    if (
+                        goal_world_xy.shape != (2,)
+                        or not np.isfinite(goal_world_xy).all()
+                    ):
+                        errors.append("successful episode world goal XY is invalid")
+                    else:
+                        poses = np.asarray(
+                            data["pose_world_xyyaw"], dtype=np.float64
+                        )
+                        if np.linalg.norm(
+                            poses[-1, :2] - goal_world_xy
+                        ) > 0.30:
+                            errors.append("last world position exceeds goal tolerance")
 
                 teleop = meta.get("teleop", {})
                 if isinstance(teleop, dict):

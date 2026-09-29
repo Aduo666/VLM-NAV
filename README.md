@@ -33,7 +33,8 @@
 ## 环境与运行
 
 - 在 conda 环境中安装 Isaac Sim 5.1 和 [requirements.txt](requirements.txt) 中的依赖。
-- S2 地址、指令和 pixel-goal 转换参数位于 [导航配置](configs/navigation.yaml) 的 `internnav_s2` 段。
+- S2 地址和 pixel-goal 转换参数位于 [导航配置](configs/navigation.yaml) 的 `internnav_s2` 段。
+- 场景文件、初始位姿和导航指令位于 [任务清单](configs/episodes.json)。
 - `COARSE` 模式需要启动 NavDP 服务，其地址由 [导航配置](configs/navigation.yaml) 的 `server.base_url` 指定。
 - AGX 的 USD、相机和轮组参数位于 [AGX 配置](configs/robots/agx.yaml)。
 
@@ -42,11 +43,13 @@ conda activate vlmnav
 bash scripts/run_nav.sh
 ```
 
-完整导航需要先启动远程 S2 服务和 NavDP 服务，再运行主程序。主程序获得有效前视帧后自动调用 `/reset` 创建会话，随后通过 `/infer` 执行配置中的指令。S2 输出 `LOOKDOWN` 时，程序停车并将固定下视相机的新图像发回同一会话。
+启动后，终端会列出 `episodes.json` 中的任务。输入任务编号后，程序才会启动 Isaac Sim，并使用该任务的场景、初始位姿和指令。输入无效编号时会要求重新输入，不会自动选择任务。
+
+完整导航需要先启动远程 S2 服务和 NavDP 服务，再运行主程序。主程序获得有效前视帧后自动调用 `/reset` 创建会话，随后通过 `/infer` 执行所选任务的指令。S2 输出 `LOOKDOWN` 时，程序停车并将固定下视相机的新图像发回同一会话。
 
 Isaac Sim 中只保留 `S2 Decision` 和 `Goal Map` 两个导航窗口。任务开始、局部目标切换和最终停止均由主导航自动处理。点击 Goal Map 中的已知空闲位置仍可执行手动点目标导航，方向键可以手动控制 AGX。
 
-切换场景时，在 [导航配置](configs/navigation.yaml) 的 `scene` 段一起修改 `usd_path`、`start_xy_m` 与 `start_yaw_deg`。XY 和朝向使用场景世界坐标，初始高度由 AGX 配置决定。`add_indoor_lighting` 控制运行时室内灯光；原始场景 USD 不会被修改。
+新增任务时，在 [任务清单](configs/episodes.json) 中增加唯一 `id`、名称、USD 路径、初始 XY、初始朝向和指令。XY 和朝向使用场景世界坐标，初始高度由 AGX 配置决定。[导航配置](configs/navigation.yaml) 中的 `scene` 段只保存场景加载公共参数；`add_indoor_lighting` 控制运行时室内灯光，原始场景 USD 不会被修改。
 
 ## 代码与输出
 
@@ -54,6 +57,8 @@ Isaac Sim 中只保留 `S2 Decision` 和 `Goal Map` 两个导航窗口。任务�
 | --- | --- |
 | [navigation.py](src/vln_nav/app/navigation.py) | 场景加载、目标选择与两种导航模式 |
 | [navigation.yaml](configs/navigation.yaml) | 场景、相机、地图、规划和跟踪参数 |
+| [episodes.json](configs/episodes.json) | 可选择任务的场景、初始位姿和指令 |
+| [episode.py](src/vln_nav/runtime/episode.py) | 任务清单校验与终端选择 |
 | [navdp_client.py](src/vln_nav/navigation/navdp_client.py) | NavDP 请求与轨迹校验 |
 | [internnav_s2_client.py](src/vln_nav/navigation/internnav_s2_client.py) | 远程 S2 请求与输出校验 |
 | [s2_goal_adapter.py](src/vln_nav/navigation/s2_goal_adapter.py) | pixel-goal 深度反投影与 metric goal 转换 |

@@ -115,6 +115,8 @@ execution:
   default_mode: "COARSE"
   # NavDP 滚动推理周期，单位为秒。
   coarse_planning_period_sec: 0.50
+  # 同一局部目标允许连续出现短轨迹的最大次数。
+  max_short_trajectory_retries: 3
   # Hybrid A* 滚动规划周期，单位为秒。
   fine_planning_period_sec: 0.20
   # 沿已知空闲地图路径选择细粒度局部目标的前视距离，单位为米。

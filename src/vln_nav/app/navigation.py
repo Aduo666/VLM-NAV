@@ -751,6 +751,7 @@ def _load_settings() -> tuple[
     if set(execution) != {
         "default_mode",
         "coarse_planning_period_sec",
+        "max_short_trajectory_retries",
         "fine_planning_period_sec",
         "fine_local_goal_lookahead_m",
         "max_result_age_sec",
@@ -761,6 +762,12 @@ def _load_settings() -> tuple[
         raise ValueError("Invalid navigation modes execution fields")
     if execution["default_mode"] not in {"COARSE", "FINE"}:
         raise ValueError("Invalid default navigation mode")
+    if (
+        isinstance(execution["max_short_trajectory_retries"], bool)
+        or not isinstance(execution["max_short_trajectory_retries"], int)
+        or int(execution["max_short_trajectory_retries"]) <= 0
+    ):
+        raise ValueError("execution.max_short_trajectory_retries 必须为正整数")
     if any(
         float(value) <= 0
         for name, value in execution.items()
@@ -941,6 +948,9 @@ def main() -> int:
     try:
         episodes = load_episodes(EPISODES_PATH, project_root=PROJECT_ROOT)
         episode = select_episode(episodes)
+    except KeyboardInterrupt:
+        logger.info("[EpisodeSelection] cancelled")
+        return 130
     except (OSError, ValueError, RuntimeError) as exc:
         logger.error("[EpisodeSelection] failed: %s", exc)
         return 1
@@ -1346,6 +1356,8 @@ def _run(
         float(s2_settings["goal_reached_tolerance_m"]),
         float(settings["goal"]["min_distance_m"]),
     )
+    navdp_short_retry_count = 0
+    navdp_waiting_stable_after_short = False
     logger.info("[NavigationMode] selected=%s", mode)
     if s2_active:
         idle_status = "S2 waiting for first front frame"
@@ -1582,6 +1594,8 @@ def _run(
                             last_failed_fine_input = None
                             last_coarse_request_time = -float("inf")
                             last_fine_request_time = -float("inf")
+                            navdp_short_retry_count = 0
+                            navdp_waiting_stable_after_short = False
                             s2_stop_count = 0
                             idle_status = f"S2 GOAL ACTIVE: {mode}"
                             decision_image = _render_s2_decision(
@@ -1704,33 +1718,61 @@ def _run(
                             selected_goal_odom_xy
                             - np.asarray([state.pose.x, state.pose.y], dtype=np.float64)
                         ))
-                        if current_goal_distance > coarse_goal_tolerance and s2_active:
-                            adapter.stop()
-                            tracker = None
-                            tracker_mode = None
-                            navigation_active = False
-                            selected_goal_odom_xy = None
-                            display_path_odom_xy = None
-                            frozen_candidates = []
-                            s2_actions.clear()
-                            s2_turn_target_yaw_odom = None
-                            s2_stop_count = 0
-                            s2_need_request = True
-                            s2_next_view = "front"
-                            s2_min_frame_index = frame_index + 1
+                        if (
+                            current_goal_distance > coarse_goal_tolerance
+                            and tracker is not None
+                        ):
                             idle_status = (
-                                "NavDP short trajectory; requesting new S2 decision"
+                                "NavDP short trajectory ignored; continuing active tracker"
                             )
                             logger.warning(
                                 "[NavDPShortTrajectory] request=%d path=%s "
-                                "length=%.3fm minimum=%.3fm goal_distance=%.3fm "
-                                "action=s2_front_redecision",
+                                "length=%.3fm goal_distance=%.3fm "
+                                "action=keep_active_tracker",
                                 job.request_id,
                                 error.path_name,
                                 error.length_m,
-                                error.minimum_length_m,
                                 current_goal_distance,
                             )
+                        elif current_goal_distance > coarse_goal_tolerance:
+                            adapter.stop()
+                            tracker = None
+                            tracker_mode = None
+                            display_path_odom_xy = None
+                            frozen_candidates = []
+                            navdp_short_retry_count += 1
+                            maximum_retries = int(
+                                settings["execution"]["max_short_trajectory_retries"]
+                            )
+                            if navdp_short_retry_count >= maximum_retries:
+                                navigation_active = False
+                                navdp_waiting_stable_after_short = False
+                                s2_need_request = False
+                                idle_status = "NAVDP_STALLED"
+                                logger.error(
+                                    "[NavDPStalled] goal_locked=%s retries=%d "
+                                    "goal_distance=%.3fm action=safety_hold",
+                                    selected_goal_odom_xy.tolist(),
+                                    navdp_short_retry_count,
+                                    current_goal_distance,
+                                )
+                            else:
+                                navdp_waiting_stable_after_short = True
+                                idle_status = (
+                                    "NavDP short trajectory; waiting to stop before retry"
+                                )
+                                logger.warning(
+                                    "[NavDPShortTrajectory] request=%d path=%s "
+                                    "length=%.3fm minimum=%.3fm goal_distance=%.3fm "
+                                    "retry=%d/%d action=hold_goal_wait_stop",
+                                    job.request_id,
+                                    error.path_name,
+                                    error.length_m,
+                                    error.minimum_length_m,
+                                    current_goal_distance,
+                                    navdp_short_retry_count,
+                                    maximum_retries,
+                                )
                         else:
                             idle_status = "NavDP short trajectory near local goal"
                             logger.info(
@@ -1750,6 +1792,8 @@ def _run(
                         )
                 else:
                     result_age = now - float(job.odom_state.timestamp_sec)
+                    navdp_short_retry_count = 0
+                    navdp_waiting_stable_after_short = False
                     model_choice = result.model_choice
                     logger.info(
                         "[NavDPResult] request=%d candidates=%d selected=%d "
@@ -2012,6 +2056,8 @@ def _run(
                             generation_index = 0
                             last_coarse_request_time = -float("inf")
                             last_fine_request_time = -float("inf")
+                            navdp_short_retry_count = 0
+                            navdp_waiting_stable_after_short = False
                             idle_status = f"GOAL ACTIVE: {mode}"
                             logger.info(
                                 "[NavigationGoal] mode=%s forward=%.2fm left=%+.2fm "
@@ -2054,6 +2100,8 @@ def _run(
                     goal_distance,
                 )
                 selected_goal_odom_xy = None
+                navdp_short_retry_count = 0
+                navdp_waiting_stable_after_short = False
                 if s2_active:
                     if not s2_actions:
                         s2_need_request = True
@@ -2107,6 +2155,8 @@ def _run(
                     navigation_active = True
                     last_coarse_request_time = -float("inf")
                     last_fine_request_time = -float("inf")
+                    navdp_short_retry_count = 0
+                    navdp_waiting_stable_after_short = False
                     idle_status = f"S2 FORWARD: {mode}"
                     logger.info(
                         "[S2Action] FORWARD distance=%.2fm remaining_actions=%s",
@@ -2308,10 +2358,21 @@ def _run(
                             episode.instruction,
                         )
 
+            if navdp_waiting_stable_after_short and _is_stopped(state):
+                navdp_waiting_stable_after_short = False
+                last_coarse_request_time = -float("inf")
+                idle_status = "NavDP retrying locked goal from stable pose"
+                logger.info(
+                    "[NavDPRetry] goal_locked=%s retry=%d pose_stable=true",
+                    selected_goal_odom_xy.tolist(),
+                    navdp_short_retry_count,
+                )
+
             if (
                 navigation_active
                 and mode == "COARSE"
                 and selected_goal_odom_xy is not None
+                and not navdp_waiting_stable_after_short
                 and not worker.busy
                 and now - last_coarse_request_time
                 >= float(settings["execution"]["coarse_planning_period_sec"])

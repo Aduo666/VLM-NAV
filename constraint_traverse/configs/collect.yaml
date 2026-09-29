@@ -42,8 +42,6 @@ collection:
   png_compression: 1
   max_episode_duration_sec: 120.0
   min_success_samples: 5
-  # START 后用于初始化 episode 地图且不写入训练数据的 RGB-D 对数。
-  episode_map_warmup_pairs: 2
   start_max_linear_mps: 0.05
   start_max_angular_radps: 0.08
   # 单帧深度图中有效像素所需的最低比例。
@@ -52,11 +50,8 @@ collection:
   endpoint_position_tolerance_m: 0.15
   # 第一帧与 START 位姿、最后一帧与结束位姿允许的航向误差，单位为度。
   endpoint_yaw_tolerance_deg: 10.0
-  # 成功数据最后一帧相对目标允许的位置误差，单位为米。
-  success_goal_position_tolerance_m: 0.15
-  # 成功数据最后一帧相对目标允许的航向误差，单位为度。
-  success_goal_yaw_tolerance_deg: 10.0
+  # 成功数据最后世界位置与目标世界坐标允许的距离，单位为米。
+  success_goal_position_tolerance_m: 0.30
 
 ui:
-  bev_image_size_px: 480
   update_period_sec: 0.10

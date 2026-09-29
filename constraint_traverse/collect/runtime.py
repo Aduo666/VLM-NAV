@@ -13,6 +13,7 @@ from vln_nav.active_perception.camera_geometry import (
     capture_camera_frame,
     world_from_pose_wxyz,
 )
+from vln_nav.active_perception.bev_goal_map import render_bev_goal_map
 from vln_nav.active_perception.contracts import TimedDepthObservation
 from vln_nav.active_perception.local_geometry import LocalVoxelMap, LocalVoxelMapConfig
 from vln_nav.control.locomotion import create_locomotion_controller
@@ -38,8 +39,7 @@ from .transforms import (
     BodyMotionEstimator,
     pose_xyyaw,
     quaternion_wxyz_from_yaw,
-    relative_goal_xyyaw,
-    world_xy_to_body,
+    relative_goal_xy,
 )
 from .ui import CollectorPanel, PanelStatus
 
@@ -52,17 +52,28 @@ class RuntimeOverrides:
 
 def _load_navigation_mapping(
     project_root: Path,
-) -> tuple[dict, LocalVoxelMapConfig]:
+) -> tuple[dict, dict, LocalVoxelMapConfig]:
     config_path = Path(project_root) / "configs/navigation.yaml"
     with config_path.open(encoding="utf-8") as handle:
         navigation = yaml.safe_load(handle) or {}
     mapping = navigation.get("mapping")
+    map_selector = navigation.get("map_selector")
     if not isinstance(mapping, dict) or set(mapping) != {
         "camera",
         "map",
         "max_frame_skew_sec",
     }:
         raise ValueError("主导航 mapping 配置字段不完整")
+    if not isinstance(map_selector, dict) or set(map_selector) != {
+        "sources",
+        "image_size_px",
+        "view_size_m",
+        "rear_view_m",
+        "render_period_sec",
+        "obstacle_min_relative_z_m",
+        "obstacle_max_relative_z_m",
+    }:
+        raise ValueError("主导航 map_selector 配置字段不完整")
     camera = mapping["camera"]
     if not isinstance(camera, dict) or set(camera) != {
         "width",
@@ -77,7 +88,7 @@ def _load_navigation_mapping(
     if integration_period <= 0 or float(mapping["max_frame_skew_sec"]) <= 0:
         raise ValueError("主导航地图周期和帧同步阈值必须为正数")
     map_config = local_voxel_config_from_mapping(map_values)
-    return mapping, map_config
+    return mapping, map_selector, map_config
 
 
 class ConstraintTraverseCollector:
@@ -111,7 +122,9 @@ class ConstraintTraverseCollector:
         profile = load_agx_profile(project_root=self.project_root)
         scene = self.config["scene"]
         cameras_cfg = self.config["cameras"]
-        mapping_cfg, map_cfg = _load_navigation_mapping(self.project_root)
+        mapping_cfg, map_selector_cfg, map_cfg = _load_navigation_mapping(
+            self.project_root
+        )
         map_camera_cfg = mapping_cfg["camera"]
         map_runtime_cfg = mapping_cfg["map"]
         bev_cfg = BevConfig.from_mapping(self.config["bev"])
@@ -263,7 +276,7 @@ class ConstraintTraverseCollector:
         command_queue: list[object] = []
         panel = CollectorPanel(
             ui,
-            image_size_px=int(self.config["ui"]["bev_image_size_px"]),
+            image_size_px=int(map_selector_cfg["image_size_px"]),
             command_sink=command_queue.append,
         )
 
@@ -279,6 +292,7 @@ class ConstraintTraverseCollector:
         position, orientation = get_world_pose(robot)
         episode_map = LocalVoxelMap(map_cfg)
         episode_map.reset(np.asarray(position[:3], dtype=np.float64))
+        latest_snapshot = episode_map.snapshot()
         motion = BodyMotionEstimator()
         session = EpisodeSession()
         recorder = EpisodeRecorder(
@@ -304,6 +318,8 @@ class ConstraintTraverseCollector:
         )
         frame_index = 0
         mapping_state = {"last_integration_time": -float("inf")}
+        last_map_render_time = -float("inf")
+        last_control_fallback_log_time = -float("inf")
 
         self.logger.info(
             "[Collector] scene=%s output=%s placement=manual map_config=%s",
@@ -365,6 +381,7 @@ class ConstraintTraverseCollector:
                             articulation_path,
                         )
                     pose = pose_xyyaw(position, orientation)
+                    latest_snapshot = episode_map.snapshot()
 
                 ui_now = time.monotonic()
                 if not world.is_playing():
@@ -373,17 +390,6 @@ class ConstraintTraverseCollector:
                     if ui_now - last_ui_update >= float(
                         self.config["ui"]["update_period_sec"]
                     ):
-                        start_body, goal_body, trajectory_body = _body_overlay(
-                            session=session,
-                            pose=pose,
-                        )
-                        panel.update_bev(
-                            last_bev,
-                            config=bev_cfg,
-                            start_body_xy=start_body,
-                            goal_body_xy=goal_body,
-                            trajectory_body_xy=trajectory_body,
-                        )
                         panel.update_status(
                             PanelStatus(
                                 mode=session.mode.value,
@@ -391,7 +397,7 @@ class ConstraintTraverseCollector:
                                 sample_count=session.sample_count,
                                 elapsed_sec=session.elapsed(now),
                                 robot_placed=session.robot_placed,
-                                goal_selected=session.goal_pose_world is not None,
+                                goal_selected=session.goal_world_xy is not None,
                                 can_reset_start=(
                                     session.last_start_pose_world is not None
                                 ),
@@ -402,11 +408,24 @@ class ConstraintTraverseCollector:
                     continue
 
                 desired = teleop.step(dt)
-                if session.recording and session.warmup_pairs_remaining > 0:
-                    teleop.reset()
-                    desired = VelocityCommand()
                 try:
-                    applied = adapter.apply(desired)
+                    applied, used_spin_fallback = _apply_velocity_command(
+                        adapter,
+                        desired,
+                    )
+                    if (
+                        used_spin_fallback
+                        and now - last_control_fallback_log_time >= 1.0
+                    ):
+                        self.logger.info(
+                            "[CollectorControl] steering transition "
+                            "desired=[%.3f,%.3f] applied=[%.3f,%.3f]",
+                            desired.linear_mps,
+                            desired.angular_radps,
+                            applied.linear_mps,
+                            applied.angular_radps,
+                        )
+                        last_control_fallback_log_time = now
                 except Exception as exc:
                     self.logger.error("[CollectorControl] command rejected: %s", exc)
                     teleop.reset()
@@ -473,6 +492,7 @@ class ConstraintTraverseCollector:
                                 )
                                 mapping_state["last_integration_time"] = now
                             snapshot = episode_map.snapshot()
+                            latest_snapshot = snapshot
                             last_bev = snapshot_to_robot_bev(
                                 snapshot,
                                 robot_world_xyyaw=pose,
@@ -521,14 +541,9 @@ class ConstraintTraverseCollector:
                                     front_base_from_camera=front.base_from_camera,
                                     down_base_from_camera=down.base_from_camera,
                                     map_version=int(snapshot.version),
-                                    goal_body_xyyaw=relative_goal_xyyaw(
-                                        pose,
-                                        session.goal_pose_world,
-                                    ),
                                 )
-                                if not session.consume_warmup_pair():
-                                    recorder.append(sample)
-                                    session.note_sample(pose)
+                                recorder.append(sample)
+                                session.note_sample(pose)
                     elif map_active:
                         self.logger.warning(
                             "[CollectorMap] skipped RGB-D pair skew=%.3fs limit=%.3fs",
@@ -537,17 +552,6 @@ class ConstraintTraverseCollector:
                         )
 
                 if ui_now - last_ui_update >= float(self.config["ui"]["update_period_sec"]):
-                    start_body, goal_body, trajectory_body = _body_overlay(
-                        session=session,
-                        pose=pose,
-                    )
-                    panel.update_bev(
-                        last_bev,
-                        config=bev_cfg,
-                        start_body_xy=start_body,
-                        goal_body_xy=goal_body,
-                        trajectory_body_xy=trajectory_body,
-                    )
                     panel.update_status(
                         PanelStatus(
                             mode=session.mode.value,
@@ -555,11 +559,39 @@ class ConstraintTraverseCollector:
                             sample_count=session.sample_count,
                             elapsed_sec=session.elapsed(now),
                             robot_placed=session.robot_placed,
-                            goal_selected=session.goal_pose_world is not None,
+                            goal_selected=session.goal_world_xy is not None,
                             can_reset_start=session.last_start_pose_world is not None,
                         )
                     )
                     last_ui_update = ui_now
+
+                if (
+                    session.robot_placed
+                    and now - last_map_render_time
+                    >= float(map_selector_cfg["render_period_sec"])
+                ):
+                    goal_local_xy = None
+                    if session.goal_world_xy is not None:
+                        goal_local_xy = relative_goal_xy(
+                            pose,
+                            session.goal_world_xy,
+                        )
+                    panel.update_map(render_bev_goal_map(
+                        latest_snapshot,
+                        robot_world_xyz=position[:3],
+                        robot_yaw_rad=float(pose[2]),
+                        view_size_m=float(map_selector_cfg["view_size_m"]),
+                        rear_view_m=float(map_selector_cfg["rear_view_m"]),
+                        image_size_px=int(map_selector_cfg["image_size_px"]),
+                        obstacle_min_relative_z_m=float(
+                            map_selector_cfg["obstacle_min_relative_z_m"]
+                        ),
+                        obstacle_max_relative_z_m=float(
+                            map_selector_cfg["obstacle_max_relative_z_m"]
+                        ),
+                        goal_local_xy=goal_local_xy,
+                    ))
+                    last_map_render_time = now
 
                 max_duration = float(collection["max_episode_duration_sec"])
                 if session.recording and session.elapsed(now) > max_duration:
@@ -667,14 +699,12 @@ class ConstraintTraverseCollector:
             sine = math.sin(float(pose[2]))
             goal_x = float(pose[0]) + cosine * forward - sine * left
             goal_y = float(pose[1]) + sine * forward + cosine * left
-            if math.hypot(forward, left) > 1.0e-6:
-                goal_yaw = float(pose[2]) + math.atan2(left, forward)
-            else:
-                goal_yaw = float(pose[2])
-            goal_yaw = math.atan2(math.sin(goal_yaw), math.cos(goal_yaw))
-            goal_pose = np.asarray([goal_x, goal_y, goal_yaw], dtype=np.float64)
-            session.set_goal(goal_pose)
-            self.logger.info("[CollectorGoal] map goal selected pose=%s", goal_pose.tolist())
+            goal_world_xy = np.asarray([goal_x, goal_y], dtype=np.float64)
+            session.set_goal(goal_world_xy)
+            self.logger.info(
+                "[CollectorGoal] map goal selected xy=%s",
+                goal_world_xy.tolist(),
+            )
             return "", current_episode_id
 
         if command == "RESET_MAP":
@@ -689,7 +719,7 @@ class ConstraintTraverseCollector:
         if command == "START":
             if session.mode is not EpisodeMode.IDLE:
                 return "", current_episode_id
-            if not session.robot_placed or session.goal_pose_world is None:
+            if not session.robot_placed or session.goal_world_xy is None:
                 return "", current_episode_id
             if (
                 abs(float(measured_v)) > float(collection["start_max_linear_mps"])
@@ -699,19 +729,15 @@ class ConstraintTraverseCollector:
             teleop.reset()
             adapter.stop()
             motion.reset()
-            episode_map.reset(np.asarray(position[:3], dtype=np.float64))
-            _clear_bev(last_bev)
-            mapping_state["last_integration_time"] = -float("inf")
             session.begin(
                 start_pose_world=pose,
                 start_position_world_xyz=position,
                 timestamp_sec=now,
-                warmup_pairs=int(collection["episode_map_warmup_pairs"]),
             )
             temp_dir = recorder.begin(
                 start_pose_world=pose,
                 start_position_world_xyz=position,
-                goal_pose_world=session.goal_pose_world,
+                goal_world_xy=session.goal_world_xy,
                 start_time_sec=now,
                 extra_meta={
                     "teleop": dict(self.config["teleop"]),
@@ -927,32 +953,20 @@ def _ordered_readback(values: dict[str, float], names: tuple[str, ...]) -> np.nd
     return np.asarray([float(values[name]) for name in names], dtype=np.float32)
 
 
-def _body_overlay(
-    *,
-    session: EpisodeSession,
-    pose: np.ndarray,
-) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
-    current_xy = (float(pose[0]), float(pose[1]))
-    yaw = float(pose[2])
-    start = None
-    goal = None
-    trajectory = None
-    if session.last_start_pose_world is not None:
-        start = world_xy_to_body(
-            session.last_start_pose_world[:2],
-            robot_world_xy=current_xy,
-            robot_yaw_rad=yaw,
-        )[0]
-    if session.goal_pose_world is not None:
-        goal = world_xy_to_body(
-            session.goal_pose_world[:2],
-            robot_world_xy=current_xy,
-            robot_yaw_rad=yaw,
-        )[0]
-    if session.trajectory_world_xy:
-        trajectory = world_xy_to_body(
-            np.asarray(session.trajectory_world_xy, dtype=np.float64),
-            robot_world_xy=current_xy,
-            robot_yaw_rad=yaw,
+def _apply_velocity_command(
+    adapter: AgxVelocityAdapter,
+    desired: VelocityCommand,
+) -> tuple[VelocityCommand, bool]:
+    try:
+        return adapter.apply(desired), False
+    except ValueError as exc:
+        if (
+            "Requested curvature exceeds AGX steering limit" not in str(exc)
+            or abs(float(desired.angular_radps)) <= 1.0e-9
+        ):
+            raise
+        fallback = VelocityCommand(
+            linear_mps=0.0,
+            angular_radps=float(desired.angular_radps),
         )
-    return start, goal, trajectory
+        return adapter.apply(fallback), True

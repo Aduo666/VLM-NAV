@@ -145,14 +145,12 @@ def _validate_top_level_config(data: dict) -> None:
         "png_compression",
         "max_episode_duration_sec",
         "min_success_samples",
-        "episode_map_warmup_pairs",
         "start_max_linear_mps",
         "start_max_angular_radps",
         "min_depth_valid_ratio",
         "endpoint_position_tolerance_m",
         "endpoint_yaw_tolerance_deg",
         "success_goal_position_tolerance_m",
-        "success_goal_yaw_tolerance_deg",
     }
     if set(collection) != required_collection:
         raise ValueError(
@@ -162,12 +160,9 @@ def _validate_top_level_config(data: dict) -> None:
         raise ValueError("collection.jpeg_quality 必须位于 1 至 100")
     if not 0 <= int(collection["png_compression"]) <= 9:
         raise ValueError("collection.png_compression 必须位于 0 至 9")
-    if int(collection["episode_map_warmup_pairs"]) < 0:
-        raise ValueError("collection.episode_map_warmup_pairs 不能为负数")
     for name in required_collection - {
         "jpeg_quality",
         "png_compression",
-        "episode_map_warmup_pairs",
     }:
         value = float(collection[name])
         if not math.isfinite(value) or value <= 0:
@@ -176,9 +171,9 @@ def _validate_top_level_config(data: dict) -> None:
         raise ValueError("collection.min_depth_valid_ratio 必须位于 0 至 1")
 
     ui = data["ui"]
-    if set(ui) != {"bev_image_size_px", "update_period_sec"}:
+    if set(ui) != {"update_period_sec"}:
         raise ValueError("ui 配置字段不完整")
-    if int(ui["bev_image_size_px"]) < 128 or float(ui["update_period_sec"]) <= 0:
+    if float(ui["update_period_sec"]) <= 0:
         raise ValueError("ui 配置值无效")
 
 

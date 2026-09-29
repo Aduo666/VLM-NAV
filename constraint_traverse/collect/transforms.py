@@ -41,17 +41,20 @@ def pose_xyyaw(position_xyz: np.ndarray, orientation_wxyz: np.ndarray) -> np.nda
     )
 
 
-def relative_goal_xyyaw(pose_world_xyyaw: np.ndarray, goal_world_xyyaw: np.ndarray) -> np.ndarray:
+def relative_goal_xy(
+    pose_world_xyyaw: np.ndarray,
+    goal_world_xy: np.ndarray,
+) -> np.ndarray:
     pose = np.asarray(pose_world_xyyaw, dtype=np.float64).reshape(3)
-    goal = np.asarray(goal_world_xyyaw, dtype=np.float64).reshape(3)
+    goal = np.asarray(goal_world_xy, dtype=np.float64).reshape(2)
     dx = float(goal[0] - pose[0])
     dy = float(goal[1] - pose[1])
-    c = math.cos(float(pose[2]))
-    s = math.sin(float(pose[2]))
-    forward = c * dx + s * dy
-    left = -s * dx + c * dy
-    yaw = float(wrap_angle(float(goal[2] - pose[2])))
-    return np.asarray([forward, left, yaw], dtype=np.float32)
+    cosine = math.cos(float(pose[2]))
+    sine = math.sin(float(pose[2]))
+    return np.asarray(
+        [cosine * dx + sine * dy, -sine * dx + cosine * dy],
+        dtype=np.float32,
+    )
 
 
 def world_xy_to_body(

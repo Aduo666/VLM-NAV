@@ -87,6 +87,7 @@ from vln_nav.runtime.isaac_runtime_utils import (
     get_world_pose,
     resolve_existing_prim_path,
     resolve_robot_relative_prim_path,
+    set_camera_horizontal_fov,
     set_local_xform,
     wait_for_stage_assets,
 )
@@ -707,6 +708,7 @@ def _load_settings() -> tuple[
         "forward_action_distance_m",
         "goal_reached_tolerance_m",
         "turn_action_deg",
+        "turn_redecision_deg",
         "turn_tolerance_deg",
         "turn_gain",
         "turn_max_angular_radps",
@@ -721,22 +723,43 @@ def _load_settings() -> tuple[
         "forward_action_distance_m",
         "goal_reached_tolerance_m",
         "turn_action_deg",
+        "turn_redecision_deg",
         "turn_tolerance_deg",
         "turn_gain",
         "turn_max_angular_radps",
     ):
         if not math.isfinite(float(s2[name])) or float(s2[name]) <= 0:
             raise ValueError(f"internnav_s2.{name} 必须为有限正数")
+    turn_actions_per_request = (
+        float(s2["turn_redecision_deg"]) / float(s2["turn_action_deg"])
+    )
+    if (
+        turn_actions_per_request < 1.0
+        or not math.isclose(
+            turn_actions_per_request,
+            round(turn_actions_per_request),
+            abs_tol=1.0e-9,
+        )
+    ):
+        raise ValueError("S2 重新请求角度必须是单次转向角度的整数倍")
     if int(s2["stop_confirmations"]) <= 0 or int(s2["lookdown_settle_frames"]) < 0:
         raise ValueError("S2 stop_confirmations/lookdown_settle_frames 无效")
     s2_client_config = InternNavS2Config.from_mapping(s2["server"])
     s2_goal_config = S2GoalAdapterConfig.from_mapping(s2["goal_adapter"])
 
     camera = data["camera"]
-    if set(camera) != {"width", "height", "frequency_hz", "warmup_render_frames"}:
+    if set(camera) != {
+        "width", "height", "frequency_hz", "warmup_render_frames",
+        "horizontal_fov_deg",
+    }:
         raise ValueError("Invalid navigation modes camera fields")
-    if any(int(camera[name]) <= 0 for name in camera):
+    if any(
+        int(camera[name]) <= 0
+        for name in ("width", "height", "frequency_hz", "warmup_render_frames")
+    ):
         raise ValueError("Navigation modes camera values must be positive")
+    if not 0.0 < float(camera["horizontal_fov_deg"]) < 180.0:
+        raise ValueError("camera.horizontal_fov_deg 必须位于 0 至 180 度之间")
 
     goal = data["goal"]
     if set(goal) != {
@@ -1152,6 +1175,17 @@ def _run(
     if not stage.GetPrimAtPath(s2_down_path).IsA(UsdGeom.Camera):
         raise RuntimeError(f"S2 look-down prim is not a Camera: {s2_down_path}")
     camera_config = settings["camera"]
+    focal_mm = set_camera_horizontal_fov(
+        stage=stage,
+        prim_path=camera_path,
+        fov_deg=float(camera_config["horizontal_fov_deg"]),
+    )
+    logger.info(
+        "[FrontCamera] horizontal_fov=%.1fdeg focal_length=%.3fmm path=%s",
+        float(camera_config["horizontal_fov_deg"]),
+        focal_mm,
+        camera_path,
+    )
     camera = Camera(
         prim_path=camera_path,
         name="agx_navdp_rgbd",
@@ -1668,6 +1702,13 @@ def _run(
                                 s2_next_view = "front"
                                 s2_min_frame_index = frame_index + 1
                                 idle_status = "S2 repeated LOOKDOWN; requesting front view"
+                        actions = _turn_actions_before_redecision(
+                            actions,
+                            turn_action_deg=float(s2_settings["turn_action_deg"]),
+                            turn_redecision_deg=float(
+                                s2_settings["turn_redecision_deg"]
+                            ),
+                        )
                         s2_actions.extend(actions)
                         s2_stop_count = (
                             s2_stop_count
@@ -2165,7 +2206,13 @@ def _run(
                     )
                 elif action_code in {2, 3}:
                     s2_stop_count = 0
-                    signed_angle = math.radians(float(s2_settings["turn_action_deg"]))
+                    turn_count = 1
+                    while s2_actions and s2_actions[0] == action_code:
+                        s2_actions.popleft()
+                        turn_count += 1
+                    signed_angle = math.radians(
+                        float(s2_settings["turn_action_deg"]) * turn_count
+                    )
                     if action_code == 3:
                         signed_angle = -signed_angle
                     s2_turn_target_yaw_odom = _wrap_angle(
@@ -2174,8 +2221,10 @@ def _run(
                     display_path_odom_xy = None
                     idle_status = "S2 TURNING LEFT" if action_code == 2 else "S2 TURNING RIGHT"
                     logger.info(
-                        "[S2Action] %s target_yaw_deg=%.1f remaining_actions=%s",
+                        "[S2Action] %s turn_deg=%.1f target_yaw_deg=%.1f "
+                        "remaining_actions=%s",
                         "LEFT" if action_code == 2 else "RIGHT",
+                        math.degrees(signed_angle),
                         math.degrees(s2_turn_target_yaw_odom),
                         list(s2_actions),
                     )
@@ -2711,6 +2760,32 @@ def _rolling_result_rejection(
     if remaining_length_m < float(execution["min_remaining_path_m"]):
         return "path_too_short"
     return None
+
+
+def _turn_actions_before_redecision(
+    actions: tuple[int, ...],
+    *,
+    turn_action_deg: float,
+    turn_redecision_deg: float,
+) -> tuple[int, ...]:
+    maximum_turns = int(round(turn_redecision_deg / turn_action_deg))
+    selected: list[int] = []
+    direction = None
+    turn_count = 0
+    for action in actions:
+        if action not in {2, 3}:
+            if turn_count:
+                break
+            selected.append(action)
+            continue
+        if direction is not None and action != direction:
+            break
+        direction = action
+        selected.append(action)
+        turn_count += 1
+        if turn_count >= maximum_turns:
+            break
+    return tuple(selected)
 
 
 def _freeze_candidates(result: NavDPResult, job: _InferenceJob) -> list[_FrozenCandidate]:

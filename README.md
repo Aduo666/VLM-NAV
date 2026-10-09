@@ -47,6 +47,8 @@ bash scripts/run_nav.sh
 
 完整导航需要先启动远程 S2 服务和 NavDP 服务，再运行主程序。主程序获得有效前视帧后自动调用 `/reset` 创建会话，随后通过 `/infer` 执行所选任务的指令。S2 输出 `LOOKDOWN` 时，程序停车并将固定下视相机的新图像发回同一会话。
 
+前视相机水平视角由 `configs/navigation.yaml` 的 `camera.horizontal_fov_deg` 设置，当前为 `80°`。S2 返回连续同向转向时，程序最多执行 `30°`，停稳后用新的前视画面重新请求决策。
+
 Isaac Sim 中只保留 `S2 Decision` 和 `Goal Map` 两个导航窗口。任务开始、局部目标切换和最终停止均由主导航自动处理。点击 Goal Map 中的已知空闲位置仍可执行手动点目标导航，方向键可以手动控制 AGX。
 
 新增任务时，在 [任务清单](configs/episodes.json) 中增加唯一 `id`、名称、USD 路径、初始 XY、初始朝向和指令。XY 和朝向使用场景世界坐标，初始高度由 AGX 配置决定。[导航配置](configs/navigation.yaml) 中的 `scene` 段只保存场景加载公共参数；`add_indoor_lighting` 控制运行时室内灯光，原始场景 USD 不会被修改。

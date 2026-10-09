@@ -26,6 +26,7 @@ from vln_nav.runtime.isaac_runtime_utils import (
     get_world_pose,
     resolve_existing_prim_path,
     resolve_robot_relative_prim_path,
+    set_camera_horizontal_fov,
     set_local_xform,
     wait_for_stage_assets,
 )
@@ -52,12 +53,13 @@ class RuntimeOverrides:
 
 def _load_navigation_mapping(
     project_root: Path,
-) -> tuple[dict, dict, LocalVoxelMapConfig]:
+) -> tuple[dict, dict, dict, LocalVoxelMapConfig]:
     config_path = Path(project_root) / "configs/navigation.yaml"
     with config_path.open(encoding="utf-8") as handle:
         navigation = yaml.safe_load(handle) or {}
     mapping = navigation.get("mapping")
     map_selector = navigation.get("map_selector")
+    navigation_camera = navigation.get("camera")
     if not isinstance(mapping, dict) or set(mapping) != {
         "camera",
         "map",
@@ -83,12 +85,18 @@ def _load_navigation_mapping(
         raise ValueError("主导航 mapping.camera 配置字段不完整")
     if any(int(camera[name]) <= 0 for name in camera):
         raise ValueError("主导航 mapping.camera 配置必须为正整数")
+    if (
+        not isinstance(navigation_camera, dict)
+        or "horizontal_fov_deg" not in navigation_camera
+        or not 0.0 < float(navigation_camera["horizontal_fov_deg"]) < 180.0
+    ):
+        raise ValueError("主导航前视相机水平视角配置无效")
     map_values = dict(mapping["map"])
     integration_period = float(map_values.pop("integration_period_sec"))
     if integration_period <= 0 or float(mapping["max_frame_skew_sec"]) <= 0:
         raise ValueError("主导航地图周期和帧同步阈值必须为正数")
     map_config = local_voxel_config_from_mapping(map_values)
-    return mapping, map_selector, map_config
+    return mapping, map_selector, navigation_camera, map_config
 
 
 class ConstraintTraverseCollector:
@@ -122,8 +130,8 @@ class ConstraintTraverseCollector:
         profile = load_agx_profile(project_root=self.project_root)
         scene = self.config["scene"]
         cameras_cfg = self.config["cameras"]
-        mapping_cfg, map_selector_cfg, map_cfg = _load_navigation_mapping(
-            self.project_root
+        mapping_cfg, map_selector_cfg, navigation_camera_cfg, map_cfg = (
+            _load_navigation_mapping(self.project_root)
         )
         map_camera_cfg = mapping_cfg["camera"]
         map_runtime_cfg = mapping_cfg["map"]
@@ -214,6 +222,18 @@ class ConstraintTraverseCollector:
         for name, path in (("front", front_path), ("down", down_path), ("observer", observer_path)):
             if not stage.GetPrimAtPath(path).IsA(UsdGeom.Camera):
                 raise RuntimeError(f"{name} prim is not a Camera: {path}")
+
+        focal_mm = set_camera_horizontal_fov(
+            stage=stage,
+            prim_path=front_path,
+            fov_deg=float(navigation_camera_cfg["horizontal_fov_deg"]),
+        )
+        self.logger.info(
+            "[FrontCamera] horizontal_fov=%.1fdeg focal_length=%.3fmm path=%s",
+            float(navigation_camera_cfg["horizontal_fov_deg"]),
+            focal_mm,
+            front_path,
+        )
 
         resolution = (
             int(map_camera_cfg["width"]),

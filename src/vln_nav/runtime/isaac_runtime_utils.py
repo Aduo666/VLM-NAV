@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import time
 from pathlib import Path
 
@@ -74,6 +75,24 @@ def resolve_existing_prim_path(*, stage, prim_path: str, kind: str) -> str:
                 return fallback_path
 
     raise RuntimeError(f"Configured {kind} prim does not exist: {prim_path}")
+
+
+def set_camera_horizontal_fov(*, stage, prim_path: str, fov_deg: float) -> float:
+    from pxr import UsdGeom
+
+    angle = float(fov_deg)
+    if not math.isfinite(angle) or not 0.0 < angle < 180.0:
+        raise ValueError("Camera horizontal FOV must be within (0, 180) degrees")
+    prim = stage.GetPrimAtPath(str(prim_path))
+    if not prim or not prim.IsValid() or not prim.IsA(UsdGeom.Camera):
+        raise RuntimeError(f"Camera prim is invalid: {prim_path}")
+    camera = UsdGeom.Camera(prim)
+    aperture_mm = float(camera.GetHorizontalApertureAttr().Get())
+    if not math.isfinite(aperture_mm) or aperture_mm <= 0.0:
+        raise RuntimeError(f"Camera horizontal aperture is invalid: {prim_path}")
+    focal_mm = aperture_mm / (2.0 * math.tan(math.radians(angle) / 2.0))
+    camera.GetFocalLengthAttr().Set(focal_mm)
+    return focal_mm
 
 
 def find_articulation_root_path(*, stage, root_path: str) -> str:

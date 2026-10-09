@@ -80,6 +80,8 @@ internnav_s2:
   goal_reached_tolerance_m: 0.10
   # LEFT/RIGHT 动作对应的航向变化，单位为度。
   turn_action_deg: 15.0
+  # 连续转向达到该角度后重新获取前视画面并请求 S2。
+  turn_redecision_deg: 30.0
   # 离散转向完成容差，单位为度。
   turn_tolerance_deg: 2.0
   # 离散转向比例控制增益。
@@ -93,6 +95,8 @@ internnav_s2:
 
 # 发送给 NavDP 的前视相机参数。
 camera:
+  # 前视相机水平视角，导航与数据采集共用。
+  horizontal_fov_deg: 80.0
   # RGB-D 图像宽度，单位为像素。
   width: 640
   # RGB-D 图像高度，单位为像素。
@@ -112,7 +116,7 @@ goal:
 # 粗粒度与细粒度规划任务的调度参数。
 execution:
   # 程序启动后的默认导航模式。
-  default_mode: "COARSE"
+  default_mode: "FINE"
   # NavDP 滚动推理周期，单位为秒。
   coarse_planning_period_sec: 0.50
   # 同一局部目标允许连续出现短轨迹的最大次数。

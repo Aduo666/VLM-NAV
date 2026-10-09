@@ -132,7 +132,7 @@ class NavDPClient:
 
         ok, encoded_rgb = cv2.imencode(
             ".jpg",
-            rgb_image,
+            cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR),
             [int(cv2.IMWRITE_JPEG_QUALITY), self.config.jpeg_quality],
         )
         if not ok:

@@ -115,6 +115,7 @@ class IncrementalUnknownMetrics:
     ratio: float
     cell_count: int
     area_m2: float
+    unknown_linear_indices: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -358,7 +359,7 @@ class FootprintCollisionChecker:
             yaw_rad=float(initial[2]),
         )
         if len(sweep) == 0:
-            return IncrementalUnknownMetrics(0.0, 0, 0.0)
+            return IncrementalUnknownMetrics(0.0, 0, 0.0, np.empty(0, dtype=np.int64))
         swept_cells = []
         for pose in sweep:
             cells, _ = self.covered_linear_indices(
@@ -370,17 +371,18 @@ class FootprintCollisionChecker:
             if cells.size:
                 swept_cells.append(cells)
         if not swept_cells:
-            return IncrementalUnknownMetrics(0.0, 0, 0.0)
+            return IncrementalUnknownMetrics(0.0, 0, 0.0, np.empty(0, dtype=np.int64))
         all_swept = np.unique(np.concatenate(swept_cells))
         newly_covered = np.setdiff1d(all_swept, initial_cells, assume_unique=True)
         if newly_covered.size == 0:
-            return IncrementalUnknownMetrics(0.0, 0, 0.0)
+            return IncrementalUnknownMetrics(0.0, 0, 0.0, np.empty(0, dtype=np.int64))
         unknown = grid.unknown_mask.reshape(-1)[newly_covered]
         unknown_count = int(np.count_nonzero(unknown))
         return IncrementalUnknownMetrics(
             ratio=float(unknown_count / newly_covered.size),
             cell_count=unknown_count,
             area_m2=float(unknown_count * grid.resolution_m**2),
+            unknown_linear_indices=newly_covered[unknown],
         )
 
     def _indices(

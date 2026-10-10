@@ -207,6 +207,10 @@ fine_planner:
   yaw_resolution_deg: 5.0
   # 单个平移运动段长度，单位为米。
   step_length_m: 0.10
+  # 完整局部目标暂时不可达时，允许返回的增量路径最大行程，单位为米。
+  partial_path_max_distance_m: 0.30
+  # 已找到安全增量路径后，继续搜索完整目标的最大节点数量。
+  partial_search_max_expansions: 60
   # 每个运动段进行碰撞检查的采样间隔，单位为米。
   collision_sample_step_m: 0.05
   # 前进与后退运动段使用的曲率样本，单位为每米。

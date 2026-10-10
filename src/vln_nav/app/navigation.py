@@ -43,6 +43,7 @@ from vln_nav.navigation.fine_local_planner import (
     FineLocalPlanner,
     FinePlanningConstraint,
     FinePlannerConfig,
+    FineUnknownBlockedError,
 )
 from vln_nav.navigation.navdp_client import (
     NavDPCandidate,
@@ -1373,6 +1374,7 @@ def _run(
     latest_snapshot = local_map.snapshot()
     latest_planning_grid = None
     last_failed_fine_input: _FineFailureInput | None = None
+    rejected_unknown_world_xy: np.ndarray | None = None
     latest_camera_frames: dict[str, CameraFrameGeometry] = {}
     s2_settings = settings["internnav_s2"]
     s2_active = s2_worker is not None
@@ -1549,6 +1551,15 @@ def _run(
                         settings["map_selector"]["obstacle_max_relative_z_m"]
                     ),
                     goal_local_xy=displayed_goal,
+                    projection_reference_z_m=(
+                        float(position[2]) - float(profile.spawn_z_m)
+                    ),
+                    show_source_coverage=True,
+                    rejected_unknown_world_xy=(
+                        rejected_unknown_world_xy
+                        if mode == "FINE" and navigation_active
+                        else None
+                    ),
                 )
                 if display_path_odom_xy is not None:
                     path_local = _odom_path_to_local(display_path_odom_xy, state)
@@ -1626,6 +1637,7 @@ def _run(
                             display_path_odom_xy = None
                             navigation_active = True
                             last_failed_fine_input = None
+                            rejected_unknown_world_xy = None
                             last_coarse_request_time = -float("inf")
                             last_fine_request_time = -float("inf")
                             navdp_short_retry_count = 0
@@ -1919,7 +1931,33 @@ def _run(
                 elif error is not None:
                     if grid is not None:
                         last_failed_fine_input = _FineFailureInput.from_job(grid, job)
-                    idle_status = "Fine planning failed; inspect Fine Geometry and log"
+                    if isinstance(error, FineUnknownBlockedError) and grid is not None:
+                        rows, columns = np.unravel_index(
+                            error.unknown_linear_indices, grid.shape
+                        )
+                        rejected_unknown_world_xy = np.column_stack((
+                            grid.origin_x_m + (columns + 0.5) * grid.resolution_m,
+                            grid.origin_y_m + (rows + 0.5) * grid.resolution_m,
+                        ))
+                        adapter.stop()
+                        tracker = None
+                        tracker_mode = None
+                        display_path_odom_xy = None
+                        idle_status = "Fine blocked by nearby unknown cells; see Goal Map"
+                        logger.warning(
+                            "[FineUnknownArea] request=%d cells=%d x=[%.2f,%.2f] "
+                            "y=[%.2f,%.2f] map_version=%d",
+                            job.request_id,
+                            len(rejected_unknown_world_xy),
+                            float(np.min(rejected_unknown_world_xy[:, 0])),
+                            float(np.max(rejected_unknown_world_xy[:, 0])),
+                            float(np.min(rejected_unknown_world_xy[:, 1])),
+                            float(np.max(rejected_unknown_world_xy[:, 1])),
+                            grid.map_version,
+                        )
+                    else:
+                        rejected_unknown_world_xy = None
+                        idle_status = "Fine planning failed; inspect Fine Geometry and log"
                     logger.error(
                         "[FineResult] request=%d map_version=%d target=[%.2f,%.2f] failed: %s",
                         job.request_id,
@@ -2024,6 +2062,7 @@ def _run(
                             )
                     else:
                         last_failed_fine_input = None
+                        rejected_unknown_world_xy = None
                         tracker = FinePathTracker(
                             joined_path,
                             path_odom_yaw,
@@ -2037,13 +2076,19 @@ def _run(
                         previous_tracking_status = None
                         previous_adapter_status = None
                         logger.info(
-                            "[FineSwitch] generation=%d request=%d nodes=%d cost=%.3f "
+                            "[FineSwitch] generation=%d request=%d partial=%s "
+                            "first_direction=%d endpoint=[%.2f,%.2f] "
+                            "nodes=%d cost=%.3f "
                             "age=%.3fs join_error=%.3fm remaining=%.3fm "
                             "local_goal=[%.2f,%.2f] clearance=%.3fm unknown=%.3f "
                             "path_unknown=[ratio:%.3f area:%.3fm2] "
                             "rejected=[collision:%d,unknown:%d,outside:%d]",
                             generation_index,
                             job.request_id,
+                            plan.partial,
+                            int(plan.path_motion_direction[1]),
+                            plan.path_world_xy[-1, 0],
+                            plan.path_world_xy[-1, 1],
                             plan.expanded_node_count,
                             plan.path_cost,
                             result_age,
@@ -2094,6 +2139,7 @@ def _run(
                             selected_index = 0
                             navigation_active = True
                             last_failed_fine_input = None
+                            rejected_unknown_world_xy = None
                             generation_index = 0
                             last_coarse_request_time = -float("inf")
                             last_fine_request_time = -float("inf")
@@ -2141,6 +2187,7 @@ def _run(
                     goal_distance,
                 )
                 selected_goal_odom_xy = None
+                rejected_unknown_world_xy = None
                 navdp_short_retry_count = 0
                 navdp_waiting_stable_after_short = False
                 if s2_active:
@@ -2194,6 +2241,7 @@ def _run(
                     fine_request_id += 1
                     accepted_fine_request_id = fine_request_id
                     navigation_active = True
+                    rejected_unknown_world_xy = None
                     last_coarse_request_time = -float("inf")
                     last_fine_request_time = -float("inf")
                     navdp_short_retry_count = 0
@@ -2247,6 +2295,7 @@ def _run(
                     tracker_mode = None
                     navigation_active = False
                     display_path_odom_xy = None
+                    rejected_unknown_world_xy = None
                     request_id += 1
                     accepted_request_id = request_id
                     fine_request_id += 1
@@ -2492,7 +2541,11 @@ def _run(
                     )
                 )
                 if failed_input_unchanged:
-                    idle_status = "Fine planning input unchanged after failure"
+                    idle_status = (
+                        "Fine blocked by nearby unknown cells; see Goal Map"
+                        if rejected_unknown_world_xy is not None
+                        else "Fine planning input unchanged after failure"
+                    )
                     if idle_status != last_reported_idle_status:
                         logger.warning("[NavigationStatus] %s", idle_status)
                         last_reported_idle_status = idle_status

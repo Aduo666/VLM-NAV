@@ -9,6 +9,7 @@ from PIL import Image, ImageDraw
 from vln_nav.active_perception.local_geometry import (
     FREE,
     OCCUPIED,
+    SOURCE_BITS,
     LocalVoxelSnapshot,
 )
 
@@ -42,6 +43,9 @@ def render_bev_goal_map(
     obstacle_min_relative_z_m: float,
     obstacle_max_relative_z_m: float,
     goal_local_xy: tuple[float, float] | None = None,
+    projection_reference_z_m: float | None = None,
+    show_source_coverage: bool = False,
+    rejected_unknown_world_xy: np.ndarray | None = None,
 ) -> BevGoalMap:
     """Project a 3-D voxel snapshot into a clean robot-centric occupancy image."""
     robot = np.asarray(robot_world_xyz, dtype=np.float64).reshape(-1)
@@ -55,14 +59,19 @@ def render_bev_goal_map(
         raise ValueError("BEV rear view must be within [0, view_size)")
     if obstacle_min_relative_z_m >= obstacle_max_relative_z_m:
         raise ValueError("BEV obstacle height interval is invalid")
+    reference_z = (
+        robot[2] if projection_reference_z_m is None else float(projection_reference_z_m)
+    )
+    if not math.isfinite(reference_z):
+        raise ValueError("BEV projection reference height must be finite")
 
     state = np.asarray(snapshot.state, dtype=np.int8)
     z_centers = snapshot.origin_world_xyz[2] + (
         np.arange(state.shape[0], dtype=np.float64) + 0.5
     ) * snapshot.resolution_m
     z_band = (
-        (z_centers >= robot[2] + obstacle_min_relative_z_m)
-        & (z_centers <= robot[2] + obstacle_max_relative_z_m)
+        (z_centers >= reference_z + obstacle_min_relative_z_m)
+        & (z_centers <= reference_z + obstacle_max_relative_z_m)
     )
     if not np.any(z_band):
         raise ValueError("BEV obstacle height interval does not overlap the voxel map")
@@ -98,8 +107,61 @@ def render_bev_goal_map(
     rgb = np.full((size, size, 3), (108, 110, 112), dtype=np.uint8)
     rgb[free] = (238, 237, 232)
     rgb[occupied] = (28, 29, 29)
+    if show_source_coverage:
+        source_world = np.bitwise_or.reduce(
+            np.asarray(snapshot.source_mask[z_band], dtype=np.uint8),
+            axis=0,
+        )
+        sources = source_world[safe_y, safe_x]
+        front_seen = inside & ((sources & SOURCE_BITS["front"]) != 0)
+        down_seen = inside & ((sources & SOURCE_BITS["down"]) != 0)
+        coverage = (
+            (front_seen & ~down_seen, (242, 224, 187), (119, 111, 97)),
+            (down_seen & ~front_seen, (195, 225, 247), (102, 113, 124)),
+            (front_seen & down_seen, (202, 232, 203), (101, 123, 103)),
+        )
+        for seen, free_color, unknown_color in coverage:
+            rgb[seen & free] = free_color
+            rgb[seen & ~free & ~occupied] = unknown_color
+    if rejected_unknown_world_xy is not None:
+        rejected_points = np.asarray(rejected_unknown_world_xy, dtype=np.float64)
+        if rejected_points.ndim != 2 or rejected_points.shape[1] != 2:
+            raise ValueError("rejected_unknown_world_xy must have shape (N, 2)")
+        if not np.isfinite(rejected_points).all():
+            raise ValueError("rejected_unknown_world_xy must be finite")
+        rejected_world = np.zeros(state.shape[1:], dtype=bool)
+        rejected_x = np.floor(
+            (rejected_points[:, 0] - snapshot.origin_world_xyz[0])
+            / snapshot.resolution_m
+        ).astype(np.int64)
+        rejected_y = np.floor(
+            (rejected_points[:, 1] - snapshot.origin_world_xyz[1])
+            / snapshot.resolution_m
+        ).astype(np.int64)
+        rejected_inside = (
+            (rejected_x >= 0)
+            & (rejected_x < state.shape[2])
+            & (rejected_y >= 0)
+            & (rejected_y < state.shape[1])
+        )
+        rejected_world[rejected_y[rejected_inside], rejected_x[rejected_inside]] = True
+        rgb[inside & rejected_world[safe_y, safe_x] & ~free & ~occupied] = (
+            235, 68, 125
+        )
     image = Image.fromarray(rgb, mode="RGB")
     draw = ImageDraw.Draw(image)
+    if show_source_coverage and size >= 160:
+        draw.rectangle((6, 6, 126, 73), fill=(37, 40, 44))
+        legend = (
+            ("Front", (242, 224, 187)),
+            ("Base down", (195, 225, 247)),
+            ("Both", (202, 232, 203)),
+            ("Blocked unknown", (235, 68, 125)),
+        )
+        for index, (label, color) in enumerate(legend):
+            top = 11 + 15 * index
+            draw.rectangle((12, top, 22, top + 9), fill=color)
+            draw.text((29, top - 1), label, fill=(245, 245, 242))
     center_x = size / 2.0
     center_y = (1.0 - rear_view_m / view_size_m) * size
     arrow_half_width = max(5, round(size * 0.015))
@@ -131,9 +193,12 @@ def render_bev_goal_map(
     rgba = np.empty((size, size, 4), dtype=np.uint8)
     rgba[:, :, :3] = np.asarray(image, dtype=np.uint8)
     rgba[:, :, 3] = 255
+    selectable = free.copy()
+    if show_source_coverage and size >= 160:
+        selectable[6:74, 6:127] = False
     return BevGoalMap(
         rgba=np.ascontiguousarray(rgba),
-        selectable_mask=np.ascontiguousarray(free),
+        selectable_mask=np.ascontiguousarray(selectable),
         view_size_m=float(view_size_m),
         rear_view_m=float(rear_view_m),
     )

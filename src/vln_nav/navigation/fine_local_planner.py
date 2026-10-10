@@ -52,6 +52,8 @@ class FinePlanningConstraint:
 class FinePlannerConfig:
     yaw_resolution_deg: float
     step_length_m: float
+    partial_path_max_distance_m: float
+    partial_search_max_expansions: int
     collision_sample_step_m: float
     curvature_samples_per_m: tuple[float, ...]
     goal_tolerance_m: float
@@ -80,9 +82,16 @@ class FinePlannerConfig:
             float(value) for value in data["curvature_samples_per_m"]
         )
         values["max_expansions"] = int(data["max_expansions"])
+        values["partial_search_max_expansions"] = int(
+            data["partial_search_max_expansions"]
+        )
         config = cls(**{
             name: values[name]
-            if name in {"curvature_samples_per_m", "max_expansions"}
+            if name in {
+                "curvature_samples_per_m",
+                "max_expansions",
+                "partial_search_max_expansions",
+            }
             else float(values[name])
             for name in expected
         })
@@ -93,6 +102,7 @@ class FinePlannerConfig:
         positive = (
             self.yaw_resolution_deg,
             self.step_length_m,
+            self.partial_path_max_distance_m,
             self.collision_sample_step_m,
             self.goal_tolerance_m,
             self.max_plan_distance_m,
@@ -114,8 +124,12 @@ class FinePlannerConfig:
             raise ValueError("细粒度规划器朝向分辨率必须位于 1 至 30 度范围内")
         if self.collision_sample_step_m > self.step_length_m:
             raise ValueError("碰撞采样间隔不能超过运动段长度")
+        if self.partial_path_max_distance_m < self.step_length_m:
+            raise ValueError("增量路径最大距离不能短于单个运动段")
         if self.max_expansions < 100:
             raise ValueError("细粒度规划器 max_expansions 至少为 100")
+        if not 1 <= self.partial_search_max_expansions <= self.max_expansions:
+            raise ValueError("增量路径搜索节点上限必须位于 1 至 max_expansions 之间")
         if not 0 <= self.max_near_unknown_ratio <= 1:
             raise ValueError("细粒度规划器未知比例必须位于 0 至 1 范围内")
         if not self.curvature_samples_per_m or 0.0 not in self.curvature_samples_per_m:
@@ -139,8 +153,17 @@ class FinePlan:
     rejected_constraint_count: int
     max_unknown_ratio: float
     max_unknown_area_m2: float
+    partial: bool = False
     refinement_applied: bool = False
     refinement_iterations: int = 0
+
+
+class FineUnknownBlockedError(RuntimeError):
+    def __init__(self, message: str, unknown_linear_indices: np.ndarray) -> None:
+        super().__init__(message)
+        self.unknown_linear_indices = np.ascontiguousarray(
+            unknown_linear_indices, dtype=np.int64
+        )
 
 
 @dataclass(frozen=True)
@@ -374,6 +397,7 @@ class FineLocalPlanner:
         node_parent: dict[int, int | None] = {0: None}
         node_action: dict[int, int | None] = {0: None}
         node_cost = {0: 0.0}
+        node_travel_distance = {0: 0.0}
         node_key = {0: start_key}
         node_max_unknown_ratio = {0: 0.0}
         node_max_unknown_area_m2 = {0: 0.0}
@@ -386,6 +410,9 @@ class FineLocalPlanner:
             ),
         )
         goal_node = None
+        best_partial_node = None
+        best_partial_rank = None
+        start_goal_distance = float(np.linalg.norm(start[:2] - goal))
         expanded = 0
         rejected_collision = 0
         rejected_unknown = 0
@@ -393,8 +420,14 @@ class FineLocalPlanner:
         rejected_constraint = 0
         observed_max_unknown_ratio = 0.0
         observed_max_unknown_area_m2 = 0.0
+        rejected_unknown_mask = np.zeros(grid.shape, dtype=bool)
 
         while queue and expanded < self.config.max_expansions:
+            if (
+                best_partial_node is not None
+                and expanded >= self.config.partial_search_max_expansions
+            ):
+                break
             _, _, current_node = heapq.heappop(queue)
             key = node_key[current_node]
             cost = node_cost[current_node]
@@ -463,6 +496,9 @@ class FineLocalPlanner:
                 )
                 if near_unknown_blocked:
                     rejected_unknown += 1
+                    rejected_unknown_mask.reshape(-1)[
+                        unknown_metrics.unknown_linear_indices
+                    ] = True
                     continue
                 endpoint = primitive[-1]
                 next_key = self._state_key(
@@ -526,6 +562,9 @@ class FineLocalPlanner:
                 node_parent[counter] = current_node
                 node_action[counter] = action_index
                 node_cost[counter] = new_cost
+                node_travel_distance[counter] = (
+                    node_travel_distance[current_node] + transition_length
+                )
                 node_key[counter] = next_key
                 node_max_unknown_ratio[counter] = max(
                     node_max_unknown_ratio[current_node], unknown_ratio
@@ -533,19 +572,47 @@ class FineLocalPlanner:
                 node_max_unknown_area_m2[counter] = max(
                     node_max_unknown_area_m2[current_node], unknown_metrics.area_m2
                 )
+                progress = start_goal_distance - math.hypot(
+                    endpoint[0] - goal[0], endpoint[1] - goal[1]
+                )
+                if (
+                    node_travel_distance[counter]
+                    <= self.config.partial_path_max_distance_m + 1.0e-9
+                    and node_max_unknown_area_m2[counter] == 0.0
+                    and progress >= max(
+                        self.config.goal_tolerance_m,
+                        0.5 * self.config.step_length_m,
+                    )
+                ):
+                    candidate_rank = (
+                        progress,
+                        -new_cost,
+                    )
+                    if best_partial_rank is None or candidate_rank > best_partial_rank:
+                        best_partial_rank = candidate_rank
+                        best_partial_node = counter
                 priority = new_cost + self.config.heuristic_weight * self._heuristic(
                     endpoint[:2], goal
                 )
                 heapq.heappush(queue, (priority, counter, counter))
 
+        partial = goal_node is None and best_partial_node is not None
+        if partial:
+            goal_node = best_partial_node
         if goal_node is None:
-            raise RuntimeError(
+            message = (
                 f"细粒度规划器扩展 {expanded} 个节点后仍未找到路径；"
                 f"碰撞拒绝={rejected_collision}，未知拒绝={rejected_unknown}，"
                 f"地图外拒绝={rejected_outside}，管道拒绝={rejected_constraint}，"
                 f"未知最大比例={observed_max_unknown_ratio:.3f}，"
                 f"未知最大面积={observed_max_unknown_area_m2:.3f}m2"
             )
+            if rejected_unknown:
+                raise FineUnknownBlockedError(
+                    message,
+                    np.flatnonzero(rejected_unknown_mask),
+                )
+            raise RuntimeError(message)
         node_ids = []
         current = goal_node
         while current is not None:
@@ -583,6 +650,7 @@ class FineLocalPlanner:
             rejected_constraint_count=int(rejected_constraint),
             max_unknown_ratio=float(node_max_unknown_ratio[goal_node]),
             max_unknown_area_m2=float(node_max_unknown_area_m2[goal_node]),
+            partial=bool(partial),
         )
 
     def _state_key(

@@ -161,7 +161,7 @@ class FootprintCollisionChecker:
         self.footprint = footprint
         self._yaw_step = math.radians(float(yaw_resolution_deg))
         self._yaw_bins = int(round(2.0 * math.pi / self._yaw_step))
-        self._offset_cache: dict[tuple[float, int, float], np.ndarray] = {}
+        self._offset_cache: dict[tuple[float, int, float, str | None], np.ndarray] = {}
 
     @property
     def bounding_radius_m(self) -> float:
@@ -329,13 +329,18 @@ class FootprintCollisionChecker:
         x_m: float,
         y_m: float,
         yaw_rad: float,
+        part_name: str | None = None,
+        margin_m: float | None = None,
     ) -> tuple[np.ndarray, float]:
         rows, columns, inside = self._indices(
             grid,
             x_m=float(x_m),
             y_m=float(y_m),
             yaw_rad=float(yaw_rad),
-            margin_m=self.footprint.margin_m,
+            margin_m=(
+                self.footprint.margin_m if margin_m is None else float(margin_m)
+            ),
+            part_name=part_name,
         )
         outside_ratio = float(1.0 - np.mean(inside))
         if not np.any(inside):
@@ -393,9 +398,10 @@ class FootprintCollisionChecker:
         y_m: float,
         yaw_rad: float,
         margin_m: float,
+        part_name: str | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         row, column, _ = grid.world_to_cell(x_m, y_m)
-        offsets = self._offsets(grid.resolution_m, yaw_rad, margin_m)
+        offsets = self._offsets(grid.resolution_m, yaw_rad, margin_m, part_name)
         rows = row + offsets[:, 0]
         columns = column + offsets[:, 1]
         inside = (
@@ -411,11 +417,12 @@ class FootprintCollisionChecker:
         resolution_m: float,
         yaw_rad: float,
         margin_m: float,
+        part_name: str | None,
     ) -> np.ndarray:
         yaw_index = int(
             round(((float(yaw_rad) + math.pi) % (2.0 * math.pi)) / self._yaw_step)
         ) % self._yaw_bins
-        key = (float(resolution_m), yaw_index, float(margin_m))
+        key = (float(resolution_m), yaw_index, float(margin_m), part_name)
         cached = self._offset_cache.get(key)
         if cached is not None:
             return cached
@@ -423,6 +430,8 @@ class FootprintCollisionChecker:
         local_chunks = []
         margin = float(margin_m)
         for part in self.footprint.parts:
+            if part_name is not None and part.name != part_name:
+                continue
             local_x = np.arange(
                 part.min_x_m - margin,
                 part.max_x_m + margin + 0.5 * sample_step,
@@ -435,6 +444,8 @@ class FootprintCollisionChecker:
             )
             xx, yy = np.meshgrid(local_x, local_y, indexing="xy")
             local_chunks.append(np.column_stack((xx.ravel(), yy.ravel())))
+        if not local_chunks:
+            raise ValueError(f"未知车体部件：{part_name}")
         local = np.concatenate(local_chunks, axis=0)
         yaw = yaw_index * self._yaw_step - math.pi
         cosine, sine = math.cos(yaw), math.sin(yaw)
@@ -559,6 +570,151 @@ def assess_path_clearance(
         first_collision_world_xyyaw=first_collision_world_xyyaw,
         first_collision_cell=first_collision_cell,
     )
+
+
+def sample_swept_path(
+    path_xy: np.ndarray,
+    path_yaw_rad: np.ndarray,
+    *,
+    max_step_m: float,
+    max_yaw_step_deg: float,
+) -> np.ndarray:
+    points = np.asarray(path_xy, dtype=np.float64)
+    yaw = np.asarray(path_yaw_rad, dtype=np.float64).reshape(-1)
+    if (
+        points.ndim != 2
+        or points.shape[1] != 2
+        or len(points) < 2
+        or len(yaw) != len(points)
+        or not np.isfinite(points).all()
+        or not np.isfinite(yaw).all()
+        or not math.isfinite(max_step_m)
+        or not math.isfinite(max_yaw_step_deg)
+        or max_step_m <= 0
+        or max_yaw_step_deg <= 0
+    ):
+        raise ValueError("路径扫掠采样参数无效")
+    samples = [np.asarray([points[0, 0], points[0, 1], yaw[0]], dtype=np.float64)]
+    max_yaw_step = math.radians(max_yaw_step_deg)
+    for index in range(1, len(points)):
+        delta_xy = points[index] - points[index - 1]
+        delta_yaw = (yaw[index] - yaw[index - 1] + math.pi) % (2.0 * math.pi) - math.pi
+        steps = max(
+            1,
+            int(math.ceil(np.linalg.norm(delta_xy) / max_step_m)),
+            int(math.ceil(abs(delta_yaw) / max_yaw_step)),
+        )
+        for fraction in np.arange(1, steps + 1, dtype=np.float64) / steps:
+            xy = points[index - 1] + fraction * delta_xy
+            heading = (yaw[index - 1] + fraction * delta_yaw + math.pi) % (
+                2.0 * math.pi
+            ) - math.pi
+            samples.append(np.asarray([xy[0], xy[1], heading], dtype=np.float64))
+    return np.ascontiguousarray(samples)
+
+
+def assess_known_swept_path(
+    grid: PlanningGrid,
+    path_xy: np.ndarray,
+    path_yaw_rad: np.ndarray,
+    *,
+    collision_checker: FootprintCollisionChecker,
+    max_step_m: float,
+    max_yaw_step_deg: float,
+) -> tuple[PathClearance, IncrementalUnknownMetrics]:
+    poses = sample_swept_path(
+        path_xy,
+        path_yaw_rad,
+        max_step_m=max_step_m,
+        max_yaw_step_deg=max_yaw_step_deg,
+    )
+    clearance = assess_path_clearance(
+        grid,
+        poses[:, :2],
+        poses[:, 2],
+        collision_checker=collision_checker,
+    )
+    unknown = collision_checker.incremental_unknown_metrics(
+        grid,
+        initial_pose=poses[0],
+        swept_poses=poses[1:],
+    )
+    return clearance, unknown
+
+
+def stopping_distance_m(
+    speed_mps: float,
+    *,
+    reaction_time_sec: float,
+    braking_deceleration_mps2: float,
+    reserve_m: float,
+) -> float:
+    values = (
+        speed_mps,
+        reaction_time_sec,
+        braking_deceleration_mps2,
+        reserve_m,
+    )
+    if (
+        not all(math.isfinite(float(value)) for value in values)
+        or reaction_time_sec < 0
+        or braking_deceleration_mps2 <= 0
+        or reserve_m < 0
+    ):
+        raise ValueError("停车距离参数无效")
+    speed = abs(float(speed_mps))
+    return (
+        speed * reaction_time_sec
+        + speed * speed / (2.0 * braking_deceleration_mps2)
+        + reserve_m
+    )
+
+
+def translation_distance_until_direction_change(
+    path_xy: np.ndarray,
+    motion_direction: np.ndarray,
+    *,
+    first_segment_start_xy: np.ndarray | None = None,
+) -> float:
+    points = np.asarray(path_xy, dtype=np.float64)
+    direction = np.asarray(motion_direction, dtype=np.int8).reshape(-1)
+    if (
+        points.ndim != 2
+        or points.shape[1] != 2
+        or len(points) < 2
+        or len(direction) != len(points)
+        or not np.isfinite(points).all()
+    ):
+        raise ValueError("运动方向与轨迹长度不一致")
+    first_start = (
+        None
+        if first_segment_start_xy is None
+        else np.asarray(first_segment_start_xy, dtype=np.float64).reshape(2)
+    )
+    if first_start is not None and not np.isfinite(first_start).all():
+        raise ValueError("原始运动段起点必须有效")
+    initial_direction = int(direction[1])
+    if initial_direction == 0:
+        return 0.0
+    total = 0.0
+    for index in range(1, len(points)):
+        if int(direction[index]) != initial_direction:
+            break
+        if index == 1 and first_start is not None:
+            segment = points[index] - first_start
+            segment_length = float(np.linalg.norm(segment))
+            distance = (
+                float(np.clip(
+                    np.dot(points[index] - points[0], segment) / segment_length,
+                    0.0,
+                    segment_length,
+                ))
+                if segment_length > 1.0e-9 else 0.0
+            )
+        else:
+            distance = float(np.linalg.norm(points[index] - points[index - 1]))
+        total += distance
+    return total
 
 
 def _geometry_status(metrics: FootprintMetrics) -> GeometryStatus:

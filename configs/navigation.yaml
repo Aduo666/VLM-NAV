@@ -153,6 +153,10 @@ fine_tracking:
   arrival_distance_m: 0.05
   # 允许的最大横向轨迹误差，单位为米。
   max_path_error_m: 0.20
+  # 停车距离计算使用的保守减速度，单位为米每二次方秒。
+  safety_braking_deceleration_mps2: 0.30
+  # 从新障碍出现到停车指令生效的估计时间，单位为秒。
+  safety_reaction_time_sec: 0.30
 
 # 键盘方向键的手动控制速度。
 manual_control:
@@ -221,16 +225,8 @@ fine_planner:
   max_plan_distance_m: 4.0
   # 单次搜索允许扩展的最大节点数量。
   max_expansions: 10000
-  # 机器人附近将未知区域视为硬约束的半径，单位为米。
-  unknown_block_radius_m: 0.80
-  # 近场车体轮廓允许覆盖的最大未知栅格比例。
-  max_near_unknown_ratio: 0.05
-  # 触发近场未知硬约束所需的最小未知面积，单位为平方米。
-  min_near_unknown_area_m2: 0.02
   # 低余量路径的代价权重。
   clearance_weight: 0.01
-  # 未知区域的代价权重。
-  unknown_weight: 2.0
   # 大曲率运动段的代价权重。
   curvature_weight: 0.01
   # 相邻运动段曲率变化的代价权重。

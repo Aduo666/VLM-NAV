@@ -10,6 +10,9 @@ from vln_nav.control.trajectory import (
     VelocityCommand,
     wheel_targets,
 )
+from vln_nav.navigation.trajectory_clearance import (
+    translation_distance_until_direction_change,
+)
 
 
 class FinePathTracker:
@@ -23,6 +26,9 @@ class FinePathTracker:
         initial_speed_mps: float = 0.0,
         waypoint_tolerance_m: float = 0.04,
         yaw_tolerance_deg: float = 3.0,
+        safety_braking_deceleration_mps2: float | None = None,
+        safety_reaction_time_sec: float = 0.0,
+        safety_reserve_m: float = 0.0,
     ) -> None:
         config.validate()
         points = np.asarray(path_xy, dtype=np.float64)
@@ -38,12 +44,28 @@ class FinePathTracker:
             raise ValueError("细粒度轨迹运动方向必须属于 -1、0、1")
         if not math.isfinite(initial_speed_mps):
             raise ValueError("细粒度轨迹初始速度必须有效")
+        braking = (
+            config.max_acceleration_mps2
+            if safety_braking_deceleration_mps2 is None
+            else float(safety_braking_deceleration_mps2)
+        )
+        if (
+            not math.isfinite(braking)
+            or braking <= 0
+            or not math.isfinite(safety_reaction_time_sec)
+            or safety_reaction_time_sec < 0
+            or not math.isfinite(safety_reserve_m)
+            or safety_reserve_m < 0
+        ):
+            raise ValueError("细粒度跟踪停车参数无效")
         self.path = points
         self.yaw = yaw
         self.direction = direction
         self.config = config
         self.waypoint_tolerance_m = float(waypoint_tolerance_m)
         self.yaw_tolerance_rad = math.radians(float(yaw_tolerance_deg))
+        self.safety_braking_deceleration_mps2 = braking
+        self.safety_reaction_time_sec = float(safety_reaction_time_sec)
         self.segment_index = 0
         self.elapsed = 0.0
         self.speed = min(abs(float(initial_speed_mps)), config.max_linear_mps)
@@ -51,6 +73,11 @@ class FinePathTracker:
         self.fault: str | None = None
         delta = np.diff(points, axis=0)
         translation = np.linalg.norm(delta, axis=1)
+        moving_segments = translation[direction[1:] != 0]
+        self.safety_reserve_m = min(
+            float(safety_reserve_m),
+            0.4 * float(np.min(moving_segments)) if moving_segments.size else 0.0,
+        )
         yaw_delta = np.abs(np.asarray([
             _wrap_angle(yaw[index + 1] - yaw[index])
             for index in range(len(yaw) - 1)
@@ -79,12 +106,44 @@ class FinePathTracker:
                 reached = abs(_wrap_angle(self.yaw[next_index] - yaw)) <= self.yaw_tolerance_rad
             else:
                 segment = self.path[next_index] - self.path[self.segment_index]
-                passed = float(np.dot(position - self.path[next_index], segment)) >= 0.0
-                reached = (
-                    float(np.linalg.norm(position - self.path[next_index]))
-                    <= self.waypoint_tolerance_m
-                    or passed
+                segment_length = float(np.linalg.norm(segment))
+                lateral_error = (
+                    abs(float(np.cross(
+                        segment,
+                        position - self.path[self.segment_index],
+                    ))) / segment_length
+                    if segment_length > 1.0e-9
+                    else 0.0
                 )
+                if lateral_error > self.config.max_path_error_m:
+                    self.fault = "PATH_ERROR"
+                    break
+                passed = float(np.dot(position - self.path[next_index], segment)) >= 0.0
+                distance_to_waypoint = float(
+                    np.linalg.norm(position - self.path[next_index])
+                )
+                if next_index == len(self.path) - 1:
+                    reached = distance_to_waypoint <= min(
+                        self.waypoint_tolerance_m,
+                        self.config.arrival_distance_m,
+                        0.4 * segment_length,
+                    )
+                    if passed and not reached:
+                        self.fault = "PATH_ERROR"
+                        break
+                else:
+                    next_direction = int(self.direction[next_index + 1])
+                    waypoint_tolerance = (
+                        min(self.waypoint_tolerance_m, 0.4 * segment_length)
+                        if next_direction != direction
+                        else self.waypoint_tolerance_m
+                    )
+                    reached = distance_to_waypoint <= waypoint_tolerance
+                    if next_direction != direction and passed and not reached:
+                        self.fault = "PATH_ERROR"
+                        break
+                    if next_direction == direction:
+                        reached = reached or passed
             if not reached:
                 break
             self.segment_index = next_index
@@ -162,6 +221,24 @@ class FinePathTracker:
                 ),
                 math.sqrt(2.0 * self.config.max_acceleration_mps2 * max(remaining, 0.0)),
             )
+            remaining_translation = translation_distance_until_direction_change(
+                np.vstack((position, self.path[next_index:])),
+                np.r_[np.int8(0), self.direction[next_index:]],
+                first_segment_start_xy=self.path[self.segment_index],
+            )
+            usable_distance = max(
+                remaining_translation - self.safety_reserve_m,
+                0.0,
+            )
+            braking = self.safety_braking_deceleration_mps2
+            safe_stopping_speed = braking * (
+                math.sqrt(
+                    self.safety_reaction_time_sec**2
+                    + 2.0 * usable_distance / braking
+                )
+                - self.safety_reaction_time_sec
+            )
+            speed_limit = min(speed_limit, safe_stopping_speed)
             speed = min(
                 speed_limit,
                 self.speed + self.config.max_acceleration_mps2 * dt,

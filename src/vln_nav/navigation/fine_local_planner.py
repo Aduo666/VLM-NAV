@@ -9,6 +9,7 @@ import numpy as np
 from vln_nav.navigation.trajectory_clearance import (
     FootprintCollisionChecker,
     PlanningGrid,
+    stopping_distance_m,
 )
 
 
@@ -59,11 +60,7 @@ class FinePlannerConfig:
     goal_tolerance_m: float
     max_plan_distance_m: float
     max_expansions: int
-    unknown_block_radius_m: float
-    max_near_unknown_ratio: float
-    min_near_unknown_area_m2: float
     clearance_weight: float
-    unknown_weight: float
     curvature_weight: float
     curvature_change_weight: float
     reverse_penalty: float
@@ -106,10 +103,7 @@ class FinePlannerConfig:
             self.collision_sample_step_m,
             self.goal_tolerance_m,
             self.max_plan_distance_m,
-            self.unknown_block_radius_m,
-            self.min_near_unknown_area_m2,
             self.clearance_weight,
-            self.unknown_weight,
             self.curvature_weight,
             self.curvature_change_weight,
             self.reverse_penalty,
@@ -130,8 +124,6 @@ class FinePlannerConfig:
             raise ValueError("细粒度规划器 max_expansions 至少为 100")
         if not 1 <= self.partial_search_max_expansions <= self.max_expansions:
             raise ValueError("增量路径搜索节点上限必须位于 1 至 max_expansions 之间")
-        if not 0 <= self.max_near_unknown_ratio <= 1:
-            raise ValueError("细粒度规划器未知比例必须位于 0 至 1 范围内")
         if not self.curvature_samples_per_m or 0.0 not in self.curvature_samples_per_m:
             raise ValueError("细粒度规划器曲率样本必须包含零")
         if not all(math.isfinite(value) for value in self.curvature_samples_per_m):
@@ -157,10 +149,50 @@ class FinePlan:
     refinement_applied: bool = False
     refinement_iterations: int = 0
 
+    @property
+    def status(self) -> str:
+        return "SAFE_PARTIAL_PATH" if self.partial else "FULL_PATH"
 
-class FineUnknownBlockedError(RuntimeError):
-    def __init__(self, message: str, unknown_linear_indices: np.ndarray) -> None:
+
+@dataclass(frozen=True)
+class FineActionDiagnostic:
+    action_name: str
+    endpoint_world_xyyaw: tuple[float, float, float]
+    result: str
+    unknown_ratio: float
+    unknown_area_m2: float
+    unknown_linear_indices: tuple[int, ...]
+    part_unknown_counts: tuple[tuple[str, int], ...]
+    part_unknown_linear_indices: tuple[tuple[str, tuple[int, ...]], ...]
+    swept_linear_indices: tuple[int, ...]
+
+
+class FinePlanningFailure(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: str,
+        action_diagnostics: tuple[FineActionDiagnostic, ...],
+    ) -> None:
         super().__init__(message)
+        self.reason = reason
+        self.action_diagnostics = action_diagnostics
+
+
+class FineUnknownBlockedError(FinePlanningFailure):
+    def __init__(
+        self,
+        message: str,
+        unknown_linear_indices: np.ndarray,
+        action_diagnostics: tuple[FineActionDiagnostic, ...],
+        reason: str = "UNKNOWN_BLOCKED",
+    ) -> None:
+        super().__init__(
+            message,
+            reason=reason,
+            action_diagnostics=action_diagnostics,
+        )
         self.unknown_linear_indices = np.ascontiguousarray(
             unknown_linear_indices, dtype=np.int64
         )
@@ -211,6 +243,161 @@ class FineLocalPlanner:
             ]
         )
 
+    def inspect_initial_actions(
+        self,
+        *,
+        grid: PlanningGrid,
+        start_pose_world: tuple[float, float, float],
+        constraint: FinePlanningConstraint | None = None,
+    ) -> tuple[FineActionDiagnostic, ...]:
+        initial = np.asarray(start_pose_world, dtype=np.float64).reshape(3)
+        diagnostics = []
+        for action in self._actions:
+            primitive = self._sample_primitive(tuple(map(float, initial)), action)
+            metrics = [
+                self.collision_checker.metrics(
+                    grid,
+                    x_m=float(pose[0]),
+                    y_m=float(pose[1]),
+                    yaw_rad=float(pose[2]),
+                )
+                for pose in primitive[1:]
+            ]
+            unknown = self.collision_checker.incremental_unknown_metrics(
+                grid,
+                initial_pose=initial,
+                swept_poses=primitive[1:],
+            )
+            part_counts = []
+            part_unknown_cells = []
+            all_swept_parts = []
+            for part in self.footprint.parts:
+                swept_parts = [
+                    self.collision_checker.covered_linear_indices(
+                        grid,
+                        x_m=float(pose[0]),
+                        y_m=float(pose[1]),
+                        yaw_rad=float(pose[2]),
+                        part_name=part.name,
+                    )[0]
+                    for pose in primitive[1:]
+                ]
+                part_cells = np.unique(np.concatenate(swept_parts))
+                all_swept_parts.append(part_cells)
+                unknown_part_cells = np.intersect1d(
+                    part_cells,
+                    unknown.unknown_linear_indices,
+                    assume_unique=True,
+                )
+                part_counts.append((
+                    part.name,
+                    int(unknown_part_cells.size),
+                ))
+                part_unknown_cells.append((
+                    part.name,
+                    tuple(map(int, unknown_part_cells)),
+                ))
+            if constraint is not None and any(
+                not constraint.allows(
+                    float(pose[0]), float(pose[1]), float(pose[2])
+                )
+                for pose in primitive[1:]
+            ):
+                result = "CONSTRAINT"
+            elif any(item.outside_ratio > 0 for item in metrics):
+                result = "OUTSIDE"
+            elif any(item.collision for item in metrics):
+                result = "COLLISION"
+            elif unknown.cell_count > 0:
+                result = "UNKNOWN"
+            else:
+                result = "SAFE"
+            diagnostics.append(FineActionDiagnostic(
+                action_name=action.name,
+                endpoint_world_xyyaw=tuple(map(float, primitive[-1])),
+                result=result,
+                unknown_ratio=unknown.ratio,
+                unknown_area_m2=unknown.area_m2,
+                unknown_linear_indices=tuple(
+                    map(int, unknown.unknown_linear_indices)
+                ),
+                part_unknown_counts=tuple(part_counts),
+                part_unknown_linear_indices=tuple(part_unknown_cells),
+                swept_linear_indices=tuple(map(
+                    int, np.unique(np.concatenate(all_swept_parts))
+                )),
+            ))
+        return tuple(diagnostics)
+
+    def _has_safe_partial_continuation(
+        self,
+        *,
+        grid: PlanningGrid,
+        initial_pose: np.ndarray,
+        endpoint_pose: tuple[float, float, float],
+        reference_path_world_xy: np.ndarray,
+        travel_distance_m: float,
+        constraint: FinePlanningConstraint | None,
+    ) -> bool:
+        endpoint = np.asarray(endpoint_pose, dtype=np.float64)
+        route_position, lateral_error, tangent_yaw = _route_projection(
+            endpoint[:2],
+            reference_path_world_xy,
+            max_progress_m=travel_distance_m + grid.resolution_m,
+        )
+        current_score = (
+            route_position
+            - 0.5 * lateral_error
+            - 0.15 * abs(_wrap_angle(endpoint[2] - tangent_yaw))
+        )
+        for action in self._actions:
+            if action.direction == 0:
+                continue
+            primitive = self._sample_primitive(endpoint_pose, action)
+            if constraint is not None and any(
+                not constraint.allows(
+                    float(pose[0]), float(pose[1]), float(pose[2])
+                )
+                for pose in primitive[1:]
+            ):
+                continue
+            metrics = [
+                self.collision_checker.metrics(
+                    grid,
+                    x_m=float(pose[0]),
+                    y_m=float(pose[1]),
+                    yaw_rad=float(pose[2]),
+                )
+                for pose in primitive[1:]
+            ]
+            if any(item.collision or item.outside_ratio > 0 for item in metrics):
+                continue
+            unknown = self.collision_checker.incremental_unknown_metrics(
+                grid,
+                initial_pose=initial_pose,
+                swept_poses=primitive[1:],
+            )
+            if unknown.cell_count > 0:
+                continue
+            next_pose = primitive[-1]
+            next_position, next_lateral, next_tangent = _route_projection(
+                next_pose[:2],
+                reference_path_world_xy,
+                max_progress_m=(
+                    travel_distance_m
+                    + self.config.step_length_m
+                    + grid.resolution_m
+                ),
+            )
+            next_score = (
+                next_position
+                - 0.5 * next_lateral
+                - 0.15 * abs(_wrap_angle(next_pose[2] - next_tangent))
+            )
+            if next_score >= current_score + 0.5 * grid.resolution_m:
+                return True
+        return False
+
     def select_local_goal(
         self,
         *,
@@ -219,6 +406,22 @@ class FineLocalPlanner:
         target_world_xy: tuple[float, float],
         lookahead_m: float,
     ) -> tuple[float, float]:
+        goal, _ = self.select_local_route(
+            grid=grid,
+            start_pose_world=start_pose_world,
+            target_world_xy=target_world_xy,
+            lookahead_m=lookahead_m,
+        )
+        return goal
+
+    def select_local_route(
+        self,
+        *,
+        grid: PlanningGrid,
+        start_pose_world: tuple[float, float, float],
+        target_world_xy: tuple[float, float],
+        lookahead_m: float,
+    ) -> tuple[tuple[float, float], np.ndarray]:
         start = np.asarray(start_pose_world, dtype=np.float64)
         target = np.asarray(target_world_xy, dtype=np.float64)
         if start.shape != (3,) or target.shape != (2,) or not (
@@ -366,7 +569,10 @@ class FineLocalPlanner:
                     yaw_rad=yaw,
                 )]
             ):
-                return float(candidate[0]), float(candidate[1])
+                return (
+                    (float(candidate[0]), float(candidate[1])),
+                    np.ascontiguousarray(path[:index + 1]),
+                )
         raise RuntimeError("局部路径内没有满足车体足迹的短程目标")
 
     def plan(
@@ -377,6 +583,11 @@ class FineLocalPlanner:
         goal_world_xy: tuple[float, float],
         goal_world_yaw_rad: float | None = None,
         constraint: FinePlanningConstraint | None = None,
+        reference_path_world_xy: np.ndarray | None = None,
+        recent_world_poses: np.ndarray | None = None,
+        initial_speed_mps: float = 0.0,
+        reaction_time_sec: float = 0.25,
+        braking_deceleration_mps2: float = 0.60,
     ) -> FinePlan:
         start = np.asarray(start_pose_world, dtype=np.float64)
         goal = np.asarray(goal_world_xy, dtype=np.float64)
@@ -386,6 +597,25 @@ class FineLocalPlanner:
             raise ValueError("细粒度规划器需要有限的起始位姿和目标坐标")
         if float(np.linalg.norm(goal - start[:2])) > self.config.max_plan_distance_m:
             raise ValueError("细粒度局部目标超出规划距离")
+        reference = (
+            np.vstack((start[:2], goal))
+            if reference_path_world_xy is None
+            else np.asarray(reference_path_world_xy, dtype=np.float64)
+        )
+        if (
+            reference.ndim != 2
+            or reference.shape[1] != 2
+            or len(reference) < 2
+            or not np.isfinite(reference).all()
+        ):
+            raise ValueError("细粒度参考路线必须包含至少两个有效位置")
+        recent = (
+            np.empty((0, 3), dtype=np.float64)
+            if recent_world_poses is None
+            else np.asarray(recent_world_poses, dtype=np.float64).reshape(-1, 3)
+        )
+        if not np.isfinite(recent).all():
+            raise ValueError("近期实际位姿必须有效")
         start_key = self._state_key(grid, start[0], start[1], start[2], -1)
         if start_key is None:
             raise RuntimeError("细粒度规划器起始位姿位于局部地图外部")
@@ -398,6 +628,7 @@ class FineLocalPlanner:
         node_action: dict[int, int | None] = {0: None}
         node_cost = {0: 0.0}
         node_travel_distance = {0: 0.0}
+        node_translation_distance = {0: 0.0}
         node_key = {0: start_key}
         node_max_unknown_ratio = {0: 0.0}
         node_max_unknown_area_m2 = {0: 0.0}
@@ -410,9 +641,20 @@ class FineLocalPlanner:
             ),
         )
         goal_node = None
-        best_partial_node = None
-        best_partial_rank = None
-        start_goal_distance = float(np.linalg.norm(start[:2] - goal))
+        partial_candidates: list[tuple[tuple[float, float], int]] = []
+        _, start_lateral, start_tangent = _route_projection(
+            start[:2], reference, max_progress_m=grid.resolution_m
+        )
+        start_route_score = (
+            -0.5 * start_lateral
+            -0.15 * abs(_wrap_angle(start[2] - start_tangent))
+        )
+        minimum_stop_distance = stopping_distance_m(
+            initial_speed_mps,
+            reaction_time_sec=reaction_time_sec,
+            braking_deceleration_mps2=braking_deceleration_mps2,
+            reserve_m=grid.resolution_m,
+        )
         expanded = 0
         rejected_collision = 0
         rejected_unknown = 0
@@ -424,7 +666,7 @@ class FineLocalPlanner:
 
         while queue and expanded < self.config.max_expansions:
             if (
-                best_partial_node is not None
+                partial_candidates
                 and expanded >= self.config.partial_search_max_expansions
             ):
                 break
@@ -485,16 +727,7 @@ class FineLocalPlanner:
                 observed_max_unknown_area_m2 = max(
                     observed_max_unknown_area_m2, unknown_metrics.area_m2
                 )
-                distance_from_start = math.hypot(
-                    primitive[-1, 0] - start[0], primitive[-1, 1] - start[1]
-                )
-                near_unknown_blocked = (
-                    distance_from_start <= self.config.unknown_block_radius_m
-                    and unknown_ratio > self.config.max_near_unknown_ratio
-                    and unknown_metrics.area_m2
-                    >= self.config.min_near_unknown_area_m2
-                )
-                if near_unknown_blocked:
+                if unknown_metrics.cell_count > 0:
                     rejected_unknown += 1
                     rejected_unknown_mask.reshape(-1)[
                         unknown_metrics.unknown_linear_indices
@@ -536,11 +769,6 @@ class FineLocalPlanner:
                     / max(min_clearance, 0.02)
                 )
                 transition_cost += (
-                    self.config.unknown_weight
-                    * unknown_ratio
-                    * transition_length
-                )
-                transition_cost += (
                     self.config.curvature_weight
                     * abs(action.curvature_per_m)
                     * transition_length
@@ -565,6 +793,10 @@ class FineLocalPlanner:
                 node_travel_distance[counter] = (
                     node_travel_distance[current_node] + transition_length
                 )
+                node_translation_distance[counter] = (
+                    node_translation_distance[current_node]
+                    + (self.config.step_length_m if action.direction != 0 else 0.0)
+                )
                 node_key[counter] = next_key
                 node_max_unknown_ratio[counter] = max(
                     node_max_unknown_ratio[current_node], unknown_ratio
@@ -572,13 +804,35 @@ class FineLocalPlanner:
                 node_max_unknown_area_m2[counter] = max(
                     node_max_unknown_area_m2[current_node], unknown_metrics.area_m2
                 )
-                progress = start_goal_distance - math.hypot(
-                    endpoint[0] - goal[0], endpoint[1] - goal[1]
+                route_progress, lateral_error, tangent_yaw = _route_projection(
+                    endpoint[:2],
+                    reference,
+                    max_progress_m=(
+                        node_travel_distance[counter] + grid.resolution_m
+                    ),
+                )
+                progress = (
+                    route_progress
+                    - 0.5 * lateral_error
+                    - 0.15 * abs(_wrap_angle(endpoint[2] - tangent_yaw))
+                    - start_route_score
+                )
+                repeated_pose = any(
+                    math.hypot(
+                        endpoint[0] - old_pose[0],
+                        endpoint[1] - old_pose[1],
+                    ) < grid.resolution_m
+                    and abs(_wrap_angle(endpoint[2] - old_pose[2]))
+                    < self._yaw_step
+                    for old_pose in recent
                 )
                 if (
                     node_travel_distance[counter]
                     <= self.config.partial_path_max_distance_m + 1.0e-9
+                    and node_translation_distance[counter]
+                    >= minimum_stop_distance
                     and node_max_unknown_area_m2[counter] == 0.0
+                    and not repeated_pose
                     and progress >= max(
                         self.config.goal_tolerance_m,
                         0.5 * self.config.step_length_m,
@@ -588,18 +842,34 @@ class FineLocalPlanner:
                         progress,
                         -new_cost,
                     )
-                    if best_partial_rank is None or candidate_rank > best_partial_rank:
-                        best_partial_rank = candidate_rank
-                        best_partial_node = counter
+                    partial_candidates.append((candidate_rank, counter))
                 priority = new_cost + self.config.heuristic_weight * self._heuristic(
                     endpoint[:2], goal
                 )
                 heapq.heappush(queue, (priority, counter, counter))
 
-        partial = goal_node is None and best_partial_node is not None
-        if partial:
-            goal_node = best_partial_node
+        partial = False
         if goal_node is None:
+            for _, candidate_node in sorted(
+                partial_candidates, reverse=True
+            ):
+                if self._has_safe_partial_continuation(
+                    grid=grid,
+                    initial_pose=start,
+                    endpoint_pose=node_pose[candidate_node],
+                    reference_path_world_xy=reference,
+                    travel_distance_m=node_travel_distance[candidate_node],
+                    constraint=constraint,
+                ):
+                    goal_node = candidate_node
+                    partial = True
+                    break
+        if goal_node is None:
+            diagnostics = self.inspect_initial_actions(
+                grid=grid,
+                start_pose_world=start_pose_world,
+                constraint=constraint,
+            )
             message = (
                 f"细粒度规划器扩展 {expanded} 个节点后仍未找到路径；"
                 f"碰撞拒绝={rejected_collision}，未知拒绝={rejected_unknown}，"
@@ -607,12 +877,39 @@ class FineLocalPlanner:
                 f"未知最大比例={observed_max_unknown_ratio:.3f}，"
                 f"未知最大面积={observed_max_unknown_area_m2:.3f}m2"
             )
-            if rejected_unknown:
+            budget_exhausted = (
+                bool(queue)
+                and (
+                    expanded >= self.config.max_expansions
+                    or (
+                        bool(partial_candidates)
+                        and expanded >= self.config.partial_search_max_expansions
+                    )
+                )
+            )
+            reason = (
+                "SEARCH_BUDGET_EXHAUSTED"
+                if budget_exhausted
+                else "NO_SAFE_CONTINUATION"
+                if partial_candidates
+                else "UNKNOWN_BLOCKED"
+                if rejected_unknown
+                else "NO_SAFE_PROGRESS"
+            )
+            if partial_candidates and not budget_exhausted:
+                message += "；安全短路径终点没有朝参考路线继续移动的空间"
+            if rejected_unknown and not budget_exhausted:
                 raise FineUnknownBlockedError(
                     message,
                     np.flatnonzero(rejected_unknown_mask),
+                    diagnostics,
+                    reason=reason,
                 )
-            raise RuntimeError(message)
+            raise FinePlanningFailure(
+                message,
+                reason=reason,
+                action_diagnostics=diagnostics,
+            )
         node_ids = []
         current = goal_node
         while current is not None:
@@ -718,3 +1015,39 @@ class FineLocalPlanner:
 
 def _wrap_angle(angle_rad: float) -> float:
     return (float(angle_rad) + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def _route_projection(
+    position_xy: np.ndarray,
+    reference_path_xy: np.ndarray,
+    *,
+    max_progress_m: float,
+) -> tuple[float, float, float]:
+    point = np.asarray(position_xy, dtype=np.float64).reshape(2)
+    path = np.asarray(reference_path_xy, dtype=np.float64)
+    cumulative = 0.0
+    best = None
+    for start, end in zip(path[:-1], path[1:]):
+        segment = end - start
+        length = float(np.linalg.norm(segment))
+        if length < 1.0e-9:
+            continue
+        allowed = min(1.0, max(0.0, (max_progress_m - cumulative) / length))
+        fraction = float(np.clip(
+            np.dot(point - start, segment) / (length * length),
+            0.0,
+            allowed,
+        ))
+        projected = start + fraction * segment
+        lateral = float(np.linalg.norm(point - projected))
+        progress = cumulative + fraction * length
+        tangent = math.atan2(float(segment[1]), float(segment[0]))
+        candidate = (lateral, progress, tangent)
+        if best is None or candidate[:2] < best[:2]:
+            best = candidate
+        cumulative += length
+        if cumulative >= max_progress_m:
+            break
+    if best is None:
+        raise ValueError("参考路线没有有效的运动段")
+    return best[1], best[0], best[2]

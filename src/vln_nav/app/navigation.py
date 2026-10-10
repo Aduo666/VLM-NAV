@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass, fields, replace
+from dataclasses import asdict, dataclass, fields, replace
+import json
 import logging
 import math
 from pathlib import Path
@@ -43,6 +44,7 @@ from vln_nav.navigation.fine_local_planner import (
     FineLocalPlanner,
     FinePlanningConstraint,
     FinePlannerConfig,
+    FinePlanningFailure,
     FineUnknownBlockedError,
 )
 from vln_nav.navigation.navdp_client import (
@@ -74,9 +76,11 @@ from vln_nav.navigation.trajectory_refiner import (
 from vln_nav.navigation.trajectory_clearance import (
     FootprintConfig,
     FootprintCollisionChecker,
-    assess_path_clearance,
+    assess_known_swept_path,
     clear_current_footprint,
     planning_grid_from_snapshot,
+    stopping_distance_m,
+    translation_distance_until_direction_change,
 )
 from vln_nav.navigation.traversability_graph import (
     TraversabilityGraphBuilder,
@@ -144,6 +148,10 @@ class _FinePlanningJob:
     lookahead_m: float
     submitted_sim_time_sec: float
     floor_z_m: float
+    recent_world_poses: tuple[tuple[float, float, float], ...] = ()
+    initial_speed_mps: float = 0.0
+    reaction_time_sec: float = 0.25
+    braking_deceleration_mps2: float = 0.60
 
 
 @dataclass(frozen=True)
@@ -157,15 +165,33 @@ class _FineFailureInput:
     occupied_mask: np.ndarray
     unknown_mask: np.ndarray
     origin_xy: tuple[float, float]
+    bounds: tuple[int, int, int, int]
     start_pose_world: tuple[float, float, float]
     goal_world_xy: tuple[float, float]
 
     @classmethod
-    def from_job(cls, grid, job: _FinePlanningJob) -> "_FineFailureInput":
+    def from_job(
+        cls,
+        grid,
+        job: _FinePlanningJob,
+        *,
+        relevant_radius_m: float,
+    ) -> "_FineFailureInput":
+        row, column, _ = grid.world_to_cell(
+            job.start_pose_world[0], job.start_pose_world[1]
+        )
+        radius_cells = int(math.ceil(relevant_radius_m / grid.resolution_m))
+        row_start = max(0, row - radius_cells)
+        row_stop = min(grid.shape[0], row + radius_cells + 1)
+        column_start = max(0, column - radius_cells)
+        column_stop = min(grid.shape[1], column + radius_cells + 1)
+        bounds = (row_start, row_stop, column_start, column_stop)
+        region = np.s_[row_start:row_stop, column_start:column_stop]
         return cls(
-            occupied_mask=grid.occupied_mask.copy(),
-            unknown_mask=grid.unknown_mask.copy(),
+            occupied_mask=grid.occupied_mask[region].copy(),
+            unknown_mask=grid.unknown_mask[region].copy(),
             origin_xy=(grid.origin_x_m, grid.origin_y_m),
+            bounds=bounds,
             start_pose_world=job.start_pose_world,
             goal_world_xy=job.goal_world_xy,
         )
@@ -174,10 +200,12 @@ class _FineFailureInput:
         yaw_delta = (
             float(start_pose_world[2]) - self.start_pose_world[2] + math.pi
         ) % (2.0 * math.pi) - math.pi
+        row_start, row_stop, column_start, column_stop = self.bounds
+        region = np.s_[row_start:row_stop, column_start:column_stop]
         return bool(
             self.origin_xy == (grid.origin_x_m, grid.origin_y_m)
-            and np.array_equal(self.occupied_mask, grid.occupied_mask)
-            and np.array_equal(self.unknown_mask, grid.unknown_mask)
+            and np.array_equal(self.occupied_mask, grid.occupied_mask[region])
+            and np.array_equal(self.unknown_mask, grid.unknown_mask[region])
             and np.linalg.norm(
                 np.asarray(start_pose_world[:2])
                 - np.asarray(self.start_pose_world[:2])
@@ -187,6 +215,31 @@ class _FineFailureInput:
                 np.asarray(goal_world_xy) - np.asarray(self.goal_world_xy)
             ) < grid.resolution_m
         )
+
+
+def _repeated_partial_path(
+    plan: FinePlan,
+    *,
+    current_world_xy: np.ndarray,
+    last_switch_world_xy: np.ndarray | None,
+    last_endpoint_world_xy: np.ndarray | None,
+    resolution_m: float,
+) -> bool:
+    if (
+        not plan.partial
+        or last_switch_world_xy is None
+        or last_endpoint_world_xy is None
+    ):
+        return False
+    return bool(
+        np.linalg.norm(
+            np.asarray(current_world_xy, dtype=np.float64)
+            - last_switch_world_xy
+        ) < resolution_m
+        and np.linalg.norm(
+            plan.path_world_xy[-1] - last_endpoint_world_xy
+        ) < resolution_m
+    )
 
 
 class _NavDPWorker:
@@ -418,19 +471,41 @@ class _FinePlanningWorker:
                 local_goal = analysis.tube.goal_world_pose[:2]
                 local_goal_yaw = analysis.tube.goal_world_pose[2]
             else:
-                local_goal = self._planner.select_local_goal(
-                    grid=grid,
-                    start_pose_world=job.start_pose_world,
-                    target_world_xy=job.goal_world_xy,
-                    lookahead_m=job.lookahead_m,
-                )
+                try:
+                    local_goal, reference_route = self._planner.select_local_route(
+                        grid=grid,
+                        start_pose_world=job.start_pose_world,
+                        target_world_xy=job.goal_world_xy,
+                        lookahead_m=job.lookahead_m,
+                    )
+                except RuntimeError as exc:
+                    raise FinePlanningFailure(
+                        str(exc),
+                        reason="LOCAL_GOAL_UNREACHABLE",
+                        action_diagnostics=self._planner.inspect_initial_actions(
+                            grid=grid,
+                            start_pose_world=job.start_pose_world,
+                        ),
+                    ) from exc
                 local_goal_yaw = None
+            if job.use_restricted_analysis:
+                reference_route = np.vstack((
+                    np.asarray(job.start_pose_world[:2], dtype=np.float64),
+                    np.asarray(local_goal, dtype=np.float64),
+                ))
             plan = self._planner.plan(
                 grid=grid,
                 start_pose_world=job.start_pose_world,
                 goal_world_xy=local_goal,
                 goal_world_yaw_rad=local_goal_yaw,
                 constraint=constraint,
+                reference_path_world_xy=reference_route,
+                recent_world_poses=np.asarray(
+                    job.recent_world_poses, dtype=np.float64
+                ).reshape(-1, 3),
+                initial_speed_mps=job.initial_speed_mps,
+                reaction_time_sec=job.reaction_time_sec,
+                braking_deceleration_mps2=job.braking_deceleration_mps2,
             )
             refined = self._trajectory_refiner.refine(
                 grid=grid,
@@ -818,6 +893,8 @@ def _load_settings() -> tuple[
         "lookahead_m",
         "arrival_distance_m",
         "max_path_error_m",
+        "safety_braking_deceleration_mps2",
+        "safety_reaction_time_sec",
     }
     if not isinstance(fine_tracking, dict) or set(fine_tracking) != fine_tracking_fields:
         raise ValueError(
@@ -1041,6 +1118,136 @@ def _make_logger() -> logging.Logger:
     logger.addHandler(file_handler)
     logger.info("[NavigationModes] log=%s", log_path)
     return logger
+
+
+def _save_fine_failure_diagnostic(
+    *,
+    job: _FinePlanningJob,
+    grid,
+    failure: FinePlanningFailure,
+    collision_checker: FootprintCollisionChecker,
+) -> tuple[Path, Path, Path]:
+    output_dir = PROJECT_ROOT / "debug/local"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stem = f"fine_failure_{job.request_id:04d}_{uuid.uuid4().hex[:8]}"
+    map_path = output_dir / f"{stem}.npz"
+    report_path = output_dir / f"{stem}.json"
+    image_path = output_dir / f"{stem}.png"
+    np.savez_compressed(
+        map_path,
+        occupied_mask=grid.occupied_mask,
+        free_mask=grid.free_mask,
+        unknown_mask=grid.unknown_mask,
+        clearance_m=grid.clearance_m,
+        state_zyx=job.snapshot.state,
+        source_mask_zyx=job.snapshot.source_mask,
+        map_origin_world_xyz=job.snapshot.origin_world_xyz,
+        resolution_m=np.asarray(grid.resolution_m),
+        map_version=np.asarray(grid.map_version),
+        start_pose_world=np.asarray(job.start_pose_world),
+        target_world_xy=np.asarray(job.goal_world_xy),
+        floor_z_m=np.asarray(job.floor_z_m),
+    )
+    report = {
+        "request_id": job.request_id,
+        "map_version": grid.map_version,
+        "reason": failure.reason,
+        "start_pose_world": job.start_pose_world,
+        "target_world_xy": job.goal_world_xy,
+        "action_diagnostics": [
+            asdict(item) for item in failure.action_diagnostics
+        ],
+        "footprint": {
+            "margin_m": collision_checker.footprint.margin_m,
+            "parts": [
+                asdict(part) for part in collision_checker.footprint.parts
+            ],
+        },
+    }
+    with report_path.open("w", encoding="utf-8") as handle:
+        json.dump(report, handle, ensure_ascii=False, indent=2)
+    image = _render_fine_failure_diagnostic(
+        grid=grid,
+        start_pose_world=job.start_pose_world,
+        failure=failure,
+        collision_checker=collision_checker,
+    )
+    image.save(image_path)
+    return map_path, report_path, image_path
+
+
+def _render_fine_failure_diagnostic(
+    *,
+    grid,
+    start_pose_world: tuple[float, float, float],
+    failure: FinePlanningFailure,
+    collision_checker: FootprintCollisionChecker,
+) -> Image.Image:
+    rgb = np.full((*grid.shape, 3), (108, 110, 112), dtype=np.uint8)
+    rgb[grid.free_mask] = (238, 237, 232)
+    rgb[grid.occupied_mask] = (28, 29, 29)
+    current_cells, _ = collision_checker.covered_linear_indices(
+        grid,
+        x_m=start_pose_world[0],
+        y_m=start_pose_world[1],
+        yaw_rad=start_pose_world[2],
+        margin_m=0.0,
+    )
+    padded_cells, _ = collision_checker.covered_linear_indices(
+        grid,
+        x_m=start_pose_world[0],
+        y_m=start_pose_world[1],
+        yaw_rad=start_pose_world[2],
+    )
+    left = rgb.copy()
+    left.reshape(-1, 3)[padded_cells] = (238, 184, 45)
+    left.reshape(-1, 3)[current_cells] = (55, 92, 168)
+    right = rgb.copy()
+    for item in failure.action_diagnostics:
+        if item.action_name == "forward_2":
+            right.reshape(-1, 3)[list(item.swept_linear_indices)] = (73, 160, 212)
+            right.reshape(-1, 3)[list(item.unknown_linear_indices)] = (
+                235, 68, 125
+            )
+        elif item.action_name in {"spin_left", "spin_right"}:
+            right.reshape(-1, 3)[list(item.unknown_linear_indices)] = (
+                242, 147, 66
+            )
+    for item in failure.action_diagnostics:
+        if item.action_name == "forward_2":
+            right.reshape(-1, 3)[list(item.unknown_linear_indices)] = (
+                235, 68, 125
+            )
+            break
+    scale = 4
+    width = grid.shape[1] * scale
+    height = grid.shape[0] * scale
+    image = Image.new("RGB", (2 * width, height + 52), (37, 40, 44))
+    image.paste(
+        Image.fromarray(np.flipud(left), mode="RGB").resize(
+            (width, height), Image.NEAREST
+        ),
+        (0, 32),
+    )
+    image.paste(
+        Image.fromarray(np.flipud(right), mode="RGB").resize(
+            (width, height), Image.NEAREST
+        ),
+        (width, 32),
+    )
+    draw = ImageDraw.Draw(image)
+    draw.text((8, 8), "CURRENT BLUE / MARGIN YELLOW", fill=(245, 245, 242))
+    draw.text(
+        (width + 8, 8),
+        "FORWARD 0.1m BLUE / UNKNOWN PINK / SPIN ORANGE",
+        fill=(245, 245, 242),
+    )
+    draw.text(
+        (8, height + 35),
+        f"map_version={grid.map_version}  resolution={grid.resolution_m:.3f}m",
+        fill=(245, 245, 242),
+    )
+    return image
 
 
 def _run(
@@ -1369,11 +1576,17 @@ def _run(
     last_map_render_time = -float("inf")
     last_coarse_request_time = -float("inf")
     last_fine_request_time = -float("inf")
+    last_fine_safety_check_time = -float("inf")
+    last_fine_safety_map_version = -1
     map_integration_period = float(map_settings["map"]["integration_period_sec"])
     map_render_period = float(settings["map_selector"]["render_period_sec"])
     latest_snapshot = local_map.snapshot()
     latest_planning_grid = None
     last_failed_fine_input: _FineFailureInput | None = None
+    fine_diagnostic_saved_for_goal = False
+    recent_fine_world_poses: deque[tuple[float, float, float]] = deque(maxlen=30)
+    last_partial_switch_world_xy: np.ndarray | None = None
+    last_partial_endpoint_world_xy: np.ndarray | None = None
     rejected_unknown_world_xy: np.ndarray | None = None
     latest_camera_frames: dict[str, CameraFrameGeometry] = {}
     s2_settings = settings["internnav_s2"]
@@ -1429,6 +1642,25 @@ def _run(
                 float(world_from_base[1, 0]),
                 float(world_from_base[0, 0]),
             )
+            if navigation_active and mode == "FINE":
+                current_pose_world = (
+                    float(position[0]), float(position[1]), float(robot_yaw_world)
+                )
+                if not recent_fine_world_poses:
+                    recent_fine_world_poses.append(current_pose_world)
+                else:
+                    previous_pose = recent_fine_world_poses[-1]
+                    yaw_change = (
+                        current_pose_world[2] - previous_pose[2] + math.pi
+                    ) % (2.0 * math.pi) - math.pi
+                    if (
+                        math.hypot(
+                            current_pose_world[0] - previous_pose[0],
+                            current_pose_world[1] - previous_pose[1],
+                        ) >= 0.08
+                        or abs(yaw_change) >= math.radians(10.0)
+                    ):
+                        recent_fine_world_poses.append(current_pose_world)
             if now - last_map_integration_time >= map_integration_period:
                 captured = {
                     source: sample
@@ -1637,6 +1869,10 @@ def _run(
                             display_path_odom_xy = None
                             navigation_active = True
                             last_failed_fine_input = None
+                            fine_diagnostic_saved_for_goal = False
+                            recent_fine_world_poses.clear()
+                            last_partial_switch_world_xy = None
+                            last_partial_endpoint_world_xy = None
                             rejected_unknown_world_xy = None
                             last_coarse_request_time = -float("inf")
                             last_fine_request_time = -float("inf")
@@ -1929,8 +2165,56 @@ def _run(
                 ):
                     logger.info("[FineResult] ignored stale request=%d", job.request_id)
                 elif error is not None:
-                    if grid is not None:
-                        last_failed_fine_input = _FineFailureInput.from_job(grid, job)
+                    if (
+                        isinstance(error, FinePlanningFailure)
+                        and grid is not None
+                        and not fine_diagnostic_saved_for_goal
+                    ):
+                        try:
+                            map_path, report_path, image_path = (
+                                _save_fine_failure_diagnostic(
+                                    job=job,
+                                    grid=grid,
+                                    failure=error,
+                                    collision_checker=collision_checker,
+                                )
+                            )
+                            fine_diagnostic_saved_for_goal = True
+                            logger.info(
+                                "[FineDiagnostic] reason=%s map=%s report=%s image=%s",
+                                error.reason,
+                                map_path,
+                                report_path,
+                                image_path,
+                            )
+                            for item in error.action_diagnostics:
+                                logger.info(
+                                    "[FineAction] action=%s result=%s "
+                                    "endpoint=%s unknown=%d area=%.3fm2 "
+                                    "parts=%s map_version=%d",
+                                    item.action_name,
+                                    item.result,
+                                    item.endpoint_world_xyyaw,
+                                    len(item.unknown_linear_indices),
+                                    item.unknown_area_m2,
+                                    dict(item.part_unknown_counts),
+                                    grid.map_version,
+                                )
+                        except Exception:
+                            logger.exception("[FineDiagnostic] 保存失败")
+                    if (
+                        isinstance(error, FinePlanningFailure)
+                        and error.reason == "SEARCH_BUDGET_EXHAUSTED"
+                    ):
+                        last_failed_fine_input = None
+                    elif grid is not None:
+                        last_failed_fine_input = _FineFailureInput.from_job(
+                            grid,
+                            job,
+                            relevant_radius_m=(
+                                job.lookahead_m + collision_checker.bounding_radius_m
+                            ),
+                        )
                     if isinstance(error, FineUnknownBlockedError) and grid is not None:
                         rows, columns = np.unravel_index(
                             error.unknown_linear_indices, grid.shape
@@ -1959,11 +2243,25 @@ def _run(
                         rejected_unknown_world_xy = None
                         idle_status = "Fine planning failed; inspect Fine Geometry and log"
                     logger.error(
-                        "[FineResult] request=%d map_version=%d target=[%.2f,%.2f] failed: %s",
+                        "[FineResult] request=%d map_version=%d "
+                        "target=[%.2f,%.2f] status=%s reason=%s failed: %s",
                         job.request_id,
                         job.snapshot.version,
                         job.goal_world_xy[0],
                         job.goal_world_xy[1],
+                        (
+                            "SEARCH_INCOMPLETE"
+                            if isinstance(error, FinePlanningFailure)
+                            and error.reason == "SEARCH_BUDGET_EXHAUSTED"
+                            else "NO_SAFE_PROGRESS"
+                            if isinstance(error, FinePlanningFailure)
+                            else "ERROR"
+                        ),
+                        (
+                            error.reason
+                            if isinstance(error, FinePlanningFailure)
+                            else type(error).__name__
+                        ),
                         error,
                     )
                 else:
@@ -1984,18 +2282,22 @@ def _run(
                         plan.path_world_yaw_rad,
                         state,
                     )
-                    clearance = assess_path_clearance(
+                    clearance, planned_unknown = assess_known_swept_path(
                         grid,
                         plan.path_world_xy,
                         plan.path_world_yaw_rad,
                         collision_checker=collision_checker,
+                        max_step_m=fine_config.collision_sample_step_m,
+                        max_yaw_step_deg=fine_config.yaw_resolution_deg,
                     )
                     validation_grid = latest_planning_grid or grid
-                    latest_clearance = assess_path_clearance(
+                    latest_clearance, current_unknown = assess_known_swept_path(
                         validation_grid,
                         plan.path_world_xy,
                         plan.path_world_yaw_rad,
                         collision_checker=collision_checker,
+                        max_step_m=fine_config.collision_sample_step_m,
+                        max_yaw_step_deg=fine_config.yaw_resolution_deg,
                     )
                     rejection = _rolling_result_rejection(
                         result_age_sec=result_age,
@@ -2009,11 +2311,48 @@ def _run(
                         rejection = "fine_path_new_collision"
                     elif clearance.outside_ratio > 0 or latest_clearance.outside_ratio > 0:
                         rejection = "fine_path_outside_map"
-                    elif (
-                        latest_clearance.unknown_ratio
-                        > clearance.unknown_ratio + fine_config.max_near_unknown_ratio
-                    ):
+                    elif planned_unknown.cell_count > 0:
+                        rejection = "fine_path_unknown"
+                    elif current_unknown.cell_count > 0:
                         rejection = "fine_path_new_unknown"
+                    elif (
+                        (
+                            int(plan.path_motion_direction[1]) != 0
+                            or abs(state.linear_velocity_mps) > 0.02
+                        )
+                        and translation_distance_until_direction_change(
+                            np.vstack((
+                                np.asarray(
+                                    [[state.pose.x, state.pose.y]],
+                                    dtype=np.float64,
+                                ),
+                                joined_path[1:],
+                            )),
+                            plan.path_motion_direction,
+                            first_segment_start_xy=joined_path[0],
+                        ) < stopping_distance_m(
+                            state.linear_velocity_mps,
+                            reaction_time_sec=float(
+                                fine_tracking["safety_reaction_time_sec"]
+                            ),
+                            braking_deceleration_mps2=float(
+                                fine_tracking["safety_braking_deceleration_mps2"]
+                            ),
+                            reserve_m=min(
+                                0.4 * validation_grid.resolution_m,
+                                0.5 * fine_tracking_config.arrival_distance_m,
+                            ),
+                        )
+                    ):
+                        rejection = "fine_path_stop_distance"
+                    elif _repeated_partial_path(
+                        plan,
+                        current_world_xy=np.asarray(position[:2]),
+                        last_switch_world_xy=last_partial_switch_world_xy,
+                        last_endpoint_world_xy=last_partial_endpoint_world_xy,
+                        resolution_m=validation_grid.resolution_m,
+                    ):
+                        rejection = "fine_partial_repeated_without_motion"
                     elif rejection == "result_too_old":
                         yaw_delta = (
                             robot_yaw_world - job.start_pose_world[2] + math.pi
@@ -2027,12 +2366,21 @@ def _run(
                             rejection = None
                     if rejection is not None:
                         last_failed_fine_input = (
-                            _FineFailureInput.from_job(validation_grid, job)
+                            _FineFailureInput.from_job(
+                                validation_grid,
+                                job,
+                                relevant_radius_m=(
+                                    job.lookahead_m
+                                    + collision_checker.bounding_radius_m
+                                ),
+                            )
                             if rejection in {
                                 "fine_path_collision",
                                 "fine_path_new_collision",
                                 "fine_path_outside_map",
+                                "fine_path_unknown",
                                 "fine_path_new_unknown",
+                                "fine_partial_repeated_without_motion",
                             }
                             else None
                         )
@@ -2063,12 +2411,29 @@ def _run(
                     else:
                         last_failed_fine_input = None
                         rejected_unknown_world_xy = None
+                        last_partial_switch_world_xy = (
+                            np.asarray(position[:2], dtype=np.float64).copy()
+                            if plan.partial else None
+                        )
+                        last_partial_endpoint_world_xy = (
+                            plan.path_world_xy[-1].copy() if plan.partial else None
+                        )
                         tracker = FinePathTracker(
                             joined_path,
                             path_odom_yaw,
                             plan.path_motion_direction,
                             fine_tracking_config,
                             initial_speed_mps=state.linear_velocity_mps,
+                            safety_braking_deceleration_mps2=float(
+                                fine_tracking["safety_braking_deceleration_mps2"]
+                            ),
+                            safety_reaction_time_sec=float(
+                                fine_tracking["safety_reaction_time_sec"]
+                            ),
+                            safety_reserve_m=min(
+                                0.4 * validation_grid.resolution_m,
+                                0.5 * fine_tracking_config.arrival_distance_m,
+                            ),
                         )
                         display_path_odom_xy = joined_path.copy()
                         tracker_mode = mode
@@ -2076,7 +2441,7 @@ def _run(
                         previous_tracking_status = None
                         previous_adapter_status = None
                         logger.info(
-                            "[FineSwitch] generation=%d request=%d partial=%s "
+                            "[FineSwitch] generation=%d request=%d status=%s partial=%s "
                             "first_direction=%d endpoint=[%.2f,%.2f] "
                             "nodes=%d cost=%.3f "
                             "age=%.3fs join_error=%.3fm remaining=%.3fm "
@@ -2085,6 +2450,7 @@ def _run(
                             "rejected=[collision:%d,unknown:%d,outside:%d]",
                             generation_index,
                             job.request_id,
+                            plan.status,
                             plan.partial,
                             int(plan.path_motion_direction[1]),
                             plan.path_world_xy[-1, 0],
@@ -2139,6 +2505,10 @@ def _run(
                             selected_index = 0
                             navigation_active = True
                             last_failed_fine_input = None
+                            fine_diagnostic_saved_for_goal = False
+                            recent_fine_world_poses.clear()
+                            last_partial_switch_world_xy = None
+                            last_partial_endpoint_world_xy = None
                             rejected_unknown_world_xy = None
                             generation_index = 0
                             last_coarse_request_time = -float("inf")
@@ -2187,6 +2557,10 @@ def _run(
                     goal_distance,
                 )
                 selected_goal_odom_xy = None
+                fine_diagnostic_saved_for_goal = False
+                recent_fine_world_poses.clear()
+                last_partial_switch_world_xy = None
+                last_partial_endpoint_world_xy = None
                 rejected_unknown_world_xy = None
                 navdp_short_retry_count = 0
                 navdp_waiting_stable_after_short = False
@@ -2241,6 +2615,10 @@ def _run(
                     fine_request_id += 1
                     accepted_fine_request_id = fine_request_id
                     navigation_active = True
+                    fine_diagnostic_saved_for_goal = False
+                    recent_fine_world_poses.clear()
+                    last_partial_switch_world_xy = None
+                    last_partial_endpoint_world_xy = None
                     rejected_unknown_world_xy = None
                     last_coarse_request_time = -float("inf")
                     last_fine_request_time = -float("inf")
@@ -2288,6 +2666,91 @@ def _run(
                     idle_status = "S2 LOOKDOWN waiting for down-camera frame"
                     logger.info("[S2LookDown] requested down-camera continuation")
 
+            if (
+                tracker is not None
+                and tracker_mode == "FINE"
+                and latest_planning_grid is not None
+                and (
+                    latest_planning_grid.map_version != last_fine_safety_map_version
+                    or now - last_fine_safety_check_time >= 0.10
+                )
+            ):
+                last_fine_safety_check_time = now
+                last_fine_safety_map_version = latest_planning_grid.map_version
+                next_index = min(tracker.segment_index + 1, len(tracker.path) - 1)
+                remaining_odom = np.vstack((
+                    np.asarray([[state.pose.x, state.pose.y]], dtype=np.float64),
+                    tracker.path[next_index:],
+                ))
+                remaining_world = _odom_path_to_world(remaining_odom, state)
+                remaining_yaw_world = np.r_[
+                    robot_yaw_world,
+                    tracker.yaw[next_index:] + state.origin_world_yaw_rad,
+                ]
+                safety_grid = clear_current_footprint(
+                    latest_planning_grid,
+                    x_m=float(position[0]),
+                    y_m=float(position[1]),
+                    yaw_rad=float(robot_yaw_world),
+                    collision_checker=collision_checker,
+                )
+                safety_clearance, safety_unknown = assess_known_swept_path(
+                    safety_grid,
+                    remaining_world,
+                    remaining_yaw_world,
+                    collision_checker=collision_checker,
+                    max_step_m=fine_config.collision_sample_step_m,
+                    max_yaw_step_deg=fine_config.yaw_resolution_deg,
+                )
+                remaining_distance = translation_distance_until_direction_change(
+                    remaining_world,
+                    np.r_[
+                        np.int8(0),
+                        tracker.direction[next_index:],
+                    ],
+                    first_segment_start_xy=_odom_path_to_world(
+                        tracker.path[tracker.segment_index][None, :],
+                        state,
+                    )[0],
+                )
+                stop_distance = stopping_distance_m(
+                    state.linear_velocity_mps,
+                    reaction_time_sec=float(
+                        fine_tracking["safety_reaction_time_sec"]
+                    ),
+                    braking_deceleration_mps2=float(
+                        fine_tracking["safety_braking_deceleration_mps2"]
+                    ),
+                    reserve_m=0.0,
+                )
+                safety_reason = None
+                if safety_clearance.collision:
+                    safety_reason = "collision"
+                elif safety_clearance.outside_ratio > 0:
+                    safety_reason = "outside_map"
+                elif safety_unknown.cell_count > 0:
+                    safety_reason = "unknown"
+                elif (
+                    abs(state.linear_velocity_mps) > 0.02
+                    and remaining_distance < stop_distance
+                ):
+                    safety_reason = "insufficient_stop_distance"
+                if safety_reason is not None:
+                    adapter.stop()
+                    tracker = None
+                    tracker_mode = None
+                    display_path_odom_xy = None
+                    idle_status = f"FINE SAFETY STOP: {safety_reason}"
+                    logger.warning(
+                        "[FineSafetyStop] reason=%s map_version=%d "
+                        "remaining=%.3fm stop_distance=%.3fm unknown_cells=%d",
+                        safety_reason,
+                        safety_grid.map_version,
+                        remaining_distance,
+                        stop_distance,
+                        safety_unknown.cell_count,
+                    )
+
             manual_action = panel.manual_action
             if manual_action != "STOP":
                 if not manual_active:
@@ -2295,6 +2758,10 @@ def _run(
                     tracker_mode = None
                     navigation_active = False
                     display_path_odom_xy = None
+                    fine_diagnostic_saved_for_goal = False
+                    recent_fine_world_poses.clear()
+                    last_partial_switch_world_xy = None
+                    last_partial_endpoint_world_xy = None
                     rejected_unknown_world_xy = None
                     request_id += 1
                     accepted_request_id = request_id
@@ -2564,6 +3031,14 @@ def _run(
                         ),
                         submitted_sim_time_sec=now,
                         floor_z_m=float(position[2]) - float(profile.spawn_z_m),
+                        recent_world_poses=tuple(recent_fine_world_poses),
+                        initial_speed_mps=float(state.linear_velocity_mps),
+                        reaction_time_sec=float(
+                            fine_tracking["safety_reaction_time_sec"]
+                        ),
+                        braking_deceleration_mps2=float(
+                            fine_tracking["safety_braking_deceleration_mps2"]
+                        ),
                     )
                     if fine_worker.submit(job):
                         last_fine_request_time = now

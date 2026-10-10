@@ -70,3 +70,5 @@ Isaac Sim 中只保留 `S2 Decision` 和 `Goal Map` 两个导航窗口。任务�
 | [scene_lighting.py](src/vln_nav/runtime/scene_lighting.py) | 仿真 Stage 中的室内灯光 |
 
 程序覆盖写入 `logs/nav_latest.log`。S2 pixel-goal、NavDP 候选轨迹和细粒度几何图片覆盖写入 `debug/local/`。
+
+Fine 模式对完整路径和增量路径统一检查车体扫掠区域：新增覆盖的二维未知栅格或已知障碍会阻止执行。增量路径还检查停车距离与近期实际位姿，避免反复接收没有实际进展的短路径。日志中的 `FULL_PATH`、`SAFE_PARTIAL_PATH`、`NO_SAFE_PROGRESS` 和 `SEARCH_INCOMPLETE` 表示规划结果；首次失败时，`debug/local/fine_failure_*.json` 记录各动作与车体部件的未知覆盖，配套 `.npz` 保存相同地图版本的规划栅格及三维观测，`.png` 显示当前车体、膨胀余量、直行扫掠及转向未知区域。固定地图测试命令为 `PYTHONPATH=src python3 -m unittest discover -s scripts -p 'test_fine_incremental.py'`。

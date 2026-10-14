@@ -224,7 +224,7 @@ class PassageRuntime:
         self.record = TrialRecord(self.output, metadata)
         self.contacts, self.actual = [], []
         self.start_time = float(self.world.current_time)
-        self.step_index, self.stopped_since, self.unsafe_since = 0, None, None
+        self.step_index, self.stopped_since = 0, None
         self.mode, self.result_text = "RUNNING", "-"
         self.logger.info("[TrialStart] method=%s condition=%s goal=%s output=%s", method, condition, self.goal.tolist(), self.record.path)
         return True
@@ -372,13 +372,9 @@ class PassageRuntime:
             self.last_plan = self.planner.plan(state)
             self.record.add_plan(self.last_plan, elapsed)
             self.requested = self.last_plan.command.copy()
-            if not self.last_plan.safe:
-                self.unsafe_since = elapsed if self.unsafe_since is None else self.unsafe_since
-                if elapsed - self.unsafe_since >= cfg["no_safe_control_timeout_sec"]:
-                    self._finish("NO_SAFE_CONTROL")
-                    return
-            else:
-                self.unsafe_since = None
+            if not self.last_plan.valid:
+                self._finish("INVALID_OUTPUT")
+                return
         if elapsed >= cfg["timeout_sec"]:
             self._finish("TIMEOUT")
             return

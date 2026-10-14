@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -129,18 +130,24 @@ class PlannerTests(unittest.TestCase):
         for method in ("MPPI", "KMPPI"):
             first = SamplingPlanner(method, model, cost, cfg["planner"], cfg["safety"]).plan(initial)
             repeated = SamplingPlanner(method, model, cost, cfg["planner"], cfg["safety"]).plan(initial)
-            self.assertTrue(first.safe, first.reason)
+            self.assertTrue(first.valid, first.reason)
             np.testing.assert_array_equal(first.controls, repeated.controls)
             self.assertEqual(first.candidates.shape, (32, 10, 3))
 
-    def test_unsafe_optimum_outputs_braking_command(self):
+    def test_optimizer_command_used_directly(self):
         cfg, model, geometry, cost = fixture()
         cfg["planner"].update(samples=16, horizon_steps=10, iterations=1)
         initial = np.zeros(STATE_SIZE, dtype=np.float32)
         initial[:2] = [0, 0.7]
-        result = SamplingPlanner("MPPI", model, cost, cfg["planner"], cfg["safety"]).plan(initial)
-        self.assertFalse(result.safe)
-        np.testing.assert_array_equal(result.command, [0, 0])
+        for method in ("MPPI", "KMPPI"):
+            with self.subTest(method=method), patch.object(geometry, "validate_poses") as validator, \
+                    patch.object(model, "braking_rollout") as braking:
+                result = SamplingPlanner(method, model, cost, cfg["planner"], cfg["safety"]).plan(initial)
+                self.assertTrue(result.valid)
+                self.assertEqual(result.reason, "OPTIMIZED")
+                np.testing.assert_array_equal(result.command, result.controls[0])
+                validator.assert_not_called()
+                braking.assert_not_called()
 
 
 class SnapshotTests(unittest.TestCase):

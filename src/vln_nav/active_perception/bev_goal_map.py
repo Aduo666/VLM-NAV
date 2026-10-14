@@ -79,6 +79,48 @@ def render_bev_goal_map(
     band = state[z_band]
     occupied_world = np.any(band == OCCUPIED, axis=0)
     free_world = np.any(band == FREE, axis=0) & ~occupied_world
+    source_world = np.bitwise_or.reduce(snapshot.source_mask[z_band], axis=0)
+    return _render_goal_map(
+        occupied_world, free_world, source_world,
+        origin_world_xy=snapshot.origin_world_xyz[:2], resolution_m=snapshot.resolution_m,
+        robot_world_xyz=robot, robot_yaw_rad=robot_yaw_rad, view_size_m=view_size_m,
+        rear_view_m=rear_view_m, image_size_px=image_size_px, goal_local_xy=goal_local_xy,
+        show_source_coverage=show_source_coverage,
+        rejected_unknown_world_xy=rejected_unknown_world_xy,
+    )
+
+
+def render_planning_goal_map(
+    grid, *, source_mask, robot_world_xyz, robot_yaw_rad, view_size_m,
+    rear_view_m, image_size_px, goal_local_xy=None,
+    show_source_coverage=False, rejected_unknown_world_xy=None,
+) -> BevGoalMap:
+    robot = np.asarray(robot_world_xyz, dtype=np.float64).reshape(3)
+    if not np.isfinite(robot).all() or not math.isfinite(robot_yaw_rad):
+        raise ValueError("地图显示需要有效的机器人位姿")
+    if not math.isfinite(view_size_m) or view_size_m <= 0 or image_size_px < 32:
+        raise ValueError("地图显示尺寸无效")
+    if not math.isfinite(rear_view_m) or not 0 <= rear_view_m < view_size_m:
+        raise ValueError("地图后方显示范围无效")
+    if np.asarray(source_mask).shape != grid.shape:
+        raise ValueError("二维地图来源标记尺寸无效")
+    return _render_goal_map(
+        grid.occupied_mask, grid.free_mask, source_mask,
+        origin_world_xy=(grid.origin_x_m, grid.origin_y_m), resolution_m=grid.resolution_m,
+        robot_world_xyz=robot, robot_yaw_rad=robot_yaw_rad, view_size_m=view_size_m,
+        rear_view_m=rear_view_m, image_size_px=image_size_px, goal_local_xy=goal_local_xy,
+        show_source_coverage=show_source_coverage,
+        rejected_unknown_world_xy=rejected_unknown_world_xy,
+    )
+
+
+def _render_goal_map(
+    occupied_world, free_world, source_world, *, origin_world_xy, resolution_m,
+    robot_world_xyz, robot_yaw_rad, view_size_m, rear_view_m, image_size_px,
+    goal_local_xy, show_source_coverage, rejected_unknown_world_xy,
+):
+    robot = np.asarray(robot_world_xyz)
+    height, width = occupied_world.shape
 
     size = int(image_size_px)
     rows, columns = np.indices((size, size), dtype=np.float64)
@@ -88,19 +130,19 @@ def render_bev_goal_map(
     world_x = robot[0] + cosine * forward - sine * left
     world_y = robot[1] + sine * forward + cosine * left
     grid_x = np.floor(
-        (world_x - snapshot.origin_world_xyz[0]) / snapshot.resolution_m
+        (world_x - origin_world_xy[0]) / resolution_m
     ).astype(np.int64)
     grid_y = np.floor(
-        (world_y - snapshot.origin_world_xyz[1]) / snapshot.resolution_m
+        (world_y - origin_world_xy[1]) / resolution_m
     ).astype(np.int64)
     inside = (
         (grid_x >= 0)
-        & (grid_x < state.shape[2])
+        & (grid_x < width)
         & (grid_y >= 0)
-        & (grid_y < state.shape[1])
+        & (grid_y < height)
     )
-    safe_x = np.clip(grid_x, 0, state.shape[2] - 1)
-    safe_y = np.clip(grid_y, 0, state.shape[1] - 1)
+    safe_x = np.clip(grid_x, 0, width - 1)
+    safe_y = np.clip(grid_y, 0, height - 1)
     occupied = inside & occupied_world[safe_y, safe_x]
     free = inside & free_world[safe_y, safe_x] & ~occupied
 
@@ -108,10 +150,6 @@ def render_bev_goal_map(
     rgb[free] = (238, 237, 232)
     rgb[occupied] = (28, 29, 29)
     if show_source_coverage:
-        source_world = np.bitwise_or.reduce(
-            np.asarray(snapshot.source_mask[z_band], dtype=np.uint8),
-            axis=0,
-        )
         sources = source_world[safe_y, safe_x]
         front_seen = inside & ((sources & SOURCE_BITS["front"]) != 0)
         down_seen = inside & ((sources & SOURCE_BITS["down"]) != 0)
@@ -129,20 +167,20 @@ def render_bev_goal_map(
             raise ValueError("rejected_unknown_world_xy must have shape (N, 2)")
         if not np.isfinite(rejected_points).all():
             raise ValueError("rejected_unknown_world_xy must be finite")
-        rejected_world = np.zeros(state.shape[1:], dtype=bool)
+        rejected_world = np.zeros((height, width), dtype=bool)
         rejected_x = np.floor(
-            (rejected_points[:, 0] - snapshot.origin_world_xyz[0])
-            / snapshot.resolution_m
+            (rejected_points[:, 0] - origin_world_xy[0])
+            / resolution_m
         ).astype(np.int64)
         rejected_y = np.floor(
-            (rejected_points[:, 1] - snapshot.origin_world_xyz[1])
-            / snapshot.resolution_m
+            (rejected_points[:, 1] - origin_world_xy[1])
+            / resolution_m
         ).astype(np.int64)
         rejected_inside = (
             (rejected_x >= 0)
-            & (rejected_x < state.shape[2])
+            & (rejected_x < width)
             & (rejected_y >= 0)
-            & (rejected_y < state.shape[1])
+            & (rejected_y < height)
         )
         rejected_world[rejected_y[rejected_inside], rejected_x[rejected_inside]] = True
         rgb[inside & rejected_world[safe_y, safe_x] & ~free & ~occupied] = (

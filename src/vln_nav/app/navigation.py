@@ -16,22 +16,14 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 import yaml
 
-from vln_nav.active_perception.bev_goal_map import BevGoalMap, render_bev_goal_map
+from vln_nav.active_perception.bev_goal_map import BevGoalMap, render_planning_goal_map
 from vln_nav.active_perception.camera_geometry import (
     CameraFrameGeometry,
     capture_camera_frame,
     world_from_pose_wxyz,
 )
 from vln_nav.active_perception.contracts import TimedDepthObservation
-from vln_nav.active_perception.local_geometry import (
-    LocalVoxelMap,
-    LocalVoxelMapConfig,
-    LocalVoxelSnapshot,
-)
-from vln_nav.active_perception.map_visualization import (
-    project_local_points,
-    render_local_occupancy,
-)
+from constraint_traverse.rgbd_map import RGBDMapConfig, RGBDPlanarMap
 from vln_nav.control.locomotion import create_locomotion_controller
 from vln_nav.control.fine_path_tracker import FinePathTracker, fit_agx_command
 from vln_nav.control.trajectory import (
@@ -77,9 +69,9 @@ from vln_nav.navigation.trajectory_refiner import (
 from vln_nav.navigation.trajectory_clearance import (
     FootprintConfig,
     FootprintCollisionChecker,
+    PlanningGrid,
     assess_known_swept_path,
     clear_current_footprint,
-    planning_grid_from_snapshot,
     stopping_distance_m,
     translation_distance_until_direction_change,
 )
@@ -143,7 +135,7 @@ class _S2InferenceJob:
 @dataclass(frozen=True)
 class _FinePlanningJob:
     request_id: int
-    snapshot: LocalVoxelSnapshot
+    grid: PlanningGrid
     start_pose_world: tuple[float, float, float]
     goal_world_xy: tuple[float, float]
     route_hint_world_xy: np.ndarray | None
@@ -377,14 +369,10 @@ class _FinePlanningWorker:
         planner: FineLocalPlanner,
         restricted_analyzer: RestrictedSpaceAnalyzer,
         trajectory_refiner: TrajectoryRefiner,
-        obstacle_min_height_m: float,
-        obstacle_max_height_m: float,
     ) -> None:
         self._planner = planner
         self._restricted_analyzer = restricted_analyzer
         self._trajectory_refiner = trajectory_refiner
-        self._obstacle_min_height_m = float(obstacle_min_height_m)
-        self._obstacle_max_height_m = float(obstacle_max_height_m)
         self._busy = False
         self._lock = threading.Lock()
         self._results: queue.Queue = queue.Queue()
@@ -411,12 +399,7 @@ class _FinePlanningWorker:
     def _run(self, job: _FinePlanningJob) -> None:
         grid = None
         try:
-            grid = planning_grid_from_snapshot(
-                job.snapshot,
-                floor_z_m=job.floor_z_m,
-                obstacle_min_height_m=self._obstacle_min_height_m,
-                obstacle_max_height_m=self._obstacle_max_height_m,
-            )
+            grid = job.grid
             grid = clear_current_footprint(
                 grid,
                 x_m=job.start_pose_world[0],
@@ -751,7 +734,7 @@ def _load_settings() -> tuple[
     InternNavS2Config,
     S2GoalAdapterConfig,
     dict,
-    LocalVoxelMapConfig,
+    RGBDMapConfig,
     FinePlannerConfig,
     FootprintConfig,
     RouteCorridorConfig,
@@ -1024,12 +1007,8 @@ def _load_settings() -> tuple[
         raise ValueError("Invalid RGB-D mapping camera settings")
     if float(map_settings["max_frame_skew_sec"]) <= 0:
         raise ValueError("mapping.max_frame_skew_sec must be positive")
-    map_fields = {item.name for item in fields(LocalVoxelMapConfig)}
     map_values = map_settings["map"]
-    if set(map_values) != map_fields | {"integration_period_sec"}:
-        raise ValueError("map selector source map fields do not match LocalVoxelMapConfig")
-    map_config = LocalVoxelMapConfig(**{name: map_values[name] for name in map_fields})
-    map_config.validate()
+    map_config = RGBDMapConfig.from_mapping(map_values)
     if float(map_values["integration_period_sec"]) <= 0:
         raise ValueError("map integration period must be positive")
 
@@ -1178,9 +1157,7 @@ def _save_fine_failure_diagnostic(
         free_mask=grid.free_mask,
         unknown_mask=grid.unknown_mask,
         clearance_m=grid.clearance_m,
-        state_zyx=job.snapshot.state,
-        source_mask_zyx=job.snapshot.source_mask,
-        map_origin_world_xyz=job.snapshot.origin_world_xyz,
+        map_origin_world_xy=np.asarray([grid.origin_x_m, grid.origin_y_m]),
         resolution_m=np.asarray(grid.resolution_m),
         map_version=np.asarray(grid.map_version),
         start_pose_world=np.asarray(job.start_pose_world),
@@ -1555,8 +1532,6 @@ def _run(
         planner=fine_planner,
         restricted_analyzer=restricted_analyzer,
         trajectory_refiner=trajectory_refiner,
-        obstacle_min_height_m=float(settings["fine_planner"]["obstacle_min_height_m"]),
-        obstacle_max_height_m=float(settings["fine_planner"]["obstacle_max_height_m"]),
     )
     fine_tracking_config = replace(
         profile.agx_controller.continuous,
@@ -1615,8 +1590,14 @@ def _run(
             )
 
     position, orientation = get_world_pose(robot)
-    local_map = LocalVoxelMap(map_config)
-    local_map.reset(np.asarray(position[:3], dtype=np.float64))
+    local_map = RGBDPlanarMap(
+        map_config,
+        obstacle_min_height_m=float(settings["fine_planner"]["obstacle_min_height_m"]),
+        obstacle_max_height_m=float(settings["fine_planner"]["obstacle_max_height_m"]),
+    )
+    local_map.reset(np.asarray(position[:2], dtype=np.float64))
+    logger.info("[Mapping] type=RGBD_2D sources=front,down resolution=%.3fm size=%.1fx%.1fm",
+                map_config.resolution_m, map_config.size_x_m, map_config.size_y_m)
 
     tracker = None
     tracker_mode: str | None = None
@@ -1772,19 +1753,11 @@ def _run(
                                 )
                                 for source, sample in captured.items()
                             ],
-                            center_world_xyz=np.asarray(position[:3], dtype=np.float64),
+                            center_world_xy=np.asarray(position[:2], dtype=np.float64),
+                            floor_z_m=float(position[2]) - float(profile.spawn_z_m),
                         )
                         latest_snapshot = local_map.snapshot()
-                        latest_planning_grid = planning_grid_from_snapshot(
-                            latest_snapshot,
-                            floor_z_m=float(position[2]) - float(profile.spawn_z_m),
-                            obstacle_min_height_m=float(
-                                settings["fine_planner"]["obstacle_min_height_m"]
-                            ),
-                            obstacle_max_height_m=float(
-                                settings["fine_planner"]["obstacle_max_height_m"]
-                            ),
-                        )
+                        latest_planning_grid = latest_snapshot.grid
                         latest_planning_grid = clear_current_footprint(
                             latest_planning_grid,
                             x_m=float(position[0]),
@@ -1801,7 +1774,7 @@ def _run(
                                     "occupied": int(occupied_count),
                                 }
                                 for source, free_count, occupied_count
-                                in map_update.source_voxel_update_counts
+                                in map_update.source_cell_update_counts
                             }
                             cell_count = latest_planning_grid.unknown_mask.size
                             logger.info(
@@ -1840,27 +1813,19 @@ def _run(
                     if selected_goal_odom_xy is None
                     else _odom_goal_to_local(selected_goal_odom_xy, state)
                 )
-                goal_map = render_bev_goal_map(
-                    latest_snapshot,
+                goal_map = render_planning_goal_map(
+                    latest_snapshot.grid if latest_planning_grid is None else latest_planning_grid,
+                    source_mask=latest_snapshot.source_mask,
                     robot_world_xyz=position[:3],
                     robot_yaw_rad=robot_yaw_world,
                     view_size_m=float(settings["map_selector"]["view_size_m"]),
                     rear_view_m=float(settings["map_selector"]["rear_view_m"]),
                     image_size_px=int(settings["map_selector"]["image_size_px"]),
-                    obstacle_min_relative_z_m=float(
-                        settings["map_selector"]["obstacle_min_relative_z_m"]
-                    ),
-                    obstacle_max_relative_z_m=float(
-                        settings["map_selector"]["obstacle_max_relative_z_m"]
-                    ),
                     goal_local_xy=displayed_goal,
-                    projection_reference_z_m=(
-                        float(position[2]) - float(profile.spawn_z_m)
-                    ),
                     show_source_coverage=True,
                     rejected_unknown_world_xy=(
                         rejected_unknown_world_xy
-                        if mode in ("FINE", *SAMPLING_MODES) and navigation_active
+                        if mode == "FINE" and navigation_active
                         else None
                     ),
                 )
@@ -2316,7 +2281,7 @@ def _run(
                         "[FineResult] request=%d map_version=%d "
                         "target=[%.2f,%.2f] status=%s reason=%s failed: %s",
                         job.request_id,
-                        job.snapshot.version,
+                        job.grid.map_version,
                         job.goal_world_xy[0],
                         job.goal_world_xy[1],
                         (
@@ -2938,8 +2903,8 @@ def _run(
                         goal_world_xy=goal_world, now=now,
                     )
                     idle_status = f"{mode} {sampling_controller.status} v={applied.linear_mps:.2f} w={applied.angular_radps:.2f}"
-                    rejected_unknown_world_xy = sampling_controller.geometry.rejected_unknown_world_xy
-                    if sampling_controller.last_plan is not None and sampling_controller.last_plan.safe:
+                    rejected_unknown_world_xy = None
+                    if sampling_controller.last_plan is not None and sampling_controller.last_plan.valid:
                         display_path_odom_xy = _world_path_to_odom(sampling_controller.last_plan.prediction[:, :2], state)
                         if sampling_controller.last_plan is not previous_sampling_plan:
                             generation_index += 1
@@ -3116,7 +3081,7 @@ def _run(
                 navigation_active
                 and mode == "FINE"
                 and selected_goal_odom_xy is not None
-                and latest_snapshot.version > 0
+                and latest_snapshot.grid.map_version > 0
                 and latest_planning_grid is not None
                 and not fine_worker.busy
                 and now - last_fine_request_time
@@ -3151,7 +3116,7 @@ def _run(
                     accepted_fine_request_id = fine_request_id
                     job = _FinePlanningJob(
                         request_id=fine_request_id,
-                        snapshot=latest_snapshot,
+                        grid=latest_planning_grid,
                         start_pose_world=start_pose_world,
                         goal_world_xy=target_world_xy,
                         route_hint_world_xy=None,
@@ -3176,7 +3141,7 @@ def _run(
                             "[FineRequest] request=%d map_version=%d "
                             "target_world=[%.2f,%.2f]",
                             fine_request_id,
-                            latest_snapshot.version,
+                            latest_snapshot.grid.map_version,
                             target_world_xy[0],
                             target_world_xy[1],
                         )
@@ -3298,48 +3263,6 @@ def _overlay_path_on_goal_map(
         view_size_m=goal_map.view_size_m,
         rear_view_m=goal_map.rear_view_m,
     )
-
-
-def _render_fine_geometry(
-    snapshot: LocalVoxelSnapshot,
-    *,
-    robot_pose: tuple[float, float, float, float],
-    path_world_xy: np.ndarray | None,
-    goal_world_xy: np.ndarray | None,
-    image_size: tuple[int, int] = (800, 560),
-) -> Image.Image:
-    image = render_local_occupancy(
-        snapshot,
-        robot_pose=robot_pose,
-        image_size=image_size,
-    )
-    draw = ImageDraw.Draw(image)
-    robot_z = float(robot_pose[2])
-    if path_world_xy is not None and len(path_world_xy) >= 2:
-        path = np.asarray(path_world_xy, dtype=np.float64)
-        path_xyz = np.column_stack((path, np.full(len(path), robot_z)))
-        u, v, _, _ = project_local_points(
-            path_xyz,
-            robot_pose=robot_pose,
-            image_size=image_size,
-        )
-        if len(u) >= 2:
-            pixels = [(int(x), int(y)) for x, y in zip(u, v)]
-            draw.line(pixels, fill=(30, 255, 90), width=5)
-    if goal_world_xy is not None:
-        goal = np.asarray(
-            [[float(goal_world_xy[0]), float(goal_world_xy[1]), robot_z]],
-            dtype=np.float64,
-        )
-        u, v, _, _ = project_local_points(
-            goal,
-            robot_pose=robot_pose,
-            image_size=image_size,
-        )
-        if len(u) == 1:
-            x, y = int(u[0]), int(v[0])
-            draw.ellipse((x - 9, y - 9, x + 9, y + 9), fill=(255, 45, 35))
-    return image
 
 
 def _save_image(path: Path, image: Image.Image) -> None:

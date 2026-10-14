@@ -57,12 +57,11 @@ class PlanResult:
     candidates: np.ndarray
     candidate_controls: np.ndarray
     candidate_costs: np.ndarray
-    safe: bool
+    valid: bool
     reason: str
     min_clearance_m: float
     planning_sec: float
     optimizer_sec: float
-    validation_sec: float
 
 
 class SamplingPlanner:
@@ -126,20 +125,12 @@ class SamplingPlanner:
             self._synchronize()
             optimized = time.perf_counter()
             poses = prediction[:, :3].cpu().numpy()
-            validation = self.cost.geometry.validate_poses(poses)
-            reason = validation.reason
-            safe = validation.safe and bool(torch.all(prediction[:, 16] < 0.5))
-            if not safe and reason == "SAFE":
-                reason = "MOTION_CONSTRAINT"
-            # 完整预测序列和本次短动作后的制动区域分别复核。
-            braking = self.model.braking_rollout(prediction[1], self.safety["reaction_time_sec"])
-            brake_check = self.cost.geometry.validate_poses(braking[:, :3].cpu().numpy())
-            if safe and not brake_check.safe:
-                safe, reason = False, "UNSAFE_BRAKING"
-            command = controls[0].cpu().numpy() if safe else np.zeros(2, dtype=np.float32)
+            valid = bool(torch.isfinite(controls).all() and torch.isfinite(prediction).all())
+            reason = "OPTIMIZED" if valid else "INVALID_OUTPUT"
+            command = controls[0].cpu().numpy() if valid else np.zeros(2, dtype=np.float32)
+            clearance = float(self.cost.geometry.torch_clearance(prediction[:, :3]).amin()) if valid else 0.0
         finished = time.perf_counter()
         return PlanResult(
             command, controls.cpu().numpy(), poses, candidates, candidate_controls, candidate_costs,
-            safe, reason, min(validation.min_clearance_m, brake_check.min_clearance_m),
-            finished - started, optimized - started, finished - optimized,
+            valid, reason, clearance, finished - started, optimized - started,
         )

@@ -351,7 +351,7 @@ mapping:
     min_z_m: -0.20
     # 相对机器人基座的最高高度，单位为米。
     max_z_m: 2.80
-    # 体素边长，单位为米。
+    # 二维地图栅格边长，单位为米。
     resolution_m: 0.05
     # 局部地图平移阈值，单位为米。
     slide_threshold_m: 0.20
@@ -367,9 +367,9 @@ mapping:
     probability_hit: 0.85
     # 射线穿过空闲空间时的更新概率。
     probability_miss: 0.30
-    # 体素占用概率下限。
+    # 栅格占用概率下限。
     probability_min: 0.12
-    # 体素占用概率上限。
+    # 栅格占用概率上限。
     probability_max: 0.98
     # 判为障碍的占用概率阈值。
     probability_occupied: 0.80

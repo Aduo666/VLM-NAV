@@ -68,10 +68,9 @@ class TrialRecord:
             candidate_controls=result.candidate_controls, candidate_costs=result.candidate_costs,
         )
         self.plan_stats.append({
-            "time_sec": float(timestamp_sec), "safe": bool(result.safe), "reason": result.reason,
+            "time_sec": float(timestamp_sec), "valid": bool(result.valid), "reason": result.reason,
             "min_clearance_m": float(result.min_clearance_m),
             "planning_sec": float(result.planning_sec), "optimizer_sec": float(result.optimizer_sec),
-            "validation_sec": float(result.validation_sec),
         })
 
     def add_sample(self, timestamp_sec, state, requested, applied, clearance_m):

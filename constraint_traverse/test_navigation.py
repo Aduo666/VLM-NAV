@@ -33,59 +33,62 @@ def make_grid(*, origin=(-2.0, -2.0), resolution=0.05, known=True, version=1):
 
 def make_geometry():
     footprint = FootprintConfig((FootprintPartConfig("body", -0.15, 0.15, -0.1, 0.1),), 0.03)
-    return PlanningGridGeometry(footprint, 0.01)
+    return PlanningGridGeometry(footprint)
 
 
 class GridTests(unittest.TestCase):
     def test_free_grid(self):
         geometry = make_geometry()
         geometry.update_grid(make_grid())
-        self.assertTrue(geometry.validate_poses([[0, 0, 0], [0.5, 0, 0]]).safe)
+        gaps = geometry.torch_clearance(torch.tensor([[0, 0, 0], [0.5, 0, 0]], dtype=torch.float32))
+        self.assertTrue(bool(torch.all(gaps > geometry.margin_m)))
 
-    def test_unknown_blocked_and_visualized(self):
+    def test_unknown_in_cost_field(self):
         geometry = make_geometry()
         grid = make_grid()
         grid.unknown_mask[40, 49] = True
         grid.free_mask[40, 49] = False
         geometry.update_grid(grid)
-        result = geometry.validate_poses([[0, 0, 0], [0.5, 0, 0]])
-        self.assertFalse(result.safe)
-        self.assertEqual(result.reason, "UNKNOWN")
-        self.assertGreater(len(geometry.rejected_unknown_world_xy), 0)
+        gap = geometry.torch_clearance(torch.tensor([[0.5, 0, 0]], dtype=torch.float32))
+        self.assertLess(float(gap[0]), 0)
 
-    def test_occupied_between_endpoints(self):
+    def test_occupied_in_cost_field(self):
         geometry = make_geometry()
         grid = make_grid()
         grid.occupied_mask[40, 47] = True
         grid.free_mask[40, 47] = False
         geometry.update_grid(grid)
-        self.assertEqual(geometry.validate_poses([[0, 0, 0], [0.7, 0, 0]]).reason, "OBSTACLE")
+        gap = geometry.torch_clearance(torch.tensor([[0.375, 0, 0]], dtype=torch.float32))
+        self.assertLess(float(gap[0]), 0)
 
     def test_grid_corner_overlap_detected(self):
         footprint = FootprintConfig((FootprintPartConfig("tiny", -0.01, 0.01, -0.01, 0.01),), 0)
-        geometry = PlanningGridGeometry(footprint, 0.01)
+        geometry = PlanningGridGeometry(footprint)
         grid = make_grid()
         grid.occupied_mask[40, 41] = True
         grid.free_mask[40, 41] = False
         geometry.update_grid(grid)
-        self.assertFalse(geometry.validate_poses([[0.045, 0.025, 0]]).safe)
+        gap = geometry.torch_clearance(torch.tensor([[0.045, 0.025, 0]], dtype=torch.float32))
+        self.assertLess(float(gap[0]), 0)
 
     def test_shifted_map_world_coordinates(self):
         geometry = make_geometry()
         geometry.update_grid(make_grid(origin=(10, 20)))
-        self.assertTrue(geometry.validate_poses([[11, 21, 0]]).safe)
-        self.assertEqual(geometry.validate_poses([[0, 0, 0]]).reason, "OUTSIDE_MAP")
+        gaps = geometry.torch_clearance(torch.tensor([[11, 21, 0], [0, 0, 0]], dtype=torch.float32))
+        self.assertGreater(float(gaps[0]), geometry.margin_m)
+        self.assertLess(float(gaps[1]), 0)
 
     def test_latest_map_invalidates_cache(self):
         geometry = make_geometry()
         first = make_grid(version=1)
         geometry.update_grid(first)
-        self.assertTrue(geometry.validate_poses([[0.5, 0, 0]]).safe)
+        pose = torch.tensor([[0.5, 0, 0]], dtype=torch.float32)
+        self.assertGreater(float(geometry.torch_clearance(pose)[0]), geometry.margin_m)
         second = make_grid(version=2)
         second.unknown_mask[40, 49] = True
         second.free_mask[40, 49] = False
         geometry.update_grid(second)
-        self.assertFalse(geometry.validate_poses([[0.5, 0, 0]]).safe)
+        self.assertLess(float(geometry.torch_clearance(pose)[0]), 0)
 
     def test_cost_field_unknown_and_outside(self):
         geometry = make_geometry()
@@ -153,10 +156,14 @@ class ControllerTests(unittest.TestCase):
                                           goal_world_xy=[1, 0], now=0)
                 self.assertIsNotNone(controller.last_plan)
                 self.assertEqual(controller.last_plan.candidates.shape[0], controller.config["planner"]["samples"])
-                self.assertEqual(controller.status, "UNKNOWN")
-                self.assertFalse(controller.last_plan.safe)
-                self.assertEqual(applied.linear_mps, 0)
-                self.assertEqual(applied.angular_radps, 0)
+                self.assertEqual(controller.status, "TRACKING")
+                self.assertTrue(controller.last_plan.valid)
+                np.testing.assert_array_equal(controller.requested, controller.last_plan.controls[0])
+                requested = controller.requested.copy()
+                controller.step(robot=Robot(), drive=drive, grid=make_grid(known=False, version=3),
+                                goal_world_xy=[1, 0], now=0.01)
+                np.testing.assert_array_equal(controller.requested, requested)
+                self.assertEqual(controller.status, "TRACKING")
 
 
 if __name__ == "__main__":

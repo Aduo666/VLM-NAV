@@ -51,7 +51,9 @@ bash scripts/run_nav.sh --local-planner KMPPI
 
 完整导航使用远程 S2 服务。`COARSE` 另外需要 NavDP 服务；`FINE`、`MPPI`、`KMPPI` 在本机进行底层规划。主程序获得有效前视帧后自动调用 `/reset` 创建会话，随后通过 `/infer` 执行所选任务的指令。S2 输出 `LOOKDOWN` 时，程序停车并将固定下视相机的新图像发回同一会话。
 
-MPPI/KMPPI 依赖通过 `python -m pip install -r constraint_traverse/benchmark/requirements.txt` 安装，参数由 `sampling_planner.config_path` 指向的配置读取，当前为 `constraint_traverse/configs/benchmark.yaml` 中的模型、代价、采样与安全设置。输入使用主导航现有的前视和底盘下视 RGB-D 规划地图、S2 局部目标及实测轮组状态。每个规划周期直接进行采样优化，随后复核生成轨迹、制动区域及最新地图。未知区域继续禁行；面板显示 `UNKNOWN` 时，对应区域会在 Goal Map 中标记，日志记录 `[SamplingPlan] status=UNKNOWN` 或 `[SamplingSafetyStop]`。
+MPPI/KMPPI 依赖通过 `python -m pip install -r constraint_traverse/benchmark/requirements.txt` 安装，参数由 `sampling_planner.config_path` 指向的配置读取，当前为 `constraint_traverse/configs/benchmark.yaml` 中的运动模型、代价、采样和障碍余量设置。输入包括前视和底盘下视 RGB-D 直接建立的二维规划地图、S2 局部目标及实测轮组状态。每个周期执行优化器输出的首个控制指令，底盘控制器限制速度、加减速与转向。障碍和 UNKNOWN 参与优化代价。日志记录 `[SamplingPlan]`、优化耗时及估计间距。
+
+主导航使用二维占用栅格：深度像素根据相机内外参转换到世界坐标，按地面相对高度识别障碍和地面；平面射线更新空闲栅格，障碍终点更新占用栅格。地图随机器人平移并保留重叠区域的证据，Goal Map 与规划器使用同一份二维地图。启动日志显示 `[Mapping] type=RGBD_2D`。地图尺寸、栅格分辨率、采样间隔及融合周期读取 `mapping.map`，障碍高度范围读取 `fine_planner.obstacle_min_height_m/obstacle_max_height_m`。
 
 前视相机水平视角由 `configs/navigation.yaml` 的 `camera.horizontal_fov_deg` 设置，当前为 `80°`。S2 返回连续同向转向时，程序最多执行 `30°`，停稳后用新的前视画面重新请求决策。
 
@@ -71,7 +73,7 @@ Isaac Sim 中包含 `S2 Decision`、`Goal Map` 和 `Navigation Controls` 窗口�
 | [navdp_client.py](src/vln_nav/navigation/navdp_client.py) | NavDP 请求与轨迹校验 |
 | [internnav_s2_client.py](src/vln_nav/navigation/internnav_s2_client.py) | 远程 S2 请求与输出校验 |
 | [s2_goal_adapter.py](src/vln_nav/navigation/s2_goal_adapter.py) | pixel-goal 深度反投影与 metric goal 转换 |
-| [local_geometry.py](src/vln_nav/active_perception/local_geometry.py) | RGB-D 局部体素地图 |
+| [rgbd_map.py](constraint_traverse/rgbd_map.py) | RGB-D 直接二维建图 |
 | [fine_local_planner.py](src/vln_nav/navigation/fine_local_planner.py) | 细粒度局部轨迹搜索 |
 | [trajectory.py](src/vln_nav/control/trajectory.py) | AGX 连续轨迹跟踪与轮组速度转换 |
 | [scene_lighting.py](src/vln_nav/runtime/scene_lighting.py) | 仿真 Stage 中的室内灯光 |

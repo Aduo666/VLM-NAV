@@ -116,7 +116,7 @@ goal:
 # 粗粒度与细粒度规划任务的调度参数。
 execution:
   # 程序启动后的默认导航模式。
-  default_mode: "FINE"
+  default_mode: "COARSE"
   # NavDP 滚动推理周期，单位为秒。
   coarse_planning_period_sec: 0.50
   # 同一局部目标允许连续出现短轨迹的最大次数。

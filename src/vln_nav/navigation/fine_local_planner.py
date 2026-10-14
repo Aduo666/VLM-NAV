@@ -165,6 +165,12 @@ class FineActionDiagnostic:
     part_unknown_counts: tuple[tuple[str, int], ...]
     part_unknown_linear_indices: tuple[tuple[str, tuple[int, ...]], ...]
     swept_linear_indices: tuple[int, ...]
+    physical_unknown_count: int = 0
+    safety_margin_unknown_count: int = 0
+    physical_collision: bool = False
+    safety_margin_collision: bool = False
+    physical_unknown_linear_indices: tuple[int, ...] = ()
+    safety_margin_unknown_linear_indices: tuple[int, ...] = ()
 
 
 class FinePlanningFailure(RuntimeError):
@@ -326,6 +332,12 @@ class FineLocalPlanner:
                 swept_linear_indices=tuple(map(
                     int, np.unique(np.concatenate(all_swept_parts))
                 )),
+                physical_unknown_count=int(unknown.physical_unknown_linear_indices.size),
+                safety_margin_unknown_count=int(unknown.safety_margin_unknown_linear_indices.size),
+                physical_collision=any(item.physical_collision for item in metrics),
+                safety_margin_collision=any(item.safety_margin_collision for item in metrics),
+                physical_unknown_linear_indices=tuple(map(int, unknown.physical_unknown_linear_indices)),
+                safety_margin_unknown_linear_indices=tuple(map(int, unknown.safety_margin_unknown_linear_indices)),
             ))
         return tuple(diagnostics)
 

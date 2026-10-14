@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 import math
 
@@ -23,11 +23,12 @@ class FootprintPartConfig:
     max_x_m: float
     min_y_m: float
     max_y_m: float
+    clearing_bounds_m: tuple[float, float, float, float] | None = None
 
     @classmethod
     def from_mapping(cls, data: dict) -> "FootprintPartConfig":
         expected = {"name", "min_x_m", "max_x_m", "min_y_m", "max_y_m"}
-        if not isinstance(data, dict) or set(data) != expected:
+        if not isinstance(data, dict) or not expected <= set(data) or set(data) - expected - {"clearing_bounds_m"}:
             raise ValueError(f"车体部件必须包含这些字段：{sorted(expected)}")
         part = cls(
             name=str(data["name"]),
@@ -35,6 +36,10 @@ class FootprintPartConfig:
             max_x_m=float(data["max_x_m"]),
             min_y_m=float(data["min_y_m"]),
             max_y_m=float(data["max_y_m"]),
+            clearing_bounds_m=(
+                tuple(map(float, data["clearing_bounds_m"]))
+                if data.get("clearing_bounds_m") is not None else None
+            ),
         )
         part.validate()
         return part
@@ -45,6 +50,13 @@ class FootprintPartConfig:
             raise ValueError("车体部件名称和尺寸必须有效")
         if self.min_x_m >= self.max_x_m or self.min_y_m >= self.max_y_m:
             raise ValueError(f"车体部件 {self.name} 的尺寸范围无效")
+        if self.clearing_bounds_m is not None:
+            core = self.clearing_bounds_m
+            if len(core) != 4 or not all(math.isfinite(value) for value in core):
+                raise ValueError(f"车体部件 {self.name} 的当前占用范围无效")
+            if not (self.min_x_m <= core[0] < core[1] <= self.max_x_m and
+                    self.min_y_m <= core[2] < core[3] <= self.max_y_m):
+                raise ValueError(f"车体部件 {self.name} 的当前占用范围超出物理包络")
 
 
 @dataclass(frozen=True)
@@ -96,6 +108,10 @@ class FootprintMetrics:
     min_clearance_m: float
     unknown_ratio: float
     outside_ratio: float
+    physical_collision: bool = False
+    safety_margin_collision: bool = False
+    physical_unknown_count: int = 0
+    safety_margin_unknown_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -116,6 +132,12 @@ class IncrementalUnknownMetrics:
     cell_count: int
     area_m2: float
     unknown_linear_indices: np.ndarray
+    physical_unknown_linear_indices: np.ndarray = field(
+        default_factory=lambda: np.empty(0, dtype=np.int64)
+    )
+    safety_margin_unknown_linear_indices: np.ndarray = field(
+        default_factory=lambda: np.empty(0, dtype=np.int64)
+    )
 
 
 @dataclass(frozen=True)
@@ -161,7 +183,7 @@ class FootprintCollisionChecker:
         self.footprint = footprint
         self._yaw_step = math.radians(float(yaw_resolution_deg))
         self._yaw_bins = int(round(2.0 * math.pi / self._yaw_step))
-        self._offset_cache: dict[tuple[float, int, float, str | None], np.ndarray] = {}
+        self._offset_cache: dict[tuple[float, int, float, str | None, bool], np.ndarray] = {}
 
     @property
     def bounding_radius_m(self) -> float:
@@ -194,11 +216,22 @@ class FootprintCollisionChecker:
         unknown_count = int(np.count_nonzero(grid.unknown_mask[valid_rows, valid_columns]))
         unknown_count += int(np.count_nonzero(~inside))
         clearances = grid.clearance_m[valid_rows, valid_columns]
+        physical, _ = self.covered_linear_indices(
+            grid, x_m=x_m, y_m=y_m, yaw_rad=yaw_rad, margin_m=0.0,
+        )
+        padded = np.unique(valid_rows * grid.shape[1] + valid_columns)
+        margin_only = np.setdiff1d(padded, physical, assume_unique=True)
+        occupied_flat = grid.occupied_mask.reshape(-1)
+        unknown_flat = grid.unknown_mask.reshape(-1)
         return FootprintMetrics(
             collision=bool(np.any(occupied)),
             min_clearance_m=float(np.min(clearances)) if clearances.size else 0.0,
             unknown_ratio=float(unknown_count / max(len(inside), 1)),
             outside_ratio=outside_ratio,
+            physical_collision=bool(np.any(occupied_flat[physical])),
+            safety_margin_collision=bool(np.any(occupied_flat[margin_only])),
+            physical_unknown_count=int(np.count_nonzero(unknown_flat[physical])),
+            safety_margin_unknown_count=int(np.count_nonzero(unknown_flat[margin_only])),
         )
 
     def classify_pose(
@@ -277,6 +310,7 @@ class FootprintCollisionChecker:
             y_m=float(y_m),
             yaw_rad=float(yaw_rad),
             margin_m=0.0,
+            clearing_only=True,
         )
         occupied = grid.occupied_mask.copy()
         free = grid.free_mask.copy()
@@ -331,6 +365,7 @@ class FootprintCollisionChecker:
         yaw_rad: float,
         part_name: str | None = None,
         margin_m: float | None = None,
+        clearing_only: bool = False,
     ) -> tuple[np.ndarray, float]:
         rows, columns, inside = self._indices(
             grid,
@@ -341,6 +376,7 @@ class FootprintCollisionChecker:
                 self.footprint.margin_m if margin_m is None else float(margin_m)
             ),
             part_name=part_name,
+            clearing_only=clearing_only,
         )
         outside_ratio = float(1.0 - np.mean(inside))
         if not np.any(inside):
@@ -362,10 +398,12 @@ class FootprintCollisionChecker:
             x_m=float(initial[0]),
             y_m=float(initial[1]),
             yaw_rad=float(initial[2]),
+            clearing_only=True,
         )
         if len(sweep) == 0:
             return IncrementalUnknownMetrics(0.0, 0, 0.0, np.empty(0, dtype=np.int64))
         swept_cells = []
+        physical_swept_cells = []
         for pose in sweep:
             cells, _ = self.covered_linear_indices(
                 grid,
@@ -375,6 +413,11 @@ class FootprintCollisionChecker:
             )
             if cells.size:
                 swept_cells.append(cells)
+            physical, _ = self.covered_linear_indices(
+                grid, x_m=float(pose[0]), y_m=float(pose[1]),
+                yaw_rad=float(pose[2]), margin_m=0.0,
+            )
+            physical_swept_cells.append(physical)
         if not swept_cells:
             return IncrementalUnknownMetrics(0.0, 0, 0.0, np.empty(0, dtype=np.int64))
         all_swept = np.unique(np.concatenate(swept_cells))
@@ -383,11 +426,20 @@ class FootprintCollisionChecker:
             return IncrementalUnknownMetrics(0.0, 0, 0.0, np.empty(0, dtype=np.int64))
         unknown = grid.unknown_mask.reshape(-1)[newly_covered]
         unknown_count = int(np.count_nonzero(unknown))
+        unknown_cells = newly_covered[unknown]
+        physical_unknown = np.intersect1d(
+            unknown_cells, np.unique(np.concatenate(physical_swept_cells)),
+            assume_unique=True,
+        )
         return IncrementalUnknownMetrics(
             ratio=float(unknown_count / newly_covered.size),
             cell_count=unknown_count,
             area_m2=float(unknown_count * grid.resolution_m**2),
-            unknown_linear_indices=newly_covered[unknown],
+            unknown_linear_indices=unknown_cells,
+            physical_unknown_linear_indices=physical_unknown,
+            safety_margin_unknown_linear_indices=np.setdiff1d(
+                unknown_cells, physical_unknown, assume_unique=True,
+            ),
         )
 
     def _indices(
@@ -399,9 +451,12 @@ class FootprintCollisionChecker:
         yaw_rad: float,
         margin_m: float,
         part_name: str | None = None,
+        clearing_only: bool = False,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         row, column, _ = grid.world_to_cell(x_m, y_m)
-        offsets = self._offsets(grid.resolution_m, yaw_rad, margin_m, part_name)
+        offsets = self._offsets(
+            grid.resolution_m, yaw_rad, margin_m, part_name, clearing_only,
+        )
         rows = row + offsets[:, 0]
         columns = column + offsets[:, 1]
         inside = (
@@ -418,11 +473,12 @@ class FootprintCollisionChecker:
         yaw_rad: float,
         margin_m: float,
         part_name: str | None,
+        clearing_only: bool = False,
     ) -> np.ndarray:
         yaw_index = int(
             round(((float(yaw_rad) + math.pi) % (2.0 * math.pi)) / self._yaw_step)
         ) % self._yaw_bins
-        key = (float(resolution_m), yaw_index, float(margin_m), part_name)
+        key = (float(resolution_m), yaw_index, float(margin_m), part_name, clearing_only)
         cached = self._offset_cache.get(key)
         if cached is not None:
             return cached
@@ -432,14 +488,19 @@ class FootprintCollisionChecker:
         for part in self.footprint.parts:
             if part_name is not None and part.name != part_name:
                 continue
+            bounds = (
+                part.clearing_bounds_m
+                if clearing_only and part.clearing_bounds_m is not None
+                else (part.min_x_m, part.max_x_m, part.min_y_m, part.max_y_m)
+            )
             local_x = np.arange(
-                part.min_x_m - margin,
-                part.max_x_m + margin + 0.5 * sample_step,
+                bounds[0] - margin,
+                bounds[1] + margin + 0.5 * sample_step,
                 sample_step,
             )
             local_y = np.arange(
-                part.min_y_m - margin,
-                part.max_y_m + margin + 0.5 * sample_step,
+                bounds[2] - margin,
+                bounds[3] + margin + 0.5 * sample_step,
                 sample_step,
             )
             xx, yy = np.meshgrid(local_x, local_y, indexing="xy")
@@ -456,6 +517,12 @@ class FootprintCollisionChecker:
             (sine * local[:, 0] + cosine * local[:, 1]) / resolution_m
         ).astype(np.int64)
         offsets = np.unique(np.column_stack((row_offset, column_offset)), axis=0)
+        if margin > 0:
+            # 不同余量的离散采样起点不同，显式保留全部物理覆盖栅格。
+            physical_offsets = self._offsets(
+                resolution_m, yaw_rad, 0.0, part_name, clearing_only,
+            )
+            offsets = np.unique(np.concatenate((offsets, physical_offsets)), axis=0)
         self._offset_cache[key] = offsets
         return offsets
 

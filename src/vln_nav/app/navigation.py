@@ -99,7 +99,7 @@ from vln_nav.runtime.isaac_runtime_utils import (
 from vln_nav.runtime.agx_profile import load_agx_profile
 from vln_nav.runtime.episode import NavigationEpisode, load_episodes, select_episode
 from vln_nav.runtime.scene_lighting import add_indoor_lighting
-from vln_nav.runtime.agx_geometry import validate_agx_geometry
+from vln_nav.runtime.agx_geometry import build_agx_footprint, validate_agx_geometry
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -1449,6 +1449,21 @@ def _run(
         else None
     )
     s2_goal_adapter = S2GoalAdapter(s2_goal_config)
+    footprint, footprint_audit = build_agx_footprint(
+        stage, profile, articulation_path, margin_m=footprint.margin_m,
+    )
+    footprint_audit_path = (
+        PROJECT_ROOT / "constraint_traverse/data/diagnostics"
+        / f"agx_footprint_{uuid.uuid4().hex[:8]}.json"
+    )
+    footprint_audit_path.parent.mkdir(parents=True, exist_ok=True)
+    with footprint_audit_path.open("w", encoding="utf-8") as handle:
+        json.dump(footprint_audit, handle, ensure_ascii=False, indent=2)
+    logger.info(
+        "[FootprintGeometry] 碰撞体=%d 独立部件=%d 状态=%s 安全余量=%.3fm 核查报告=%s",
+        footprint_audit["collider_count"], len(footprint.parts),
+        footprint_audit["status"], footprint.margin_m, footprint_audit_path,
+    )
     collision_checker = FootprintCollisionChecker(
         footprint,
         yaw_resolution_deg=fine_config.yaw_resolution_deg,

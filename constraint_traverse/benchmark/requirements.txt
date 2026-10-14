@@ -1,0 +1,2 @@
+pytorch-mppi==0.9.1
+shapely==2.2.0

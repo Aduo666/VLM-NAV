@@ -1,0 +1,145 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+import math
+
+import numpy as np
+import shapely
+import torch
+from shapely import affinity
+from shapely.geometry import box
+from shapely.ops import unary_union
+
+
+@dataclass(frozen=True)
+class DoorScene:
+    width_m: float
+    thickness_m: float = 0.25
+    half_size_m: float = 3.0
+    height_m: float = 2.0
+
+    def __post_init__(self):
+        values = (self.width_m, self.thickness_m, self.half_size_m, self.height_m)
+        if not all(math.isfinite(v) and v > 0 for v in values):
+            raise ValueError("窄门尺寸必须为有限正数")
+        if self.width_m >= 2 * self.half_size_m:
+            raise ValueError("门宽必须小于场景宽度")
+
+    @property
+    def obstacles(self) -> np.ndarray:
+        t, w, h = self.thickness_m / 2, self.width_m / 2, self.half_size_m
+        return np.asarray([[-t, t, w, h], [-t, t, -h, -w]], dtype=np.float64)
+
+    @property
+    def exit_x_m(self) -> float:
+        return self.thickness_m / 2
+
+
+@dataclass(frozen=True)
+class SweepResult:
+    safe: bool
+    reason: str
+    min_clearance_m: float
+
+
+class PassageGeometry:
+    def __init__(self, parts, scene: DoorScene, *, margin_m=0.03, sweep_step_m=0.01):
+        self.parts = np.asarray(parts, dtype=np.float64).reshape(-1, 4)
+        if len(self.parts) == 0 or not np.isfinite(self.parts).all():
+            raise ValueError("车体轮廓不能为空且必须包含有效坐标")
+        if np.any(self.parts[:, 0] >= self.parts[:, 1]) or np.any(self.parts[:, 2] >= self.parts[:, 3]):
+            raise ValueError("车体部件的边界无效")
+        if margin_m < 0 or sweep_step_m <= 0:
+            raise ValueError("安全余量和扫掠步长无效")
+        self.scene = scene
+        self.margin_m = float(margin_m)
+        self.sweep_step_m = float(sweep_step_m)
+        self.body = unary_union([box(p[0], p[2], p[1], p[3]) for p in self.parts])
+        self.obstacle_geometry = unary_union([box(p[0], p[2], p[1], p[3]) for p in scene.obstacles])
+        self.room = box(-scene.half_size_m, -scene.half_size_m, scene.half_size_m, scene.half_size_m)
+        self.radius_m = float(np.max(np.hypot(np.abs(self.parts[:, :2]).max(axis=1), np.abs(self.parts[:, 2:]).max(axis=1))))
+        self.corners = np.stack((self.parts[:, [0, 2]], self.parts[:, [1, 2]], self.parts[:, [1, 3]], self.parts[:, [0, 3]]), axis=1)
+        self._tensor_cache = {}
+
+    @property
+    def body_width_m(self):
+        return float(self.parts[:, 3].max() - self.parts[:, 2].min())
+
+    def body_at(self, pose):
+        x, y, yaw = np.asarray(pose, dtype=float)[:3]
+        rotated = affinity.rotate(self.body, float(yaw), origin=(0, 0), use_radians=True)
+        return affinity.translate(rotated, float(x), float(y))
+
+    def clearance(self, pose):
+        return float(self.body_at(pose).distance(self.obstacle_geometry))
+
+    def completely_passed(self, pose):
+        return self.body_at(pose).bounds[0] > self.scene.exit_x_m + 1.0e-6
+
+    def validate_poses(self, poses) -> SweepResult:
+        poses = np.asarray(poses, dtype=float).reshape(-1, 3)
+        if len(poses) == 0 or not np.isfinite(poses).all():
+            return SweepResult(False, "INVALID_PREDICTION", 0.0)
+        previous = poses[0]
+        samples, margins = [], []
+        for endpoint in poses:
+            delta = endpoint - previous
+            delta[2] = (delta[2] + math.pi) % (2 * math.pi) - math.pi
+            motion_bound = np.linalg.norm(delta[:2]) + self.radius_m * abs(delta[2])
+            count = max(1, math.ceil(motion_bound / self.sweep_step_m))
+            # 相邻采样间最大轮廓位移的一半覆盖连续运动空隙。
+            interpolation_margin = motion_bound / (2 * count)
+            fractions = np.linspace(0, 1, count + 1)
+            samples.append(previous[None, :] + fractions[:, None] * delta)
+            margins.extend([self.margin_m + interpolation_margin] * len(fractions))
+            previous = endpoint
+        samples = np.concatenate(samples)
+        c, s = np.cos(samples[:, 2, None, None]), np.sin(samples[:, 2, None, None])
+        x = samples[:, 0, None, None] + c * self.corners[:, :, 0] - s * self.corners[:, :, 1]
+        y = samples[:, 1, None, None] + s * self.corners[:, :, 0] + c * self.corners[:, :, 1]
+        polygons = shapely.polygons(np.stack((x, y), axis=-1).reshape(-1, 4, 2))
+        distances = shapely.distance(polygons, self.obstacle_geometry).reshape(len(samples), -1).min(axis=1)
+        margins = np.asarray(margins)
+        room_gap = self.scene.half_size_m - np.maximum(np.abs(x).max(axis=(1, 2)), np.abs(y).max(axis=(1, 2)))
+        outside = room_gap < margins
+        blocked = distances <= margins + 1.0e-9
+        bad = np.flatnonzero(outside | blocked)
+        if len(bad):
+            index = int(bad[0])
+            return SweepResult(False, "OUTSIDE_SCENE" if outside[index] else "OBSTACLE_OR_MARGIN", float(distances[:index + 1].min()))
+        return SweepResult(True, "SAFE", float(distances.min()))
+
+    def torch_clearance(self, poses: torch.Tensor):
+        key = (poses.device, poses.dtype)
+        if key not in self._tensor_cache:
+            parts = torch.as_tensor(self.parts, device=poses.device, dtype=poses.dtype)
+            obstacles = torch.as_tensor(self.scene.obstacles, device=poses.device, dtype=poses.dtype)
+            self._tensor_cache[key] = (
+                torch.stack(((parts[:, 0] + parts[:, 1]) / 2, (parts[:, 2] + parts[:, 3]) / 2), dim=-1),
+                torch.stack(((parts[:, 1] - parts[:, 0]) / 2, (parts[:, 3] - parts[:, 2]) / 2), dim=-1),
+                torch.stack(((obstacles[:, 0] + obstacles[:, 1]) / 2, (obstacles[:, 2] + obstacles[:, 3]) / 2), dim=-1),
+                torch.stack(((obstacles[:, 1] - obstacles[:, 0]) / 2, (obstacles[:, 3] - obstacles[:, 2]) / 2), dim=-1),
+            )
+        centers, half, oc, oh = self._tensor_cache[key]
+        c, s = torch.cos(poses[..., 2]), torch.sin(poses[..., 2])
+        wx = poses[..., 0, None] + c[..., None] * centers[:, 0] - s[..., None] * centers[:, 1]
+        wy = poses[..., 1, None] + s[..., None] * centers[:, 0] + c[..., None] * centers[:, 1]
+        dx = wx[..., :, None] - oc[:, 0]
+        dy = wy[..., :, None] - oc[:, 1]
+        c, s = c[..., None, None], s[..., None, None]
+        hx, hy = half[:, 0, None], half[:, 1, None]
+        ox, oy = oh[:, 0], oh[:, 1]
+        separation = torch.stack((
+            dx.abs() - (c.abs() * hx + s.abs() * hy + ox),
+            dy.abs() - (s.abs() * hx + c.abs() * hy + oy),
+            (c * dx + s * dy).abs() - (hx + c.abs() * ox + s.abs() * oy),
+            (-s * dx + c * dy).abs() - (hy + s.abs() * ox + c.abs() * oy),
+        ), dim=-1).amax(dim=-1)
+        obstacle_gap = separation.amin(dim=(-1, -2))
+        extent_x = c[..., 0].abs() * half[:, 0] + s[..., 0].abs() * half[:, 1]
+        extent_y = s[..., 0].abs() * half[:, 0] + c[..., 0].abs() * half[:, 1]
+        room_gap = torch.minimum(
+            self.scene.half_size_m - wx.abs() - extent_x,
+            self.scene.half_size_m - wy.abs() - extent_y,
+        ).amin(dim=-1)
+        return torch.minimum(obstacle_gap, room_gap)

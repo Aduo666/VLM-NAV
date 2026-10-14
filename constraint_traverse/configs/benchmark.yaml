@@ -1,0 +1,65 @@
+simulation:
+  active_gpu: 0
+  physics_gpu: 0
+  multi_gpu: false
+
+scene:
+  door_clearance_m: 0.40
+  door_thickness_m: 0.25
+  wall_height_m: 2.0
+  room_half_size_m: 3.0
+  start_x_m: -1.6
+  start_y_m: 0.0
+  start_yaw_deg: 0.0
+
+planner:
+  method: MPPI
+  device: cpu
+  dt_sec: 0.20
+  horizon_steps: 20
+  samples: 256
+  iterations: 1
+  temperature: 1.0
+  noise_linear_std: 0.18
+  noise_angular_std: 0.18
+  kernel_support_points: 6
+  kernel_sigma: 3.0
+  candidate_display_count: 24
+  seed: 0
+
+# 轮组几何、关节符号和硬件上限读取 configs/robots/agx.yaml。
+motion:
+  max_linear_mps: 0.50
+  max_angular_radps: 0.50
+  linear_accel_mps2: 0.60
+  linear_decel_mps2: 0.30
+  angular_accel_radps2: 1.0
+  angular_decel_radps2: 1.4
+  steering_rate_radps: 2.0
+  steering_response_sec: 0.12
+
+cost:
+  goal: 8.0
+  terminal_goal: 60.0
+  heading: 1.5
+  reference_path: 12.0
+  control: 0.10
+  obstacle: 15.0
+  obstacle_soft_distance_m: 0.12
+  invalid: 100000.0
+
+safety:
+  margin_m: 0.03
+  sweep_step_m: 0.01
+  reaction_time_sec: 0.10
+
+trial:
+  goal_tolerance_m: 0.30
+  stopped_linear_mps: 0.025
+  stopped_angular_radps: 0.04
+  stopped_hold_sec: 0.30
+  timeout_sec: 45.0
+  no_safe_control_timeout_sec: 3.0
+  settle_frames: 60
+  map_size_px: 520
+  navigation_condition: goal

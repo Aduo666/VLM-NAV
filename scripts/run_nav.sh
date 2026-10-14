@@ -9,7 +9,7 @@ if [[ -z "${CONDA_PREFIX:-}" || "${CONDA_DEFAULT_ENV:-base}" == "base" ]]; then
   exit 1
 fi
 
-export PYTHONPATH="${ROOT_DIR}/src:${PYTHONPATH:-}"
+export PYTHONPATH="${ROOT_DIR}/src:${ROOT_DIR}:${PYTHONPATH:-}"
 export PYTHONUNBUFFERED=1
 export OMNI_KIT_ACCEPT_EULA="${OMNI_KIT_ACCEPT_EULA:-YES}"
-exec "${CONDA_PREFIX}/bin/python" -m vln_nav.app.navigation
+exec "${CONDA_PREFIX}/bin/python" -m vln_nav.app.navigation "$@"

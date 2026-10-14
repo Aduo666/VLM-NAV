@@ -18,17 +18,12 @@
           |
           +---- STOP ----> 静止复核
                                   |
-               +------------------+------------------+
-               |                                     |
-          COARSE: NavDP                         FINE: Hybrid A*
-          滚动生成轨迹                         使用局部地图规划轨迹
-               |                                     |
-               +------------------+------------------+
+            COARSE / FINE / MPPI / KMPPI
                                   |
-                           AGX 连续轨迹跟踪
+                           AGX 四轮连续控制
 ```
 
-当前固定使用 `COARSE`，通过独立运行的 NavDP point-goal 服务生成轨迹。细粒度规划代码仍保留，界面暂时不显示模式选择按钮和 Fine Geometry 窗口。
+底层支持 `COARSE`（NavDP）、`FINE`（Hybrid A*）、`MPPI` 和 `KMPPI`。默认模式由 `configs/navigation.yaml` 的 `execution.default_mode` 设置，当前为 `COARSE`。Isaac Sim 的 `Navigation Controls` 窗口提供四种模式的下拉选择；切换时清除旧轨迹和规划历史，保留当前局部目标。
 
 ## 环境与运行
 
@@ -43,13 +38,24 @@ conda activate vlmnav
 bash scripts/run_nav.sh
 ```
 
+可以通过启动参数直接选择底层：
+
+```bash
+bash scripts/run_nav.sh --local-planner MPPI
+bash scripts/run_nav.sh --local-planner KMPPI
+```
+
+启动参数只影响本次运行。运行过程中也可以在 `Navigation Controls` 下拉框切换回 `COARSE` 或 `FINE`。
+
 启动后，终端会列出 `episodes.json` 中的任务。输入任务编号后，程序才会启动 Isaac Sim，并使用该任务的场景、初始位姿和指令。输入无效编号时会要求重新输入，不会自动选择任务。
 
-完整导航需要先启动远程 S2 服务和 NavDP 服务，再运行主程序。主程序获得有效前视帧后自动调用 `/reset` 创建会话，随后通过 `/infer` 执行所选任务的指令。S2 输出 `LOOKDOWN` 时，程序停车并将固定下视相机的新图像发回同一会话。
+完整导航使用远程 S2 服务。`COARSE` 另外需要 NavDP 服务；`FINE`、`MPPI`、`KMPPI` 在本机进行底层规划。主程序获得有效前视帧后自动调用 `/reset` 创建会话，随后通过 `/infer` 执行所选任务的指令。S2 输出 `LOOKDOWN` 时，程序停车并将固定下视相机的新图像发回同一会话。
+
+MPPI/KMPPI 依赖通过 `python -m pip install -r constraint_traverse/benchmark/requirements.txt` 安装，参数由 `sampling_planner.config_path` 指向的配置读取，当前为 `constraint_traverse/configs/benchmark.yaml` 中的模型、代价、采样与安全设置。输入使用主导航现有的前视和底盘下视 RGB-D 规划地图、S2 局部目标及实测轮组状态。未知区域继续禁行；面板显示 `UNKNOWN` 时，对应区域会在 Goal Map 中标记，日志记录 `[SamplingStop]` 或 `[SamplingSafetyStop]`。
 
 前视相机水平视角由 `configs/navigation.yaml` 的 `camera.horizontal_fov_deg` 设置，当前为 `80°`。S2 返回连续同向转向时，程序最多执行 `30°`，停稳后用新的前视画面重新请求决策。
 
-Isaac Sim 中只保留 `S2 Decision` 和 `Goal Map` 两个导航窗口。任务开始、局部目标切换和最终停止均由主导航自动处理。点击 Goal Map 中的已知空闲位置仍可执行手动点目标导航，方向键可以手动控制 AGX。
+Isaac Sim 中包含 `S2 Decision`、`Goal Map` 和 `Navigation Controls` 窗口。任务开始、局部目标切换和最终停止均由主导航自动处理。点击 Goal Map 中的已知空闲位置仍可执行手动点目标导航，方向键可以手动控制 AGX。
 
 新增任务时，在 [任务清单](configs/episodes.json) 中增加唯一 `id`、名称、USD 路径、初始 XY、初始朝向和指令。XY 和朝向使用场景世界坐标，初始高度由 AGX 配置决定。[导航配置](configs/navigation.yaml) 中的 `scene` 段只保存场景加载公共参数；`add_indoor_lighting` 控制运行时室内灯光，原始场景 USD 不会被修改。
 
@@ -57,7 +63,8 @@ Isaac Sim 中只保留 `S2 Decision` 和 `Goal Map` 两个导航窗口。任务�
 
 | 文件 | 用途 |
 | --- | --- |
-| [navigation.py](src/vln_nav/app/navigation.py) | 场景加载、目标选择与两种导航模式 |
+| [navigation.py](src/vln_nav/app/navigation.py) | 场景加载、目标选择与四种底层模式 |
+| [constraint_traverse/navigation.py](constraint_traverse/navigation.py) | MPPI/KMPPI 规划地图适配与轮组执行 |
 | [navigation.yaml](configs/navigation.yaml) | 场景、相机、地图、规划和跟踪参数 |
 | [episodes.json](configs/episodes.json) | 可选择任务的场景、初始位姿和指令 |
 | [episode.py](src/vln_nav/runtime/episode.py) | 任务清单校验与终端选择 |

@@ -42,6 +42,30 @@ class SweepResult:
     min_clearance_m: float
 
 
+def swept_part_polygons(parts, poses, *, radius_m, margin_m, step_m):
+    parts = np.asarray(parts, dtype=float).reshape(-1, 4)
+    poses = np.asarray(poses, dtype=float).reshape(-1, 3)
+    previous = poses[0]
+    samples, margins = [], []
+    for endpoint in poses:
+        delta = endpoint - previous
+        delta[2] = (delta[2] + math.pi) % (2 * math.pi) - math.pi
+        motion_bound = np.linalg.norm(delta[:2]) + radius_m * abs(delta[2])
+        count = max(1, math.ceil(motion_bound / step_m))
+        # 相邻采样间最大轮廓位移的一半覆盖连续运动空隙。
+        fractions = np.linspace(0, 1, count + 1)
+        samples.append(previous[None, :] + fractions[:, None] * delta)
+        margins.extend([margin_m + motion_bound / (2 * count)] * len(fractions))
+        previous = endpoint
+    samples = np.concatenate(samples)
+    corners = np.stack((parts[:, [0, 2]], parts[:, [1, 2]], parts[:, [1, 3]], parts[:, [0, 3]]), axis=1)
+    c, s = np.cos(samples[:, 2, None, None]), np.sin(samples[:, 2, None, None])
+    x = samples[:, 0, None, None] + c * corners[:, :, 0] - s * corners[:, :, 1]
+    y = samples[:, 1, None, None] + s * corners[:, :, 0] + c * corners[:, :, 1]
+    polygons = shapely.polygons(np.stack((x, y), axis=-1).reshape(-1, 4, 2))
+    return polygons, np.asarray(margins), x, y
+
+
 class PassageGeometry:
     def __init__(self, parts, scene: DoorScene, *, margin_m=0.03, sweep_step_m=0.01):
         self.parts = np.asarray(parts, dtype=np.float64).reshape(-1, 4)
@@ -80,26 +104,10 @@ class PassageGeometry:
         poses = np.asarray(poses, dtype=float).reshape(-1, 3)
         if len(poses) == 0 or not np.isfinite(poses).all():
             return SweepResult(False, "INVALID_PREDICTION", 0.0)
-        previous = poses[0]
-        samples, margins = [], []
-        for endpoint in poses:
-            delta = endpoint - previous
-            delta[2] = (delta[2] + math.pi) % (2 * math.pi) - math.pi
-            motion_bound = np.linalg.norm(delta[:2]) + self.radius_m * abs(delta[2])
-            count = max(1, math.ceil(motion_bound / self.sweep_step_m))
-            # 相邻采样间最大轮廓位移的一半覆盖连续运动空隙。
-            interpolation_margin = motion_bound / (2 * count)
-            fractions = np.linspace(0, 1, count + 1)
-            samples.append(previous[None, :] + fractions[:, None] * delta)
-            margins.extend([self.margin_m + interpolation_margin] * len(fractions))
-            previous = endpoint
-        samples = np.concatenate(samples)
-        c, s = np.cos(samples[:, 2, None, None]), np.sin(samples[:, 2, None, None])
-        x = samples[:, 0, None, None] + c * self.corners[:, :, 0] - s * self.corners[:, :, 1]
-        y = samples[:, 1, None, None] + s * self.corners[:, :, 0] + c * self.corners[:, :, 1]
-        polygons = shapely.polygons(np.stack((x, y), axis=-1).reshape(-1, 4, 2))
-        distances = shapely.distance(polygons, self.obstacle_geometry).reshape(len(samples), -1).min(axis=1)
-        margins = np.asarray(margins)
+        polygons, margins, x, y = swept_part_polygons(
+            self.parts, poses, radius_m=self.radius_m, margin_m=self.margin_m, step_m=self.sweep_step_m,
+        )
+        distances = shapely.distance(polygons, self.obstacle_geometry).reshape(len(margins), -1).min(axis=1)
         room_gap = self.scene.half_size_m - np.maximum(np.abs(x).max(axis=(1, 2)), np.abs(y).max(axis=(1, 2)))
         outside = room_gap < margins
         blocked = distances <= margins + 1.0e-9

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import asdict, dataclass, fields, replace
+import argparse
 import json
 import logging
 import math
@@ -105,6 +106,8 @@ from vln_nav.runtime.agx_geometry import build_agx_footprint, validate_agx_geome
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 SETTINGS_PATH = PROJECT_ROOT / "configs/navigation.yaml"
 EPISODES_PATH = PROJECT_ROOT / "configs/episodes.json"
+LOW_LEVEL_MODES = ("COARSE", "FINE", "MPPI", "KMPPI")
+SAMPLING_MODES = ("MPPI", "KMPPI")
 
 
 @dataclass(frozen=True)
@@ -538,11 +541,12 @@ class _GoalMapPanel:
         "RIGHT": "TURN_RIGHT",
     }
 
-    def __init__(self, ui, *, image_size_px: int, command_sink) -> None:
+    def __init__(self, ui, *, image_size_px: int, command_sink, mode="COARSE", bind_keyboard=True) -> None:
         import carb.input
         import omni.appwindow
 
         self._command_sink = command_sink
+        self._updating_mode = False
         self._map: BevGoalMap | None = None
         self._carb_input = carb.input
         self._held_actions: dict[str, str] = {}
@@ -553,6 +557,13 @@ class _GoalMapPanel:
         initial[:, :, 3] = 255
         self._provider = ui.ByteImageProvider()
         self._provider.set_data_array(initial.reshape(-1), [size, size])
+        self.controls_window = ui.Window("Navigation Controls", width=340, height=160, visible=True)
+        with self.controls_window.frame:
+            with ui.VStack(spacing=6):
+                ui.Label("底层规划器", height=24)
+                self._mode_combo = ui.ComboBox(LOW_LEVEL_MODES.index(mode), *LOW_LEVEL_MODES, height=28)
+                self._mode_combo.model.add_item_changed_fn(self._on_mode_changed)
+                self._status_label = ui.Label(f"底层：{mode}", height=70, word_wrap=True)
         self.map_window = ui.Window(
             "Goal Map",
             width=max(size + 20, 600),
@@ -570,15 +581,17 @@ class _GoalMapPanel:
             )
             self._image.set_mouse_pressed_fn(self._on_map_pressed)
 
-        app_window = omni.appwindow.get_default_app_window()
-        if app_window is None:
-            raise RuntimeError("Isaac Sim app window is unavailable")
-        self._keyboard = app_window.get_keyboard()
-        self._input = carb.input.acquire_input_interface()
-        self._keyboard_subscription = self._input.subscribe_to_keyboard_events(
-            self._keyboard,
-            self._on_keyboard_event,
-        )
+        self._keyboard_subscription = None
+        if bind_keyboard:
+            app_window = omni.appwindow.get_default_app_window()
+            if app_window is None:
+                raise RuntimeError("Isaac Sim app window is unavailable")
+            self._keyboard = app_window.get_keyboard()
+            self._input = carb.input.acquire_input_interface()
+            self._keyboard_subscription = self._input.subscribe_to_keyboard_events(
+                self._keyboard,
+                self._on_keyboard_event,
+            )
 
     @property
     def manual_action(self) -> str:
@@ -591,6 +604,22 @@ class _GoalMapPanel:
         height, width = goal_map.rgba.shape[:2]
         self._provider.set_data_array(goal_map.rgba.reshape(-1), [width, height])
 
+    def update_controls(self, mode, status):
+        self._status_label.text = f"底层：{mode}\n{status}"
+        value_model = self._mode_combo.model.get_item_value_model()
+        selected_index = LOW_LEVEL_MODES.index(mode)
+        if value_model.as_int == selected_index:
+            return
+        self._updating_mode = True
+        try:
+            value_model.set_value(selected_index)
+        finally:
+            self._updating_mode = False
+
+    def _on_mode_changed(self, model, _item):
+        if not self._updating_mode:
+            self._command_sink(("SET_MODE", LOW_LEVEL_MODES[model.get_item_value_model().as_int]))
+
     def shutdown(self) -> None:
         if self._keyboard_subscription is not None:
             self._input.unsubscribe_to_keyboard_events(
@@ -599,6 +628,7 @@ class _GoalMapPanel:
             )
             self._keyboard_subscription = None
         self.map_window.visible = False
+        self.controls_window.visible = False
 
     def _on_keyboard_event(self, event, *_args, **_kwargs) -> bool:
         key_name = str(event.input.name)
@@ -740,6 +770,7 @@ def _load_settings() -> tuple[
         "execution",
         "coarse_tracking",
         "fine_tracking",
+        "sampling_planner",
         "manual_control",
         "fine_planner",
         "restricted_space",
@@ -859,8 +890,11 @@ def _load_settings() -> tuple[
         "goal_reached_tolerance_m",
     }:
         raise ValueError("Invalid navigation modes execution fields")
-    if execution["default_mode"] not in {"COARSE", "FINE"}:
+    if execution["default_mode"] not in LOW_LEVEL_MODES:
         raise ValueError("Invalid default navigation mode")
+    sampling = data["sampling_planner"]
+    if not isinstance(sampling, dict) or set(sampling) != {"config_path"} or not str(sampling["config_path"]).strip():
+        raise ValueError("sampling_planner 必须包含 config_path")
     if (
         isinstance(execution["max_short_trajectory_retries"], bool)
         or not isinstance(execution["max_short_trajectory_retries"], int)
@@ -1031,6 +1065,9 @@ def _load_settings() -> tuple[
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description="AGX 视觉语言主导航")
+    parser.add_argument("--local-planner", choices=LOW_LEVEL_MODES, help="本次运行的底层规划器")
+    args = parser.parse_args()
     profile = load_agx_profile(project_root=PROJECT_ROOT)
     (
         settings,
@@ -1045,6 +1082,8 @@ def main() -> int:
         graph_config,
         refiner_config,
     ) = _load_settings()
+    if args.local_planner is not None:
+        settings["execution"]["default_mode"] = args.local_planner
     logger = _make_logger()
     try:
         episodes = load_episodes(EPISODES_PATH, project_root=PROJECT_ROOT)
@@ -1468,6 +1507,20 @@ def _run(
         footprint,
         yaw_resolution_deg=fine_config.yaw_resolution_deg,
     )
+    sampling_controller = None
+
+    def create_sampling_controller(selected_mode):
+        from constraint_traverse.navigation import SamplingNavigationController
+        config_path = Path(settings["sampling_planner"]["config_path"])
+        if not config_path.is_absolute():
+            config_path = PROJECT_ROOT / config_path
+        return SamplingNavigationController(
+            method=selected_mode, hardware=profile.agx_controller.continuous,
+            footprint=footprint, physics_dt=world.get_physics_dt(), config_path=config_path, logger=logger,
+        )
+
+    if settings["execution"]["default_mode"] in SAMPLING_MODES:
+        sampling_controller = create_sampling_controller(settings["execution"]["default_mode"])
     fine_planner = FineLocalPlanner(fine_config, collision_checker)
     graph_builder = TraversabilityGraphBuilder(
         config=graph_config,
@@ -1536,6 +1589,7 @@ def _run(
         ui,
         image_size_px=int(settings["map_selector"]["image_size_px"]),
         command_sink=lambda value: command.__setitem__(0, value),
+        mode=str(settings["execution"]["default_mode"]),
     )
     s2_panel = _S2DecisionPanel(ui)
 
@@ -1635,6 +1689,8 @@ def _run(
         while app.is_running():
             if not world.is_playing():
                 adapter.stop()
+                if sampling_controller is not None:
+                    sampling_controller.reset()
                 tracker = None
                 navigation_active = False
                 command[0] = None
@@ -1804,7 +1860,7 @@ def _run(
                     show_source_coverage=True,
                     rejected_unknown_world_xy=(
                         rejected_unknown_world_xy
-                        if mode == "FINE" and navigation_active
+                        if mode in ("FINE", *SAMPLING_MODES) and navigation_active
                         else None
                     ),
                 )
@@ -1813,9 +1869,8 @@ def _run(
                     goal_map = _overlay_path_on_goal_map(
                         goal_map,
                         path_local,
-                        color=(34, 177, 76, 255)
-                        if tracker_mode == "FINE"
-                        else (238, 184, 45, 255),
+                        color=((51, 139, 230, 255) if mode in SAMPLING_MODES else (34, 177, 76, 255)
+                               if tracker_mode == "FINE" else (238, 184, 45, 255)),
                     )
                 panel.update_map(goal_map)
                 last_map_render_time = now
@@ -2488,7 +2543,39 @@ def _run(
 
             if command[0] is not None:
                 action, command[0] = command[0], None
-                if isinstance(action, tuple) and action[0] == "GOAL_ERROR":
+                if isinstance(action, tuple) and action[0] == "SET_MODE":
+                    selected_mode = str(action[1])
+                    if selected_mode in LOW_LEVEL_MODES and selected_mode != mode:
+                        try:
+                            replacement_controller = create_sampling_controller(selected_mode) if selected_mode in SAMPLING_MODES else None
+                        except Exception as exc:
+                            logger.error("[NavigationMode] 无法启用 %s：%s", selected_mode, exc)
+                            idle_status = f"Mode unavailable: {selected_mode}; see log"
+                            panel.update_controls(mode, idle_status)
+                        else:
+                            adapter.stop()
+                            if sampling_controller is not None:
+                                sampling_controller.reset()
+                            sampling_controller = replacement_controller
+                            mode = selected_mode
+                            tracker = tracker_mode = None
+                            display_path_odom_xy = None
+                            frozen_candidates = []
+                            rejected_unknown_world_xy = None
+                            last_failed_fine_input = None
+                            fine_diagnostic_saved_for_goal = False
+                            recent_fine_world_poses.clear()
+                            last_partial_switch_world_xy = last_partial_endpoint_world_xy = None
+                            last_coarse_request_time = last_fine_request_time = -float("inf")
+                            navdp_waiting_stable_after_short = False
+                            navdp_short_retry_count = 0
+                            request_id += 1
+                            accepted_request_id = request_id
+                            fine_request_id += 1
+                            accepted_fine_request_id = fine_request_id
+                            idle_status = f"Mode selected: {mode}"
+                            logger.info("[NavigationMode] selected=%s goal_retained=%s", mode, selected_goal_odom_xy is not None)
+                elif isinstance(action, tuple) and action[0] == "GOAL_ERROR":
                     logger.warning("[NavigationGoal] rejected: %s", action[1])
                 elif isinstance(action, tuple) and action[0] == "SELECT_GOAL":
                     if tracker is not None or not _is_stopped(state):
@@ -2564,6 +2651,8 @@ def _run(
                 tracker = None
                 tracker_mode = None
                 adapter.stop()
+                if sampling_controller is not None:
+                    sampling_controller.reset()
                 idle_status = f"GOAL REACHED: distance={goal_distance:.2f}m"
                 logger.info(
                     "[NavigationGoalReached] mode=%s generations=%d distance=%.3fm",
@@ -2769,6 +2858,8 @@ def _run(
             manual_action = panel.manual_action
             if manual_action != "STOP":
                 if not manual_active:
+                    if sampling_controller is not None:
+                        sampling_controller.reset()
                     tracker = None
                     tracker_mode = None
                     navigation_active = False
@@ -2838,6 +2929,28 @@ def _run(
                         float(s2_settings["turn_max_angular_radps"]),
                     ))
                     applied = adapter.apply(VelocityCommand(0.0, angular))
+            elif mode in SAMPLING_MODES and navigation_active and selected_goal_odom_xy is not None:
+                goal_world = _odom_path_to_world(selected_goal_odom_xy[None, :], state)[0]
+                try:
+                    previous_sampling_plan = sampling_controller.last_plan
+                    applied = sampling_controller.step(
+                        robot=robot, drive=drive, grid=latest_planning_grid,
+                        goal_world_xy=goal_world, now=now,
+                    )
+                    idle_status = f"{mode} {sampling_controller.status} v={applied.linear_mps:.2f} w={applied.angular_radps:.2f}"
+                    rejected_unknown_world_xy = sampling_controller.geometry.rejected_unknown_world_xy
+                    if sampling_controller.last_plan is not None and sampling_controller.last_plan.safe:
+                        display_path_odom_xy = _world_path_to_odom(sampling_controller.last_plan.prediction[:, :2], state)
+                        if sampling_controller.last_plan is not previous_sampling_plan:
+                            generation_index += 1
+                    else:
+                        display_path_odom_xy = None
+                except Exception:
+                    adapter.stop()
+                    sampling_controller.reset()
+                    navigation_active = False
+                    idle_status = f"{mode} stopped after error; see log"
+                    logger.exception("[SamplingError] mode=%s", mode)
             elif tracker is not None:
                 tracking_config = (
                     fine_tracking_config
@@ -2894,6 +3007,8 @@ def _run(
                     )
             else:
                 adapter.stop()
+                if sampling_controller is not None and sampling_controller.goal is not None:
+                    sampling_controller.reset()
 
             if (
                 s2_active
@@ -3069,6 +3184,7 @@ def _run(
             if tracker is None and idle_status != last_reported_idle_status:
                 logger.info("[NavigationStatus] %s", idle_status)
                 last_reported_idle_status = idle_status
+            panel.update_controls(mode, idle_status)
             world.step(render=frame_index % render_stride == 0)
             frame_index += 1
     finally:

@@ -173,21 +173,14 @@ class SamplingNavigationController:
             self.geometry.update_grid(grid)
             if now - self.last_planning_time >= self.config["planner"]["dt_sec"]:
                 self.last_planning_time = now
-                initial = self.geometry.validate_poses([state[:3]])
-                if not initial.safe:
-                    self.requested[:] = 0
-                    self.last_plan = None
-                    self.status = initial.reason
-                    self.logger.warning("[SamplingStop] mode=%s reason=%s map_version=%d", self.method, self.status, grid.map_version)
-                else:
-                    self.last_plan = self.planner.plan(state)
-                    self.requested = self.last_plan.command.copy()
-                    self.status = "TRACKING" if self.last_plan.safe else self.last_plan.reason
-                    if self.status == "UNKNOWN":
-                        self.geometry.validate_poses(self.last_plan.prediction)
-                    self.logger.info("[SamplingPlan] mode=%s map_version=%d status=%s latency=%.3fs clearance=%.3fm goal_world=%s",
-                                     self.method, grid.map_version, self.status, self.last_plan.planning_sec,
-                                     self.last_plan.min_clearance_m, goal.tolist())
+                self.last_plan = self.planner.plan(state)
+                self.requested = self.last_plan.command.copy()
+                self.status = "TRACKING" if self.last_plan.safe else self.last_plan.reason
+                if self.status == "UNKNOWN":
+                    self.geometry.validate_poses(self.last_plan.prediction)
+                self.logger.info("[SamplingPlan] mode=%s map_version=%d status=%s latency=%.3fs clearance=%.3fm goal_world=%s",
+                                 self.method, grid.map_version, self.status, self.last_plan.planning_sec,
+                                 self.last_plan.min_clearance_m, goal.tolist())
                 self.last_checked_map_key = self.geometry._version_key
             elif self.geometry._version_key != self.last_checked_map_key:
                 future = self.execution_model.rollout(state, [self.requested])

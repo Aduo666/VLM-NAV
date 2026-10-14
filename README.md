@@ -51,7 +51,7 @@ bash scripts/run_nav.sh --local-planner KMPPI
 
 完整导航使用远程 S2 服务。`COARSE` 另外需要 NavDP 服务；`FINE`、`MPPI`、`KMPPI` 在本机进行底层规划。主程序获得有效前视帧后自动调用 `/reset` 创建会话，随后通过 `/infer` 执行所选任务的指令。S2 输出 `LOOKDOWN` 时，程序停车并将固定下视相机的新图像发回同一会话。
 
-MPPI/KMPPI 依赖通过 `python -m pip install -r constraint_traverse/benchmark/requirements.txt` 安装，参数由 `sampling_planner.config_path` 指向的配置读取，当前为 `constraint_traverse/configs/benchmark.yaml` 中的模型、代价、采样与安全设置。输入使用主导航现有的前视和底盘下视 RGB-D 规划地图、S2 局部目标及实测轮组状态。未知区域继续禁行；面板显示 `UNKNOWN` 时，对应区域会在 Goal Map 中标记，日志记录 `[SamplingStop]` 或 `[SamplingSafetyStop]`。
+MPPI/KMPPI 依赖通过 `python -m pip install -r constraint_traverse/benchmark/requirements.txt` 安装，参数由 `sampling_planner.config_path` 指向的配置读取，当前为 `constraint_traverse/configs/benchmark.yaml` 中的模型、代价、采样与安全设置。输入使用主导航现有的前视和底盘下视 RGB-D 规划地图、S2 局部目标及实测轮组状态。每个规划周期直接进行采样优化，随后复核生成轨迹、制动区域及最新地图。未知区域继续禁行；面板显示 `UNKNOWN` 时，对应区域会在 Goal Map 中标记，日志记录 `[SamplingPlan] status=UNKNOWN` 或 `[SamplingSafetyStop]`。
 
 前视相机水平视角由 `configs/navigation.yaml` 的 `camera.horizontal_fov_deg` 设置，当前为 `80°`。S2 返回连续同向转向时，程序最多执行 `30°`，停稳后用新的前视画面重新请求决策。
 

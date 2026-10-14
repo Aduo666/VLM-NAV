@@ -148,6 +148,15 @@ class ControllerTests(unittest.TestCase):
             controller.reset()
             self.assertIsNone(controller.planner)
             self.assertIsNone(controller.goal)
+            with self.subTest(method=method, start="UNKNOWN"):
+                applied = controller.step(robot=Robot(), drive=drive, grid=make_grid(known=False, version=2),
+                                          goal_world_xy=[1, 0], now=0)
+                self.assertIsNotNone(controller.last_plan)
+                self.assertEqual(controller.last_plan.candidates.shape[0], controller.config["planner"]["samples"])
+                self.assertEqual(controller.status, "UNKNOWN")
+                self.assertFalse(controller.last_plan.safe)
+                self.assertEqual(applied.linear_mps, 0)
+                self.assertEqual(applied.angular_radps, 0)
 
 
 if __name__ == "__main__":

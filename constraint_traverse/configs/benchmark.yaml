@@ -19,7 +19,7 @@ planner:
   horizon_steps: 20
   samples: 256
   iterations: 1
-  temperature: 1.0
+  temperature: 5.0
   noise_linear_std: 0.18
   noise_angular_std: 0.18
   kernel_support_points: 6
@@ -39,6 +39,8 @@ motion:
   steering_response_sec: 0.12
 
 cost:
+  reference_dt_sec: 0.20
+  goal_distance_scale_m: 1.0
   goal: 8.0
   terminal_goal: 60.0
   heading: 1.5
@@ -46,7 +48,12 @@ cost:
   control: 0.10
   obstacle: 15.0
   obstacle_soft_distance_m: 0.12
-  invalid: 100000.0
+  penetration_scale_m: 0.05
+  penetration: 500.0
+  occupied: 500.0
+  unknown: 500.0
+  outside: 1000.0
+  motion_constraint: 500.0
 
 safety:
   margin_m: 0.03

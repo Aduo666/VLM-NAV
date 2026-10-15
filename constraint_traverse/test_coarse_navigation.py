@@ -93,9 +93,28 @@ class CoarseTests(unittest.TestCase):
         tracker = PathTracker([[0, 0], [2, 0]], replace(self.tracking_config, timeout_sec=0.01))
         self.assertEqual(tracker.step([0, 0, 0], 0.02).status, "TRACKING")
 
-    def test_target_behind_does_not_stop(self):
+    def test_target_behind_commands_reverse(self):
         tracker = PathTracker([[0, 0], [-2, 0]], self.tracking_config)
-        self.assertEqual(tracker.step([0, 0, 0], 1 / 60).status, "TRACKING")
+        result = tracker.step([0, 0, 0], 1 / 60)
+        self.assertEqual(result.status, "TRACKING")
+        self.assertLess(result.command.linear_mps, 0)
+        self.assertEqual(result.command.angular_radps, 0)
+
+    def test_four_centimeter_path_requires_movement(self):
+        tracker = PathTracker([[0, 0], [0.04, 0]], self.tracking_config)
+        start = tracker.step([0, 0, 0], 1 / 60)
+        self.assertEqual(start.status, "TRACKING")
+        self.assertGreater(start.command.linear_mps, 0)
+        self.assertEqual(tracker.step([0.04, 0, 0], 1 / 60).status, "ARRIVED")
+
+    def test_reverse_transition_decelerates_before_reversing(self):
+        tracker = PathTracker([[0, 0], [-2, 0]], self.tracking_config, initial_speed_mps=0.2)
+        previous = 0.2
+        for _ in range(40):
+            command = tracker.step([0, 0, 0], 1 / 60).command
+            self.assertLessEqual(abs(command.linear_mps - previous), self.tracking_config.max_acceleration_mps2 / 60 + 1.0e-8)
+            previous = command.linear_mps
+        self.assertLess(previous, 0)
 
     def test_arrival_still_stops(self):
         tracker = PathTracker([[0, 0], [0.1, 0]], self.tracking_config)

@@ -177,8 +177,8 @@ class PathTracker:
         initial_speed_mps: float = 0.0,
     ):
         config.validate()
-        if not math.isfinite(float(initial_speed_mps)) or float(initial_speed_mps) < 0:
-            raise ValueError("initial_speed_mps 必须为有限非负数")
+        if not math.isfinite(float(initial_speed_mps)):
+            raise ValueError("initial_speed_mps 必须为有限数值")
         path = np.asarray(path_xy, dtype=float)
         if path.ndim != 2 or path.shape[1] != 2 or len(path) < 2 or not np.isfinite(path).all():
             raise ValueError("Path must have at least two finite XY points")
@@ -190,11 +190,13 @@ class PathTracker:
         self.lengths = np.linalg.norm(np.diff(path, axis=0), axis=1)
         self.s = np.r_[0.0, np.cumsum(self.lengths)]
         self.progress = self.elapsed = 0.0
-        self.speed = min(float(initial_speed_mps), float(config.max_linear_mps))
+        self.speed = float(np.clip(initial_speed_mps, -config.max_linear_mps, config.max_linear_mps))
+        self.arrival_tolerance_m = min(config.arrival_distance_m, 0.25 * self.s[-1])
+        self.direction = None
         self.finished = False
 
     def feedback(self, applied: VelocityCommand) -> None:
-        self.speed = abs(applied.linear_mps)
+        self.speed = float(applied.linear_mps)
 
     def _point(self, s: float) -> np.ndarray:
         return np.array([np.interp(s, self.s, self.path[:, axis]) for axis in (0, 1)])
@@ -223,22 +225,31 @@ class PathTracker:
         remaining = float(self.s[-1] - self.progress)
         target = self._point(min(self.s[-1], self.progress + cfg.lookahead_m))
         delta = target - position
+        forward = math.cos(yaw) * delta[0] + math.sin(yaw) * delta[1]
         left = -math.sin(yaw) * delta[0] + math.cos(yaw) * delta[1]
         distance_to_end = float(np.linalg.norm(position - self.path[-1]))
-        if remaining <= cfg.arrival_distance_m and distance_to_end <= cfg.arrival_distance_m:
+        if remaining <= self.arrival_tolerance_m and distance_to_end <= self.arrival_tolerance_m:
             self.finished = True
         status = "ARRIVED" if self.finished else "TRACKING"
         command = VelocityCommand()
         nominal = VelocityCommand()
         if status == "TRACKING":
+            # 侧向目标附近保留当前方向，方向切换经过零速度。
+            if self.direction is None or abs(forward) > 0.1 * max(float(np.linalg.norm(delta)), 1.0e-9):
+                self.direction = -1.0 if forward < 0 else 1.0
             curvature = 2.0 * left / max(float(np.dot(delta, delta)), 1e-9)
             speed_limit = min(cfg.max_linear_mps,
                         math.sqrt(cfg.max_lateral_acceleration_mps2 / max(abs(curvature), 1e-9)),
                         cfg.max_angular_radps / max(abs(curvature), 1e-9),
                         1.5 * distance_to_end,
                         math.sqrt(2 * cfg.max_acceleration_mps2 * max(0, remaining)))
-            nominal = VelocityCommand(speed_limit, speed_limit * curvature)
-            speed = min(speed_limit, self.speed + cfg.max_acceleration_mps2 * dt)
+            desired_speed = self.direction * speed_limit
+            nominal = VelocityCommand(desired_speed, desired_speed * curvature)
+            if self.speed * desired_speed < 0:
+                desired_speed = 0.0
+            speed = self.speed + float(np.clip(desired_speed - self.speed,
+                                               -cfg.max_acceleration_mps2 * dt,
+                                               cfg.max_acceleration_mps2 * dt))
             command = VelocityCommand(speed, speed * curvature)
             self.speed = speed
         else:

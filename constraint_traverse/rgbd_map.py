@@ -6,6 +6,7 @@ import math
 import cv2
 import numpy as np
 from scipy.ndimage import distance_transform_edt
+from skimage.draw import line
 
 from vln_nav.active_perception.camera_geometry import backproject_depth_pixels_to_world
 from vln_nav.active_perception.contracts import TimedDepthObservation
@@ -139,13 +140,8 @@ class RGBDPlanarMap:
         valid &= np.isfinite(points).all(axis=-1) & (distance > 1.0e-6)
         obstacle = valid & (height >= self.min_height) & (height <= self.max_height)
         floor = valid & (height >= -0.20) & (height < self.min_height)
-        # 每列优先采用最近障碍；没有障碍时，以最远地面观测建立平面空闲射线。
-        has_obstacle, has_floor = obstacle.any(axis=0), floor.any(axis=0)
-        nearest = np.argmin(np.where(obstacle, distance, np.inf), axis=0)
-        farthest = np.argmax(np.where(floor, distance, -np.inf), axis=0)
-        columns = np.flatnonzero(has_obstacle | has_floor)
-        rows = np.where(has_obstacle, nearest, farthest)[columns]
-        return points[rows, columns, :2], has_obstacle[columns]
+        keep = obstacle | floor
+        return points[..., :2][keep], obstacle[keep]
 
     def integrate_batch(self, observations: list[TimedDepthObservation], *, center_world_xy, floor_z_m):
         center = np.asarray(center_world_xy, dtype=float).reshape(2)
@@ -160,6 +156,7 @@ class RGBDPlanarMap:
         ray_counts, cell_counts = [], []
         r = self.config.resolution_m
         height, width = self.shape
+        prepared = []
         for observation in observations:
             endpoints, hits = self._rays(observation, floor_z_m)
             origin = observation.camera_to_world[:2, 3]
@@ -170,21 +167,27 @@ class RGBDPlanarMap:
             hits = hits & ~clipped
             start = tuple(np.floor((origin - self.origin) / r).astype(int))
             cells = np.floor((endpoints - self.origin) / r).astype(int)
-            free = np.zeros(self.shape, np.uint8)
             occupied = np.zeros(self.shape, bool)
             for (column, row), hit in zip(cells, hits):
+                if hit and 0 <= column < width and 0 <= row < height:
+                    occupied[row, column] = True
+            hit_all |= occupied
+            prepared.append((observation, start, np.unique(cells, axis=0), occupied, len(endpoints)))
+        for observation, start, cells, occupied, ray_count in prepared:
+            free = np.zeros(self.shape, bool)
+            for column, row in cells:
                 endpoint = (int(column), int(row))
                 intersects, first, last = cv2.clipLine((0, 0, width, height), tuple(map(int, start)), endpoint)
                 if intersects:
-                    cv2.line(free, first, last, 1, thickness=1, lineType=cv2.LINE_8)
-                if hit and 0 <= column < width and 0 <= row < height:
-                    occupied[row, column] = True
-            free_mask = free.astype(bool) & ~occupied
+                    rr, cc = line(first[1], first[0], last[1], last[0])
+                    blocked = np.flatnonzero(hit_all[rr, cc])
+                    end = int(blocked[0]) if len(blocked) else len(rr)
+                    free[rr[:end], cc[:end]] = True
+            free_mask = free & ~hit_all
             observed = free_mask | occupied
             self.source_mask[observed] |= SOURCE_BITS[observation.source]
             free_all |= free_mask
-            hit_all |= occupied
-            ray_counts.append((observation.source, len(endpoints)))
+            ray_counts.append((observation.source, ray_count))
             cell_counts.append((observation.source, int(free_mask.sum()), int(occupied.sum())))
         # 同一批相机的障碍证据优先，空闲射线不能清除本批障碍终点。
         free_all &= ~hit_all

@@ -96,8 +96,8 @@ class PassageRuntime:
         self.drive = self._create_drive()
         limits = MotionLimits(**self.config["motion"])
         self.model = FourWheelModel(self.profile.agx_controller.continuous, limits, self.config["planner"]["dt_sec"],
-                                   device=self.config["planner"]["device"])
-        self.execution_model = FourWheelModel(self.profile.agx_controller.continuous, limits, self.dt)
+                                   device=self.config["planner"]["device"], integration_dt_sec=self.dt)
+        self.execution_model = FourWheelModel(self.profile.agx_controller.continuous, limits, self.dt, integration_dt_sec=self.dt)
         self.cost = PassageCost(self.geometry, self.config["cost"], device=self.model.device)
         self.renderer = MapRenderer(self.geometry, self.config["trial"]["map_size_px"])
         self.subscription = get_physx_simulation_interface().subscribe_contact_report_events(self._on_contact)

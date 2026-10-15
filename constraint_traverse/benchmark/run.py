@@ -23,6 +23,7 @@ def load_config(path):
         "planner": ("dt_sec", "horizon_steps", "samples", "iterations", "temperature", "noise_linear_std", "noise_angular_std", "kernel_support_points", "kernel_sigma"),
         "trial": ("goal_tolerance_m", "timeout_sec", "stopped_hold_sec", "settle_frames", "map_size_px"),
         "safety": ("sweep_step_m", "reaction_time_sec"),
+        "cost": ("reference_dt_sec", "goal_distance_scale_m", "penetration_scale_m", "obstacle_soft_distance_m"),
     }.items():
         if any(float(cfg[section][field]) <= 0 for field in fields):
             raise ValueError(f"{section} 的数值配置必须为正数")

@@ -49,8 +49,10 @@ class GridTests(unittest.TestCase):
         grid.unknown_mask[40, 49] = True
         grid.free_mask[40, 49] = False
         geometry.update_grid(grid)
-        gap = geometry.torch_clearance(torch.tensor([[0.5, 0, 0]], dtype=torch.float32))
-        self.assertLess(float(gap[0]), 0)
+        metrics = geometry.torch_metrics(torch.tensor([[0.5, 0, 0]], dtype=torch.float32))
+        self.assertGreater(float(metrics["clearance"][0]), 0)
+        self.assertGreater(float(metrics["unknown_fraction"][0]), 0)
+        self.assertEqual(float(metrics["occupied_fraction"][0]), 0)
 
     def test_occupied_in_cost_field(self):
         geometry = make_geometry()
@@ -88,13 +90,14 @@ class GridTests(unittest.TestCase):
         second.unknown_mask[40, 49] = True
         second.free_mask[40, 49] = False
         geometry.update_grid(second)
-        self.assertLess(float(geometry.torch_clearance(pose)[0]), 0)
+        self.assertGreater(float(geometry.torch_metrics(pose)["unknown_fraction"][0]), 0)
 
     def test_cost_field_unknown_and_outside(self):
         geometry = make_geometry()
         geometry.update_grid(make_grid(known=False))
-        gaps = geometry.torch_clearance(torch.tensor([[0, 0, 0], [10, 10, 0]], dtype=torch.float32))
-        self.assertTrue(bool(torch.all(gaps < 0)))
+        metrics = geometry.torch_metrics(torch.tensor([[0, 0, 0], [10, 10, 0]], dtype=torch.float32))
+        self.assertEqual(metrics["unknown_fraction"].tolist(), [1, 0])
+        self.assertEqual(metrics["outside_fraction"].tolist(), [0, 1])
 
 
 class ModeTests(unittest.TestCase):

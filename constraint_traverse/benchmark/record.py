@@ -71,6 +71,7 @@ class TrialRecord:
             "time_sec": float(timestamp_sec), "valid": bool(result.valid), "reason": result.reason,
             "min_clearance_m": float(result.min_clearance_m),
             "planning_sec": float(result.planning_sec), "optimizer_sec": float(result.optimizer_sec),
+            "diagnostics": result.diagnostics,
         })
 
     def add_sample(self, timestamp_sec, state, requested, applied, clearance_m):

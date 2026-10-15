@@ -2057,7 +2057,8 @@ def _run(
                         selected.odom_path_xy,
                         joined_path=joined_path,
                         config=coarse_tracking_config,
-                        initial_speed_mps=state.linear_velocity_mps,
+                        initial_speed_mps=float(np.dot(np.asarray(robot.get_linear_velocity())[:2],
+                                                       [math.cos(robot_yaw_world), math.sin(robot_yaw_world)])),
                     )
                     if tracker is None:
                         tracker_mode = None

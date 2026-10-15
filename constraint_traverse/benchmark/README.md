@@ -17,6 +17,8 @@ python -m constraint_traverse.benchmark.run
 
 配置位于 `constraint_traverse/configs/benchmark.yaml`。物理计算采用 60 Hz，规划周期为 0.20 s，预测时域为 4 s；轮组几何和硬件上限读取 `configs/robots/agx.yaml`。MPPI/KMPPI 使用同一运动模型、物理代价、安全余量和执行接口。
 
+预测动作使用物理级子步积分，并沿子步运动计算几何代价。已知障碍按侵入深度和车体采样点覆盖比例计价，UNKNOWN 和运动约束分别计价。KMPPI 的停车候选直接在控制支撑点层生成，候选和输出控制均限幅，滚动后重新建立一致的控制序列。
+
 ## 操作
 
 `Passage Controls` 和 `Passage Map` 是可移动窗口。
@@ -59,7 +61,7 @@ python -m constraint_traverse.benchmark.run \
 - `meta.json`：配置、起始状态、刚体与控制器状态、几何核查、代码与依赖版本、终止原因和指标。
 - `state.npz`：仿真时间、实际位姿与运动状态、请求控制、限速控制和保守轮廓间距。
 - `plans/*.npz`：全部候选、候选控制与代价、优化控制序列和最终预测。
-- `events.json`：规划耗时、代价模型估计间距及障碍接触事件。
+- `events.json`：规划耗时、代价模型估计间距、ESS、分项成本、控制边界及障碍接触事件。
 
 规划耗时包含优化、预测轨迹计算和数据转换，记录均值、P95 和超过规划周期的次数。当前仿真采用同步规划，推理期间不推进物理时间；这些结果不能直接声称满足实际机器人实时控制要求。保存候选数据的耗时没有包含在 `planning_sec` 中。
 
@@ -75,10 +77,16 @@ python -m constraint_traverse.benchmark.replay \
 ```bash
 python -m unittest constraint_traverse.benchmark.test_benchmark -v
 python -m constraint_traverse.benchmark.verify
+python -m constraint_traverse.benchmark.verify_prediction
+python -m constraint_traverse.benchmark.verify_passage
 ```
 
 第二条命令启动真实 Isaac Sim，检查状态恢复后的重复运动、单物理周期预测误差、面板 START 接口，并通过已知障碍接触验证碰撞回调。验证报告位于 `constraint_traverse/data/benchmark_validation/`。
 
+`verify_prediction` 对比 0.2、1、4 秒预测误差，检查 COARSE 倒退与短轨迹，并采集真实前视、底盘下视 RGB-D 建图。`verify_passage` 对直门、偏转 15°、绕行及墙前状态进行 MPPI/KMPPI 配对测试，记录完整初始状态、碰撞、通行结果和优化诊断。
+
 已完成的功能验收与窄门通行数据见 [VALIDATION.md](VALIDATION.md)。
+
+当前规划一致性修改、真实 RGB-D 检查及配对通行结果见 [2026-10-15 验证记录](VALIDATION_20261015.md)。
 
 iCEM、RGB-D 地图、动态起点和参数组合批量评测尚未接入。RGB-D 条件将沿用主导航的前视与底盘下视建图设置，UNKNOWN 继续独立记录和禁行。

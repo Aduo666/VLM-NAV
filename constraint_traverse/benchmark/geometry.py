@@ -42,6 +42,16 @@ class SweepResult:
     min_clearance_m: float
 
 
+def sample_body_points(parts, spacing_m):
+    points = []
+    for xmin, xmax, ymin, ymax in np.asarray(parts):
+        xs = np.linspace(xmin, xmax, max(2, math.ceil((xmax - xmin) / spacing_m) + 1))
+        ys = np.linspace(ymin, ymax, max(2, math.ceil((ymax - ymin) / spacing_m) + 1))
+        x, y = np.meshgrid(xs, ys)
+        points.append(np.column_stack((x.ravel(), y.ravel())))
+    return np.unique(np.round(np.concatenate(points), 7), axis=0).astype(np.float32)
+
+
 def swept_part_polygons(parts, poses, *, radius_m, margin_m, step_m):
     parts = np.asarray(parts, dtype=float).reshape(-1, 4)
     poses = np.asarray(poses, dtype=float).reshape(-1, 3)
@@ -84,6 +94,35 @@ class PassageGeometry:
         self.radius_m = float(np.max(np.hypot(np.abs(self.parts[:, :2]).max(axis=1), np.abs(self.parts[:, 2:]).max(axis=1))))
         self.corners = np.stack((self.parts[:, [0, 2]], self.parts[:, [1, 2]], self.parts[:, [1, 3]], self.parts[:, [0, 3]]), axis=1)
         self._tensor_cache = {}
+        self._point_cache = {}
+
+    def torch_metrics(self, poses):
+        key = (poses.device, poses.dtype)
+        if key not in self._point_cache:
+            self._point_cache[key] = (
+                torch.as_tensor(sample_body_points(self.parts, 0.05), device=poses.device, dtype=poses.dtype),
+                torch.as_tensor(self.scene.obstacles, device=poses.device, dtype=poses.dtype),
+            )
+        points, obstacles = self._point_cache[key]
+        clearance = self.torch_clearance(poses)
+        occupied_fraction = torch.zeros_like(clearance)
+        outside_fraction = torch.zeros_like(clearance)
+        # 精确分离轴距离为正时，车体覆盖的障碍面积为零。
+        overlapping = clearance <= 0
+        selected = poses[overlapping]
+        if len(selected):
+            c, s = torch.cos(selected[..., 2, None]), torch.sin(selected[..., 2, None])
+            x = selected[..., 0, None] + c * points[:, 0] - s * points[:, 1]
+            y = selected[..., 1, None] + s * points[:, 0] + c * points[:, 1]
+            occupied = ((x[..., None] >= obstacles[:, 0]) & (x[..., None] <= obstacles[:, 1])
+                        & (y[..., None] >= obstacles[:, 2]) & (y[..., None] <= obstacles[:, 3])).any(dim=-1)
+            outside = (x.abs() > self.scene.half_size_m) | (y.abs() > self.scene.half_size_m)
+            occupied_fraction[overlapping] = occupied.to(poses.dtype).mean(dim=-1)
+            outside_fraction[overlapping] = outside.to(poses.dtype).mean(dim=-1)
+        return {"clearance": clearance, "penetration": torch.relu(-clearance),
+                "occupied_fraction": occupied_fraction,
+                "unknown_fraction": torch.zeros_like(clearance),
+                "outside_fraction": outside_fraction}
 
     @property
     def body_width_m(self):

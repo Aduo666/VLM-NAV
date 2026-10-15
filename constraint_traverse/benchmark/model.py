@@ -6,6 +6,7 @@ import math
 import numpy as np
 import torch
 
+from .motion_kernel import DynamicsKernel, rate_limit
 
 STATE_SIZE = 17
 
@@ -26,14 +27,8 @@ class MotionLimits:
             raise ValueError("运动模型参数必须为有限正数")
 
 
-def rate_limit(current, target, acceleration, deceleration, dt):
-    increasing = (current * target >= 0) & (target.abs() > current.abs())
-    rate = torch.where(increasing, acceleration, deceleration)
-    return current + torch.maximum(torch.minimum(target - current, rate * dt), -rate * dt)
-
-
 class FourWheelModel:
-    def __init__(self, hardware, limits: MotionLimits, dt_sec: float, *, device="cpu"):
+    def __init__(self, hardware, limits: MotionLimits, dt_sec: float, *, device="cpu", integration_dt_sec=1 / 60):
         if not math.isfinite(dt_sec) or dt_sec <= 0:
             raise ValueError("积分周期必须为有限正数")
         if limits.max_linear_mps > hardware.max_linear_mps or limits.max_angular_radps > hardware.max_angular_radps:
@@ -41,6 +36,10 @@ class FourWheelModel:
         if limits.linear_accel_mps2 > hardware.max_acceleration_mps2:
             raise ValueError("实验加速度超过机器人配置上限")
         self.hardware, self.limits, self.dt_sec = hardware, limits, float(dt_sec)
+        if not math.isfinite(integration_dt_sec) or integration_dt_sec <= 0:
+            raise ValueError("物理积分周期必须为有限正数")
+        self.integration_dt_sec = float(integration_dt_sec)
+        self.last_substeps = None
         self.device = torch.device(device)
         wheels = hardware.wheels
         self.xy = torch.tensor([[w.x_m, w.y_m] for w in wheels], dtype=torch.float32, device=self.device)
@@ -51,57 +50,40 @@ class FourWheelModel:
         matrix[0::2, 0], matrix[1::2, 1] = 1, 1
         matrix[0::2, 2], matrix[1::2, 2] = -self.xy[:, 1], self.xy[:, 0]
         self.velocity_inverse = torch.linalg.pinv(matrix)
+        self.kernel = torch.jit.script(DynamicsKernel(self.xy, self.radii, self.velocity_inverse, limits, hardware))
 
     def step(self, state, action, dt_sec=None):
         state = torch.as_tensor(state, dtype=torch.float32, device=self.device)
         action = torch.as_tensor(action, dtype=state.dtype, device=self.device)
         dt = self.dt_sec if dt_sec is None else float(dt_sec)
-        lim = self.limits
-        v = rate_limit(state[..., 14], action[..., 0].clamp(-lim.max_linear_mps, lim.max_linear_mps),
-                       torch.full_like(action[..., 0], lim.linear_accel_mps2),
-                       torch.full_like(action[..., 0], lim.linear_decel_mps2), dt)
-        w = rate_limit(state[..., 15], action[..., 1].clamp(-lim.max_angular_radps, lim.max_angular_radps),
-                       torch.full_like(action[..., 1], lim.angular_accel_radps2),
-                       torch.full_like(action[..., 1], lim.angular_decel_radps2), dt)
-        vx, vy = v[..., None] - w[..., None] * self.xy[:, 1], w[..., None] * self.xy[:, 0]
-        angles = torch.atan2(vy, vx)
-        speeds = torch.hypot(vx, vy)
-        reverse = angles.abs() > math.pi / 2
-        angles = torch.where(reverse, angles - torch.sign(angles) * math.pi, angles)
-        speeds = torch.where(reverse, -speeds, speeds)
-        stopping = (v.abs() + w.abs()) < 1.0e-6
-        angles = torch.where(stopping[..., None], state[..., 6:10], angles)
-        invalid = (angles.abs() > self.hardware.max_steering_rad + 1.0e-6).any(dim=-1)
-        invalid = invalid | ((v * w).abs() > self.hardware.max_lateral_acceleration_mps2 + 1.0e-6)
-        scale = (self.hardware.max_wheel_radps / (speeds.abs() / self.radii).amax(dim=-1).clamp_min(1.0e-6)).clamp(max=1)
-        speeds, v, w = speeds * scale[..., None], v * scale, w * scale
-        angles = torch.where(invalid[..., None], state[..., 6:10], angles)
-        speeds = torch.where(invalid[..., None], torch.zeros_like(speeds), speeds)
-        steer_delta = (angles - state[..., 6:10]) * (1 - math.exp(-dt / lim.steering_response_sec))
-        steering = state[..., 6:10] + steer_delta.clamp(-lim.steering_rate_radps * dt, lim.steering_rate_radps * dt)
-        wheel_speeds = rate_limit(state[..., 10:14], speeds,
-                                 torch.full_like(speeds, lim.linear_accel_mps2),
-                                 torch.full_like(speeds, lim.linear_decel_mps2), dt)
-        vectors = torch.stack((wheel_speeds * torch.cos(steering), wheel_speeds * torch.sin(steering)), dim=-1)
-        twist = vectors.flatten(start_dim=-2) @ self.velocity_inverse.T
-        yaw_mid = state[..., 2] + 0.5 * twist[..., 2] * dt
-        c, s = torch.cos(yaw_mid), torch.sin(yaw_mid)
+        if not math.isfinite(dt) or dt <= 0:
+            raise ValueError("动作持续时间必须为有限正数")
+        count = max(1, math.ceil(dt / self.integration_dt_sec - 1.0e-9))
+        substeps = []
+        for index in range(count):
+            step_dt = min(self.integration_dt_sec, dt - index * self.integration_dt_sec)
+            state = self._physical_step(state, action, step_dt)
+            substeps.append(state)
+        self.last_substeps = torch.stack(substeps)
         result = state.clone()
-        result[..., 0] += (c * twist[..., 0] - s * twist[..., 1]) * dt
-        result[..., 1] += (s * twist[..., 0] + c * twist[..., 1]) * dt
-        result[..., 2] += twist[..., 2] * dt
-        result[..., 3:6], result[..., 6:10], result[..., 10:14] = twist, steering, wheel_speeds
-        result[..., 14], result[..., 15], result[..., 16] = v, w, invalid.float()
+        result[..., 16] = self.last_substeps[..., 16].amax(dim=0)
         return result
 
-    def rollout(self, initial, actions, dt_sec=None):
+    def _physical_step(self, state, action, dt):
+        return self.kernel(state, action, float(dt))
+
+    def rollout(self, initial, actions, dt_sec=None, *, return_substeps=False):
         actions = torch.as_tensor(actions, dtype=torch.float32, device=self.device)
         state = torch.as_tensor(initial, dtype=torch.float32, device=self.device)
         states = [state]
+        substeps = []
         for action in actions:
             state = self.step(state, action, dt_sec)
             states.append(state)
-        return torch.stack(states)
+            if return_substeps:
+                substeps.append(self.last_substeps)
+        result = torch.stack(states)
+        return (result, torch.stack(substeps, dim=1)) if return_substeps else result
 
     def braking_rollout(self, initial, reaction_sec=0.10):
         state = torch.as_tensor(initial, dtype=torch.float32, device=self.device)

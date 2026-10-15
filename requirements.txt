@@ -8,3 +8,4 @@ numpy==1.26.0
 PyYAML==6.0.2
 Pillow==11.3.0
 opencv-contrib-python-headless==4.11.0.86
+scikit-image==0.25.2

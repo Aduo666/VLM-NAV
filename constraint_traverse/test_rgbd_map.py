@@ -53,8 +53,20 @@ class DirectMapTests(unittest.TestCase):
         grid = self.integrate(observation(wall=True), observation(source="down", floor=True))
         snapshot = self.map.snapshot()
         self.assertTrue(grid.occupied_mask[self.cell(grid, 1)])
-        self.assertEqual(snapshot.source_mask[self.cell(grid, 1)], 3)
-        self.assertEqual(snapshot.source_mask[self.cell(grid, 2)], 2)
+        self.assertEqual(snapshot.source_mask[self.cell(grid, 1)], 1)
+        self.assertTrue(grid.unknown_mask[self.cell(grid, 2)])
+        self.assertEqual(snapshot.source_mask[self.cell(grid, 0.5)], 3)
+
+    def test_down_camera_keeps_obstacles_in_same_column(self):
+        depth = np.full((50, 50), np.nan, dtype=np.float32)
+        depth[15, 45], depth[35, 45] = 0.4, 0.8
+        intrinsics = np.asarray([[20, 0, 25], [0, 20, 25], [0, 0, 1]], dtype=float)
+        transform = np.diag([1.0, -1.0, -1.0, 1.0])
+        transform[2, 3] = 1.0
+        frame = TimedDepthObservation("down", 1.0, depth, intrinsics, transform)
+        grid = self.integrate(frame)
+        self.assertTrue(grid.occupied_mask[self.cell(grid, 0.400001, 0.200001)])
+        self.assertTrue(grid.occupied_mask[self.cell(grid, 0.800001, -0.400001)])
 
     def test_invalid_depth_retains_unknown(self):
         frame = observation()

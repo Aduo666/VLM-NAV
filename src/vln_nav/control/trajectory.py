@@ -169,11 +169,6 @@ class AgxVelocityAdapter:
 
 
 class PathTracker:
-    """Forward-only pure pursuit with monotonic, locally bounded path progress.
-
-    Input paths must already be feasible and collision checked. This class is
-    not an obstacle planner; it never invents a turn/recovery for an invalid path.
-    """
     def __init__(
         self,
         path_xy,
@@ -197,7 +192,6 @@ class PathTracker:
         self.progress = self.elapsed = 0.0
         self.speed = min(float(initial_speed_mps), float(config.max_linear_mps))
         self.finished = False
-        self.fault: str | None = None
 
     def feedback(self, applied: VelocityCommand) -> None:
         self.speed = abs(applied.linear_mps)
@@ -229,18 +223,11 @@ class PathTracker:
         remaining = float(self.s[-1] - self.progress)
         target = self._point(min(self.s[-1], self.progress + cfg.lookahead_m))
         delta = target - position
-        forward = math.cos(yaw) * delta[0] + math.sin(yaw) * delta[1]
         left = -math.sin(yaw) * delta[0] + math.cos(yaw) * delta[1]
         distance_to_end = float(np.linalg.norm(position - self.path[-1]))
         if remaining <= cfg.arrival_distance_m and distance_to_end <= cfg.arrival_distance_m:
             self.finished = True
-        if error > cfg.max_path_error_m:
-            self.fault = "PATH_ERROR"
-        elif self.elapsed > cfg.timeout_sec and not self.finished:
-            self.fault = "TIMEOUT"
-        elif forward <= 0 and not self.finished:
-            self.fault = "TARGET_BEHIND"
-        status = self.fault or ("ARRIVED" if self.finished else "TRACKING")
+        status = "ARRIVED" if self.finished else "TRACKING"
         command = VelocityCommand()
         nominal = VelocityCommand()
         if status == "TRACKING":

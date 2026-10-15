@@ -19,7 +19,7 @@ scene:
   stage_load_timeout_sec: 120.0
   # 是否调用公共室内灯光接口，在当前仿真场景中添加顶灯。
   add_indoor_lighting: true
-# NavDP 推理服务连接与轨迹结果校验参数。
+# NavDP 推理服务连接与候选匹配参数。
 server:
   # NavDP HTTP 服务地址。
   base_url: "http://127.0.0.1:8889"
@@ -29,12 +29,6 @@ server:
   stop_threshold: -0.5
   # 上传 RGB 图像的 JPEG 质量。
   jpeg_quality: 92
-  # 允许轨迹坐标出现的最大绝对值，单位为米。
-  max_abs_coordinate_m: 12.0
-  # 相邻轨迹点允许的最大距离，单位为米。
-  max_point_jump_m: 2.0
-  # 有效轨迹的最小长度，单位为米。
-  min_path_length_m: 0.08
   # 客户端与服务端模型信息的匹配容差，单位为米。
   model_match_tolerance_m: 0.02
 
@@ -119,17 +113,15 @@ execution:
   default_mode: "COARSE"
   # NavDP 滚动推理周期，单位为秒。
   coarse_planning_period_sec: 0.50
-  # 同一局部目标允许连续出现短轨迹的最大次数。
-  max_short_trajectory_retries: 3
   # Hybrid A* 滚动规划周期，单位为秒。
   fine_planning_period_sec: 0.20
   # 沿已知空闲地图路径选择细粒度局部目标的前视距离，单位为米。
   fine_local_goal_lookahead_m: 1.20
-  # 规划结果允许的最大时间延迟，单位为秒。
+  # FINE 规划结果允许的最大时间延迟，单位为秒。
   max_result_age_sec: 1.00
-  # 新轨迹起点与机器人当前位置允许的最大连接误差，单位为米。
+  # FINE 新轨迹与机器人当前位置允许的最大连接误差，单位为米。
   max_path_join_error_m: 0.35
-  # 接受新轨迹所需的最小剩余长度，单位为米。
+  # FINE 接受新轨迹所需的最小剩余长度，单位为米。
   min_remaining_path_m: 0.05
   # 判定机器人到达最终目标的距离，单位为米。
   goal_reached_tolerance_m: 0.30

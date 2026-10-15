@@ -44,7 +44,6 @@ from vln_nav.navigation.navdp_client import (
     NavDPCandidate,
     NavDPClient,
     NavDPClientConfig,
-    NavDPPathTooShortError,
     NavDPResult,
 )
 from vln_nav.navigation.internnav_s2_client import (
@@ -270,7 +269,7 @@ class _NavDPWorker:
         intrinsics: np.ndarray,
         rgb: np.ndarray,
         depth_m: np.ndarray,
-    ) -> NavDPResult | None:
+    ) -> NavDPResult:
         with self._lock:
             if self._busy:
                 raise RuntimeError("NavDP worker 正忙，无法执行预热")
@@ -278,15 +277,12 @@ class _NavDPWorker:
         try:
             self._client.reset(intrinsics)
             try:
-                try:
-                    return self._client.pointgoal_step(
-                        rgb=rgb,
-                        depth_m=depth_m,
-                        goal_forward_m=1.0,
-                        goal_left_m=0.0,
-                    )
-                except NavDPPathTooShortError:
-                    return None
+                return self._client.pointgoal_step(
+                    rgb=rgb,
+                    depth_m=depth_m,
+                    goal_forward_m=1.0,
+                    goal_left_m=0.0,
+                )
             finally:
                 self._client.reset(intrinsics)
                 self._initialized = True
@@ -864,7 +860,6 @@ def _load_settings() -> tuple[
     if set(execution) != {
         "default_mode",
         "coarse_planning_period_sec",
-        "max_short_trajectory_retries",
         "fine_planning_period_sec",
         "fine_local_goal_lookahead_m",
         "max_result_age_sec",
@@ -878,12 +873,6 @@ def _load_settings() -> tuple[
     sampling = data["sampling_planner"]
     if not isinstance(sampling, dict) or set(sampling) != {"config_path"} or not str(sampling["config_path"]).strip():
         raise ValueError("sampling_planner 必须包含 config_path")
-    if (
-        isinstance(execution["max_short_trajectory_retries"], bool)
-        or not isinstance(execution["max_short_trajectory_retries"], int)
-        or int(execution["max_short_trajectory_retries"]) <= 0
-    ):
-        raise ValueError("execution.max_short_trajectory_retries 必须为正整数")
     if any(
         float(value) <= 0
         for name, value in execution.items()
@@ -1579,15 +1568,12 @@ def _run(
             rgb=warmup_rgb,
             depth_m=warmup_depth,
         )
-        if warmup_result is None:
-            logger.info("[NavDPWarmup] complete result=short_trajectory reset=2")
-        else:
-            logger.info(
-                "[NavDPWarmup] complete candidates=%d dropped=%d latency=%.3fs reset=2",
-                len(warmup_result.candidates),
-                len(warmup_result.dropped_candidates),
-                warmup_result.latency_sec,
-            )
+        logger.info(
+            "[NavDPWarmup] complete candidates=%d dropped=%d latency=%.3fs reset=2",
+            len(warmup_result.candidates),
+            len(warmup_result.dropped_candidates),
+            warmup_result.latency_sec,
+        )
 
     position, orientation = get_world_pose(robot)
     local_map = RGBDPlanarMap(
@@ -1651,12 +1637,6 @@ def _run(
     s2_actions: deque[int] = deque()
     s2_turn_target_yaw_odom: float | None = None
     s2_stop_count = 0
-    coarse_goal_tolerance = max(
-        float(s2_settings["goal_reached_tolerance_m"]),
-        float(settings["goal"]["min_distance_m"]),
-    )
-    navdp_short_retry_count = 0
-    navdp_waiting_stable_after_short = False
     logger.info("[NavigationMode] selected=%s", mode)
     if s2_active:
         idle_status = "S2 waiting for first front frame"
@@ -1911,8 +1891,6 @@ def _run(
                             rejected_unknown_world_xy = None
                             last_coarse_request_time = -float("inf")
                             last_fine_request_time = -float("inf")
-                            navdp_short_retry_count = 0
-                            navdp_waiting_stable_after_short = False
                             s2_stop_count = 0
                             idle_status = f"S2 GOAL ACTIVE: {mode}"
                             decision_image = _render_s2_decision(
@@ -2037,87 +2015,14 @@ def _run(
                 ):
                     logger.info("[NavDPResult] ignored stale request=%d", job.request_id)
                 elif error is not None:
-                    if isinstance(error, NavDPPathTooShortError):
-                        current_goal_distance = float(np.linalg.norm(
-                            selected_goal_odom_xy
-                            - np.asarray([state.pose.x, state.pose.y], dtype=np.float64)
-                        ))
-                        if (
-                            current_goal_distance > coarse_goal_tolerance
-                            and tracker is not None
-                        ):
-                            idle_status = (
-                                "NavDP short trajectory ignored; continuing active tracker"
-                            )
-                            logger.warning(
-                                "[NavDPShortTrajectory] request=%d path=%s "
-                                "length=%.3fm goal_distance=%.3fm "
-                                "action=keep_active_tracker",
-                                job.request_id,
-                                error.path_name,
-                                error.length_m,
-                                current_goal_distance,
-                            )
-                        elif current_goal_distance > coarse_goal_tolerance:
-                            adapter.stop()
-                            tracker = None
-                            tracker_mode = None
-                            display_path_odom_xy = None
-                            frozen_candidates = []
-                            navdp_short_retry_count += 1
-                            maximum_retries = int(
-                                settings["execution"]["max_short_trajectory_retries"]
-                            )
-                            if navdp_short_retry_count >= maximum_retries:
-                                navigation_active = False
-                                navdp_waiting_stable_after_short = False
-                                s2_need_request = False
-                                idle_status = "NAVDP_STALLED"
-                                logger.error(
-                                    "[NavDPStalled] goal_locked=%s retries=%d "
-                                    "goal_distance=%.3fm action=safety_hold",
-                                    selected_goal_odom_xy.tolist(),
-                                    navdp_short_retry_count,
-                                    current_goal_distance,
-                                )
-                            else:
-                                navdp_waiting_stable_after_short = True
-                                idle_status = (
-                                    "NavDP short trajectory; waiting to stop before retry"
-                                )
-                                logger.warning(
-                                    "[NavDPShortTrajectory] request=%d path=%s "
-                                    "length=%.3fm minimum=%.3fm goal_distance=%.3fm "
-                                    "retry=%d/%d action=hold_goal_wait_stop",
-                                    job.request_id,
-                                    error.path_name,
-                                    error.length_m,
-                                    error.minimum_length_m,
-                                    current_goal_distance,
-                                    navdp_short_retry_count,
-                                    maximum_retries,
-                                )
-                        else:
-                            idle_status = "NavDP short trajectory near local goal"
-                            logger.info(
-                                "[NavDPShortTrajectory] request=%d path=%s "
-                                "length=%.3fm goal_distance=%.3fm action=goal_check",
-                                job.request_id,
-                                error.path_name,
-                                error.length_m,
-                                current_goal_distance,
-                            )
-                    else:
-                        idle_status = "NavDP inference failed; see log"
-                        logger.error(
-                            "[NavDPResult] request=%d failed: %s",
-                            job.request_id,
-                            error,
-                        )
+                    idle_status = "NavDP inference failed; see log"
+                    logger.error(
+                        "[NavDPResult] request=%d failed: %s",
+                        job.request_id,
+                        error,
+                    )
                 else:
                     result_age = now - float(job.odom_state.timestamp_sec)
-                    navdp_short_retry_count = 0
-                    navdp_waiting_stable_after_short = False
                     model_choice = result.model_choice
                     logger.info(
                         "[NavDPResult] request=%d candidates=%d selected=%d "
@@ -2141,36 +2046,24 @@ def _run(
                         selected.odom_path_xy,
                         current_xy=(state.pose.x, state.pose.y),
                     )
-                    execution = settings["execution"]
-                    rejection = _rolling_result_rejection(
-                        result_age_sec=result_age,
-                        join_error_m=join_error,
-                        remaining_length_m=remaining_length,
-                        execution=execution,
+                    _save_candidate_debug(
+                        debug_path,
+                        result,
+                        selected_index=selected_index,
+                        goal_xy=(job.goal_forward_m, job.goal_left_m),
+                        view_size_m=float(settings["debug"]["view_size_m"]),
                     )
-                    if rejection is not None:
-                        logger.warning(
-                            "[NavDPReject] request=%d reason=%s age=%.3fs "
-                            "join_error=%.3fm remaining=%.3fm",
-                            job.request_id,
-                            rejection,
-                            result_age,
-                            join_error,
-                            remaining_length,
-                        )
+                    tracker = _create_coarse_tracker(
+                        selected.odom_path_xy,
+                        joined_path=joined_path,
+                        config=coarse_tracking_config,
+                        initial_speed_mps=state.linear_velocity_mps,
+                    )
+                    if tracker is None:
+                        tracker_mode = None
+                        display_path_odom_xy = None
+                        idle_status = "NavDP zero-motion trajectory; waiting for next inference"
                     else:
-                        _save_candidate_debug(
-                            debug_path,
-                            result,
-                            selected_index=selected_index,
-                            goal_xy=(job.goal_forward_m, job.goal_left_m),
-                            view_size_m=float(settings["debug"]["view_size_m"]),
-                        )
-                        tracker = PathTracker(
-                            joined_path,
-                            coarse_tracking_config,
-                            initial_speed_mps=state.linear_velocity_mps,
-                        )
                         display_path_odom_xy = joined_path.copy()
                         tracker_mode = mode
                         generation_index += 1
@@ -2532,8 +2425,6 @@ def _run(
                             recent_fine_world_poses.clear()
                             last_partial_switch_world_xy = last_partial_endpoint_world_xy = None
                             last_coarse_request_time = last_fine_request_time = -float("inf")
-                            navdp_waiting_stable_after_short = False
-                            navdp_short_retry_count = 0
                             request_id += 1
                             accepted_request_id = request_id
                             fine_request_id += 1
@@ -2580,8 +2471,6 @@ def _run(
                             generation_index = 0
                             last_coarse_request_time = -float("inf")
                             last_fine_request_time = -float("inf")
-                            navdp_short_retry_count = 0
-                            navdp_waiting_stable_after_short = False
                             idle_status = f"GOAL ACTIVE: {mode}"
                             logger.info(
                                 "[NavigationGoal] mode=%s forward=%.2fm left=%+.2fm "
@@ -2602,14 +2491,10 @@ def _run(
                     selected_goal_odom_xy
                     - np.asarray([state.pose.x, state.pose.y], dtype=np.float64)
                 ))
-            goal_tolerance = (
-                coarse_goal_tolerance
-                if s2_active and mode == "COARSE"
-                else float(
-                    s2_settings["goal_reached_tolerance_m"]
-                    if s2_active
-                    else settings["execution"]["goal_reached_tolerance_m"]
-                )
+            goal_tolerance = float(
+                s2_settings["goal_reached_tolerance_m"]
+                if s2_active
+                else settings["execution"]["goal_reached_tolerance_m"]
             )
             if navigation_active and goal_distance <= goal_tolerance:
                 navigation_active = False
@@ -2631,8 +2516,6 @@ def _run(
                 last_partial_switch_world_xy = None
                 last_partial_endpoint_world_xy = None
                 rejected_unknown_world_xy = None
-                navdp_short_retry_count = 0
-                navdp_waiting_stable_after_short = False
                 if s2_active:
                     if not s2_actions:
                         s2_need_request = True
@@ -2691,8 +2574,6 @@ def _run(
                     rejected_unknown_world_xy = None
                     last_coarse_request_time = -float("inf")
                     last_fine_request_time = -float("inf")
-                    navdp_short_retry_count = 0
-                    navdp_waiting_stable_after_short = False
                     idle_status = f"S2 FORWARD: {mode}"
                     logger.info(
                         "[S2Action] FORWARD distance=%.2fm remaining_actions=%s",
@@ -3018,30 +2899,17 @@ def _run(
                             episode.instruction,
                         )
 
-            if navdp_waiting_stable_after_short and _is_stopped(state):
-                navdp_waiting_stable_after_short = False
-                last_coarse_request_time = -float("inf")
-                idle_status = "NavDP retrying locked goal from stable pose"
-                logger.info(
-                    "[NavDPRetry] goal_locked=%s retry=%d pose_stable=true",
-                    selected_goal_odom_xy.tolist(),
-                    navdp_short_retry_count,
-                )
-
             if (
                 navigation_active
                 and mode == "COARSE"
                 and selected_goal_odom_xy is not None
-                and not navdp_waiting_stable_after_short
                 and not worker.busy
                 and now - last_coarse_request_time
                 >= float(settings["execution"]["coarse_planning_period_sec"])
             ):
                 last_coarse_request_time = now
                 try:
-                    forward, left = _validate_goal_values(
-                        *_odom_goal_to_local(selected_goal_odom_xy, state), settings
-                    )
+                    forward, left = _odom_goal_to_local(selected_goal_odom_xy, state)
                     rgb, depth = _capture_rgbd(camera)
                     valid_depth = np.isfinite(depth) & (depth > 0.0)
                     depth_valid_fraction = float(
@@ -3326,6 +3194,14 @@ def _join_path_from_current(
     joined = joined[np.r_[True, segment_length > 1.0e-5]]
     remaining = float(np.sum(np.linalg.norm(np.diff(joined, axis=0), axis=1)))
     return np.ascontiguousarray(joined), join_error, remaining
+
+
+def _create_coarse_tracker(path_xy, *, joined_path, config, initial_speed_mps):
+    points = np.asarray(path_xy, dtype=np.float64)
+    # 静止输出保持静止，局部目标由下一次 NavDP 推理继续处理。
+    if len(joined_path) < 2 or not np.any(np.linalg.norm(np.diff(points, axis=0), axis=1) > 1.0e-6):
+        return None
+    return PathTracker(joined_path, config, initial_speed_mps=initial_speed_mps)
 
 
 def _rolling_result_rejection(

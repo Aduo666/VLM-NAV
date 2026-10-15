@@ -51,6 +51,8 @@ bash scripts/run_nav.sh --local-planner KMPPI
 
 完整导航使用远程 S2 服务。`COARSE` 另外需要 NavDP 服务；`FINE`、`MPPI`、`KMPPI` 在本机进行底层规划。主程序获得有效前视帧后自动调用 `/reset` 创建会话，随后通过 `/infer` 执行所选任务的指令。S2 输出 `LOOKDOWN` 时，程序停车并将固定下视相机的新图像发回同一会话。
 
+COARSE 将 NavDP 选中的轨迹根据请求时的机器人位姿转换到里程计坐标，再使用 Pure Pursuit 进行滚动跟踪。轨迹年龄、连接距离、轨迹长度与跟踪偏差用于记录；有效运动轨迹直接交给跟踪器。服务返回静止轨迹时，机器人保持静止并继续请求当前局部目标。请求编号和运行模式用于确认结果所属任务，输入输出保留尺寸及有限数值检查。到达 S2 局部目标后，按 `internnav_s2.goal_reached_tolerance_m` 完成该目标并继续高层决策；轮组执行保留物理运动限制。
+
 MPPI/KMPPI 依赖通过 `python -m pip install -r constraint_traverse/benchmark/requirements.txt` 安装，参数由 `sampling_planner.config_path` 指向的配置读取，当前为 `constraint_traverse/configs/benchmark.yaml` 中的运动模型、代价、采样和障碍余量设置。输入包括前视和底盘下视 RGB-D 直接建立的二维规划地图、S2 局部目标及实测轮组状态。每个周期执行优化器输出的首个控制指令，底盘控制器限制速度、加减速与转向。障碍和 UNKNOWN 参与优化代价。日志记录 `[SamplingPlan]`、优化耗时及估计间距。
 
 主导航使用二维占用栅格：深度像素根据相机内外参转换到世界坐标，按地面相对高度识别障碍和地面；平面射线更新空闲栅格，障碍终点更新占用栅格。地图随机器人平移并保留重叠区域的证据，Goal Map 与规划器使用同一份二维地图。启动日志显示 `[Mapping] type=RGBD_2D`。地图尺寸、栅格分辨率、采样间隔及融合周期读取 `mapping.map`，障碍高度范围读取 `fine_planner.obstacle_min_height_m/obstacle_max_height_m`。

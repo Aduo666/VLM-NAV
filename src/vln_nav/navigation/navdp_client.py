@@ -18,9 +18,6 @@ class NavDPClientConfig:
     timeout_sec: float
     stop_threshold: float
     jpeg_quality: int
-    max_abs_coordinate_m: float
-    max_point_jump_m: float
-    min_path_length_m: float
     model_match_tolerance_m: float
 
     @classmethod
@@ -33,9 +30,6 @@ class NavDPClientConfig:
             timeout_sec=float(data["timeout_sec"]),
             stop_threshold=float(data["stop_threshold"]),
             jpeg_quality=int(data["jpeg_quality"]),
-            max_abs_coordinate_m=float(data["max_abs_coordinate_m"]),
-            max_point_jump_m=float(data["max_point_jump_m"]),
-            min_path_length_m=float(data["min_path_length_m"]),
             model_match_tolerance_m=float(data["model_match_tolerance_m"]),
         )
         config.validate()
@@ -50,26 +44,8 @@ class NavDPClientConfig:
             raise ValueError("NavDP stop_threshold must be finite")
         if not 1 <= self.jpeg_quality <= 100:
             raise ValueError("NavDP jpeg_quality must be in [1, 100]")
-        for name in (
-            "max_abs_coordinate_m",
-            "max_point_jump_m",
-            "min_path_length_m",
-            "model_match_tolerance_m",
-        ):
-            value = float(getattr(self, name))
-            if not math.isfinite(value) or value <= 0:
-                raise ValueError(f"NavDP {name} must be finite and positive")
-
-
-class NavDPPathTooShortError(RuntimeError):
-    def __init__(self, path_name: str, length_m: float, minimum_length_m: float) -> None:
-        self.path_name = str(path_name)
-        self.length_m = float(length_m)
-        self.minimum_length_m = float(minimum_length_m)
-        super().__init__(
-            f"NavDP {self.path_name} length {self.length_m:.3f}m is below "
-            f"the configured minimum {self.minimum_length_m:.3f}m"
-        )
+        if not math.isfinite(self.model_match_tolerance_m) or self.model_match_tolerance_m <= 0:
+            raise ValueError("NavDP model_match_tolerance_m must be finite and positive")
 
 
 @dataclass(frozen=True)
@@ -259,14 +235,14 @@ def normalize_navdp_response(
             f"NavDP candidate/value mismatch paths={len(all_paths)} values={values.shape}"
         )
 
-    selected_xy = _validate_path(selected, "trajectory", config)
+    selected_xy = _validate_path(selected, "trajectory")
     paths_xy = []
     original_indices = []
     candidate_values = []
     dropped_candidates = []
     for index, (path, value) in enumerate(zip(all_paths, values)):
         try:
-            validated = _validate_path(path, f"all_trajectory[{index}]", config)
+            validated = _validate_path(path, f"all_trajectory[{index}]")
         except RuntimeError as exc:
             dropped_candidates.append((index, str(exc)))
             continue
@@ -317,21 +293,13 @@ def _remove_single_batch_axis(array: np.ndarray, target_ndim: int, name: str) ->
     return array
 
 
-def _validate_path(path: np.ndarray, name: str, config: NavDPClientConfig) -> np.ndarray:
+def _validate_path(path: np.ndarray, name: str) -> np.ndarray:
     values = np.asarray(path, dtype=np.float64)
     if values.ndim != 2 or values.shape[0] < 2 or values.shape[1] < 2:
         raise RuntimeError(f"NavDP {name} must be Nx2+, got {values.shape}")
     values = values[:, :2]
     if not np.isfinite(values).all():
         raise RuntimeError(f"NavDP {name} contains non-finite coordinates")
-    if float(np.max(np.abs(values))) > config.max_abs_coordinate_m:
-        raise RuntimeError(f"NavDP {name} exceeds coordinate bound")
-    segments = np.linalg.norm(np.diff(values, axis=0), axis=1)
-    if float(np.max(segments)) > config.max_point_jump_m:
-        raise RuntimeError(f"NavDP {name} contains an implausible point jump")
-    path_length = float(np.sum(segments))
-    if path_length < config.min_path_length_m:
-        raise NavDPPathTooShortError(name, path_length, config.min_path_length_m)
     return values
 
 
@@ -360,7 +328,4 @@ def _validate_observation(rgb: np.ndarray, depth_m: np.ndarray) -> tuple[np.ndar
     image = np.ascontiguousarray(np.clip(image, 0, 255).astype(np.uint8))
     if depth.ndim != 2 or depth.shape != image.shape[:2]:
         raise ValueError(f"NavDP RGB/depth mismatch rgb={image.shape} depth={depth.shape}")
-    valid_ratio = float(np.mean(np.isfinite(depth) & (depth > 0.0)))
-    if valid_ratio < 0.01:
-        raise ValueError(f"NavDP depth has too few valid pixels: ratio={valid_ratio:.4f}")
     return image, np.ascontiguousarray(depth)

@@ -5,7 +5,9 @@ from pytorch_mppi import mppi
 
 
 class ConsistentKMPPI(mppi.KMPPI):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, project_action=None, **kwargs):
+        self.project_action = project_action
+        self.action_priors = None
         super().__init__(*args, **kwargs)
         if self.specific_action_sampler is not None:
             raise ValueError("KMPPI 自定义候选需要同时提供控制支撑点")
@@ -22,8 +24,15 @@ class ConsistentKMPPI(mppi.KMPPI):
         self.interpolation_excess = (raw - self.U).abs().amax()
 
     def shift_nominal_trajectory(self):
-        self.theta, _ = self.do_kernel_interpolation(self.Tk[0] + 1, self.Tk[0], self.theta)
+        self.advance_nominal(1.0)
+
+    def advance_nominal(self, steps):
+        self.theta, _ = self.do_kernel_interpolation(self.Tk[0] + steps, self.Tk[0], self.theta)
         self.synchronize_controls()
+
+    def _bound_action(self, action):
+        bounded = super()._bound_action(action)
+        return bounded if self.project_action is None else self.project_action(bounded)
 
     def reset(self):
         super().reset()
@@ -34,6 +43,12 @@ class ConsistentKMPPI(mppi.KMPPI):
         # 停车候选在支撑点层生成，候选评分与参数更新使用同一组动作。
         if self.sample_null_action:
             points[0] = 0
+        if self.action_priors is not None:
+            count = min(len(self.action_priors), len(points) - 1)
+            indices = self.Tk[0]
+            lower, upper = indices.floor().long(), indices.ceil().long().clamp(max=self.T - 1)
+            points[1:1 + count] = torch.lerp(self.action_priors[:count, lower], self.action_priors[:count, upper],
+                                           (indices - lower)[None, :, None])
         self.noise_theta = points - self.theta
         actions, _ = self.deparameterize_to_trajectory_batch(points)
         self.perturbed_action = self._bound_action(actions)

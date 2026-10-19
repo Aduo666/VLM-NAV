@@ -6,7 +6,7 @@ import math
 import numpy as np
 import torch
 
-from .motion_kernel import DynamicsKernel, rate_limit
+from .motion_kernel import DynamicsKernel, rate_limit, project_twist
 
 STATE_SIZE = 17
 
@@ -40,6 +40,8 @@ class FourWheelModel:
             raise ValueError("物理积分周期必须为有限正数")
         self.integration_dt_sec = float(integration_dt_sec)
         self.last_substeps = None
+        if device == "auto":
+            device = f"cuda:{1 if torch.cuda.device_count() > 1 else 0}" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device)
         wheels = hardware.wheels
         self.xy = torch.tensor([[w.x_m, w.y_m] for w in wheels], dtype=torch.float32, device=self.device)
@@ -51,6 +53,10 @@ class FourWheelModel:
         matrix[0::2, 2], matrix[1::2, 2] = -self.xy[:, 1], self.xy[:, 0]
         self.velocity_inverse = torch.linalg.pinv(matrix)
         self.kernel = torch.jit.script(DynamicsKernel(self.xy, self.radii, self.velocity_inverse, limits, hardware))
+        self.max_curvature = float(self.kernel.max_curvature)
+
+    def project_actions(self, actions):
+        return project_twist(actions, self.limits.max_linear_mps, self.limits.max_angular_radps, self.max_curvature)
 
     def step(self, state, action, dt_sec=None):
         state = torch.as_tensor(state, dtype=torch.float32, device=self.device)

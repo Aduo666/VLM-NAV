@@ -1271,6 +1271,8 @@ def _run(
     graph_config,
     refiner_config,
     logger,
+    *,
+    step_observer=None,
 ) -> int:
     import omni.ui as ui
     from isaacsim.core.api import World
@@ -1669,6 +1671,12 @@ def _run(
                 timestamp_sec=float(world.current_time),
             )
             now = float(world.current_time)
+            if step_observer is not None and step_observer(
+                world=world, robot=robot, state=state, command=command,
+                grid=latest_planning_grid, controller=sampling_controller,
+                navigation_active=navigation_active,
+            ):
+                break
             world_from_base = world_from_pose_wxyz(position, orientation)
             robot_yaw_world = math.atan2(
                 float(world_from_base[1, 0]),
@@ -2414,7 +2422,7 @@ def _run(
                         else:
                             adapter.stop()
                             if sampling_controller is not None:
-                                sampling_controller.reset()
+                                sampling_controller.close()
                             sampling_controller = replacement_controller
                             mode = selected_mode
                             tracker = tracker_mode = None
@@ -3023,6 +3031,8 @@ def _run(
             frame_index += 1
     finally:
         adapter.stop()
+        if sampling_controller is not None:
+            sampling_controller.close(wait=True)
         panel.shutdown()
         s2_panel.shutdown()
     return 0

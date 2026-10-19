@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
+import threading
 import time
 
 import numpy as np
@@ -10,6 +12,10 @@ from pytorch_mppi import mppi
 from .geometry import PassageGeometry
 from .model import FourWheelModel, STATE_SIZE
 from .kmppi import ConsistentKMPPI
+from .feasible_mppi import FeasibleMPPI
+
+
+RNG_LOCK = threading.Lock()
 
 
 class PassageCost:
@@ -94,7 +100,6 @@ class SamplingPlanner:
             torch.manual_seed(self.seed)
             horizon = int(settings["horizon_steps"])
             initial = torch.zeros(horizon, 2, device=model.device)
-            initial[:, 0] = min(0.35, model.limits.max_linear_mps)
             kwargs = dict(
                 dynamics=model.step,
                 running_cost=lambda state, action: cost.running(state, action, motion_states=model.last_substeps),
@@ -108,9 +113,10 @@ class SamplingPlanner:
                 u_min=torch.tensor([-model.limits.max_linear_mps, -model.limits.max_angular_radps], device=model.device),
                 u_max=torch.tensor([model.limits.max_linear_mps, model.limits.max_angular_radps], device=model.device),
                 U_init=initial, sample_null_action=True,
+                project_action=model.project_actions,
             )
             if method == "MPPI":
-                self.controller = mppi.MPPI(**kwargs)
+                self.controller = FeasibleMPPI(**kwargs)
             else:
                 self.controller = ConsistentKMPPI(
                     **kwargs, num_support_pts=int(settings["kernel_support_points"]),
@@ -120,20 +126,78 @@ class SamplingPlanner:
             self.rng_cuda = torch.cuda.get_rng_state(model.device).clone() if self._cuda_indices else None
         self.first_command = True
 
+    def _prepare_sampling(self, tensor, elapsed_sec):
+        controller = self.controller
+        delta = self.cost.goal - tensor[:2]
+        distance = float(torch.linalg.vector_norm(delta))
+        speed_limit = min(self.model.limits.max_linear_mps, max(0.025, distance * 0.8))
+        controller.u_max = torch.tensor([speed_limit, self.model.limits.max_angular_radps], device=self.model.device)
+        controller.u_min = -controller.u_max
+        scale = min(1.0, max(0.15, distance / self.settings.get("near_goal_distance_m", 0.8)))
+        controller.lambda_ = float(self.settings["temperature"]) * scale * scale
+        sigma = torch.tensor([self.settings["noise_linear_std"], self.settings["noise_angular_std"]], device=self.model.device) * scale
+        controller.noise_sigma = torch.diag(sigma.square())
+        controller._noise_sigma_inv_diag = sigma.reciprocal().square()
+        controller._noise_sigma_sqrt_diag = sigma
+        controller.noise_sigma_inv = torch.diag(controller._noise_sigma_inv_diag)
+        controller._setup_action_cost_fn()
+        if self.first_command:
+            initial = self.model.project_actions(tensor[14:16])
+            if self.method == "KMPPI":
+                controller.theta[:] = initial
+            else:
+                controller.U[:] = initial
+        else:
+            steps = max(0.0, float(self.model.dt_sec if elapsed_sec is None else elapsed_sec)) / self.model.dt_sec
+            if self.method == "KMPPI":
+                controller.advance_nominal(steps)
+            else:
+                indices = torch.arange(controller.T, device=self.model.device) + steps
+                lower, upper = indices.floor().long(), indices.ceil().long()
+                extended = torch.cat((controller.U, controller.u_init[None]), dim=0)
+                controller.U = torch.lerp(extended[lower.clamp(max=controller.T)],
+                                          extended[upper.clamp(max=controller.T)],
+                                          (indices - lower)[:, None])
+        if self.method == "KMPPI":
+            controller.synchronize_controls()
+        else:
+            controller.U = controller._bound_action(controller.U)
+        yaw = float(tensor[2])
+        dx, dy = float(delta[0]), float(delta[1])
+        forward = math.cos(yaw) * dx + math.sin(yaw) * dy
+        left = -math.sin(yaw) * dx + math.cos(yaw) * dy
+        bearing = math.atan2(left, forward)
+        duration = controller.T * self.model.dt_sec
+        base_speed = min(speed_limit, distance / max(duration - 0.5, self.model.dt_sec))
+        direction = -1.0 if forward < 0 else 1.0
+        curvature = 2 * left / max(distance * distance, 1.0e-6)
+        priors = torch.zeros(6, controller.T, 2, device=self.model.device)
+        for index, factor in enumerate((0.5, 1.0, 1.5)):
+            v = direction * min(speed_limit, base_speed * factor)
+            priors[index, :, 0] = v
+            priors[index, :, 1] = v * curvature
+        priors[3, :, 0] = direction * min(speed_limit, base_speed)
+        priors[4, :, 1] = float(np.sign(bearing)) * min(self.model.limits.max_angular_radps, abs(bearing) / duration)
+        turn_steps = min(controller.T - 1, math.ceil(abs(bearing) / (self.model.limits.max_angular_radps * self.model.dt_sec)))
+        priors[5, :turn_steps, 1] = float(np.sign(bearing)) * self.model.limits.max_angular_radps
+        priors[5, turn_steps:, 0] = min(speed_limit, distance / max((controller.T - turn_steps) * self.model.dt_sec, self.model.dt_sec))
+        controller.action_priors = controller._bound_action(priors)
+
     def _synchronize(self):
         if self._cuda_indices:
             torch.cuda.synchronize(self.model.device)
 
-    def plan(self, state) -> PlanResult:
+    def plan(self, state, elapsed_sec=None) -> PlanResult:
         self._synchronize()
         started = time.perf_counter()
         tensor = torch.as_tensor(state, dtype=torch.float32, device=self.model.device)
-        with torch.no_grad(), torch.random.fork_rng(devices=self._cuda_indices):
+        with RNG_LOCK, torch.no_grad(), torch.random.fork_rng(devices=self._cuda_indices):
             torch.set_rng_state(self.rng_cpu)
             if self.rng_cuda is not None:
                 torch.cuda.set_rng_state(self.rng_cuda, self.model.device)
+            self._prepare_sampling(tensor, elapsed_sec)
             for iteration in range(int(self.settings["iterations"])):
-                self.controller.command(tensor, shift_nominal_trajectory=(iteration == 0 and not self.first_command))
+                self.controller.command(tensor, shift_nominal_trajectory=False)
             self.first_command = False
             self.rng_cpu = torch.get_rng_state().clone()
             self.rng_cuda = torch.cuda.get_rng_state(self.model.device).clone() if self._cuda_indices else None
@@ -154,6 +218,7 @@ class SamplingPlanner:
                 "integration_dt_sec": self.model.integration_dt_sec,
                 "ess": float(1 / self.controller.omega.square().sum()),
                 "max_weight": float(self.controller.omega.max()),
+                "temperature": float(self.controller.lambda_),
                 "best_cost": float(self.controller.cost_total.min()),
                 "control_bound_excess": float(torch.relu(controls.abs() - self.cost.action_limits).max()),
                 "command_change": float(np.linalg.norm(command - self.last_output)),

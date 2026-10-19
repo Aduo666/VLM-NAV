@@ -12,6 +12,18 @@ def rate_limit(current: torch.Tensor, target: torch.Tensor, acceleration: torch.
     return current + torch.maximum(torch.minimum(target - current, rate * dt), -rate * dt)
 
 
+@torch.jit.script
+def project_twist(action: torch.Tensor, max_linear: float, max_angular: float, max_curvature: float):
+    v = action[..., 0].clamp(-max_linear, max_linear)
+    w = action[..., 1].clamp(-max_angular, max_angular)
+    turning_limit = max_curvature * v.abs()
+    arc_w = torch.maximum(torch.minimum(w, turning_limit), -turning_limit)
+    spin = ((w - arc_w).abs() / max_angular > v.abs() / max_linear) | (v.abs() < 1.0e-6)
+    v = torch.where(spin, torch.zeros_like(v), v)
+    w = torch.where(spin, w, arc_w)
+    return torch.stack((v, w), dim=-1)
+
+
 class DynamicsKernel(torch.nn.Module):
     def __init__(self, xy, radii, inverse, limits, hardware):
         super().__init__()
@@ -29,14 +41,25 @@ class DynamicsKernel(torch.nn.Module):
         self.max_steering_rad = float(hardware.max_steering_rad)
         self.max_lateral_acceleration_mps2 = float(hardware.max_lateral_acceleration_mps2)
         self.max_wheel_radps = float(hardware.max_wheel_radps)
+        self.max_curvature = float(1 / max(float(xy[:, 1].abs().max())
+                                           + float(xy[:, 0].abs().max()) / math.tan(hardware.max_steering_rad), 1.0e-6))
 
     def forward(self, state: torch.Tensor, action: torch.Tensor, dt: float):
-        v = rate_limit(state[..., 14], action[..., 0].clamp(-self.max_linear_mps, self.max_linear_mps),
-                       torch.full_like(action[..., 0], self.linear_accel_mps2),
-                       torch.full_like(action[..., 0], self.linear_decel_mps2), dt)
-        w = rate_limit(state[..., 15], action[..., 1].clamp(-self.max_angular_radps, self.max_angular_radps),
-                       torch.full_like(action[..., 1], self.angular_accel_radps2),
-                       torch.full_like(action[..., 1], self.angular_decel_radps2), dt)
+        target = project_twist(action, self.max_linear_mps, self.max_angular_radps, self.max_curvature)
+        previous = state[..., 14:16]
+        previous_spin = (previous[..., 0].abs() < 1.0e-6) & (previous[..., 1].abs() >= 1.0e-6)
+        target_spin = (target[..., 0].abs() < 1.0e-6) & (target[..., 1].abs() >= 1.0e-6)
+        changing_mode = (previous_spin != target_spin) | (previous[..., 0] * target[..., 0] < 0)
+        changing_mode = changing_mode & (previous.abs().sum(dim=-1) >= 1.0e-6)
+        target = torch.where(changing_mode[..., None], torch.zeros_like(target), target)
+        delta = target - previous
+        accelerating = (previous * target >= 0) & (target.abs() > previous.abs())
+        linear_rate = torch.where(accelerating[..., 0], self.linear_accel_mps2, self.linear_decel_mps2)
+        angular_rate = torch.where(accelerating[..., 1], self.angular_accel_radps2, self.angular_decel_radps2)
+        rates = torch.stack((linear_rate, angular_rate), dim=-1)
+        fraction = (rates * dt / delta.abs().clamp_min(1.0e-9)).amin(dim=-1).clamp(max=1.0)
+        commanded = previous + fraction[..., None] * delta
+        v, w = commanded[..., 0], commanded[..., 1]
         vx, vy = v[..., None] - w[..., None] * self.xy[:, 1], w[..., None] * self.xy[:, 0]
         angles = torch.atan2(vy, vx)
         speeds = torch.hypot(vx, vy)

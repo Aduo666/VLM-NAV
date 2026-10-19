@@ -56,7 +56,7 @@ class ConsistencyTests(unittest.TestCase):
         np.testing.assert_allclose(result.controls, 0, atol=1.0e-7)
         np.testing.assert_allclose(result.command, 0, atol=1.0e-7)
 
-    def test_wall_stop_consistent_in_both_methods(self):
+    def test_wall_candidates_can_adjust_without_collision(self):
         for method in ("MPPI", "KMPPI"):
             cfg, model, _, cost = fixture()
             cost.set_target([1.6, 0.9])
@@ -64,8 +64,22 @@ class ConsistencyTests(unittest.TestCase):
             state[:2] = [-0.6, 0.9]
             planner = SamplingPlanner(method, model, cost, cfg["planner"], cfg["safety"])
             result = planner.plan(state)
-            self.assertGreater(float(planner.controller.omega[0]), 0.99)
-            np.testing.assert_allclose(result.command, 0, atol=1.0e-5)
+            self.assertEqual(result.diagnostics["candidate_motion_violation_fraction"], 0)
+            self.assertGreaterEqual(result.min_clearance_m, 0)
+
+    def test_near_goal_commands_make_forward_progress(self):
+        from constraint_traverse.test_navigation import make_grid, make_geometry
+        for method in ("MPPI", "KMPPI"):
+            for distance in (0.40, 0.23, 0.15):
+                cfg, model, _, cost = fixture()
+                cost.geometry = make_geometry()
+                cost.geometry.update_grid(make_grid())
+                cost.set_target([distance, 0])
+                state = np.zeros(STATE_SIZE, dtype=np.float32)
+                planner = SamplingPlanner(method, model, cost, cfg["planner"], cfg["safety"])
+                result = planner.plan(state)
+                self.assertGreater(float(result.command[0]), 0.005, (method, distance, result.command))
+                self.assertEqual(result.diagnostics["candidate_motion_violation_fraction"], 0)
 
     def test_kmppi_bounds_and_rolling_consistency(self):
         cfg, model, _, cost = fixture()

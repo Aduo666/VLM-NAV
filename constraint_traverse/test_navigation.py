@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 import io
 import logging
+import time
 from pathlib import Path
 import unittest
 from unittest.mock import patch
@@ -146,7 +147,11 @@ class ControllerTests(unittest.TestCase):
             controller = SamplingNavigationController(method=method, hardware=hardware, footprint=footprint, physics_dt=1 / 60,
                                                        config_path=ROOT / "constraint_traverse/configs/benchmark.yaml", logger=logging.getLogger("test"))
             drive = Drive()
-            applied = controller.step(robot=Robot(), drive=drive, grid=make_grid(), goal_world_xy=[1, 0], now=0)
+            controller.step(robot=Robot(), drive=drive, grid=make_grid(), goal_world_xy=[1, 0], now=0)
+            deadline = time.monotonic() + 5
+            while controller.last_plan is None and time.monotonic() < deadline:
+                time.sleep(0.01)
+                applied = controller.step(robot=Robot(), drive=drive, grid=make_grid(), goal_world_xy=[1, 0], now=0)
             self.assertEqual(controller.status, "TRACKING")
             self.assertGreater(applied.linear_mps, 0)
             self.assertEqual(len(drive.motors), 4)
@@ -157,6 +162,11 @@ class ControllerTests(unittest.TestCase):
             with self.subTest(method=method, start="UNKNOWN"):
                 applied = controller.step(robot=Robot(), drive=drive, grid=make_grid(known=False, version=2),
                                           goal_world_xy=[1, 0], now=0)
+                deadline = time.monotonic() + 5
+                while controller.last_plan is None and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                    applied = controller.step(robot=Robot(), drive=drive, grid=make_grid(known=False, version=2),
+                                              goal_world_xy=[1, 0], now=0)
                 self.assertIsNotNone(controller.last_plan)
                 self.assertEqual(controller.last_plan.candidates.shape[0], controller.config["planner"]["samples"])
                 self.assertEqual(controller.status, "TRACKING")
@@ -167,6 +177,7 @@ class ControllerTests(unittest.TestCase):
                                 goal_world_xy=[1, 0], now=0.01)
                 np.testing.assert_array_equal(controller.requested, requested)
                 self.assertEqual(controller.status, "TRACKING")
+            controller.close(wait=True)
 
 
 if __name__ == "__main__":

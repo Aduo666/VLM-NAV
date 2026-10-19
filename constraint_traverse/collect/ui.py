@@ -24,6 +24,7 @@ class CollectorPanel:
         self._command_sink = command_sink
         self._size = int(image_size_px)
         self._goal_map: BevGoalMap | None = None
+        self._map_pose: np.ndarray | None = None
         self._provider = ui.ByteImageProvider()
         initial = np.empty((self._size, self._size, 4), dtype=np.uint8)
         initial[:, :, :3] = (108, 110, 112)
@@ -109,9 +110,7 @@ class CollectorPanel:
         recording = status.mode == "RECORDING"
         self._born_button.enabled = idle or placing_born
         self._reset_map_button.enabled = idle and status.robot_placed
-        self._start_button.enabled = (
-            idle and status.robot_placed and status.goal_selected
-        )
+        self._start_button.enabled = idle and status.robot_placed
         self._success_button.enabled = recording
         self._discard_button.enabled = recording
         self._reset_start_button.enabled = (
@@ -122,14 +121,13 @@ class CollectorPanel:
         elif not status.robot_placed:
             self._step_label.text = "Step 1: Press BORN"
         elif recording:
-            self._step_label.text = "Step 4: Drive to target, press SUCCESS"
-        elif not status.goal_selected:
-            self._step_label.text = "Step 2: Click free space on Goal Map"
+            self._step_label.text = "Drive through, stop, press SUCCESS"
         else:
-            self._step_label.text = "Step 3: Stop robot, press START DEMO"
+            self._step_label.text = "Stop robot, press START DEMO; map hint is optional"
 
-    def update_map(self, goal_map: BevGoalMap) -> None:
+    def update_map(self, goal_map: BevGoalMap, *, robot_world_xyyaw: np.ndarray) -> None:
         self._goal_map = goal_map
+        self._map_pose = np.asarray(robot_world_xyyaw, dtype=np.float64).reshape(3).copy()
         rgba = np.asarray(goal_map.rgba, dtype=np.uint8)
         height, width = rgba.shape[:2]
         self._provider.set_data_array(
@@ -148,7 +146,7 @@ class CollectorPanel:
         button: int,
         _modifiers,
     ) -> None:
-        if button != 0 or self._goal_map is None:
+        if button != 0 or self._goal_map is None or self._map_pose is None:
             return
         width = max(float(self._image.computed_width), 1.0)
         height = max(float(self._image.computed_height), 1.0)
@@ -169,4 +167,9 @@ class CollectorPanel:
         if not bool(self._goal_map.selectable_mask[row, column]):
             return
         forward, left = self._goal_map.pixel_to_local(column, row)
-        self._command_sink(("SET_GOAL_BODY", forward, left))
+        cosine, sine = np.cos(self._map_pose[2]), np.sin(self._map_pose[2])
+        self._command_sink((
+            "SET_HINT_WORLD",
+            float(self._map_pose[0] + cosine * forward - sine * left),
+            float(self._map_pose[1] + sine * forward + cosine * left),
+        ))

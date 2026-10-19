@@ -19,7 +19,7 @@ spawn:
 cameras:
   warmup_render_frames: 30
 
-# Robot-centric policy input candidate saved with every sample.
+# 每个样本保存机器人坐标系中的 BEV。
 bev:
   forward_m: 3.0
   backward_m: 1.0
@@ -50,8 +50,6 @@ collection:
   endpoint_position_tolerance_m: 0.15
   # 第一帧与 START 位姿、最后一帧与结束位姿允许的航向误差，单位为度。
   endpoint_yaw_tolerance_deg: 10.0
-  # 成功数据最后世界位置与目标世界坐标允许的距离，单位为米。
-  success_goal_position_tolerance_m: 0.30
 
 ui:
   update_period_sec: 0.10

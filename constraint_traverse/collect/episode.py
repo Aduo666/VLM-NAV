@@ -23,6 +23,7 @@ class EpisodeSession:
     last_start_position_world_xyz: np.ndarray | None = None
     started_at_sec: float | None = None
     sample_count: int = 0
+    success_requested_at_sec: float | None = None
     trajectory_world_xy: list[tuple[float, float]] = field(default_factory=list)
 
     def begin(
@@ -36,8 +37,6 @@ class EpisodeSession:
             raise RuntimeError(f"Cannot start an episode while state is {self.mode.value}")
         if not self.robot_placed:
             raise RuntimeError("Robot placement has not been confirmed")
-        if self.goal_world_xy is None:
-            raise RuntimeError("Goal placement has not been confirmed")
         pose = np.asarray(start_pose_world, dtype=np.float64).reshape(3).copy()
         position = np.asarray(start_position_world_xyz, dtype=np.float64).reshape(3).copy()
         self.mode = EpisodeMode.RECORDING
@@ -47,6 +46,7 @@ class EpisodeSession:
         self.last_start_position_world_xyz = position.copy()
         self.started_at_sec = float(timestamp_sec)
         self.sample_count = 0
+        self.success_requested_at_sec = None
         self.trajectory_world_xy = [(float(pose[0]), float(pose[1]))]
 
     def note_sample(self, pose_world_xyyaw: np.ndarray) -> None:
@@ -61,6 +61,7 @@ class EpisodeSession:
             raise RuntimeError("No recording episode to complete")
         self.mode = EpisodeMode.IDLE
         self.started_at_sec = None
+        self.success_requested_at_sec = None
 
     def begin_born_placement(self) -> None:
         if self.mode is not EpisodeMode.IDLE:
@@ -89,6 +90,7 @@ class EpisodeSession:
         self.start_position_world_xyz = None
         self.started_at_sec = None
         self.sample_count = 0
+        self.success_requested_at_sec = None
         self.trajectory_world_xy = []
 
     @property

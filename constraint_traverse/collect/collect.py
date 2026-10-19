@@ -150,7 +150,6 @@ def _validate_top_level_config(data: dict) -> None:
         "min_depth_valid_ratio",
         "endpoint_position_tolerance_m",
         "endpoint_yaw_tolerance_deg",
-        "success_goal_position_tolerance_m",
     }
     if set(collection) != required_collection:
         raise ValueError(

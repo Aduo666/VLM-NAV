@@ -279,6 +279,54 @@ class LocalVoxelMap:
             timestamp_sec=float(self._timestamp),
         )
 
+    def restore(self, snapshot: LocalVoxelSnapshot) -> None:
+        shape = self._log_odds.shape
+        fields = (
+            ("log_odds", self._log_odds.dtype),
+            ("observed_mask", self._observed.dtype),
+            ("evidence_count", self._evidence.dtype),
+            ("source_mask", self._source_mask.dtype),
+            ("last_observed_time_sec", self._last_observed.dtype),
+        )
+        if not math.isclose(snapshot.resolution_m, self.config.resolution_m):
+            raise ValueError("地图状态的分辨率与配置不同")
+        arrays = {}
+        for name, dtype in fields:
+            value = np.asarray(getattr(snapshot, name))
+            if value.shape != shape or value.dtype != dtype:
+                raise ValueError(f"地图状态 {name} 的形状或类型错误")
+            arrays[name] = value.copy()
+        if not np.isfinite(arrays["log_odds"]).all():
+            raise ValueError("地图概率包含非有限数值")
+        observed = arrays["observed_mask"]
+        if not np.isfinite(arrays["last_observed_time_sec"][observed]).all():
+            raise ValueError("已观测体素的时间无效")
+        origin = self._validate_center(snapshot.origin_world_xyz)
+        center = self._validate_center(snapshot.center_world_xyz)
+        if (
+            snapshot.version < 0
+            or np.isnan(snapshot.timestamp_sec)
+            or np.isposinf(snapshot.timestamp_sec)
+            or (snapshot.version > 0 and not math.isfinite(snapshot.timestamp_sec))
+        ):
+            raise ValueError("地图版本或时间无效")
+        expected_center = origin + np.asarray([
+            0.5 * self._shape_xyz[0] * self.config.resolution_m,
+            0.5 * self._shape_xyz[1] * self.config.resolution_m,
+            -self.config.min_z_m,
+        ])
+        if not np.allclose(center, expected_center, atol=1.0e-8):
+            raise ValueError("地图中心与原点不一致")
+        self._origin, self._center = origin, center
+        self._log_odds = arrays["log_odds"]
+        self._observed = observed
+        self._evidence = arrays["evidence_count"]
+        self._source_mask = arrays["source_mask"]
+        self._last_observed = arrays["last_observed_time_sec"]
+        self._version = int(snapshot.version)
+        self._timestamp = float(snapshot.timestamp_sec)
+        self._initialized = True
+
     def _observation_indices(
         self, observation: TimedDepthObservation
     ) -> tuple[np.ndarray, np.ndarray, int, int]:

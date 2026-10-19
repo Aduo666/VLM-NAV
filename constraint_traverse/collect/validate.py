@@ -4,17 +4,29 @@ import argparse
 import json
 from pathlib import Path
 
-from .recorder import validate_episode_directory
+from .map_state import verify_episode_bevs
+from .recorder import recover_episode_directory, validate_episode_directory
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Validate collected traversal episodes")
     parser.add_argument("path", type=Path, help="Episode directory or dataset root")
+    parser.add_argument("--recover", action="store_true", help="恢复指定未完成记录中已提交的状态批次")
+    parser.add_argument("--rebuild-bev", action="store_true", help="从初始地图与 RGB-D 重建并逐帧核对 BEV")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    if args.recover:
+        try:
+            path = recover_episode_directory(args.path.expanduser().resolve())
+        except Exception as exc:
+            print(f"[RECOVERY FAILED] {exc}")
+            return 1
+        meta = json.loads((path / "meta.json").read_text(encoding="utf-8"))
+        print(f"[RECOVERED {meta['status'].upper()}] {path}")
+        return 0
     targets = _find_episode_dirs(args.path)
     if not targets:
         print(f"No episode directories found under: {args.path}")
@@ -23,6 +35,8 @@ def main() -> int:
     failed = 0
     for episode in targets:
         errors = validate_episode_directory(episode)
+        if args.rebuild_bev and not errors:
+            errors.extend(verify_episode_bevs(episode))
         if errors:
             failed += 1
             print(f"[INVALID] {episode}")
@@ -37,14 +51,13 @@ def main() -> int:
 
 def _find_episode_dirs(path: Path) -> list[Path]:
     path = path.expanduser().resolve()
-    if (path / "meta.json").is_file() and (path / "state.npz").is_file():
+    if (path / "meta.json").is_file() or path.name.startswith(("episode_", ".episode_")):
         return [path]
     return sorted(
         candidate
-        for candidate in path.rglob("episode_*")
+        for candidate in path.rglob("*")
         if candidate.is_dir()
-        and (candidate / "meta.json").is_file()
-        and (candidate / "state.npz").is_file()
+        and candidate.name.startswith(("episode_", ".episode_"))
     )
 
 

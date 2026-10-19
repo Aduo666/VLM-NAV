@@ -13,7 +13,7 @@ from .recorder import decode_depth_png
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Replay a collected traversal episode")
     parser.add_argument("episode", type=Path)
-    parser.add_argument("--fps", type=float, default=10.0)
+    parser.add_argument("--fps", type=float, help="回放帧率；默认读取记录的时间间隔")
     parser.add_argument("--output", type=Path)
     return parser.parse_args()
 
@@ -27,8 +27,14 @@ def main() -> int:
         human = np.asarray(data["human_action_vw"], dtype=np.float32)
         applied = np.asarray(data["applied_action_vw"], dtype=np.float32)
         pose = np.asarray(data["pose_world_xyyaw"], dtype=np.float32)
+        timestamps = np.asarray(data["sample_time_sec"], dtype=np.float64)
+    if count == 0:
+        raise ValueError("记录中没有可回放的样本")
+    fps = args.fps
+    if fps is None:
+        fps = 1.0 / float(np.median(np.diff(timestamps))) if count > 1 else 15.0
 
-    delay_ms = max(1, int(round(1000.0 / max(args.fps, 0.1))))
+    delay_ms = max(1, int(round(1000.0 / max(fps, 0.1))))
     print(
         f"episode={meta.get('episode_id')} success={meta.get('success')} "
         f"samples={count} duration={meta.get('duration_sec')}"
@@ -111,7 +117,7 @@ def main() -> int:
                     writer = cv2.VideoWriter(
                         str(output_path),
                         cv2.VideoWriter_fourcc(*"mp4v"),
-                        max(float(args.fps), 0.1),
+                        max(float(fps), 0.1),
                         (width, height),
                     )
                     if not writer.isOpened():
@@ -122,7 +128,10 @@ def main() -> int:
                 continue
 
             cv2.imshow("Constraint Traverse Replay", canvas)
-            key = cv2.waitKey(delay_ms) & 0xFF
+            frame_delay = delay_ms
+            if args.fps is None and index + 1 < count:
+                frame_delay = max(1, int(round(1000.0 * (timestamps[index + 1] - timestamps[index]))))
+            key = cv2.waitKey(frame_delay) & 0xFF
             if key in (27, ord("q")):
                 break
             if key == ord(" "):

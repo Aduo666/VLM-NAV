@@ -1,18 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import logging
-import math
 from pathlib import Path
 import time
 
 import numpy as np
 import yaml
 
-from vln_nav.active_perception.camera_geometry import (
-    capture_camera_frame,
-    world_from_pose_wxyz,
-)
 from vln_nav.active_perception.bev_goal_map import render_bev_goal_map
 from vln_nav.active_perception.contracts import TimedDepthObservation
 from vln_nav.active_perception.local_geometry import LocalVoxelMap, LocalVoxelMapConfig
@@ -34,7 +29,8 @@ from vln_nav.runtime.scene_lighting import add_indoor_lighting
 
 from .bev import BevConfig, local_voxel_config_from_mapping, snapshot_to_robot_bev
 from .episode import EpisodeMode, EpisodeSession
-from .recorder import EpisodeRecorder, SampleRecord
+from .recorder import ControlRecord, EpisodeRecorder, SampleRecord
+from .sampling import PhysicsHistory, PhysicsState, capture_aligned_frame
 from .teleop import ContinuousTeleop, TeleopConfig
 from .transforms import (
     BodyMotionEstimator,
@@ -145,6 +141,7 @@ class ConstraintTraverseCollector:
             rendering_dt=float(profile.simulation.rendering_dt),
             stage_units_in_meters=1.0,
         )
+        dt = float(world.get_physics_dt())
         stage = get_current_stage()
         scene_path = self.overrides.usd_path.expanduser().resolve()
         if not scene_path.is_file():
@@ -340,6 +337,10 @@ class ConstraintTraverseCollector:
         mapping_state = {"last_integration_time": -float("inf")}
         last_map_render_time = -float("inf")
         last_control_fallback_log_time = -float("inf")
+        history = PhysicsHistory()
+        desired = VelocityCommand()
+        applied = VelocityCommand()
+        last_control_time = float(world.current_time)
 
         self.logger.info(
             "[Collector] scene=%s output=%s placement=manual map_config=%s",
@@ -367,7 +368,7 @@ class ConstraintTraverseCollector:
 
                 while command_queue:
                     command = command_queue.pop(0)
-                    _, current_episode_id = self._handle_ui_command(
+                    effect, current_episode_id = self._handle_ui_command(
                         command=command,
                         session=session,
                         recorder=recorder,
@@ -393,6 +394,13 @@ class ConstraintTraverseCollector:
                         down_path=down_path,
                         last_bev=last_bev,
                     )
+                    if effect:
+                        desired = VelocityCommand()
+                        applied = VelocityCommand()
+                        last_control_time = float(world.current_time)
+                    if effect == "RESET_HISTORY":
+                        history.clear()
+                        measured_v, measured_w = 0.0, 0.0
                     if world.is_playing():
                         position, orientation = get_world_pose(robot)
                     else:
@@ -401,6 +409,9 @@ class ConstraintTraverseCollector:
                             articulation_path,
                         )
                     pose = pose_xyyaw(position, orientation)
+                    now = float(world.current_time)
+                    if effect == "RESET_HISTORY":
+                        motion.update(pose, now)
                     latest_snapshot = episode_map.snapshot()
 
                 ui_now = time.monotonic()
@@ -427,23 +438,55 @@ class ConstraintTraverseCollector:
                     self.app.update()
                     continue
 
-                desired = teleop.step(dt)
+                readback = drive.readback()
+                current_state = PhysicsState(
+                    timestamp_sec=now,
+                    physics_step=int(world.current_time_step_index),
+                    position=np.asarray(position).copy(),
+                    orientation=np.asarray(orientation).copy(),
+                    pose=pose.copy(),
+                    velocity=np.asarray([measured_v, measured_w], dtype=np.float64),
+                    steering_position=_ordered_readback(readback["steering_position"], steering_names),
+                    steering_velocity=_ordered_readback(readback["steering_velocity"], steering_names),
+                    wheel_velocity=_ordered_readback(readback["wheel_velocity"], wheel_names),
+                    front_world_from_camera=np.linalg.inv(np.asarray(front_camera.get_view_matrix_ros(), dtype=np.float64)),
+                    down_world_from_camera=np.linalg.inv(np.asarray(down_camera.get_view_matrix_ros(), dtype=np.float64)),
+                )
+                history.append(current_state)
+                front_match = capture_aligned_frame(
+                    source="front",
+                    camera=front_camera,
+                    history=history,
+                    after_sec=last_front_timestamp,
+                )
+                down_match = capture_aligned_frame(
+                    source="down",
+                    camera=down_camera,
+                    history=history,
+                    after_sec=last_down_timestamp,
+                )
+                front = None if front_match is None else front_match[0]
+                down = None if down_match is None else down_match[0]
+                new_pair = (
+                    front is not None
+                    and down is not None
+                    and front.frame_index == down.frame_index
+                    and abs(front.timestamp_sec - down.timestamp_sec) <= 1.0e-6
+                )
+                if new_pair and session.recording:
+                    new_pair = front.timestamp_sec >= session.started_at_sec - 1.0e-6
+                if session.success_requested_at_sec is not None:
+                    desired = VelocityCommand()
+                elif new_pair:
+                    desired = teleop.step(max(0.0, now - last_control_time))
+                    last_control_time = now
                 try:
-                    applied, used_spin_fallback = _apply_velocity_command(
-                        adapter,
-                        desired,
-                    )
-                    if (
-                        used_spin_fallback
-                        and now - last_control_fallback_log_time >= 1.0
-                    ):
+                    applied, used_spin_fallback = _apply_velocity_command(adapter, desired)
+                    if used_spin_fallback and now - last_control_fallback_log_time >= 1.0:
                         self.logger.info(
-                            "[CollectorControl] steering transition "
-                            "desired=[%.3f,%.3f] applied=[%.3f,%.3f]",
-                            desired.linear_mps,
-                            desired.angular_radps,
-                            applied.linear_mps,
-                            applied.angular_radps,
+                            "[CollectorControl] desired=[%.3f,%.3f] applied=[%.3f,%.3f]",
+                            desired.linear_mps, desired.angular_radps,
+                            applied.linear_mps, applied.angular_radps,
                         )
                         last_control_fallback_log_time = now
                 except Exception as exc:
@@ -452,41 +495,37 @@ class ConstraintTraverseCollector:
                     adapter.stop()
                     desired = VelocityCommand()
                     applied = VelocityCommand()
-
-                world_from_base = world_from_pose_wxyz(position, orientation)
-                front = capture_camera_frame(
-                    source="front",
-                    camera=front_camera,
-                    frame_index=frame_index,
-                    world_from_base=world_from_base,
-                )
-                down = capture_camera_frame(
-                    source="down",
-                    camera=down_camera,
-                    frame_index=frame_index,
-                    world_from_base=world_from_base,
-                )
-                new_pair = (
-                    front is not None
-                    and down is not None
-                    and front.timestamp_sec > last_front_timestamp + 1.0e-9
-                    and down.timestamp_sec > last_down_timestamp + 1.0e-9
-                )
+                if session.recording:
+                    recorder.append_control(ControlRecord(
+                        timestamp_sec=now,
+                        physics_step=current_state.physics_step,
+                        pose_world_xyyaw=current_state.pose,
+                        world_position_xyz=current_state.position,
+                        world_orientation_wxyz=current_state.orientation,
+                        measured_velocity_vw=current_state.velocity,
+                        human_action_vw=np.asarray([desired.linear_mps, desired.angular_radps]),
+                        applied_action_vw=np.asarray([applied.linear_mps, applied.angular_radps]),
+                        steering_position=current_state.steering_position,
+                        steering_velocity=current_state.steering_velocity,
+                        wheel_velocity=current_state.wheel_velocity,
+                    ))
                 map_active = session.robot_placed and session.mode in {
                     EpisodeMode.IDLE,
                     EpisodeMode.RECORDING,
                 }
                 if new_pair:
+                    observation_state = front_match[1]
                     skew = abs(float(front.timestamp_sec - down.timestamp_sec))
                     if skew <= float(mapping_cfg["max_frame_skew_sec"]):
                         last_front_timestamp = float(front.timestamp_sec)
                         last_down_timestamp = float(down.timestamp_sec)
                         if map_active:
+                            map_integrated = False
                             integration_period = float(
                                 map_runtime_cfg["integration_period_sec"]
                             )
                             if (
-                                now - mapping_state["last_integration_time"]
+                                front.timestamp_sec - mapping_state["last_integration_time"]
                                 >= integration_period
                             ):
                                 episode_map.integrate_batch(
@@ -507,20 +546,20 @@ class ConstraintTraverseCollector:
                                         ),
                                     ],
                                     center_world_xyz=np.asarray(
-                                        position[:3], dtype=np.float64
+                                        observation_state.position[:3], dtype=np.float64
                                     ),
                                 )
-                                mapping_state["last_integration_time"] = now
+                                mapping_state["last_integration_time"] = front.timestamp_sec
+                                map_integrated = True
                             snapshot = episode_map.snapshot()
                             latest_snapshot = snapshot
                             last_bev = snapshot_to_robot_bev(
                                 snapshot,
-                                robot_world_xyyaw=pose,
-                                floor_z_m=float(position[2]) - float(profile.spawn_z_m),
+                                robot_world_xyyaw=observation_state.pose,
+                                floor_z_m=float(observation_state.position[2]) - float(profile.spawn_z_m),
                                 config=bev_cfg,
                             )
                             if session.recording:
-                                readback = drive.readback()
                                 sample = SampleRecord(
                                     sample_time_sec=max(
                                         float(front.timestamp_sec),
@@ -532,13 +571,10 @@ class ConstraintTraverseCollector:
                                     front_depth_m=front.depth_m,
                                     down_depth_m=down.depth_m,
                                     bev=last_bev,
-                                    pose_world_xyyaw=pose,
-                                    world_position_xyz=position,
-                                    world_orientation_wxyz=orientation,
-                                    measured_velocity_vw=np.asarray(
-                                        [measured_v, measured_w],
-                                        dtype=np.float32,
-                                    ),
+                                    pose_world_xyyaw=observation_state.pose,
+                                    world_position_xyz=observation_state.position,
+                                    world_orientation_wxyz=observation_state.orientation,
+                                    measured_velocity_vw=observation_state.velocity,
                                     human_action_vw=np.asarray(
                                         [desired.linear_mps, desired.angular_radps],
                                         dtype=np.float32,
@@ -547,23 +583,31 @@ class ConstraintTraverseCollector:
                                         [applied.linear_mps, applied.angular_radps],
                                         dtype=np.float32,
                                     ),
-                                    steering_position=_ordered_readback(
-                                        readback["steering_position"], steering_names
-                                    ),
-                                    steering_velocity=_ordered_readback(
-                                        readback["steering_velocity"], steering_names
-                                    ),
-                                    wheel_velocity=_ordered_readback(
-                                        readback["wheel_velocity"], wheel_names
-                                    ),
+                                    steering_position=observation_state.steering_position,
+                                    steering_velocity=observation_state.steering_velocity,
+                                    wheel_velocity=observation_state.wheel_velocity,
                                     front_intrinsics=front.intrinsics,
                                     down_intrinsics=down.intrinsics,
                                     front_base_from_camera=front.base_from_camera,
                                     down_base_from_camera=down.base_from_camera,
+                                    front_world_from_camera=front.world_from_camera,
+                                    down_world_from_camera=down.world_from_camera,
                                     map_version=int(snapshot.version),
+                                    state_timestamp_sec=observation_state.timestamp_sec,
+                                    action_timestamp_sec=now,
+                                    physics_step=observation_state.physics_step,
+                                    action_physics_step=current_state.physics_step,
+                                    front_physics_step=front.frame_index,
+                                    down_physics_step=down.frame_index,
+                                    map_integrated=map_integrated,
+                                    floor_z_m=float(observation_state.position[2]) - float(profile.spawn_z_m),
                                 )
                                 recorder.append(sample)
-                                session.note_sample(pose)
+                                session.note_sample(observation_state.pose)
+                                path = _complete_requested_episode(session, recorder, sample, collection)
+                                if path is not None:
+                                    current_episode_id = ""
+                                    self.logger.info("[Collector] human success saved path=%s", path)
                     elif map_active:
                         self.logger.warning(
                             "[CollectorMap] skipped RGB-D pair skew=%.3fs limit=%.3fs",
@@ -610,30 +654,30 @@ class ConstraintTraverseCollector:
                             map_selector_cfg["obstacle_max_relative_z_m"]
                         ),
                         goal_local_xy=goal_local_xy,
-                    ))
+                    ), robot_world_xyyaw=pose)
                     last_map_render_time = now
 
                 max_duration = float(collection["max_episode_duration_sec"])
                 if session.recording and session.elapsed(now) > max_duration:
                     adapter.stop()
                     teleop.reset()
-                    recorder.discard()
+                    recorder.interrupt("timeout")
                     session.abort()
-                    self.logger.info("[Collector] timed-out episode discarded")
+                    self.logger.info("[Collector] timed-out episode preserved as incomplete")
                     current_episode_id = ""
 
-                world.step(render=(frame_index % render_stride == 0))
+                _step_physics(world, render=(frame_index % render_stride == 0))
                 frame_index += 1
         finally:
             try:
                 adapter.stop()
             except Exception:
                 pass
-            if recorder.active:
-                recorder.discard()
-            recorder.close()
-            teleop.shutdown()
-            panel.shutdown()
+            try:
+                recorder.close()
+            finally:
+                teleop.shutdown()
+                panel.shutdown()
         return 0
 
     def _handle_ui_command(
@@ -674,7 +718,7 @@ class ConstraintTraverseCollector:
                 _select_prim(articulation_path)
                 world.pause()
                 self.logger.info("[CollectorPlacement] robot placement started")
-                return "", current_episode_id
+                return "RESET_CONTROL", current_episode_id
             if session.mode is EpisodeMode.PLACING_BORN:
                 placed_position, placed_orientation = _world_pose_from_prim(
                     stage,
@@ -703,26 +747,20 @@ class ConstraintTraverseCollector:
                     "[CollectorPlacement] robot placement confirmed position=%s",
                     np.asarray(settled_position, dtype=np.float64).tolist(),
                 )
-                return "", current_episode_id
+                return "RESET_HISTORY", current_episode_id
             return "", current_episode_id
 
         if (
             isinstance(command, tuple)
             and len(command) == 3
-            and command[0] == "SET_GOAL_BODY"
+            and command[0] == "SET_HINT_WORLD"
         ):
             if session.mode is not EpisodeMode.IDLE or not session.robot_placed:
                 return "", current_episode_id
-            forward = float(command[1])
-            left = float(command[2])
-            cosine = math.cos(float(pose[2]))
-            sine = math.sin(float(pose[2]))
-            goal_x = float(pose[0]) + cosine * forward - sine * left
-            goal_y = float(pose[1]) + sine * forward + cosine * left
-            goal_world_xy = np.asarray([goal_x, goal_y], dtype=np.float64)
+            goal_world_xy = np.asarray(command[1:3], dtype=np.float64)
             session.set_goal(goal_world_xy)
             self.logger.info(
-                "[CollectorGoal] map goal selected xy=%s",
+                "[CollectorHint] map hint selected xy=%s",
                 goal_world_xy.tolist(),
             )
             return "", current_episode_id
@@ -739,7 +777,7 @@ class ConstraintTraverseCollector:
         if command == "START":
             if session.mode is not EpisodeMode.IDLE:
                 return "", current_episode_id
-            if not session.robot_placed or session.goal_world_xy is None:
+            if not session.robot_placed:
                 return "", current_episode_id
             if (
                 abs(float(measured_v)) > float(collection["start_max_linear_mps"])
@@ -748,7 +786,6 @@ class ConstraintTraverseCollector:
                 return "", current_episode_id
             teleop.reset()
             adapter.stop()
-            motion.reset()
             session.begin(
                 start_pose_world=pose,
                 start_position_world_xyz=position,
@@ -757,9 +794,12 @@ class ConstraintTraverseCollector:
             temp_dir = recorder.begin(
                 start_pose_world=pose,
                 start_position_world_xyz=position,
-                goal_world_xy=session.goal_world_xy,
                 start_time_sec=now,
+                initial_map=episode_map.snapshot(),
                 extra_meta={
+                    "physics_dt_sec": float(world.get_physics_dt()),
+                    "policy_period_sec": 1.0 / int(mapping_cfg["camera"]["frequency_hz"]),
+                    "controller": asdict(profile.agx_controller.continuous),
                     "teleop": dict(self.config["teleop"]),
                     "cameras": {
                         "front_prim_path": front_path,
@@ -800,7 +840,7 @@ class ConstraintTraverseCollector:
                 },
             )
             episode_id = temp_dir.name.removeprefix(".episode_").removesuffix(".tmp")
-            return "", episode_id
+            return "RESET_CONTROL", episode_id
 
         if command == "SUCCESS":
             if not session.recording:
@@ -815,15 +855,9 @@ class ConstraintTraverseCollector:
                 return "", current_episode_id
             teleop.reset()
             adapter.stop()
-            end_pose = pose.copy()
-            path = recorder.finish(
-                success=True,
-                end_pose_world=end_pose,
-                end_time_sec=now,
-            )
-            session.complete()
-            self.logger.info("[Collector] success saved path=%s", path)
-            return "", ""
+            session.success_requested_at_sec = now
+            self.logger.info("[Collector] human success confirmed; waiting for terminal RGB-D")
+            return "RESET_CONTROL", current_episode_id
 
         if command == "DISCARD":
             if not session.recording:
@@ -833,7 +867,7 @@ class ConstraintTraverseCollector:
             recorder.discard()
             session.abort()
             self.logger.info("[Collector] episode discarded")
-            return "", ""
+            return "RESET_CONTROL", ""
 
         if command == "RESET_TO_START":
             if session.recording:
@@ -866,7 +900,7 @@ class ConstraintTraverseCollector:
             _clear_bev(last_bev)
             mapping_state["last_integration_time"] = -float("inf")
             self.logger.info("[Collector] reset to recorded start")
-            return "", ""
+            return "RESET_HISTORY", ""
 
         self.logger.warning("[CollectorUI] unknown command=%s", command)
         return "", current_episode_id
@@ -887,6 +921,35 @@ def _teleport_robot(
         robot.set_linear_velocity(np.zeros(3, dtype=np.float32))
     if hasattr(robot, "set_angular_velocity"):
         robot.set_angular_velocity(np.zeros(3, dtype=np.float32))
+
+
+def _step_physics(world, *, render: bool) -> None:
+    world.step(render=False, update_fabric=True)
+    if render:
+        world.render()
+
+
+def _complete_requested_episode(
+    session: EpisodeSession, recorder: EpisodeRecorder, sample: SampleRecord, collection: dict,
+) -> Path | None:
+    requested = session.success_requested_at_sec
+    if requested is None or sample.sample_time_sec <= requested + 1.0e-9:
+        return None
+    if session.sample_count < int(collection["min_success_samples"]):
+        return None
+    if (
+        abs(sample.measured_velocity_vw[0]) > float(collection["start_max_linear_mps"])
+        or abs(sample.measured_velocity_vw[1]) > float(collection["start_max_angular_radps"])
+    ):
+        return None
+    path = recorder.finish(
+        success=True,
+        end_pose_world=sample.pose_world_xyyaw,
+        end_time_sec=sample.sample_time_sec,
+        success_requested_time_sec=requested,
+    )
+    session.complete()
+    return path
 
 
 def _zero_robot_velocity(robot) -> None:

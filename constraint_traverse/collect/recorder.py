@@ -637,15 +637,15 @@ def _validate_v2(path: Path, meta: dict, data, count: int, errors: list[str]) ->
         if data[name].shape != (count, 4, 4) or not np.isfinite(data[name]).all():
             errors.append(f"{name} has invalid shape or values")
     times = data["sample_time_sec"]
-    for name in ("state_timestamp_sec", "front_timestamp_sec", "down_timestamp_sec"):
-        if not np.allclose(data[name], times, atol=1.0e-6, rtol=0):
-            errors.append(f"{name} does not match observation time")
+    if not np.allclose(data["state_timestamp_sec"], times, atol=1.0e-6, rtol=0):
+        errors.append("state_timestamp_sec does not match observation time")
+    if not np.allclose(np.maximum(data["front_timestamp_sec"], data["down_timestamp_sec"]), times, atol=1.0e-6, rtol=0):
+        errors.append("sample time does not match latest camera observation")
     steps = data["physics_step"]
     if np.any(np.diff(steps) <= 0):
         errors.append("observation physics steps are not strictly increasing")
-    for name in ("front_physics_step", "down_physics_step"):
-        if not np.array_equal(steps, data[name]):
-            errors.append(f"{name} does not match observation physics step")
+    if not np.array_equal(steps, np.maximum(data["front_physics_step"], data["down_physics_step"])):
+        errors.append("observation physics step does not match latest camera observation")
     if np.any(data["action_timestamp_sec"] < times - 1.0e-6):
         errors.append("action precedes its observation")
     if times[0] < float(meta["start_time_sec"]) - 1.0e-6:
@@ -654,7 +654,8 @@ def _validate_v2(path: Path, meta: dict, data, count: int, errors: list[str]) ->
         errors.append("end time does not match terminal observation")
     requested = meta.get("success_requested_time_sec")
     if bool(meta.get("success")) and (
-        requested is None or times[-1] <= float(requested) + 1.0e-9
+        requested is None
+        or min(data["front_timestamp_sec"][-1], data["down_timestamp_sec"][-1]) <= float(requested) + 1.0e-9
     ):
         errors.append("terminal observation precedes SUCCESS")
     if not np.allclose(data["pose_world_xyyaw"][-1], meta["end_pose_world_xyyaw"], atol=1e-6, rtol=0):
@@ -718,6 +719,8 @@ def _validate_v2(path: Path, meta: dict, data, count: int, errors: list[str]) ->
                 "measured_velocity_vw", "steering_position", "steering_velocity", "wheel_velocity",
             )),
             ("action_physics_step", "action_timestamp_sec", ("human_action_vw", "applied_action_vw")),
+            ("front_physics_step", "front_timestamp_sec", ()),
+            ("down_physics_step", "down_timestamp_sec", ()),
         ):
             indices = np.searchsorted(control_steps, data[step_name])
             if np.any(indices >= total) or not np.array_equal(control_steps[indices], data[step_name]):

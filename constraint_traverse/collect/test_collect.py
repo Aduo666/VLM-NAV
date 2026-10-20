@@ -26,7 +26,8 @@ from .recorder import (
     recover_episode_directory, validate_episode_directory,
 )
 from .runtime import ConstraintTraverseCollector, RuntimeOverrides, _complete_requested_episode
-from .sampling import PhysicsHistory, PhysicsState, capture_aligned_frame
+from .sampling import PhysicsHistory, PhysicsState, capture_aligned_frame, pair_aligned_frames
+from .teleop import ContinuousTeleop, TeleopClock, TeleopConfig
 from .transforms import BodyMotionEstimator, quaternion_wxyz_from_yaw
 from .ui import CollectorPanel
 from .validate import _find_episode_dirs
@@ -87,7 +88,7 @@ class CollectionTests(unittest.TestCase):
         )
         return recorder
 
-    def record_episode(self, recorder):
+    def record_episode(self, recorder, *, front_lag_steps=0):
         samples = []
         for tick in range(21):
             timestamp = 10 + tick / 60
@@ -109,16 +110,23 @@ class CollectionTests(unittest.TestCase):
             ))
             if tick % 4:
                 continue
+            front_tick = max(0, tick - front_lag_steps)
+            front_time = 10 + front_tick / 60
+            front_position = np.array([min(front_tick, 16) * .003, 0., .32])
+            front_orientation = quaternion_wxyz_from_yaw(min(front_tick, 16) * .003).astype(np.float64)
             integrated = tick % 8 == 0
             if integrated:
                 self.local_map.integrate_batch(
-                    [self.observation(source, timestamp, position, orientation) for source in ("front", "down")],
+                    [
+                        self.observation("front", front_time, front_position, front_orientation),
+                        self.observation("down", timestamp, position, orientation),
+                    ],
                     center_world_xyz=position,
                 )
             snapshot = self.local_map.snapshot()
             sample = SampleRecord(
-                sample_time_sec=timestamp, front_timestamp_sec=timestamp, down_timestamp_sec=timestamp,
-                front_rgb=np.full((5, 5, 3), 120 + tick, dtype=np.uint8),
+                sample_time_sec=timestamp, front_timestamp_sec=front_time, down_timestamp_sec=timestamp,
+                front_rgb=np.full((5, 5, 3), 120 + front_tick, dtype=np.uint8),
                 front_depth_m=self.depth, down_depth_m=self.depth,
                 bev=snapshot_to_robot_bev(snapshot, robot_world_xyyaw=pose, floor_z_m=0., config=self.bev_config),
                 pose_world_xyyaw=pose, world_position_xyz=position, world_orientation_wxyz=orientation,
@@ -126,11 +134,11 @@ class CollectionTests(unittest.TestCase):
                 steering_position=np.zeros(4), steering_velocity=np.zeros(4), wheel_velocity=np.zeros(4),
                 front_intrinsics=self.intrinsics, down_intrinsics=self.intrinsics,
                 front_base_from_camera=self.front_transform, down_base_from_camera=self.down_transform,
-                front_world_from_camera=world_from_pose_wxyz(position, orientation) @ self.front_transform,
+                front_world_from_camera=world_from_pose_wxyz(front_position, front_orientation) @ self.front_transform,
                 down_world_from_camera=world_from_pose_wxyz(position, orientation) @ self.down_transform,
                 map_version=snapshot.version, state_timestamp_sec=timestamp, action_timestamp_sec=timestamp,
                 physics_step=1000 + tick, action_physics_step=1000 + tick,
-                front_physics_step=1000 + tick, down_physics_step=1000 + tick,
+                front_physics_step=1000 + front_tick, down_physics_step=1000 + tick,
                 map_integrated=integrated, floor_z_m=0.,
             )
             recorder.append(sample)
@@ -154,6 +162,17 @@ class CollectionTests(unittest.TestCase):
         self.assertTrue(meta["valid"])
         self.assertEqual(meta["control_count"], 21)
         self.assertEqual(load_snapshot(path / "initial_map.npz").version, self.initial_map.version)
+
+    def test_asynchronous_camera_episode_validates_and_reconstructs(self):
+        recorder = self.recorder()
+        samples = self.record_episode(recorder, front_lag_steps=1)
+        path = recorder.finish(
+            success=True, end_pose_world=samples[-1].pose_world_xyyaw,
+            end_time_sec=samples[-1].sample_time_sec, success_requested_time_sec=10 + 18 / 60,
+        )
+        self.assertNotEqual(samples[-1].front_physics_step, samples[-1].down_physics_step)
+        self.assertEqual(validate_episode_directory(path), [])
+        self.assertEqual(verify_episode_bevs(path), [])
 
     def test_close_preserves_committed_data_as_incomplete(self):
         recorder = self.recorder()
@@ -242,6 +261,11 @@ class CollectionTests(unittest.TestCase):
         session.success_requested_at_sec = samples[-1].sample_time_sec
         self.assertIsNone(_complete_requested_episode(session, recorder, samples[-1], self.config["collection"]))
         session.success_requested_at_sec = 10 + 19 / 60
+        self.assertIsNone(_complete_requested_episode(
+            session, recorder,
+            replace(samples[-1], front_timestamp_sec=10 + 19 / 60),
+            self.config["collection"],
+        ))
         self.assertIsNone(_complete_requested_episode(session, recorder, samples[-2], self.config["collection"]))
         self.assertTrue(recorder.active)
         path = _complete_requested_episode(session, recorder, samples[-1], self.config["collection"])
@@ -293,6 +317,47 @@ class CollectionTests(unittest.TestCase):
         np.testing.assert_allclose(result.base_from_camera, self.front_transform)
         frame["rendering_time"] = 8.
         self.assertIsNone(capture_aligned_frame(source="front", camera=camera, history=history, after_sec=7.))
+
+    def test_camera_pair_keeps_individual_exposure_times(self):
+        history = PhysicsHistory()
+        state = PhysicsState(
+            10., 1000, np.array([0., 0., .32]), np.array([1., 0., 0., 0.]), np.zeros(3),
+            np.zeros(2), np.zeros(4), np.zeros(4), np.zeros(4),
+            world_from_pose_wxyz(np.array([0., 0., .32]), np.array([1., 0., 0., 0.])) @ self.front_transform,
+            world_from_pose_wxyz(np.array([0., 0., .32]), np.array([1., 0., 0., 0.])) @ self.down_transform,
+        )
+        history.append(state)
+        history.append(replace(state, timestamp_sec=10 + 1 / 60, physics_step=1001))
+        front_data = {"rendering_time": 10., "rgb": np.full((5, 5, 4), 123, dtype=np.uint8), "distance_to_image_plane": self.depth}
+        down_data = {**front_data, "rendering_time": 10 + 1 / 60}
+        front_camera = SimpleNamespace(get_current_frame=lambda **kwargs: front_data, get_intrinsics_matrix=lambda: self.intrinsics)
+        down_camera = SimpleNamespace(get_current_frame=lambda **kwargs: down_data, get_intrinsics_matrix=lambda: self.intrinsics)
+        front = capture_aligned_frame(source="front", camera=front_camera, history=history, after_sec=9.)
+        down = capture_aligned_frame(source="down", camera=down_camera, history=history, after_sec=9.)
+        pair = pair_aligned_frames(front, down, max_skew_sec=.08)
+        self.assertEqual(pair.front.frame_index, 1000)
+        self.assertEqual(pair.down.frame_index, 1001)
+        self.assertEqual(pair.state.physics_step, 1001)
+        self.assertIsNone(pair_aligned_frames(front, down, max_skew_sec=.001))
+        self.assertIsNone(pair_aligned_frames(front, down, max_skew_sec=.08, not_before_sec=10 + 1 / 60))
+
+    def test_teleop_clock_controls_all_arrow_keys_without_camera_frames(self):
+        event_types = SimpleNamespace(KEY_PRESS=1, KEY_REPEAT=2, KEY_RELEASE=3)
+        for key, axis, sign in (("UP", 0, 1), ("DOWN", 0, -1), ("LEFT", 1, 1), ("RIGHT", 1, -1)):
+            with self.subTest(key=key):
+                teleop = ContinuousTeleop(TeleopConfig.from_mapping(self.config["teleop"]))
+                teleop._carb_input = SimpleNamespace(KeyboardEventType=event_types)
+                clock = TeleopClock(1 / 15, 0.)
+                teleop._on_keyboard_event(SimpleNamespace(input=SimpleNamespace(name=key), type=event_types.KEY_PRESS))
+                for tick in range(1, 61):
+                    command = clock.step(teleop, tick / 60)
+                values = [command.linear_mps, command.angular_radps]
+                self.assertGreater(sign * values[axis], .45)
+                teleop._on_keyboard_event(SimpleNamespace(input=SimpleNamespace(name=key), type=event_types.KEY_RELEASE))
+                for tick in range(61, 121):
+                    command = clock.step(teleop, tick / 60)
+                self.assertAlmostEqual(command.linear_mps, 0.)
+                self.assertAlmostEqual(command.angular_radps, 0.)
 
     def test_map_click_uses_displayed_pose(self):
         panel = CollectorPanel.__new__(CollectorPanel)

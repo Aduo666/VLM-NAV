@@ -50,6 +50,30 @@ class PhysicsHistory:
         ), None)
 
 
+@dataclass(frozen=True)
+class AlignedFramePair:
+    front: CameraFrameGeometry
+    down: CameraFrameGeometry
+    state: PhysicsState
+
+
+def pair_aligned_frames(
+    front: tuple[CameraFrameGeometry, PhysicsState] | None,
+    down: tuple[CameraFrameGeometry, PhysicsState] | None,
+    *, max_skew_sec: float, not_before_sec: float = -float("inf"),
+) -> AlignedFramePair | None:
+    if front is None or down is None:
+        return None
+    front_frame, front_state = front
+    down_frame, down_state = down
+    if abs(front_frame.timestamp_sec - down_frame.timestamp_sec) > max_skew_sec + 1.0e-9:
+        return None
+    if min(front_frame.timestamp_sec, down_frame.timestamp_sec) < not_before_sec - 1.0e-6:
+        return None
+    state = front_state if front_frame.timestamp_sec >= down_frame.timestamp_sec else down_state
+    return AlignedFramePair(front_frame, down_frame, state)
+
+
 def capture_aligned_frame(
     *, source: str, camera, history: PhysicsHistory, after_sec: float,
 ) -> tuple[CameraFrameGeometry, PhysicsState] | None:

@@ -126,6 +126,34 @@ class ContinuousTeleop:
         return True
 
 
+class TeleopClock:
+    def __init__(self, period_sec: float, timestamp_sec: float) -> None:
+        if not math.isfinite(period_sec) or period_sec <= 0:
+            raise ValueError("控制周期必须为有限正数")
+        self.period_sec = float(period_sec)
+        self.reset(timestamp_sec)
+
+    def reset(self, timestamp_sec: float) -> None:
+        self._last_update = float(timestamp_sec)
+
+    def step(
+        self, teleop: ContinuousTeleop, timestamp_sec: float, *, stopped: bool = False,
+    ) -> VelocityCommand:
+        now = float(timestamp_sec)
+        if stopped:
+            teleop.reset()
+            self.reset(now)
+            return VelocityCommand()
+        elapsed = now - self._last_update
+        if elapsed < 0:
+            self.reset(now)
+            return teleop.command
+        if elapsed + 1.0e-9 >= self.period_sec:
+            self._last_update = now
+            return teleop.step(elapsed)
+        return teleop.command
+
+
 def _approach(value: float, target: float, step: float) -> float:
     if value < target:
         return min(target, value + step)

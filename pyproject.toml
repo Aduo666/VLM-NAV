@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vlm-nav-active"
+version = "0.1.0"
+description = "AGX 导航与受限空间人工示范采集工具"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "numpy==1.26.0",
+    "PyYAML==6.0.2",
+    "Pillow==11.3.0",
+    "opencv-contrib-python-headless==4.11.0.86",
+    "scikit-image==0.25.2",
+]
+
+[project.optional-dependencies]
+simulation = ["isaacsim[all,extscache]==5.1.0"]
+
+[tool.setuptools]
+include-package-data = false
+
+[tool.setuptools.packages.find]
+where = ["src", "."]
+include = ["vln_nav", "vln_nav.*", "constraint_traverse", "constraint_traverse.*"]
+namespaces = false
+
+[tool.setuptools.package-data]
+constraint_traverse = ["configs/*.yaml", "patches/*.patch"]

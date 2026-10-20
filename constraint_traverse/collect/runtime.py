@@ -30,8 +30,8 @@ from vln_nav.runtime.scene_lighting import add_indoor_lighting
 from .bev import BevConfig, local_voxel_config_from_mapping, snapshot_to_robot_bev
 from .episode import EpisodeMode, EpisodeSession
 from .recorder import ControlRecord, EpisodeRecorder, SampleRecord
-from .sampling import PhysicsHistory, PhysicsState, capture_aligned_frame
-from .teleop import ContinuousTeleop, TeleopConfig
+from .sampling import PhysicsHistory, PhysicsState, capture_aligned_frame, pair_aligned_frames
+from .teleop import ContinuousTeleop, TeleopClock, TeleopConfig
 from .transforms import (
     BodyMotionEstimator,
     pose_xyyaw,
@@ -340,7 +340,7 @@ class ConstraintTraverseCollector:
         history = PhysicsHistory()
         desired = VelocityCommand()
         applied = VelocityCommand()
-        last_control_time = float(world.current_time)
+        control_clock = TeleopClock(1.0 / frequency, float(world.current_time))
 
         self.logger.info(
             "[Collector] scene=%s output=%s placement=manual map_config=%s",
@@ -397,7 +397,7 @@ class ConstraintTraverseCollector:
                     if effect:
                         desired = VelocityCommand()
                         applied = VelocityCommand()
-                        last_control_time = float(world.current_time)
+                        control_clock.reset(float(world.current_time))
                     if effect == "RESET_HISTORY":
                         history.clear()
                         measured_v, measured_w = 0.0, 0.0
@@ -465,21 +465,17 @@ class ConstraintTraverseCollector:
                     history=history,
                     after_sec=last_down_timestamp,
                 )
-                front = None if front_match is None else front_match[0]
-                down = None if down_match is None else down_match[0]
-                new_pair = (
-                    front is not None
-                    and down is not None
-                    and front.frame_index == down.frame_index
-                    and abs(front.timestamp_sec - down.timestamp_sec) <= 1.0e-6
+                pair = pair_aligned_frames(
+                    front_match, down_match,
+                    max_skew_sec=float(mapping_cfg["max_frame_skew_sec"]),
+                    not_before_sec=(session.started_at_sec if session.recording else -float("inf")),
                 )
-                if new_pair and session.recording:
-                    new_pair = front.timestamp_sec >= session.started_at_sec - 1.0e-6
-                if session.success_requested_at_sec is not None:
-                    desired = VelocityCommand()
-                elif new_pair:
-                    desired = teleop.step(max(0.0, now - last_control_time))
-                    last_control_time = now
+                new_pair = pair is not None
+                front = None if pair is None else pair.front
+                down = None if pair is None else pair.down
+                desired = control_clock.step(
+                    teleop, now, stopped=session.success_requested_at_sec is not None,
+                )
                 try:
                     applied, used_spin_fallback = _apply_velocity_command(adapter, desired)
                     if used_spin_fallback and now - last_control_fallback_log_time >= 1.0:
@@ -514,7 +510,8 @@ class ConstraintTraverseCollector:
                     EpisodeMode.RECORDING,
                 }
                 if new_pair:
-                    observation_state = front_match[1]
+                    observation_state = pair.state
+                    observation_time = max(front.timestamp_sec, down.timestamp_sec)
                     skew = abs(float(front.timestamp_sec - down.timestamp_sec))
                     if skew <= float(mapping_cfg["max_frame_skew_sec"]):
                         last_front_timestamp = float(front.timestamp_sec)
@@ -525,7 +522,7 @@ class ConstraintTraverseCollector:
                                 map_runtime_cfg["integration_period_sec"]
                             )
                             if (
-                                front.timestamp_sec - mapping_state["last_integration_time"]
+                                observation_time - mapping_state["last_integration_time"]
                                 >= integration_period
                             ):
                                 episode_map.integrate_batch(
@@ -549,7 +546,7 @@ class ConstraintTraverseCollector:
                                         observation_state.position[:3], dtype=np.float64
                                     ),
                                 )
-                                mapping_state["last_integration_time"] = front.timestamp_sec
+                                mapping_state["last_integration_time"] = observation_time
                                 map_integrated = True
                             snapshot = episode_map.snapshot()
                             latest_snapshot = snapshot
@@ -933,7 +930,7 @@ def _complete_requested_episode(
     session: EpisodeSession, recorder: EpisodeRecorder, sample: SampleRecord, collection: dict,
 ) -> Path | None:
     requested = session.success_requested_at_sec
-    if requested is None or sample.sample_time_sec <= requested + 1.0e-9:
+    if requested is None or min(sample.front_timestamp_sec, sample.down_timestamp_sec) <= requested + 1.0e-9:
         return None
     if session.sample_count < int(collection["min_success_samples"]):
         return None

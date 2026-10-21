@@ -29,9 +29,9 @@ bev:
   obstacle_max_height_m: 1.50
 
 teleop:
-  max_linear_mps: 0.50
+  max_linear_mps: 0.8
   max_angular_radps: 0.50
-  linear_accel_mps2: 0.60
+  linear_accel_mps2: 0.80
   angular_accel_radps2: 1.00
   linear_decel_mps2: 0.90
   angular_decel_radps2: 1.40

@@ -10,3 +10,4 @@ tests/
 流程.txt
 .agents
 .claude
+*.egg-info/

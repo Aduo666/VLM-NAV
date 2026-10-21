@@ -23,7 +23,7 @@ scene:
   robot_start_orientation_deg: [0.0, 0.0, 0.0]
 
 llm:
-  api_key: "sk-bduqejichuzwbbzuesgwfvwswcetzfagmfkyadbpkzykfjjh"
+  api_key: ""
   api_base_url: "https://api.siliconflow.cn/v1"
   model_name: "Qwen/Qwen3-VL-30B-A3B-Instruct"
   timeout_sec: 30

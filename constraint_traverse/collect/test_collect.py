@@ -15,6 +15,8 @@ from vln_nav.active_perception.bev_goal_map import BevGoalMap
 from vln_nav.active_perception.camera_geometry import world_from_pose_wxyz
 from vln_nav.active_perception.contracts import TimedDepthObservation
 from vln_nav.active_perception.local_geometry import LocalVoxelMap, LocalVoxelMapConfig
+from vln_nav.control.controller import SteeringDriveController
+from vln_nav.control.trajectory import AgxVelocityAdapter, VelocityCommand
 from vln_nav.runtime.agx_profile import load_agx_profile
 
 from .bev import BevConfig, snapshot_to_robot_bev
@@ -25,7 +27,10 @@ from .recorder import (
     ControlRecord, EpisodeRecorder, SampleRecord, quantize_depth_m,
     recover_episode_directory, validate_episode_directory,
 )
-from .runtime import ConstraintTraverseCollector, RuntimeOverrides, _complete_requested_episode
+from .runtime import (
+    ConstraintTraverseCollector, RuntimeOverrides, _apply_velocity_command,
+    _complete_requested_episode,
+)
 from .sampling import PhysicsHistory, PhysicsState, capture_aligned_frame, pair_aligned_frames
 from .teleop import ContinuousTeleop, TeleopClock, TeleopConfig
 from .transforms import BodyMotionEstimator, quaternion_wxyz_from_yaw
@@ -358,6 +363,226 @@ class CollectionTests(unittest.TestCase):
                     command = clock.step(teleop, tick / 60)
                 self.assertAlmostEqual(command.linear_mps, 0.)
                 self.assertAlmostEqual(command.angular_radps, 0.)
+
+    def test_combined_keys_keep_motion_with_either_press_order(self):
+        controller = load_agx_profile(project_root=PROJECT_ROOT).agx_controller.continuous
+        event_types = SimpleNamespace(KEY_PRESS=1, KEY_REPEAT=2, KEY_RELEASE=3)
+        for movement, direction, linear_sign, angular_sign in (
+            ("UP", "LEFT", 1, 1), ("UP", "RIGHT", 1, -1),
+            ("DOWN", "LEFT", -1, 1), ("DOWN", "RIGHT", -1, -1),
+            ("W", "A", 1, 1), ("W", "D", 1, -1),
+            ("S", "A", -1, 1), ("S", "D", -1, -1),
+        ):
+            for first, second in ((movement, direction), (direction, movement)):
+                with self.subTest(first=first, second=second):
+                    writes = []
+                    drive = SimpleNamespace(
+                        readback=lambda: {"steering_position": {
+                            wheel.steering_joint: 0. for wheel in controller.wheels
+                        }},
+                        apply_continuous_joint_targets=lambda motors, steering: writes.append((motors, steering)),
+                    )
+                    adapter = AgxVelocityAdapter(drive, controller)
+                    teleop = ContinuousTeleop(TeleopConfig.from_mapping(self.config["teleop"]))
+                    teleop._carb_input = SimpleNamespace(KeyboardEventType=event_types)
+                    clock = TeleopClock(1 / 15, 0.)
+                    timestamp = 0.
+
+                    def key_event(key, event_type):
+                        teleop._on_keyboard_event(SimpleNamespace(
+                            input=SimpleNamespace(name=key), type=event_type,
+                        ))
+
+                    def advance():
+                        nonlocal timestamp
+                        timestamp += 1 / 15
+                        desired = clock.step(teleop, timestamp)
+                        write_count = len(writes)
+                        applied, _ = _apply_velocity_command(adapter, desired)
+                        self.assertEqual(len(writes), write_count + 1)
+                        self.assertLessEqual(
+                            max(map(abs, writes[-1][1].values())),
+                            controller.max_steering_rad + 1e-9,
+                        )
+                        return applied
+
+                    key_event(first, event_types.KEY_PRESS)
+                    for _ in range(15):
+                        advance()
+                    for remaining, released in ((second, first), (first, second)):
+                        key_event(released, event_types.KEY_PRESS)
+                        key_event(remaining, event_types.KEY_PRESS)
+                        for _ in range(15):
+                            applied = advance()
+                            self.assertGreater(linear_sign * applied.linear_mps, 0.)
+                            self.assertGreater(angular_sign * applied.angular_radps, 0.)
+                        key_event(released, event_types.KEY_RELEASE)
+                        for _ in range(15):
+                            applied = advance()
+                        if remaining == movement:
+                            self.assertGreater(linear_sign * applied.linear_mps, .45)
+                            self.assertAlmostEqual(applied.angular_radps, 0.)
+                        else:
+                            self.assertAlmostEqual(applied.linear_mps, 0.)
+                            self.assertGreater(angular_sign * applied.angular_radps, .45)
+                    key_event(first, event_types.KEY_RELEASE)
+                    for _ in range(15):
+                        applied = advance()
+                    self.assertEqual(applied, VelocityCommand())
+
+    def test_low_speed_turn_preserves_translation(self):
+        controller = load_agx_profile(project_root=PROJECT_ROOT).agx_controller.continuous
+        for linear, angular in ((.04067796468734741, -.18983051180839539), (.06101695075631142, .4067796468734741)):
+            for linear_sign in (-1, 1):
+                with self.subTest(linear=linear * linear_sign, angular=angular):
+                    writes = []
+                    drive = SimpleNamespace(
+                        readback=lambda: {"steering_position": {
+                            wheel.steering_joint: 0. for wheel in controller.wheels
+                        }},
+                        apply_continuous_joint_targets=lambda motors, steering: writes.append((motors, steering)),
+                    )
+                    desired = VelocityCommand(linear * linear_sign, angular)
+                    applied, limited = _apply_velocity_command(AgxVelocityAdapter(drive, controller), desired)
+                    self.assertTrue(limited)
+                    self.assertAlmostEqual(applied.linear_mps, desired.linear_mps)
+                    self.assertGreater(applied.angular_radps * desired.angular_radps, 0.)
+                    self.assertLess(abs(applied.angular_radps), abs(desired.angular_radps))
+                    self.assertEqual(len(writes), 1)
+
+    def test_teleop_reads_all_held_arrow_keys_when_events_are_missing(self):
+        held = {"UP", "LEFT"}
+        teleop = ContinuousTeleop(TeleopConfig.from_mapping(self.config["teleop"]))
+        teleop._keyboard = object()
+        teleop._input = SimpleNamespace(get_keyboard_value=lambda keyboard, key: float(key in held))
+        teleop._carb_input = SimpleNamespace(KeyboardInput=SimpleNamespace(**{
+            name: name for name in teleop._KEYS
+        }))
+        teleop._pressed_keys = {"LEFT"}
+        for _ in range(15):
+            command = teleop.step(1 / 15)
+        self.assertAlmostEqual(command.linear_mps, .5)
+        self.assertAlmostEqual(command.angular_radps, .5)
+        held.remove("UP")
+        for _ in range(15):
+            command = teleop.step(1 / 15)
+        self.assertAlmostEqual(command.linear_mps, 0.)
+        self.assertAlmostEqual(command.angular_radps, .5)
+        held.clear()
+        for _ in range(15):
+            command = teleop.step(1 / 15)
+        self.assertEqual(command, VelocityCommand())
+
+    def test_teleop_reserves_driving_keys_and_releases_them_for_placement(self):
+        event_types = SimpleNamespace(KEY_PRESS=1, KEY_REPEAT=2, KEY_RELEASE=3)
+        teleop = ContinuousTeleop(TeleopConfig.from_mapping(self.config["teleop"]))
+        teleop._carb_input = SimpleNamespace(KeyboardEventType=event_types)
+        up_event = SimpleNamespace(input=SimpleNamespace(name="UP"), type=event_types.KEY_PRESS)
+        self.assertFalse(teleop._on_keyboard_event(up_event))
+        self.assertGreater(teleop.step(1 / 15).linear_mps, 0.)
+        teleop.set_enabled(False)
+        self.assertEqual(teleop.command, VelocityCommand())
+        self.assertTrue(teleop._on_keyboard_event(up_event))
+        self.assertEqual(teleop.step(1.), VelocityCommand())
+        teleop.set_enabled(True)
+        self.assertFalse(teleop._on_keyboard_event(up_event))
+        self.assertGreater(teleop.step(1 / 15).linear_mps, 0.)
+
+    def test_releasing_all_keys_stops_and_centers_wheels(self):
+        controller = load_agx_profile(project_root=PROJECT_ROOT).agx_controller.continuous
+        event_types = SimpleNamespace(KEY_PRESS=1, KEY_REPEAT=2, KEY_RELEASE=3)
+        for keys, press_steps in (
+            (("LEFT",), 7), (("RIGHT",), 7),
+            (("LEFT",), 15), (("RIGHT",), 15),
+            (("UP", "LEFT"), 15), (("UP", "RIGHT"), 15),
+            (("DOWN", "LEFT"), 15), (("DOWN", "RIGHT"), 15),
+        ):
+            with self.subTest(keys=keys, press_steps=press_steps):
+                writes = []
+                drive = SimpleNamespace(
+                    readback=lambda: {"steering_position": {
+                        wheel.steering_joint: 0. for wheel in controller.wheels
+                    }},
+                    apply_continuous_joint_targets=lambda motors, steering: writes.append((dict(motors), dict(steering))),
+                )
+                adapter = AgxVelocityAdapter(drive, controller)
+                teleop = ContinuousTeleop(TeleopConfig.from_mapping(self.config["teleop"]))
+                teleop._carb_input = SimpleNamespace(KeyboardEventType=event_types)
+                for key in keys:
+                    teleop._on_keyboard_event(SimpleNamespace(input=SimpleNamespace(name=key), type=event_types.KEY_PRESS))
+                for _ in range(press_steps):
+                    _apply_velocity_command(adapter, teleop.step(1 / 15))
+                steering = writes[-1][1]
+                self.assertGreater(max(map(abs, steering.values())), .1)
+                for key in keys:
+                    teleop._on_keyboard_event(SimpleNamespace(input=SimpleNamespace(name=key), type=event_types.KEY_RELEASE))
+                for _ in range(20):
+                    applied, _ = _apply_velocity_command(adapter, teleop.step(1 / 15))
+                self.assertEqual(applied, VelocityCommand())
+                self.assertTrue(all(value == 0. for value in writes[-1][0].values()))
+                self.assertTrue(all(value == 0. for value in writes[-1][1].values()))
+                adapter.stop()
+                self.assertTrue(all(value == 0. for value in writes[-1][1].values()))
+                teleop._on_keyboard_event(SimpleNamespace(input=SimpleNamespace(name="UP"), type=event_types.KEY_PRESS))
+                for _ in range(15):
+                    applied, _ = _apply_velocity_command(adapter, teleop.step(1 / 15))
+                self.assertGreater(applied.linear_mps, .45)
+                self.assertTrue(all(value == 0. for value in writes[-1][1].values()))
+
+    def test_velocity_adapter_stops_with_all_wheels_forward(self):
+        controller = load_agx_profile(project_root=PROJECT_ROOT).agx_controller.continuous
+        initial = {wheel.steering_joint: .2 for wheel in controller.wheels}
+        writes = []
+        drive = SimpleNamespace(
+            readback=lambda: {"steering_position": dict(initial)},
+            apply_continuous_joint_targets=lambda motors, steering: writes.append((dict(motors), dict(steering))),
+        )
+        adapter = AgxVelocityAdapter(drive, controller)
+        self.assertEqual(adapter.apply(VelocityCommand()), VelocityCommand())
+        self.assertTrue(all(value == 0. for value in writes[-1][0].values()))
+        self.assertTrue(all(value == 0. for value in writes[-1][1].values()))
+        adapter.apply(VelocityCommand(.3, .2))
+        self.assertTrue(any(abs(value) > .1 for value in writes[-1][1].values()))
+        adapter.stop()
+        self.assertTrue(all(value == 0. for value in writes[-1][0].values()))
+        self.assertTrue(all(value == 0. for value in writes[-1][1].values()))
+
+    def test_parking_centering_increases_steering_torque_and_restores_it_for_driving(self):
+        config = load_agx_profile(project_root=PROJECT_ROOT).agx_controller.continuous
+        for centering_effort in (None, 50.):
+            with self.subTest(centering_effort=centering_effort):
+                drive = SteeringDriveController.__new__(SteeringDriveController)
+                drive._wheel_dofs = {wheel.drive_joint: index for index, wheel in enumerate(config.wheels)}
+                drive._steering_dofs = {config.wheels[0].steering_joint: 4, config.wheels[1].steering_joint: 5}
+                drive._passive_steering_dofs = {config.wheels[2].steering_joint: 6, config.wheels[3].steering_joint: 7}
+                drive.steering_centering_max_effort_nm = centering_effort
+                drive._steering_centering_active = False
+                drive._steering_centering_original_efforts = {}
+                properties = {index: SimpleNamespace(max_effort=5., stiffness=100., damping=10.) for index in range(4, 8)}
+                writes = []
+
+                def set_properties(dof, value):
+                    properties[dof] = value
+                    writes.append((dof, value.max_effort))
+                    return True
+
+                drive._dc = SimpleNamespace(
+                    get_dof_properties=lambda dof: SimpleNamespace(**vars(properties[dof])),
+                    set_dof_properties=set_properties,
+                )
+                motors = {wheel.drive_joint: 0. for wheel in config.wheels}
+                steering = {wheel.steering_joint: 0. for wheel in config.wheels}
+                with patch.object(drive, "_apply_targets"):
+                    drive.apply_continuous_joint_targets(motors, steering)
+                    expected = 5. if centering_effort is None else 50.
+                    self.assertTrue(all(value.max_effort == expected for value in properties.values()))
+                    write_count = len(writes)
+                    drive.apply_continuous_joint_targets(motors, steering)
+                    self.assertEqual(len(writes), write_count)
+                    drive.apply_continuous_joint_targets({name: 1. for name in motors}, steering)
+                    self.assertTrue(all(value.max_effort == 5. for value in properties.values()))
+                    self.assertTrue(all(value.stiffness == 100. and value.damping == 10. for value in properties.values()))
+                    self.assertEqual(len(writes), 0 if centering_effort is None else 8)
 
     def test_map_click_uses_displayed_pose(self):
         panel = CollectorPanel.__new__(CollectorPanel)

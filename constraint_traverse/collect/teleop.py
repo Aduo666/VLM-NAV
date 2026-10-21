@@ -50,6 +50,7 @@ class ContinuousTeleop:
         self._subscription = None
         self._input = None
         self._keyboard = None
+        self._enabled = True
 
     def bind_keyboard(self) -> None:
         import carb.input
@@ -62,8 +63,8 @@ class ContinuousTeleop:
         self._keyboard = keyboard
         self._input = carb.input.acquire_input_interface()
         self._carb_input = carb.input
-        self._subscription = self._input.subscribe_to_keyboard_events(
-            keyboard, self._on_keyboard_event
+        self._subscription = self._input.subscribe_to_input_events(
+            self._on_input_event, device=keyboard, order=0,
         )
 
     def shutdown(self) -> None:
@@ -72,10 +73,7 @@ class ContinuousTeleop:
             and self._input is not None
             and self._keyboard is not None
         ):
-            self._input.unsubscribe_to_keyboard_events(
-                self._keyboard,
-                self._subscription,
-            )
+            self._input.unsubscribe_to_input_events(self._subscription)
         self._subscription = None
         self._input = None
         self._keyboard = None
@@ -85,11 +83,26 @@ class ContinuousTeleop:
         self._linear = 0.0
         self._angular = 0.0
 
+    def set_enabled(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if self._enabled != enabled:
+            self._enabled = enabled
+            self.reset()
+
     @property
     def command(self) -> VelocityCommand:
         return VelocityCommand(float(self._linear), float(self._angular))
 
     def step(self, dt: float) -> VelocityCommand:
+        if not self._enabled:
+            return VelocityCommand()
+        if self._input is not None and self._keyboard is not None:
+            self._pressed_keys = {
+                name for name in self._KEYS
+                if self._input.get_keyboard_value(
+                    self._keyboard, getattr(self._carb_input.KeyboardInput, name),
+                ) > .5
+            }
         dt = max(float(dt), 0.0)
         forward = int(bool(self._pressed_keys & self._FORWARD_KEYS)) - int(
             bool(self._pressed_keys & self._BACKWARD_KEYS)
@@ -111,7 +124,12 @@ class ContinuousTeleop:
         )
         return self.command
 
+    def _on_input_event(self, event, *_args, **_kwargs) -> bool:
+        return self._on_keyboard_event(event.event)
+
     def _on_keyboard_event(self, event, *_args, **_kwargs) -> bool:
+        if not self._enabled:
+            return True
         key_input = event.input
         key_name = str(getattr(key_input, "name", key_input))
         if key_name not in self._KEYS:
@@ -123,7 +141,8 @@ class ContinuousTeleop:
             self._pressed_keys.add(key_name)
         elif event.type == self._carb_input.KeyboardEventType.KEY_RELEASE:
             self._pressed_keys.discard(key_name)
-        return True
+        # 驾驶期间由小车处理这些按键，防止同时触发编辑工具。
+        return False
 
 
 class TeleopClock:

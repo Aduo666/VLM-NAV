@@ -11,6 +11,7 @@ import yaml
 from vln_nav.active_perception.bev_goal_map import render_bev_goal_map
 from vln_nav.active_perception.contracts import TimedDepthObservation
 from vln_nav.active_perception.local_geometry import LocalVoxelMap, LocalVoxelMapConfig
+from vln_nav.control.fine_path_tracker import fit_agx_command
 from vln_nav.control.locomotion import create_locomotion_controller
 from vln_nav.control.trajectory import AgxVelocityAdapter, VelocityCommand
 from vln_nav.runtime.agx_geometry import validate_agx_geometry
@@ -171,7 +172,7 @@ class ConstraintTraverseCollector:
         spawn = self.config["spawn"]
         scene_bounds = _scene_world_bounds(stage, str(scene["prim_path"]))
         holding_xy = 0.5 * (scene_bounds[0][:2] + scene_bounds[1][:2])
-        holding_z = float(scene_bounds[1][2]) + float(spawn["holding_height_m"])
+        holding_z = float(profile.spawn_z_m)
         set_local_xform(
             stage=stage,
             prim_path=profile.asset.prim_path,
@@ -252,6 +253,7 @@ class ConstraintTraverseCollector:
 
         world.reset()
         robot.initialize()
+        world.pause()
         for camera in (front_camera, down_camera):
             camera.initialize()
             camera.add_distance_to_image_plane_to_frame()
@@ -261,6 +263,10 @@ class ConstraintTraverseCollector:
             dtype=np.float32,
         )
         holding_orientation = quaternion_wxyz_from_yaw(0.0)
+        self.logger.info(
+            "[CollectorPlacement] 初始车体中心位置=%s",
+            holding_position.tolist(),
+        )
         for _ in range(int(spawn["query_warmup_frames"])):
             robot.set_world_pose(
                 position=holding_position,
@@ -285,10 +291,12 @@ class ConstraintTraverseCollector:
             articulation_path=articulation_path,
             available_joint_names=get_joint_names(robot),
             logger=self.logger,
+            steering_centering_max_effort_nm=float(collection["steering_centering_max_effort_nm"]),
         )
         adapter = AgxVelocityAdapter(drive, profile.agx_controller.continuous)
         teleop = ContinuousTeleop(teleop_cfg)
         teleop.bind_keyboard()
+        teleop.set_enabled(False)
 
         command_queue: list[object] = []
         panel = CollectorPanel(
@@ -336,7 +344,7 @@ class ConstraintTraverseCollector:
         frame_index = 0
         mapping_state = {"last_integration_time": -float("inf")}
         last_map_render_time = -float("inf")
-        last_control_fallback_log_time = -float("inf")
+        last_control_limit_log_time = -float("inf")
         history = PhysicsHistory()
         desired = VelocityCommand()
         applied = VelocityCommand()
@@ -348,8 +356,6 @@ class ConstraintTraverseCollector:
             self.overrides.output_root,
             self.project_root / "configs/navigation.yaml",
         )
-        world.pause()
-
         try:
             while self.app.is_running():
                 now = float(world.current_time)
@@ -414,6 +420,7 @@ class ConstraintTraverseCollector:
                         motion.update(pose, now)
                     latest_snapshot = episode_map.snapshot()
 
+                teleop.set_enabled(world.is_playing() and session.robot_placed and not session.placing)
                 ui_now = time.monotonic()
                 if not world.is_playing():
                     adapter.stop()
@@ -477,14 +484,14 @@ class ConstraintTraverseCollector:
                     teleop, now, stopped=session.success_requested_at_sec is not None,
                 )
                 try:
-                    applied, used_spin_fallback = _apply_velocity_command(adapter, desired)
-                    if used_spin_fallback and now - last_control_fallback_log_time >= 1.0:
+                    applied, command_limited = _apply_velocity_command(adapter, desired)
+                    if command_limited and now - last_control_limit_log_time >= 1.0:
                         self.logger.info(
                             "[CollectorControl] desired=[%.3f,%.3f] applied=[%.3f,%.3f]",
                             desired.linear_mps, desired.angular_radps,
                             applied.linear_mps, applied.angular_radps,
                         )
-                        last_control_fallback_log_time = now
+                        last_control_limit_log_time = now
                 except Exception as exc:
                     self.logger.error("[CollectorControl] command rejected: %s", exc)
                     teleop.reset()
@@ -712,7 +719,7 @@ class ConstraintTraverseCollector:
                 teleop.reset()
                 adapter.stop()
                 session.begin_born_placement()
-                _select_prim(articulation_path)
+                _select_robot_for_placement(articulation_path)
                 world.pause()
                 self.logger.info("[CollectorPlacement] robot placement started")
                 return "RESET_CONTROL", current_episode_id
@@ -987,9 +994,11 @@ def _world_pose_from_prim(stage, prim_path: str) -> tuple[np.ndarray, np.ndarray
     return position, orientation
 
 
-def _select_prim(prim_path: str) -> None:
+def _select_robot_for_placement(prim_path: str) -> None:
+    import carb.settings
     import omni.usd
 
+    carb.settings.get_settings().set_bool("/app/viewport/snapEnabled", False)
     omni.usd.get_context().get_selection().set_selected_prim_paths(
         [str(prim_path)],
         True,
@@ -1037,16 +1046,5 @@ def _apply_velocity_command(
     adapter: AgxVelocityAdapter,
     desired: VelocityCommand,
 ) -> tuple[VelocityCommand, bool]:
-    try:
-        return adapter.apply(desired), False
-    except ValueError as exc:
-        if (
-            "Requested curvature exceeds AGX steering limit" not in str(exc)
-            or abs(float(desired.angular_radps)) <= 1.0e-9
-        ):
-            raise
-        fallback = VelocityCommand(
-            linear_mps=0.0,
-            angular_radps=float(desired.angular_radps),
-        )
-        return adapter.apply(fallback), True
+    command = fit_agx_command(desired, adapter.config)
+    return adapter.apply(command), command != desired

@@ -169,6 +169,7 @@ class SteeringDriveController:
     hold_joint_stiffness: float
     hold_joint_damping: float
     logger: logging.Logger
+    steering_centering_max_effort_nm: float | None = None
 
     def __post_init__(self) -> None:
         from omni.isaac.dynamic_control import _dynamic_control
@@ -191,6 +192,13 @@ class SteeringDriveController:
         self._rear_right_steering_names = [name for name in self.passive_steering_joint_names if _joint_side(name) == "right"]
         self._steering_reset_pending = False
         self._steering_reset_threshold_rad = 0.05
+        self._steering_centering_active = False
+        self._steering_centering_original_efforts: dict[str, float] = {}
+        if self.steering_centering_max_effort_nm is not None and (
+            not np.isfinite(self.steering_centering_max_effort_nm)
+            or self.steering_centering_max_effort_nm <= 0
+        ):
+            raise ValueError("停车回正力矩上限必须为有限正数")
 
         self._configure_joint_drives(
             joint_names=[*self.left_wheel_joint_names, *self.right_wheel_joint_names],
@@ -284,11 +292,34 @@ class SteeringDriveController:
             raise ValueError("Continuous command must specify every wheel and steering joint")
         if not all(np.isfinite(v) for v in [*wheel_targets.values(), *steering_targets.values()]):
             raise ValueError("Non-finite continuous joint target")
+        stopped = all(abs(v) < 1e-9 for v in wheel_targets.values())
+        self._update_steering_centering_effort(
+            stopped and all(abs(value) < 1e-9 for value in steering_targets.values())
+        )
         self._apply_targets(
             wheel_targets=wheel_targets,
             steering_targets=steering_targets,
-            force_wheel_state=all(abs(v) < 1e-9 for v in wheel_targets.values()),
+            force_wheel_state=stopped,
         )
+
+    def _update_steering_centering_effort(self, enabled: bool) -> None:
+        if self.steering_centering_max_effort_nm is None or enabled == self._steering_centering_active:
+            return
+        for name, dof in {**self._steering_dofs, **self._passive_steering_dofs}.items():
+            properties = self._dc.get_dof_properties(dof)
+            if enabled:
+                self._steering_centering_original_efforts.setdefault(name, float(properties.max_effort))
+                properties.max_effort = max(
+                    self._steering_centering_original_efforts[name],
+                    float(self.steering_centering_max_effort_nm),
+                )
+            else:
+                properties.max_effort = self._steering_centering_original_efforts[name]
+            if not self._dc.set_dof_properties(dof, properties):
+                raise RuntimeError(f"无法设置转向关节的回正力矩：{name}")
+        self._steering_centering_active = enabled
+        if not enabled:
+            self._steering_centering_original_efforts.clear()
 
     def release_hold_joints(self, joint_names: Iterable[str]) -> None:
         """Transfer selected non-drive joints to an external controller.

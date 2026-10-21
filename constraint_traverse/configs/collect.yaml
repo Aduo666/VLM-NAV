@@ -9,9 +9,8 @@ scene:
   stage_load_timeout_sec: 120.0
   add_indoor_lighting: true
 
-# 手动放置期间机器人停留高度，以及恢复物理后的稳定帧数。
+# 启动预热帧数，以及确认放置后恢复物理的稳定帧数。
 spawn:
-  holding_height_m: 5.0
   query_warmup_frames: 8
   settle_frames: 12
 
@@ -44,6 +43,8 @@ collection:
   min_success_samples: 5
   start_max_linear_mps: 0.05
   start_max_angular_radps: 0.08
+  # 停车回正时转向关节的最大力矩，单位为牛米；驾驶时恢复模型原有设置。
+  steering_centering_max_effort_nm: 50.0
   # 单帧深度图中有效像素所需的最低比例。
   min_depth_valid_ratio: 0.02
   # 第一帧与 START 位姿、最后一帧与结束位姿允许的位置误差，单位为米。

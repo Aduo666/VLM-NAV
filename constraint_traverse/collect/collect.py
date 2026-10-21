@@ -124,7 +124,6 @@ def _validate_top_level_config(data: dict) -> None:
 
     spawn = data["spawn"]
     required_spawn = {
-        "holding_height_m",
         "query_warmup_frames",
         "settle_frames",
     }
@@ -147,6 +146,7 @@ def _validate_top_level_config(data: dict) -> None:
         "min_success_samples",
         "start_max_linear_mps",
         "start_max_angular_radps",
+        "steering_centering_max_effort_nm",
         "min_depth_valid_ratio",
         "endpoint_position_tolerance_m",
         "endpoint_yaw_tolerance_deg",

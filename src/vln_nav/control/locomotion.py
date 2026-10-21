@@ -28,6 +28,7 @@ def create_locomotion_controller(
     articulation_path: str,
     available_joint_names: list[str],
     logger: logging.Logger,
+    steering_centering_max_effort_nm: float | None = None,
 ) -> LocomotionController:
     agx = profile.agx_controller
     left_names, right_names, steering_names, error_message = resolve_wheel_joint_groups(
@@ -70,6 +71,7 @@ def create_locomotion_controller(
         hold_joint_stiffness=agx.hold_joint_stiffness,
         hold_joint_damping=agx.hold_joint_damping,
         logger=logger,
+        steering_centering_max_effort_nm=steering_centering_max_effort_nm,
     )
     logger.info(
         "[DriveConfig] profile=%s type=%s left_wheels=%s right_wheels=%s "

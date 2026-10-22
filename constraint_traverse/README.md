@@ -256,3 +256,87 @@ python -m constraint_traverse.collect.validate \
 - [configs/collect.yaml](configs/collect.yaml)：采集时的速度、加减速、录制时长和数据检查要求。
 - [configs/navigation.yaml](../configs/navigation.yaml)：相机图像尺寸、更新频率、地图尺寸和地图更新周期。
 - [configs/robots/agx.yaml](../configs/robots/agx.yaml)：小车模型、相机位置和轮组参数。
+
+## 使用 Isaac Lab 训练
+
+训练工具位于 `constraint_traverse/isaaclab_training/`。使用 Isaac Sim 5.1.0、Isaac Lab 官方 v2.3.2、RSL-RL 3.1.2 和 PyTorch 2.7.0。BC 学习人工给出的目标速度，输出继续经过原有轮组计算和底盘约束。
+
+现有 57 条示范全部参加训练。验证和测试使用另外采集的数据。策略读取 BEV、目标相对位置、车辆速度、关节状态、上一动作和地图年龄；主模型包含 CNN、MLP 和 LSTM。
+
+以下命令在项目根目录运行。专用训练环境和 Isaac Lab 源码位于 `/Data/qiang/constraint_traverse_training`。
+
+```bash
+cd /home/Lab/qiangsibin/VLM-NAV-active
+conda activate /Data/qiang/constraint_traverse_training/env
+export ISAACLAB_PATH=/Data/qiang/constraint_traverse_training/IsaacLab
+```
+
+检查数据并生成缓存：
+
+```bash
+python -m constraint_traverse.isaaclab_training prepare \
+  --dataset /Data/qiang/data/constraint_traverse
+```
+
+这条命令检查数据完整性、控制周期、动作接口、地图时间及 BEV 重建。缓存保存在专用训练目录的 `cache` 中，原始采集数据保留。
+
+运行模型和 PPO 接口测试：
+
+```bash
+python -m constraint_traverse.isaaclab_training check
+```
+
+启动 Isaac Lab 仿真前，加载已有 Isaac Sim 的运行环境：
+
+```bash
+source /Data/qiang/isaacsim5.1.0/setup_conda_env.sh
+```
+
+使用真实房间、机器人和相机执行仿真验收：
+
+```bash
+python -m constraint_traverse.isaaclab_training check-sim \
+  --dataset /Data/qiang/data/constraint_traverse/kujiale_0067/episode_000001
+```
+
+这条命令执行初始状态恢复、相机和地图检查、临时 BC 更新、检查点恢复、Actor 权重迁移，以及一次完整 PPO 采样和更新。还会检查停稳到达、超时价值补偿和真实障碍物碰撞。检查使用的临时模型自动清理。
+
+相机通过 Replicator 同步取得图像，取图期间保持物理时间不变。地图在物理步中处理新帧，策略读取决策前已经完成融合的地图。碰撞通过官方 PhysX 接触视图读取，并按接触对象区分地面和障碍物。
+
+正式启动 BC 训练：
+
+```bash
+python -m constraint_traverse.isaaclab_training train \
+  --model lstm --device cuda:0 --seed 0 --epochs 200 \
+  --output /Data/qiang/constraint_traverse_training/runs/bc_lstm_seed0
+```
+
+`--epochs` 表示完整使用训练数据的次数，`--batch-size` 默认同时处理 8 条示范。`last.pt` 保存最近完成的一轮，每 10 轮另存一个检查点。检查点包含模型、归一化参数、数据清单、优化器和随机状态。
+
+恢复训练时，`--epochs` 填写希望最终完成的总轮数：
+
+```bash
+python -m constraint_traverse.isaaclab_training train \
+  --model lstm --device cuda:0 --epochs 200 \
+  --resume /Data/qiang/constraint_traverse_training/runs/bc_lstm_seed0/last.pt \
+  --output /Data/qiang/constraint_traverse_training/runs/bc_lstm_seed0
+```
+
+运行 CNN＋MLP 对照模型时，将 `--model` 改为 `mlp`，并指定另外的输出目录。两个模型使用相同的数据、随机种子和评估任务。
+
+闭环评估命令中的数据目录填写另外采集的验证集或测试集：
+
+```bash
+python -m constraint_traverse.isaaclab_training evaluate \
+  --checkpoint /Data/qiang/constraint_traverse_training/runs/bc_lstm_seed0/last.pt \
+  --dataset /Data/qiang/data/constraint_traverse_validation \
+  --perturbations 3 --seed 0
+```
+
+评估执行原始起点和扰动起点，扰动位置半径为 0.1 米、朝向范围为正负 5 度，并检查起点附近的障碍物。每个回合恢复对应的历史地图。结果显示成功率、碰撞率、超时率、停滞率、耗时、终点误差和轨迹长度。添加 `--gui` 可以显示仿真窗口；添加 `--output 文件路径.json` 可以保存结果。
+
+到达要求距离目标不超过 0.15 米、实际线速度不超过 0.05 m/s、角速度不超过 0.08 rad/s，连续保持 0.3 秒。有效障碍物碰撞结束回合，60 秒超时记录为截断。碰撞、成功和超时使用明确的判定优先级，终止统计在自动重置前保存。
+
+严格统计指定门洞的通过率时，通过 `--doors 标注文件.json` 提供门洞标注。JSON 的键是 `场景名称/episode_编号`，值是该轨迹需要经过的门洞列表；每个门洞包含 `center_world_xy`、`normal_world_xy`、`width_m`、`thickness_m`。方向指向门洞出口，坐标和尺寸使用米。结果记录标注数量和整车通过数量。
+
+PPO 接入验收复用 BC 的 Actor。正式 PPO 训练的奖励权重和训练预算在 BC 闭环评估后确定。

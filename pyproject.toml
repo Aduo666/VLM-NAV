@@ -18,6 +18,12 @@ dependencies = [
 
 [project.optional-dependencies]
 simulation = ["isaacsim[all,extscache]==5.1.0"]
+isaaclab-training = [
+    "torch==2.7.0",
+    "torchvision==0.22.0",
+    "rsl-rl-lib==3.1.2",
+    "tensordict>=0.7.0",
+]
 
 [tool.setuptools]
 include-package-data = false

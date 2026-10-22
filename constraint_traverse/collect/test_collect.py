@@ -461,7 +461,7 @@ class CollectionTests(unittest.TestCase):
         teleop._pressed_keys = {"LEFT"}
         for _ in range(15):
             command = teleop.step(1 / 15)
-        self.assertAlmostEqual(command.linear_mps, .5)
+        self.assertAlmostEqual(command.linear_mps, self.config['teleop']['max_linear_mps'])
         self.assertAlmostEqual(command.angular_radps, .5)
         held.remove("UP")
         for _ in range(15):

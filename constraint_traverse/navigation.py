@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from concurrent.futures import ProcessPoolExecutor
 import logging
 import math
 import multiprocessing
@@ -21,6 +20,7 @@ from constraint_traverse.benchmark.planner import PassageCost, SamplingPlanner
 from constraint_traverse.benchmark.run import load_config
 from constraint_traverse.collect.transforms import pose_xyyaw
 from constraint_traverse.reference_path import ReferencePath, ReferenceWindow
+from constraint_traverse.lifecycle import exit_with_parent
 from vln_nav.control.trajectory import VelocityCommand
 
 
@@ -114,9 +114,23 @@ def _initialize_sampling_process(spec):
     _PROCESS_WORKER = _PlanningWorker(owner)
 
 
-def _compute_in_sampling_process(job):
-    _PROCESS_WORKER._run(job)
-    return _PROCESS_WORKER.results.get_nowait()
+def _sampling_process_main(spec, requests, replies, stop_requested):
+    exit_with_parent()
+    replies.cancel_join_thread()
+    if stop_requested.is_set():
+        return
+    _initialize_sampling_process(spec)
+    while not stop_requested.is_set():
+        try:
+            job = requests.get(timeout=0.1)
+        except queue.Empty:
+            continue
+        if job is None:
+            return
+        _PROCESS_WORKER._run(job)
+        result = _PROCESS_WORKER.results.get_nowait()
+        if not stop_requested.is_set():
+            replies.put(result)
 
 
 class _PlanningWorker:
@@ -128,34 +142,40 @@ class _PlanningWorker:
         self.lock = threading.Lock()
         self.busy = False
         self.closed = False
-        self.thread = None
-        self.executor = None
+        self.process = None
+        self.requests = self.replies = self.stop_requested = None
 
     def submit(self, job):
         with self.lock:
             if self.busy or self.closed:
                 return False
             self.busy = True
-        try:
-            if self.executor is None:
-                spec = {name: getattr(self.owner, name) for name in
-                        ("method", "hardware", "config", "limits", "planning_period", "physics_dt", "footprint")}
-                self.executor = ProcessPoolExecutor(max_workers=1, mp_context=multiprocessing.get_context("spawn"),
-                    initializer=_initialize_sampling_process, initargs=(spec,))
-            future = self.executor.submit(_compute_in_sampling_process, job)
-            future.add_done_callback(lambda result: self._completed(job, result))
-        except Exception as error:
-            self.results.put((job.epoch, job.timestamp, job.grid.map_version, None, error, job.state))
-            with self.lock:
+            try:
+                if self.process is None:
+                    spec = {name: getattr(self.owner, name) for name in
+                            ("method", "hardware", "config", "limits", "planning_period", "physics_dt", "footprint")}
+                    context = multiprocessing.get_context("spawn")
+                    self.requests, self.replies = context.Queue(), context.Queue()
+                    self.stop_requested = context.Event()
+                    self.process = context.Process(target=_sampling_process_main,
+                        args=(spec, self.requests, self.replies, self.stop_requested),
+                        name=f"navigation-{self.owner.method}", daemon=True)
+                    self.process.start()
+                self.requests.put_nowait(job)
+            except Exception as error:
+                self.results.put((job.epoch, job.timestamp, job.grid.map_version, None, error, job.state))
                 self.busy = False
         return True
 
-    def _completed(self, job, future):
-        try:
-            self.results.put(future.result())
-        except Exception as error:
-            self.results.put((job.epoch, job.timestamp, job.grid.map_version, None, error, job.state))
-        finally:
+    def poll(self):
+        if self.replies is None or self.closed:
+            return
+        while True:
+            try:
+                result = self.replies.get_nowait()
+            except queue.Empty:
+                break
+            self.results.put(result)
             with self.lock:
                 self.busy = False
 
@@ -200,11 +220,33 @@ class _PlanningWorker:
 
     def close(self, wait=False):
         with self.lock:
+            if self.closed:
+                return
             self.closed = True
-        if wait and self.thread is not None:
-            self.thread.join()
-        if self.executor is not None:
-            self.executor.shutdown(wait=wait, cancel_futures=True)
+            process = self.process
+            if self.stop_requested is not None:
+                self.stop_requested.set()
+            if self.requests is not None:
+                self.requests.put_nowait(None)
+        try:
+            if process is not None and process.pid is not None:
+                process.join(timeout=2.0 if wait else 0.1)
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=1.0)
+                if process.is_alive():
+                    process.kill()
+                    process.join(timeout=1.0)
+                if process.is_alive():
+                    raise RuntimeError(f"规划子进程未能退出：{process.pid}")
+                process.close()
+        finally:
+            for channel in (self.requests, self.replies):
+                if channel is not None:
+                    channel.cancel_join_thread()
+                    channel.close()
+            self.process = None
+            self.busy = False
 
 
 class SamplingNavigationController:
@@ -280,6 +322,7 @@ class SamplingNavigationController:
                     self.last_plan = self.plan_timestamp = None
                     self.last_planning_time = -float("inf")
                 self._segment_key = segment_key
+        self._worker.poll()
         while not self._worker.results.empty():
             epoch, timestamp, version, result, error, predicted_start = self._worker.results.get_nowait()
             if epoch != self._epoch:

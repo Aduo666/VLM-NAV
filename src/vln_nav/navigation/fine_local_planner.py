@@ -600,6 +600,7 @@ class FineLocalPlanner:
         initial_speed_mps: float = 0.0,
         reaction_time_sec: float = 0.25,
         braking_deceleration_mps2: float = 0.60,
+        cancel_requested=None,
     ) -> FinePlan:
         start = np.asarray(start_pose_world, dtype=np.float64)
         goal = np.asarray(goal_world_xy, dtype=np.float64)
@@ -677,6 +678,8 @@ class FineLocalPlanner:
         rejected_unknown_mask = np.zeros(grid.shape, dtype=bool)
 
         while queue and expanded < self.config.max_expansions:
+            if cancel_requested is not None and cancel_requested():
+                raise FinePlanningFailure("细粒度搜索已取消", reason="CANCELLED", action_diagnostics=())
             if (
                 partial_candidates
                 and expanded >= self.config.partial_search_max_expansions

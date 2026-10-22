@@ -63,6 +63,8 @@ MPPI/KMPPI 依赖通过 `python -m pip install -r constraint_traverse/benchmark/
 
 MPPI/KMPPI 在独立进程计算，每个预测动作按物理步长积分。根据近期求解延迟和已提交控制预测接续状态，结果接收时从控制序列首项执行，并记录位置、速度和轮角接续误差。KMPPI 使用 `ConsistentKMPPI` 保持支撑点与控制序列一致。已知无障碍参考路线用于确定可用的柔性间距目标，障碍侵入代价独立计算。`[SamplingPlan] diagnostics` 包含 ESS、最大权重、分项成本、控制超限、参考路径长度、柔性间距目标及运动方向。
 
+主导航退出、窗口关闭或发生异常时，统一关闭它创建的后台任务。采样进程在限定等待时间内退出，超时后终止并回收；父进程异常结束时，采样进程随之退出。退出后的任务拒绝新请求，FINE 搜索支持取消。
+
 前视相机水平视角由 `configs/navigation.yaml` 的 `camera.horizontal_fov_deg` 设置，当前为 `80°`。S2 返回连续同向转向时，程序最多执行 `30°`，停稳后用新的前视画面重新请求决策。
 
 Isaac Sim 中包含 `S2 Decision`、`Goal Map` 和 `Navigation Controls` 窗口。任务开始、局部目标切换和最终停止均由主导航自动处理。点击 Goal Map 中的已知空闲位置仍可执行手动点目标导航，方向键可以手动控制 AGX。

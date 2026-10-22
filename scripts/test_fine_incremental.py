@@ -123,6 +123,13 @@ class FineIncrementalTests(unittest.TestCase):
         self.assertEqual(plan.status, "FULL_PATH")
         self.assertGreater(plan.expanded_node_count, 1)
 
+    def test_cancel_request_stops_search(self) -> None:
+        planner = FineLocalPlanner(self.config, self.checker)
+        with self.assertRaises(FinePlanningFailure) as context:
+            planner.plan(grid=self.make_grid(np.ones((60, 60), dtype=bool)),
+                         start_pose_world=(0, 0, 0), goal_world_xy=(1, 0), cancel_requested=lambda: True)
+        self.assertEqual(context.exception.reason, "CANCELLED")
+
     def test_unknown_actions_report_vehicle_parts(self) -> None:
         grid = clear_current_footprint(
             self.make_grid(np.zeros((60, 60), dtype=bool)),

@@ -7,9 +7,7 @@ import json
 import logging
 import math
 from pathlib import Path
-import queue
 import sys
-import threading
 import uuid
 
 import numpy as np
@@ -25,6 +23,7 @@ from vln_nav.active_perception.camera_geometry import (
 from vln_nav.active_perception.contracts import TimedDepthObservation
 from constraint_traverse.rgbd_map import RGBDMapConfig, RGBDPlanarMap
 from constraint_traverse.reference_path import ReferencePath
+from constraint_traverse.lifecycle import BackgroundTasks, ThreadWorker, bind_shutdown
 from vln_nav.control.locomotion import create_locomotion_controller
 from vln_nav.control.trajectory import (
     AgxVelocityAdapter,
@@ -234,32 +233,11 @@ def _repeated_partial_path(
     )
 
 
-class _NavDPWorker:
+class _NavDPWorker(ThreadWorker):
     def __init__(self, client: NavDPClient) -> None:
+        super().__init__()
         self._client = client
         self._initialized = False
-        self._busy = False
-        self._lock = threading.Lock()
-        self._results: queue.Queue = queue.Queue()
-
-    @property
-    def busy(self) -> bool:
-        with self._lock:
-            return self._busy
-
-    def submit(self, job: _InferenceJob) -> bool:
-        with self._lock:
-            if self._busy:
-                return False
-            self._busy = True
-        threading.Thread(target=self._run, args=(job,), daemon=True).start()
-        return True
-
-    def poll(self):
-        try:
-            return self._results.get_nowait()
-        except queue.Empty:
-            return None
 
     def warm_up(
         self,
@@ -269,7 +247,7 @@ class _NavDPWorker:
         depth_m: np.ndarray,
     ) -> NavDPResult:
         with self._lock:
-            if self._busy:
+            if self._busy or self._closed:
                 raise RuntimeError("NavDP worker 正忙，无法执行预热")
             self._busy = True
         try:
@@ -290,9 +268,13 @@ class _NavDPWorker:
 
     def _run(self, job: _InferenceJob) -> None:
         try:
+            if self._stop_requested.is_set():
+                return
             if not self._initialized:
                 self._client.reset(job.intrinsics)
                 self._initialized = True
+            if self._stop_requested.is_set():
+                return
             result = self._client.pointgoal_step(
                 rgb=job.rgb,
                 depth_m=job.depth_m,
@@ -307,39 +289,22 @@ class _NavDPWorker:
                 self._busy = False
 
 
-class _S2Worker:
+class _S2Worker(ThreadWorker):
     def __init__(self, client: InternNavS2Client) -> None:
+        super().__init__()
         self._client = client
-        self._busy = False
-        self._lock = threading.Lock()
-        self._results: queue.Queue = queue.Queue()
-
-    @property
-    def busy(self) -> bool:
-        with self._lock:
-            return self._busy
-
-    def submit(self, job: _S2InferenceJob) -> bool:
-        with self._lock:
-            if self._busy:
-                return False
-            self._busy = True
-        threading.Thread(target=self._run, args=(job,), daemon=True).start()
-        return True
-
-    def poll(self):
-        try:
-            return self._results.get_nowait()
-        except queue.Empty:
-            return None
 
     def _run(self, job: _S2InferenceJob) -> None:
         try:
+            if self._stop_requested.is_set():
+                return
             if job.reset:
                 self._client.reset_session(
                     session_id=job.session_id,
                     instruction=job.instruction,
                 )
+            if self._stop_requested.is_set():
+                return
             result = self._client.infer_session(
                 rgb=job.frame.rgb,
                 session_id=job.session_id,
@@ -356,7 +321,7 @@ class _S2Worker:
                 self._busy = False
 
 
-class _FinePlanningWorker:
+class _FinePlanningWorker(ThreadWorker):
     def __init__(
         self,
         *,
@@ -364,35 +329,16 @@ class _FinePlanningWorker:
         restricted_analyzer: RestrictedSpaceAnalyzer,
         trajectory_refiner: TrajectoryRefiner,
     ) -> None:
+        super().__init__()
         self._planner = planner
         self._restricted_analyzer = restricted_analyzer
         self._trajectory_refiner = trajectory_refiner
-        self._busy = False
-        self._lock = threading.Lock()
-        self._results: queue.Queue = queue.Queue()
-
-    @property
-    def busy(self) -> bool:
-        with self._lock:
-            return self._busy
-
-    def submit(self, job: _FinePlanningJob) -> bool:
-        with self._lock:
-            if self._busy:
-                return False
-            self._busy = True
-        threading.Thread(target=self._run, args=(job,), daemon=True).start()
-        return True
-
-    def poll(self):
-        try:
-            return self._results.get_nowait()
-        except queue.Empty:
-            return None
 
     def _run(self, job: _FinePlanningJob) -> None:
         grid = None
         try:
+            if self._stop_requested.is_set():
+                return
             grid = job.grid
             grid = clear_current_footprint(
                 grid,
@@ -486,7 +432,10 @@ class _FinePlanningWorker:
                 initial_speed_mps=job.initial_speed_mps,
                 reaction_time_sec=job.reaction_time_sec,
                 braking_deceleration_mps2=job.braking_deceleration_mps2,
+                cancel_requested=self._stop_requested.is_set,
             )
+            if self._stop_requested.is_set():
+                return
             refined = self._trajectory_refiner.refine(
                 grid=grid,
                 path_world_xy=plan.path_world_xy,
@@ -1287,12 +1236,15 @@ def _run(
     step_observer=None,
 ) -> int:
     import omni.ui as ui
+    import omni.kit.app as kit_app
     from isaacsim.core.api import World
     from isaacsim.core.prims import SingleArticulation
     from isaacsim.core.utils.stage import add_reference_to_stage, get_current_stage, is_stage_loading
     from isaacsim.sensors.camera import Camera
     from pxr import UsdGeom
 
+    background_tasks = BackgroundTasks(logger)
+    shutdown_subscription = bind_shutdown(kit_app.get_app(), kit_app.PRE_SHUTDOWN_EVENT_TYPE, background_tasks)
     dt = float(profile.simulation.physics_dt)
     world = World(
         physics_dt=dt,
@@ -1461,9 +1413,9 @@ def _run(
     )
     adapter = AgxVelocityAdapter(drive, profile.agx_controller.continuous)
     odom = SimOdometrySensor(logger=logger)
-    worker = _NavDPWorker(NavDPClient(client_config))
+    worker = background_tasks.add(_NavDPWorker(NavDPClient(client_config)))
     s2_worker = (
-        _S2Worker(InternNavS2Client(s2_client_config))
+        background_tasks.add(_S2Worker(InternNavS2Client(s2_client_config)))
         if bool(settings["internnav_s2"]["enabled"])
         else None
     )
@@ -1494,10 +1446,10 @@ def _run(
         config_path = Path(settings["sampling_planner"]["config_path"])
         if not config_path.is_absolute():
             config_path = PROJECT_ROOT / config_path
-        return SamplingNavigationController(
+        return background_tasks.add(SamplingNavigationController(
             method=selected_mode, hardware=profile.agx_controller.continuous,
             footprint=footprint, physics_dt=world.get_physics_dt(), config_path=config_path, logger=logger,
-        )
+        ))
 
     control_method = str(settings["execution"]["controller"])
     sampling_controller = create_sampling_controller(control_method)
@@ -1525,11 +1477,11 @@ def _run(
             ),
             profile.agx_controller.continuous,
         )
-    fine_worker = _FinePlanningWorker(
+    fine_worker = background_tasks.add(_FinePlanningWorker(
         planner=fine_planner,
         restricted_analyzer=restricted_analyzer,
         trajectory_refiner=trajectory_refiner,
-    )
+    ))
     logger.info(
         "[NavigationModes] scene=%s camera=%s server=%s frame=base(+X forward,+Y left)",
         scene_path,
@@ -1650,7 +1602,7 @@ def _run(
         )
 
     try:
-        while app.is_running():
+        while app.is_running() and not background_tasks.closed:
             if not world.is_playing():
                 adapter.stop()
                 if sampling_controller is not None:
@@ -2871,9 +2823,11 @@ def _run(
             world.step(render=frame_index % render_stride == 0)
             frame_index += 1
     finally:
-        adapter.stop()
-        if sampling_controller is not None:
-            sampling_controller.close(wait=True)
+        try:
+            adapter.stop()
+        finally:
+            background_tasks.close()
+        shutdown_subscription = None
         panel.shutdown()
         s2_panel.shutdown()
     return 0

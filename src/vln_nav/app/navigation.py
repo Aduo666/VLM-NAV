@@ -24,8 +24,8 @@ from vln_nav.active_perception.camera_geometry import (
 )
 from vln_nav.active_perception.contracts import TimedDepthObservation
 from constraint_traverse.rgbd_map import RGBDMapConfig, RGBDPlanarMap
+from constraint_traverse.reference_path import ReferencePath
 from vln_nav.control.locomotion import create_locomotion_controller
-from vln_nav.control.fine_path_tracker import FinePathTracker, fit_agx_command
 from vln_nav.control.trajectory import (
     AgxVelocityAdapter,
     PathTracker,
@@ -71,8 +71,6 @@ from vln_nav.navigation.trajectory_clearance import (
     PlanningGrid,
     assess_known_swept_path,
     clear_current_footprint,
-    stopping_distance_m,
-    translation_distance_until_direction_change,
 )
 from vln_nav.navigation.traversability_graph import (
     TraversabilityGraphBuilder,
@@ -97,7 +95,7 @@ from vln_nav.runtime.agx_geometry import build_agx_footprint, validate_agx_geome
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 SETTINGS_PATH = PROJECT_ROOT / "configs/navigation.yaml"
 EPISODES_PATH = PROJECT_ROOT / "configs/episodes.json"
-LOW_LEVEL_MODES = ("COARSE", "FINE", "MPPI", "KMPPI")
+LOW_LEVEL_MODES = ("COARSE", "FINE")
 SAMPLING_MODES = ("MPPI", "KMPPI")
 
 
@@ -520,7 +518,7 @@ class _GoalMapPanel:
         "RIGHT": "TURN_RIGHT",
     }
 
-    def __init__(self, ui, *, image_size_px: int, command_sink, mode="COARSE", bind_keyboard=True) -> None:
+    def __init__(self, ui, *, image_size_px: int, command_sink, mode="COARSE", controller="MPPI", bind_keyboard=True) -> None:
         import carb.input
         import omni.appwindow
 
@@ -536,13 +534,16 @@ class _GoalMapPanel:
         initial[:, :, 3] = 255
         self._provider = ui.ByteImageProvider()
         self._provider.set_data_array(initial.reshape(-1), [size, size])
-        self.controls_window = ui.Window("Navigation Controls", width=340, height=160, visible=True)
+        self.controls_window = ui.Window("Navigation Controls", width=340, height=225, visible=True)
         with self.controls_window.frame:
             with ui.VStack(spacing=6):
-                ui.Label("底层规划器", height=24)
+                ui.Label("路径生成", height=24)
                 self._mode_combo = ui.ComboBox(LOW_LEVEL_MODES.index(mode), *LOW_LEVEL_MODES, height=28)
                 self._mode_combo.model.add_item_changed_fn(self._on_mode_changed)
-                self._status_label = ui.Label(f"底层：{mode}", height=70, word_wrap=True)
+                ui.Label("运动控制", height=24)
+                self._controller_combo = ui.ComboBox(SAMPLING_MODES.index(controller), *SAMPLING_MODES, height=28)
+                self._controller_combo.model.add_item_changed_fn(self._on_controller_changed)
+                self._status_label = ui.Label(f"{mode} + {controller}", height=70, word_wrap=True)
         self.map_window = ui.Window(
             "Goal Map",
             width=max(size + 20, 600),
@@ -583,21 +584,26 @@ class _GoalMapPanel:
         height, width = goal_map.rgba.shape[:2]
         self._provider.set_data_array(goal_map.rgba.reshape(-1), [width, height])
 
-    def update_controls(self, mode, status):
-        self._status_label.text = f"底层：{mode}\n{status}"
-        value_model = self._mode_combo.model.get_item_value_model()
-        selected_index = LOW_LEVEL_MODES.index(mode)
-        if value_model.as_int == selected_index:
-            return
+    def update_controls(self, mode, status, controller="MPPI"):
+        self._status_label.text = f"{mode} + {controller}\n{status}"
         self._updating_mode = True
         try:
-            value_model.set_value(selected_index)
+            for combo, choices, selected in ((self._mode_combo, LOW_LEVEL_MODES, mode),
+                                              (self._controller_combo, SAMPLING_MODES, controller)):
+                value_model = combo.model.get_item_value_model()
+                selected_index = choices.index(selected)
+                if value_model.as_int != selected_index:
+                    value_model.set_value(selected_index)
         finally:
             self._updating_mode = False
 
     def _on_mode_changed(self, model, _item):
         if not self._updating_mode:
             self._command_sink(("SET_MODE", LOW_LEVEL_MODES[model.get_item_value_model().as_int]))
+
+    def _on_controller_changed(self, model, _item):
+        if not self._updating_mode:
+            self._command_sink(("SET_CONTROLLER", SAMPLING_MODES[model.get_item_value_model().as_int]))
 
     def shutdown(self) -> None:
         if self._keyboard_subscription is not None:
@@ -859,6 +865,7 @@ def _load_settings() -> tuple[
     execution = data["execution"]
     if set(execution) != {
         "default_mode",
+        "controller",
         "coarse_planning_period_sec",
         "fine_planning_period_sec",
         "fine_local_goal_lookahead_m",
@@ -870,13 +877,15 @@ def _load_settings() -> tuple[
         raise ValueError("Invalid navigation modes execution fields")
     if execution["default_mode"] not in LOW_LEVEL_MODES:
         raise ValueError("Invalid default navigation mode")
+    if execution["controller"] not in SAMPLING_MODES:
+        raise ValueError("连续控制器必须为 MPPI 或 KMPPI")
     sampling = data["sampling_planner"]
     if not isinstance(sampling, dict) or set(sampling) != {"config_path"} or not str(sampling["config_path"]).strip():
         raise ValueError("sampling_planner 必须包含 config_path")
     if any(
         float(value) <= 0
         for name, value in execution.items()
-        if name != "default_mode"
+        if name not in {"default_mode", "controller"}
     ):
         raise ValueError("NavDP execution tolerances must be positive")
 
@@ -1034,7 +1043,8 @@ def _load_settings() -> tuple[
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="AGX 视觉语言主导航")
-    parser.add_argument("--local-planner", choices=LOW_LEVEL_MODES, help="本次运行的底层规划器")
+    parser.add_argument("--local-planner", choices=LOW_LEVEL_MODES, help="路径生成器")
+    parser.add_argument("--controller", choices=SAMPLING_MODES, help="连续运动控制器")
     args = parser.parse_args()
     profile = load_agx_profile(project_root=PROJECT_ROOT)
     (
@@ -1052,6 +1062,8 @@ def main() -> int:
     ) = _load_settings()
     if args.local_planner is not None:
         settings["execution"]["default_mode"] = args.local_planner
+    if args.controller is not None:
+        settings["execution"]["controller"] = args.controller
     logger = _make_logger()
     try:
         episodes = load_episodes(EPISODES_PATH, project_root=PROJECT_ROOT)
@@ -1487,8 +1499,8 @@ def _run(
             footprint=footprint, physics_dt=world.get_physics_dt(), config_path=config_path, logger=logger,
         )
 
-    if settings["execution"]["default_mode"] in SAMPLING_MODES:
-        sampling_controller = create_sampling_controller(settings["execution"]["default_mode"])
+    control_method = str(settings["execution"]["controller"])
+    sampling_controller = create_sampling_controller(control_method)
     fine_planner = FineLocalPlanner(fine_config, collision_checker)
     graph_builder = TraversabilityGraphBuilder(
         config=graph_config,
@@ -1504,12 +1516,6 @@ def _run(
         refiner_config,
         collision_checker,
     )
-    coarse_tracking = settings["coarse_tracking"]
-    coarse_tracking_config = replace(
-        profile.agx_controller.continuous,
-        max_linear_mps=float(coarse_tracking["max_linear_mps"]),
-        max_angular_radps=float(coarse_tracking["max_angular_radps"]),
-    )
     fine_tracking = settings["fine_tracking"]
     for curvature in fine_config.curvature_samples_per_m:
         wheel_targets(
@@ -1523,14 +1529,6 @@ def _run(
         planner=fine_planner,
         restricted_analyzer=restricted_analyzer,
         trajectory_refiner=trajectory_refiner,
-    )
-    fine_tracking_config = replace(
-        profile.agx_controller.continuous,
-        max_linear_mps=float(fine_tracking["max_linear_mps"]),
-        max_angular_radps=float(fine_tracking["max_angular_radps"]),
-        lookahead_m=float(fine_tracking["lookahead_m"]),
-        arrival_distance_m=float(fine_tracking["arrival_distance_m"]),
-        max_path_error_m=float(fine_tracking["max_path_error_m"]),
     )
     logger.info(
         "[NavigationModes] scene=%s camera=%s server=%s frame=base(+X forward,+Y left)",
@@ -1556,6 +1554,7 @@ def _run(
         image_size_px=int(settings["map_selector"]["image_size_px"]),
         command_sink=lambda value: command.__setitem__(0, value),
         mode=str(settings["execution"]["default_mode"]),
+        controller=control_method,
     )
     s2_panel = _S2DecisionPanel(ui)
 
@@ -1590,6 +1589,10 @@ def _run(
     tracker = None
     tracker_mode: str | None = None
     display_path_odom_xy: np.ndarray | None = None
+    reference_path: ReferencePath | None = None
+    reference_map_signature = None
+    reference_checked_map_version = -1
+    reference_map_changed = False
     frozen_candidates: list[_FrozenCandidate] = []
     selected_index = 0
     request_id = 0
@@ -1614,8 +1617,6 @@ def _run(
     last_map_render_time = -float("inf")
     last_coarse_request_time = -float("inf")
     last_fine_request_time = -float("inf")
-    last_fine_safety_check_time = -float("inf")
-    last_fine_safety_map_version = -1
     map_integration_period = float(map_settings["map"]["integration_period_sec"])
     map_render_period = float(settings["map_selector"]["render_period_sec"])
     latest_snapshot = local_map.snapshot()
@@ -1639,7 +1640,7 @@ def _run(
     s2_actions: deque[int] = deque()
     s2_turn_target_yaw_odom: float | None = None
     s2_stop_count = 0
-    logger.info("[NavigationMode] selected=%s", mode)
+    logger.info("[NavigationMode] path=%s controller=%s", mode, control_method)
     if s2_active:
         idle_status = "S2 waiting for first front frame"
         logger.info(
@@ -1654,6 +1655,7 @@ def _run(
                 adapter.stop()
                 if sampling_controller is not None:
                     sampling_controller.reset()
+                reference_path = None
                 tracker = None
                 navigation_active = False
                 command[0] = None
@@ -1822,9 +1824,12 @@ def _run(
                     goal_map = _overlay_path_on_goal_map(
                         goal_map,
                         path_local,
-                        color=((51, 139, 230, 255) if mode in SAMPLING_MODES else (34, 177, 76, 255)
-                               if tracker_mode == "FINE" else (238, 184, 45, 255)),
+                        color=(34, 177, 76, 255) if mode == "FINE" else (238, 184, 45, 255),
                     )
+                if navigation_active and sampling_controller.last_plan is not None:
+                    prediction_odom = _world_path_to_odom(sampling_controller.last_plan.prediction[:, :2], state)
+                    goal_map = _overlay_path_on_goal_map(goal_map, _odom_path_to_local(prediction_odom, state),
+                                                        color=(51, 139, 230, 255))
                 panel.update_map(goal_map)
                 last_map_render_time = now
 
@@ -1883,6 +1888,8 @@ def _run(
                                 np.asarray([metric_goal.world_xy], dtype=np.float64),
                                 state,
                             )[0]
+                            reference_path = None
+                            sampling_controller.reset()
                             request_id += 1
                             accepted_request_id = request_id
                             fine_request_id += 1
@@ -2061,18 +2068,21 @@ def _run(
                         goal_xy=(job.goal_forward_m, job.goal_left_m),
                         view_size_m=float(settings["debug"]["view_size_m"]),
                     )
-                    tracker = _create_coarse_tracker(
-                        selected.odom_path_xy,
-                        joined_path=joined_path,
-                        config=coarse_tracking_config,
-                        initial_speed_mps=float(np.dot(np.asarray(robot.get_linear_velocity())[:2],
-                                                       [math.cos(robot_yaw_world), math.sin(robot_yaw_world)])),
-                    )
-                    if tracker is None:
+                    if remaining_length <= 1.0e-4:
+                        reference_path = None
+                        sampling_controller.reset()
                         tracker_mode = None
                         display_path_odom_xy = None
                         idle_status = "NavDP zero-motion trajectory; waiting for next inference"
                     else:
+                        reference_path = ReferencePath.from_positions(
+                            _odom_path_to_world(joined_path, state), initial_yaw_rad=robot_yaw_world,
+                            goal_world_xy=_odom_path_to_world(selected_goal_odom_xy[None, :], state)[0],
+                            source="COARSE", request_id=job.request_id,
+                            created_sim_time_sec=float(job.odom_state.timestamp_sec),
+                            map_version=0 if latest_planning_grid is None else latest_planning_grid.map_version,
+                            partial=True,
+                        )
                         display_path_odom_xy = joined_path.copy()
                         tracker_mode = mode
                         generation_index += 1
@@ -2160,6 +2170,8 @@ def _run(
                             grid.origin_x_m + (columns + 0.5) * grid.resolution_m,
                             grid.origin_y_m + (rows + 0.5) * grid.resolution_m,
                         ))
+                        reference_path = None
+                        sampling_controller.reset()
                         adapter.stop()
                         tracker = None
                         tracker_mode = None
@@ -2215,10 +2227,6 @@ def _run(
                     remaining_length = float(np.sum(
                         np.linalg.norm(np.diff(joined_path, axis=0), axis=1)
                     ))
-                    path_odom_yaw = _world_yaw_to_odom(
-                        plan.path_world_yaw_rad,
-                        state,
-                    )
                     clearance, planned_unknown = assess_known_swept_path(
                         grid,
                         plan.path_world_xy,
@@ -2252,44 +2260,6 @@ def _run(
                         rejection = "fine_path_unknown"
                     elif current_unknown.cell_count > 0:
                         rejection = "fine_path_new_unknown"
-                    elif (
-                        (
-                            int(plan.path_motion_direction[1]) != 0
-                            or abs(state.linear_velocity_mps) > 0.02
-                        )
-                        and translation_distance_until_direction_change(
-                            np.vstack((
-                                np.asarray(
-                                    [[state.pose.x, state.pose.y]],
-                                    dtype=np.float64,
-                                ),
-                                joined_path[1:],
-                            )),
-                            plan.path_motion_direction,
-                            first_segment_start_xy=joined_path[0],
-                        ) < stopping_distance_m(
-                            state.linear_velocity_mps,
-                            reaction_time_sec=float(
-                                fine_tracking["safety_reaction_time_sec"]
-                            ),
-                            braking_deceleration_mps2=float(
-                                fine_tracking["safety_braking_deceleration_mps2"]
-                            ),
-                            reserve_m=min(
-                                0.4 * validation_grid.resolution_m,
-                                0.5 * fine_tracking_config.arrival_distance_m,
-                            ),
-                        )
-                    ):
-                        rejection = "fine_path_stop_distance"
-                    elif _repeated_partial_path(
-                        plan,
-                        current_world_xy=np.asarray(position[:2]),
-                        last_switch_world_xy=last_partial_switch_world_xy,
-                        last_endpoint_world_xy=last_partial_endpoint_world_xy,
-                        resolution_m=validation_grid.resolution_m,
-                    ):
-                        rejection = "fine_partial_repeated_without_motion"
                     elif rejection == "result_too_old":
                         yaw_delta = (
                             robot_yaw_world - job.start_pose_world[2] + math.pi
@@ -2317,7 +2287,6 @@ def _run(
                                 "fine_path_outside_map",
                                 "fine_path_unknown",
                                 "fine_path_new_unknown",
-                                "fine_partial_repeated_without_motion",
                             }
                             else None
                         )
@@ -2355,23 +2324,14 @@ def _run(
                         last_partial_endpoint_world_xy = (
                             plan.path_world_xy[-1].copy() if plan.partial else None
                         )
-                        tracker = FinePathTracker(
-                            joined_path,
-                            path_odom_yaw,
-                            plan.path_motion_direction,
-                            fine_tracking_config,
-                            initial_speed_mps=state.linear_velocity_mps,
-                            safety_braking_deceleration_mps2=float(
-                                fine_tracking["safety_braking_deceleration_mps2"]
-                            ),
-                            safety_reaction_time_sec=float(
-                                fine_tracking["safety_reaction_time_sec"]
-                            ),
-                            safety_reserve_m=min(
-                                0.4 * validation_grid.resolution_m,
-                                0.5 * fine_tracking_config.arrival_distance_m,
-                            ),
+                        reference_path = ReferencePath(
+                            plan.path_world_xy, plan.path_world_yaw_rad, plan.path_motion_direction,
+                            np.asarray(job.goal_world_xy), "FINE", job.request_id,
+                            job.submitted_sim_time_sec, grid.map_version, plan.partial,
                         )
+                        reference_map_signature = reference_path.map_signature(validation_grid, radius_m=collision_checker.bounding_radius_m)
+                        reference_checked_map_version = validation_grid.map_version
+                        reference_map_changed = False
                         display_path_odom_xy = joined_path.copy()
                         tracker_mode = mode
                         generation_index += 1
@@ -2410,21 +2370,25 @@ def _run(
 
             if command[0] is not None:
                 action, command[0] = command[0], None
-                if isinstance(action, tuple) and action[0] == "SET_MODE":
-                    selected_mode = str(action[1])
-                    if selected_mode in LOW_LEVEL_MODES and selected_mode != mode:
+                if isinstance(action, tuple) and action[0] in {"SET_MODE", "SET_CONTROLLER"}:
+                    selected_mode = str(action[1]) if action[0] == "SET_MODE" else mode
+                    selected_controller = str(action[1]) if action[0] == "SET_CONTROLLER" else control_method
+                    if (selected_mode in LOW_LEVEL_MODES and selected_controller in SAMPLING_MODES
+                            and (selected_mode != mode or selected_controller != control_method)):
                         try:
-                            replacement_controller = create_sampling_controller(selected_mode) if selected_mode in SAMPLING_MODES else None
+                            replacement_controller = create_sampling_controller(selected_controller)
                         except Exception as exc:
                             logger.error("[NavigationMode] 无法启用 %s：%s", selected_mode, exc)
                             idle_status = f"Mode unavailable: {selected_mode}; see log"
-                            panel.update_controls(mode, idle_status)
+                            panel.update_controls(mode, idle_status, control_method)
                         else:
                             adapter.stop()
                             if sampling_controller is not None:
                                 sampling_controller.close()
                             sampling_controller = replacement_controller
                             mode = selected_mode
+                            control_method = selected_controller
+                            reference_path = None
                             tracker = tracker_mode = None
                             display_path_odom_xy = None
                             frozen_candidates = []
@@ -2438,8 +2402,8 @@ def _run(
                             accepted_request_id = request_id
                             fine_request_id += 1
                             accepted_fine_request_id = fine_request_id
-                            idle_status = f"Mode selected: {mode}"
-                            logger.info("[NavigationMode] selected=%s goal_retained=%s", mode, selected_goal_odom_xy is not None)
+                            idle_status = f"{mode} + {control_method}"
+                            logger.info("[NavigationMode] path=%s controller=%s goal_retained=%s", mode, control_method, selected_goal_odom_xy is not None)
                 elif isinstance(action, tuple) and action[0] == "GOAL_ERROR":
                     logger.warning("[NavigationGoal] rejected: %s", action[1])
                 elif isinstance(action, tuple) and action[0] == "SELECT_GOAL":
@@ -2457,6 +2421,8 @@ def _run(
                                 state.pose.y,
                                 state.pose.yaw_rad,
                             )[0]
+                            reference_path = None
+                            sampling_controller.reset()
                             s2_active = False
                             s2_need_request = False
                             s2_actions.clear()
@@ -2507,6 +2473,7 @@ def _run(
             )
             if navigation_active and goal_distance <= goal_tolerance:
                 navigation_active = False
+                reference_path = None
                 tracker = None
                 tracker_mode = None
                 adapter.stop()
@@ -2571,6 +2538,8 @@ def _run(
                         state.pose.y,
                         state.pose.yaw_rad,
                     )[0]
+                    reference_path = None
+                    sampling_controller.reset()
                     request_id += 1
                     accepted_request_id = request_id
                     fine_request_id += 1
@@ -2625,96 +2594,12 @@ def _run(
                     idle_status = "S2 LOOKDOWN waiting for down-camera frame"
                     logger.info("[S2LookDown] requested down-camera continuation")
 
-            if (
-                tracker is not None
-                and tracker_mode == "FINE"
-                and latest_planning_grid is not None
-                and (
-                    latest_planning_grid.map_version != last_fine_safety_map_version
-                    or now - last_fine_safety_check_time >= 0.10
-                )
-            ):
-                last_fine_safety_check_time = now
-                last_fine_safety_map_version = latest_planning_grid.map_version
-                next_index = min(tracker.segment_index + 1, len(tracker.path) - 1)
-                remaining_odom = np.vstack((
-                    np.asarray([[state.pose.x, state.pose.y]], dtype=np.float64),
-                    tracker.path[next_index:],
-                ))
-                remaining_world = _odom_path_to_world(remaining_odom, state)
-                remaining_yaw_world = np.r_[
-                    robot_yaw_world,
-                    tracker.yaw[next_index:] + state.origin_world_yaw_rad,
-                ]
-                safety_grid = clear_current_footprint(
-                    latest_planning_grid,
-                    x_m=float(position[0]),
-                    y_m=float(position[1]),
-                    yaw_rad=float(robot_yaw_world),
-                    collision_checker=collision_checker,
-                )
-                safety_clearance, safety_unknown = assess_known_swept_path(
-                    safety_grid,
-                    remaining_world,
-                    remaining_yaw_world,
-                    collision_checker=collision_checker,
-                    max_step_m=fine_config.collision_sample_step_m,
-                    max_yaw_step_deg=fine_config.yaw_resolution_deg,
-                )
-                remaining_distance = translation_distance_until_direction_change(
-                    remaining_world,
-                    np.r_[
-                        np.int8(0),
-                        tracker.direction[next_index:],
-                    ],
-                    first_segment_start_xy=_odom_path_to_world(
-                        tracker.path[tracker.segment_index][None, :],
-                        state,
-                    )[0],
-                )
-                stop_distance = stopping_distance_m(
-                    state.linear_velocity_mps,
-                    reaction_time_sec=float(
-                        fine_tracking["safety_reaction_time_sec"]
-                    ),
-                    braking_deceleration_mps2=float(
-                        fine_tracking["safety_braking_deceleration_mps2"]
-                    ),
-                    reserve_m=0.0,
-                )
-                safety_reason = None
-                if safety_clearance.collision:
-                    safety_reason = "collision"
-                elif safety_clearance.outside_ratio > 0:
-                    safety_reason = "outside_map"
-                elif safety_unknown.cell_count > 0:
-                    safety_reason = "unknown"
-                elif (
-                    abs(state.linear_velocity_mps) > 0.02
-                    and remaining_distance < stop_distance
-                ):
-                    safety_reason = "insufficient_stop_distance"
-                if safety_reason is not None:
-                    adapter.stop()
-                    tracker = None
-                    tracker_mode = None
-                    display_path_odom_xy = None
-                    idle_status = f"FINE SAFETY STOP: {safety_reason}"
-                    logger.warning(
-                        "[FineSafetyStop] reason=%s map_version=%d "
-                        "remaining=%.3fm stop_distance=%.3fm unknown_cells=%d",
-                        safety_reason,
-                        safety_grid.map_version,
-                        remaining_distance,
-                        stop_distance,
-                        safety_unknown.cell_count,
-                    )
-
             manual_action = panel.manual_action
             if manual_action != "STOP":
                 if not manual_active:
                     if sampling_controller is not None:
                         sampling_controller.reset()
+                    reference_path = None
                     tracker = None
                     tracker_mode = None
                     navigation_active = False
@@ -2784,82 +2669,26 @@ def _run(
                         float(s2_settings["turn_max_angular_radps"]),
                     ))
                     applied = adapter.apply(VelocityCommand(0.0, angular))
-            elif mode in SAMPLING_MODES and navigation_active and selected_goal_odom_xy is not None:
+            elif navigation_active and selected_goal_odom_xy is not None:
                 goal_world = _odom_path_to_world(selected_goal_odom_xy[None, :], state)[0]
                 try:
-                    previous_sampling_plan = sampling_controller.last_plan
-                    applied = sampling_controller.step(
-                        robot=robot, drive=drive, grid=latest_planning_grid,
-                        goal_world_xy=goal_world, now=now,
-                    )
-                    idle_status = f"{mode} {sampling_controller.status} v={applied.linear_mps:.2f} w={applied.angular_radps:.2f}"
-                    rejected_unknown_world_xy = None
-                    if sampling_controller.last_plan is not None and sampling_controller.last_plan.valid:
-                        display_path_odom_xy = _world_path_to_odom(sampling_controller.last_plan.prediction[:, :2], state)
-                        if sampling_controller.last_plan is not previous_sampling_plan:
-                            generation_index += 1
+                    if reference_path is not None and np.linalg.norm(reference_path.goal_world_xy - goal_world) <= 0.01:
+                        applied = sampling_controller.step(
+                            robot=robot, drive=drive, grid=latest_planning_grid,
+                            goal_world_xy=goal_world, now=now, reference_path=reference_path,
+                        )
+                        idle_status = f"{mode} + {control_method} {sampling_controller.status} v={applied.linear_mps:.2f} w={applied.angular_radps:.2f}"
+                        if sampling_controller.status == "REFERENCE_DONE":
+                            last_coarse_request_time = last_fine_request_time = -float("inf")
                     else:
-                        display_path_odom_xy = None
+                        adapter.stop()
+                        idle_status = f"{mode} + {control_method}: waiting for reference path"
                 except Exception:
                     adapter.stop()
                     sampling_controller.reset()
                     navigation_active = False
-                    idle_status = f"{mode} stopped after error; see log"
-                    logger.exception("[SamplingError] mode=%s", mode)
-            elif tracker is not None:
-                tracking_config = (
-                    fine_tracking_config
-                    if tracker_mode == "FINE"
-                    else coarse_tracking_config
-                )
-                tracking = tracker.step(
-                    (state.pose.x, state.pose.y, state.pose.yaw_rad), dt
-                )
-                requested_command = tracking.command
-                if tracker_mode == "COARSE":
-                    requested_command = fit_agx_command(
-                        requested_command,
-                        profile.agx_controller.continuous,
-                    )
-                applied = adapter.apply(requested_command)
-                tracker.feedback(applied)
-                steering = adapter.steering_diagnostics()
-                if (
-                    adapter.status != previous_adapter_status
-                    or (
-                        adapter.status == "STEERING_TRANSIENT"
-                        and now - last_steering_log_time >= 1.0
-                    )
-                ):
-                    logger.info(
-                        "[NavigationSteering] mode=%s status=%s max_error_deg=%.2f "
-                        "target_deg=%s measured_deg=%s",
-                        tracker_mode,
-                        adapter.status,
-                        math.degrees(float(steering["max_error_rad"])),
-                        _degree_map(steering["target_rad"]),
-                        _degree_map(steering["measured_rad"]),
-                    )
-                    previous_adapter_status = adapter.status
-                    last_steering_log_time = now
-                status_text = (
-                    f"{tracker_mode} {tracking.status}/{adapter.status} "
-                    f"remaining={tracking.remaining_m:.2f}m error={tracking.cross_track_m:.2f}m\n"
-                    f"v={applied.linear_mps:.3f}m/s w={applied.angular_radps:.3f}rad/s "
-                    f"limit={tracking_config.max_linear_mps:.2f}m/s"
-                )
-                if tracking.status != previous_tracking_status:
-                    logger.info(
-                        "[NavigationTracking] %s", status_text.replace("\n", " ")
-                    )
-                    previous_tracking_status = tracking.status
-                if tracking.status != "TRACKING":
-                    adapter.stop()
-                    tracker = None
-                    tracker_mode = None
-                    idle_status = (
-                        f"TRACKER {tracking.status}; waiting for rolling replanning"
-                    )
+                    idle_status = f"{mode} + {control_method} stopped after error; see log"
+                    logger.exception("[SamplingError] mode=%s controller=%s", mode, control_method)
             else:
                 adapter.stop()
                 if sampling_controller is not None and sampling_controller.goal is not None:
@@ -2954,9 +2783,21 @@ def _run(
                     idle_status = "NavDP request failed; see log"
                     logger.error("[NavDPRequest] rejected: %s", exc)
 
+            fine_reference_needs_update = (
+                reference_path is None or reference_path.source != "FINE"
+                or reference_path.needs_extension((position[0], position[1], robot_yaw_world),
+                    lookahead_m=float(settings["execution"]["fine_local_goal_lookahead_m"]))
+            ) if mode == "FINE" else False
+            if (mode == "FINE" and reference_path is not None and latest_planning_grid is not None
+                    and latest_planning_grid.map_version != reference_checked_map_version):
+                reference_map_changed = reference_path.map_signature(
+                    latest_planning_grid, radius_m=collision_checker.bounding_radius_m) != reference_map_signature
+                reference_checked_map_version = latest_planning_grid.map_version
+            fine_reference_needs_update |= reference_map_changed if mode == "FINE" else False
             if (
                 navigation_active
                 and mode == "FINE"
+                and fine_reference_needs_update
                 and selected_goal_odom_xy is not None
                 and latest_snapshot.grid.map_version > 0
                 and latest_planning_grid is not None
@@ -3026,7 +2867,7 @@ def _run(
             if tracker is None and idle_status != last_reported_idle_status:
                 logger.info("[NavigationStatus] %s", idle_status)
                 last_reported_idle_status = idle_status
-            panel.update_controls(mode, idle_status)
+            panel.update_controls(mode, idle_status, control_method)
             world.step(render=frame_index % render_stride == 0)
             frame_index += 1
     finally:

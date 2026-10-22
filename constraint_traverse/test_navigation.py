@@ -4,6 +4,7 @@ from dataclasses import replace
 import io
 import logging
 import time
+import types
 from pathlib import Path
 import unittest
 from unittest.mock import patch
@@ -14,6 +15,9 @@ import yaml
 
 from constraint_traverse.benchmark.run import load_config
 from constraint_traverse.navigation import PlanningGridGeometry, SamplingNavigationController
+from constraint_traverse.reference_path import ReferencePath
+from constraint_traverse.benchmark.model import STATE_SIZE
+from constraint_traverse.benchmark.planner import PlanResult
 from vln_nav.app import navigation
 from vln_nav.navigation.trajectory_clearance import FootprintConfig, FootprintPartConfig, PlanningGrid
 from vln_nav.runtime.agx_profile import load_agx_profile
@@ -106,10 +110,21 @@ class ModeTests(unittest.TestCase):
         with navigation.SETTINGS_PATH.open(encoding="utf-8") as handle:
             settings = yaml.safe_load(handle)
         for mode in navigation.LOW_LEVEL_MODES:
-            settings["execution"]["default_mode"] = mode
-            with patch.object(Path, "open", return_value=io.StringIO(yaml.safe_dump(settings))):
-                result = navigation._load_settings()
-            self.assertEqual(result[0]["execution"]["default_mode"], mode)
+            for controller in navigation.SAMPLING_MODES:
+                settings["execution"]["default_mode"] = mode
+                settings["execution"]["controller"] = controller
+                with patch.object(Path, "open", return_value=io.StringIO(yaml.safe_dump(settings))):
+                    result = navigation._load_settings()
+                self.assertEqual(result[0]["execution"]["default_mode"], mode)
+                self.assertEqual(result[0]["execution"]["controller"], controller)
+
+    def test_invalid_controller_rejected(self):
+        with navigation.SETTINGS_PATH.open(encoding="utf-8") as handle:
+            settings = yaml.safe_load(handle)
+        settings["execution"]["controller"] = "BAD"
+        with patch.object(Path, "open", return_value=io.StringIO(yaml.safe_dump(settings))):
+            with self.assertRaises(ValueError):
+                navigation._load_settings()
 
     def test_invalid_mode_rejected(self):
         with navigation.SETTINGS_PATH.open(encoding="utf-8") as handle:
@@ -178,6 +193,77 @@ class ControllerTests(unittest.TestCase):
                 np.testing.assert_array_equal(controller.requested, requested)
                 self.assertEqual(controller.status, "TRACKING")
             controller.close(wait=True)
+
+
+class AsyncControllerTests(unittest.TestCase):
+    def setUp(self):
+        hardware = load_agx_profile(project_root=ROOT).agx_controller.continuous
+        self.position = np.asarray([0., 0., 0.3])
+        self.robot = types.SimpleNamespace(get_world_pose=lambda: (self.position, [1, 0, 0, 0]),
+                                          get_linear_velocity=lambda: np.zeros(3),
+                                          get_angular_velocity=lambda: np.zeros(3))
+        self.drive = types.SimpleNamespace(
+            readback=lambda: {"steering_position": {w.steering_joint: 0 for w in hardware.wheels},
+                              "wheel_velocity": {w.drive_joint: 0 for w in hardware.wheels}},
+            apply_continuous_joint_targets=lambda motors, steering: None)
+        footprint = FootprintConfig((FootprintPartConfig("body", -0.15, 0.15, -0.1, 0.1),), 0.03)
+        self.controller = SamplingNavigationController(method="MPPI", hardware=hardware, footprint=footprint,
+            physics_dt=1 / 60, config_path=ROOT / "constraint_traverse/configs/benchmark.yaml", logger=logging.getLogger("test"))
+        self.controller.goal = np.asarray([1., 0.])
+        self.addCleanup(self.controller.close, wait=True)
+
+    def step(self, now=1, **kwargs):
+        return self.controller.step(robot=self.robot, drive=self.drive, grid=make_grid(),
+                                    goal_world_xy=[1, 0], now=now, **kwargs)
+
+    def result(self):
+        controls = np.asarray([[0.1, 0], [0.2, 0], [0.3, 0]], dtype=np.float32)
+        return PlanResult(controls[0], controls, np.zeros((4, 3)), np.zeros((1, 3, 3)),
+                          controls[None], np.zeros(1), True, "OPTIMIZED", 1, 1, 1, {})
+
+    def test_delayed_result_starts_at_compensated_first_control(self):
+        controller = self.controller
+        controller._worker.busy = True
+        controller._worker.results.put((controller._epoch, 0., 1, self.result(), None, np.zeros(STATE_SIZE)))
+        self.step()
+        np.testing.assert_allclose(controller.requested, [0.1, 0])
+        self.assertEqual(controller.plan_timestamp, 1)
+        self.step(now=1.21)
+        np.testing.assert_allclose(controller.requested, [0.2, 0])
+
+    def test_old_goal_result_is_ignored(self):
+        controller = self.controller
+        controller._worker.busy = True
+        controller._worker.results.put((controller._epoch - 1, 0., 1, self.result(), None, np.zeros(STATE_SIZE)))
+        self.step()
+        self.assertIsNone(controller.last_plan)
+        np.testing.assert_array_equal(controller.requested, [0, 0])
+
+    def test_short_reference_end_retains_high_level_goal(self):
+        self.position[0] = 0.2
+        path = ReferencePath.from_positions([[0, 0], [0.2, 0]], initial_yaw_rad=0,
+            goal_world_xy=np.asarray([1., 0.]), source="FINE", request_id=1,
+            created_sim_time_sec=0, map_version=1, partial=True)
+        self.step(reference_path=path)
+        self.assertEqual(self.controller.status, "REFERENCE_DONE")
+        np.testing.assert_array_equal(self.controller.goal, [1, 0])
+        np.testing.assert_array_equal(self.controller.requested, [0, 0])
+
+    def test_planning_submission_does_not_wait_for_search(self):
+        captured = []
+        with patch.object(self.controller._worker, "submit", side_effect=lambda job: captured.append(job) or True):
+            started = time.perf_counter()
+            self.step()
+        self.assertLess(time.perf_counter() - started, 0.5)
+        self.assertEqual(len(captured), 1)
+        self.assertFalse(np.shares_memory(captured[0].grid.occupied_mask, make_grid().occupied_mask))
+
+    def test_reference_for_different_goal_is_rejected(self):
+        path = ReferencePath.from_positions([[0, 0], [0.2, 0]], initial_yaw_rad=0,
+            goal_world_xy=np.asarray([2., 0.]), source="FINE", request_id=1,
+            created_sim_time_sec=0, map_version=1)
+        with self.assertRaises(ValueError):
+            self.step(reference_path=path)
 
 
 if __name__ == "__main__":

@@ -19,8 +19,9 @@ planner:
   horizon_steps: 20
   samples: 256
   iterations: 1
-  temperature: 5.0
+  temperature: 0.5
   near_goal_distance_m: 0.80
+  reference_lookahead_m: 1.20
   noise_linear_std: 0.18
   noise_angular_std: 0.18
   kernel_support_points: 6

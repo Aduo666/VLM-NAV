@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import fields, replace
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import yaml
@@ -113,6 +114,14 @@ class FineIncrementalTests(unittest.TestCase):
             np.linalg.norm(plan.path_world_xy[-1] - np.asarray([0.4, 0.0])),
             self.config.goal_tolerance_m + 1.0e-9,
         )
+
+    def test_unusable_partial_candidate_keeps_searching(self) -> None:
+        planner = FineLocalPlanner(replace(self.config, partial_search_max_expansions=1), self.checker)
+        grid = self.make_grid(np.ones((60, 60), dtype=bool))
+        with patch.object(planner, "_has_safe_partial_continuation", return_value=False):
+            plan = planner.plan(grid=grid, start_pose_world=(0, 0, 0), goal_world_xy=(0.6, 0))
+        self.assertEqual(plan.status, "FULL_PATH")
+        self.assertGreater(plan.expanded_node_count, 1)
 
     def test_unknown_actions_report_vehicle_parts(self) -> None:
         grid = clear_current_footprint(

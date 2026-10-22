@@ -1,11 +1,15 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from concurrent.futures import ProcessPoolExecutor
+import logging
 import math
+import multiprocessing
 from pathlib import Path
 import queue
 import threading
 import time
+from types import SimpleNamespace
 
 import numpy as np
 from scipy.ndimage import distance_transform_edt
@@ -16,6 +20,7 @@ from constraint_traverse.benchmark.geometry import sample_body_points
 from constraint_traverse.benchmark.planner import PassageCost, SamplingPlanner
 from constraint_traverse.benchmark.run import load_config
 from constraint_traverse.collect.transforms import pose_xyyaw
+from constraint_traverse.reference_path import ReferencePath, ReferenceWindow
 from vln_nav.control.trajectory import VelocityCommand
 
 
@@ -85,6 +90,35 @@ class PlanningGridGeometry:
                 "outside_fraction": (~inside).to(poses.dtype).mean(dim=-1)}
 
 
+@dataclass(frozen=True)
+class _SamplingJob:
+    epoch: int
+    state: np.ndarray
+    grid: object
+    goal: np.ndarray
+    timestamp: float
+    window: ReferenceWindow | None
+    committed_controls: np.ndarray
+    previous_activation_time: float | None
+
+
+_PROCESS_WORKER = None
+
+
+def _initialize_sampling_process(spec):
+    global _PROCESS_WORKER
+    torch.set_num_threads(1)
+    owner = SimpleNamespace(**spec)
+    owner.geometry = PlanningGridGeometry(owner.footprint)
+    owner.logger = logging.getLogger("constraint_traverse.sampling")
+    _PROCESS_WORKER = _PlanningWorker(owner)
+
+
+def _compute_in_sampling_process(job):
+    _PROCESS_WORKER._run(job)
+    return _PROCESS_WORKER.results.get_nowait()
+
+
 class _PlanningWorker:
     def __init__(self, owner):
         self.owner = owner
@@ -95,18 +129,39 @@ class _PlanningWorker:
         self.busy = False
         self.closed = False
         self.thread = None
+        self.executor = None
 
     def submit(self, job):
         with self.lock:
             if self.busy or self.closed:
                 return False
             self.busy = True
-        self.thread = threading.Thread(target=self._run, args=(job,), daemon=True)
-        self.thread.start()
+        try:
+            if self.executor is None:
+                spec = {name: getattr(self.owner, name) for name in
+                        ("method", "hardware", "config", "limits", "planning_period", "physics_dt", "footprint")}
+                self.executor = ProcessPoolExecutor(max_workers=1, mp_context=multiprocessing.get_context("spawn"),
+                    initializer=_initialize_sampling_process, initargs=(spec,))
+            future = self.executor.submit(_compute_in_sampling_process, job)
+            future.add_done_callback(lambda result: self._completed(job, result))
+        except Exception as error:
+            self.results.put((job.epoch, job.timestamp, job.grid.map_version, None, error, job.state))
+            with self.lock:
+                self.busy = False
         return True
 
+    def _completed(self, job, future):
+        try:
+            self.results.put(future.result())
+        except Exception as error:
+            self.results.put((job.epoch, job.timestamp, job.grid.map_version, None, error, job.state))
+        finally:
+            with self.lock:
+                self.busy = False
+
     def _run(self, job):
-        epoch, state, grid, goal, timestamp = job
+        epoch, state, grid, goal, timestamp = job.epoch, job.state, job.grid, job.goal, job.timestamp
+        predicted_start = state.copy()
         try:
             owner = self.owner
             if self.model is None:
@@ -122,12 +177,23 @@ class _PlanningWorker:
                 self.cost.set_target(goal)
                 self.planner = SamplingPlanner(owner.method, self.model, self.cost, owner.config["planner"], owner.config["safety"])
             owner.geometry.update_grid(grid)
-            elapsed = None if self.previous_time is None else timestamp - self.previous_time
-            result = self.planner.plan(state, elapsed_sec=elapsed)
-            self.previous_time = timestamp
-            self.results.put((epoch, timestamp, grid.map_version, result, None))
+            with torch.no_grad():
+                predicted = torch.tensor(state, device=self.model.device)
+                for control in job.committed_controls:
+                    predicted = self.model._physical_step(predicted, torch.tensor(control, device=self.model.device), owner.physics_dt)
+                predicted_start = predicted.cpu().numpy()
+            prediction_time = timestamp + len(job.committed_controls) * owner.physics_dt
+            if job.window is not None:
+                self.cost.set_target(job.window.world_xy[-1])
+                self.cost.set_reference_window(job.window)
+            else:
+                self.cost.set_target(goal)
+            elapsed = None if job.previous_activation_time is None else prediction_time - job.previous_activation_time
+            result = self.planner.plan(predicted_start, elapsed_sec=elapsed)
+            self.previous_time = prediction_time
+            self.results.put((epoch, timestamp, grid.map_version, result, None, predicted_start))
         except Exception as error:
-            self.results.put((epoch, timestamp, grid.map_version, None, error))
+            self.results.put((epoch, timestamp, grid.map_version, None, error, predicted_start))
         finally:
             with self.lock:
                 self.busy = False
@@ -137,6 +203,8 @@ class _PlanningWorker:
             self.closed = True
         if wait and self.thread is not None:
             self.thread.join()
+        if self.executor is not None:
+            self.executor.shutdown(wait=wait, cancel_futures=True)
 
 
 class SamplingNavigationController:
@@ -151,6 +219,7 @@ class SamplingNavigationController:
         self.execution_model = FourWheelModel(hardware, self.limits, physics_dt, integration_dt_sec=physics_dt)
         sampling_footprint = replace(footprint, margin_m=float(self.config["safety"]["margin_m"]))
         sampling_footprint.validate()
+        self.footprint = sampling_footprint
         self.geometry = PlanningGridGeometry(sampling_footprint)
         self._worker = _PlanningWorker(self)
         self._epoch = 0
@@ -165,6 +234,10 @@ class SamplingNavigationController:
         self.requested = np.zeros(2, dtype=np.float32)
         self.last_planning_time = -float("inf")
         self.plan_timestamp = None
+        self.reference = None
+        self.reference_cursor = 1
+        self._segment_key = None
+        self._delay_estimate = 0.0
         self.status = "IDLE"
 
     def close(self, wait=False):
@@ -185,32 +258,70 @@ class SamplingNavigationController:
         state[14:16] = self.last_command
         return state
 
-    def step(self, *, robot, drive, grid, goal_world_xy, now):
+    def step(self, *, robot, drive, grid, goal_world_xy, now, reference_path: ReferencePath | None = None):
         state = self.read_state(robot, drive)
         goal = np.asarray(goal_world_xy, dtype=np.float32).reshape(2)
         if self.goal is None or np.linalg.norm(goal - self.goal) > 0.01:
             self.reset()
             self.goal = goal.copy()
+        window = None
+        if reference_path is not None:
+            if np.linalg.norm(reference_path.goal_world_xy - goal) > 0.01:
+                raise ValueError("参考路径所属目标与当前导航目标不一致")
+            if reference_path is not self.reference:
+                self.reference, self.reference_cursor = reference_path, 1
+            window = reference_path.window(state[:3], lookahead_m=self.config["planner"]["reference_lookahead_m"],
+                                           cursor=self.reference_cursor)
+            if window is not None:
+                self.reference_cursor = window.cursor
+                segment_key = (reference_path.source, window.direction)
+                if self._segment_key is not None and segment_key != self._segment_key:
+                    self._epoch += 1
+                    self.last_plan = self.plan_timestamp = None
+                    self.last_planning_time = -float("inf")
+                self._segment_key = segment_key
         while not self._worker.results.empty():
-            epoch, timestamp, version, result, error = self._worker.results.get_nowait()
+            epoch, timestamp, version, result, error, predicted_start = self._worker.results.get_nowait()
             if epoch != self._epoch:
                 continue
             if error is not None:
                 self.logger.error("[SamplingError] mode=%s error=%s", self.method, error, exc_info=(type(error), error, error.__traceback__))
                 self.status = "PLANNING_ERROR"
                 continue
-            self.last_plan, self.plan_timestamp = result, timestamp
+            self.last_plan, self.plan_timestamp = result, now
             self.planner = self._worker.planner
+            observed_delay = max(0.0, now - timestamp)
+            self._delay_estimate = min(self.planning_period * len(result.controls) / 2,
+                                       min(observed_delay, self.planning_period) if self._delay_estimate == 0
+                                       else 0.5 * (self._delay_estimate + observed_delay))
+            result.diagnostics["connection_position_error_m"] = float(np.linalg.norm(state[:2] - predicted_start[:2]))
+            result.diagnostics["connection_speed_error_mps"] = float(abs(state[3] - predicted_start[3]))
+            result.diagnostics["connection_steering_error_rad"] = float(np.abs(state[6:10] - predicted_start[6:10]).max())
             self.logger.info("[SamplingPlan] mode=%s map_version=%d latency=%.3fs age=%.3fs diagnostics=%s",
                              self.method, version, result.planning_sec, now - timestamp, result.diagnostics)
         if grid is None:
             self.requested[:] = 0
             self.status = "NO_MAP"
+        elif reference_path is not None and window is None:
+            self.requested[:] = 0
+            self.status = "REFERENCE_DONE"
+            if self.last_plan is not None:
+                self._epoch += 1
+                self.last_plan = self.plan_timestamp = None
         else:
             if not self._worker.busy and now - self.last_planning_time >= self.planning_period - 1.0e-8:
                 snapshot = replace(grid, occupied_mask=grid.occupied_mask.copy(), free_mask=grid.free_mask.copy(),
                                    unknown_mask=grid.unknown_mask.copy(), clearance_m=grid.clearance_m.copy())
-                if self._worker.submit((self._epoch, state.copy(), snapshot, goal.copy(), float(now))):
+                controls = []
+                for index in range(math.ceil(self._delay_estimate / self.physics_dt)):
+                    plan_index = (math.floor((now + index * self.physics_dt - self.plan_timestamp) / self.planning_period)
+                                  if self.plan_timestamp is not None else -1)
+                    controls.append(self.last_plan.controls[plan_index].copy()
+                                    if self.last_plan is not None and 0 <= plan_index < len(self.last_plan.controls)
+                                    else np.zeros(2, dtype=np.float32))
+                job = _SamplingJob(self._epoch, state.copy(), snapshot, goal.copy(), float(now), window,
+                                   np.asarray(controls, dtype=np.float32).reshape(-1, 2), self.plan_timestamp)
+                if self._worker.submit(job):
                     self.last_planning_time = now
             self.requested[:] = 0
             self.status = "PLANNING"

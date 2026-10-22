@@ -24,14 +24,56 @@ class PassageCost:
         self.device = torch.device(device)
         self.goal = torch.zeros(2, device=self.device)
         self.reference = None
+        self.reference_window = None
+        self.reference_clearance_target = settings["obstacle_soft_distance_m"] + geometry.margin_m
         self.dt_sec = 0.20
         self.action_limits = torch.tensor([0.5, 0.5], device=self.device)
 
     def set_target(self, goal, reference=None):
-        self.goal = torch.as_tensor(goal, dtype=torch.float32, device=self.device)
+        self.goal = torch.tensor(np.asarray(goal).copy(), dtype=torch.float32, device=self.device)
         if self.goal.shape != (2,) or not torch.isfinite(self.goal).all():
             raise ValueError("目标必须为有效的世界二维坐标")
         self.reference = None if reference is None else torch.as_tensor(reference, dtype=torch.float32, device=self.device)
+        self.reference_window = None
+        self.reference_clearance_target = self.settings["obstacle_soft_distance_m"] + self.geometry.margin_m
+
+    def set_reference_window(self, window):
+        self.reference_window = window
+        self.route_xy = torch.tensor(window.world_xy, dtype=torch.float32, device=self.device)
+        self.route_yaw = torch.tensor(window.world_yaw_rad, dtype=torch.float32, device=self.device)
+        self.route_delta = torch.diff(self.route_xy, dim=0)
+        self.route_lengths = torch.linalg.vector_norm(self.route_delta, dim=-1)
+        self.route_s = torch.cat((torch.zeros(1, device=self.device), self.route_lengths.cumsum(0)))
+        # 柔性间距使用参考路线能够提供的空间，障碍侵入代价独立计算。
+        samples = []
+        spacing = self.geometry.grid.resolution_m if getattr(self.geometry, "grid", None) is not None else 0.05
+        for index in range(1, len(window.world_xy)):
+            delta_yaw = float((window.world_yaw_rad[index] - window.world_yaw_rad[index - 1] + math.pi) % (2 * math.pi) - math.pi)
+            count = max(1, math.ceil(np.linalg.norm(window.world_xy[index] - window.world_xy[index - 1]) / spacing),
+                        math.ceil(abs(delta_yaw) / math.radians(5)))
+            fractions = np.linspace(0, 1, count + 1)
+            xy = window.world_xy[index - 1] + fractions[:, None] * (window.world_xy[index] - window.world_xy[index - 1])
+            samples.append(np.column_stack((xy, window.world_yaw_rad[index - 1] + fractions * delta_yaw)))
+        metrics = self.geometry.torch_metrics(torch.tensor(np.concatenate(samples), dtype=torch.float32, device=self.device))
+        if all(float(metrics[name].max()) == 0 for name in ("occupied_fraction", "unknown_fraction", "outside_fraction")):
+            self.reference_clearance_target = min(self.reference_clearance_target,
+                max(self.geometry.margin_m, float(metrics["clearance"].min())))
+
+    def route_errors(self, state):
+        delta = state[..., None, :2] - self.route_xy[:-1]
+        fraction = (delta * self.route_delta).sum(-1) / self.route_lengths.square().clamp_min(1.0e-9)
+        fraction = fraction.clamp(0, 1)
+        projected = self.route_xy[:-1] + fraction[..., None] * self.route_delta
+        distances = (state[..., None, :2] - projected).square().sum(-1)
+        index = distances.argmin(-1)
+        selected_fraction = fraction.gather(-1, index[..., None]).squeeze(-1)
+        progress = self.route_s[index] + selected_fraction * self.route_lengths[index]
+        yaw_delta = torch.atan2(torch.sin(torch.diff(self.route_yaw)), torch.cos(torch.diff(self.route_yaw)))
+        yaw = self.route_yaw[index] + selected_fraction * yaw_delta[index]
+        if self.reference_window.direction == 0:
+            yaw = self.route_yaw[-1].expand_as(progress)
+        heading = torch.atan2(torch.sin(state[..., 2] - yaw), torch.cos(state[..., 2] - yaw))
+        return self.route_s[-1] - progress, distances.gather(-1, index[..., None]).squeeze(-1), heading
 
     def components(self, state, action, *, motion_states=None):
         cfg = self.settings
@@ -48,14 +90,19 @@ class PassageCost:
             "goal": cfg["goal"] * distance_squared,
             "heading": cfg["heading"] * (heading / torch.pi).square() * (delta.square().sum(dim=-1) > 0.30 ** 2),
             "control": cfg["control"] * (action / self.action_limits).square().sum(dim=-1),
-            "clearance": cfg["obstacle"] * reduce(torch.relu((soft_distance + self.geometry.margin_m - gap) / soft_distance).square()),
+            "clearance": cfg["obstacle"] * reduce(torch.relu((self.reference_clearance_target - gap) / soft_distance).square()),
             "penetration": cfg["penetration"] * reduce((metrics["penetration"] / cfg["penetration_scale_m"]).square()),
             "occupied": cfg["occupied"] * reduce(metrics["occupied_fraction"]),
             "unknown": cfg["unknown"] * reduce(metrics["unknown_fraction"]),
             "outside": cfg["outside"] * reduce(metrics["outside_fraction"]),
             "motion": cfg["motion_constraint"] * reduce(checked[..., 16]),
         }
-        if self.reference is not None:
+        if self.reference_window is not None:
+            remaining, lateral_squared, route_heading = self.route_errors(state)
+            components["goal"] = cfg["goal"] * (remaining / cfg["goal_distance_scale_m"]).square()
+            components["reference"] = cfg["reference_path"] * lateral_squared / cfg["goal_distance_scale_m"] ** 2
+            components["heading"] = cfg["heading"] * route_heading.square()
+        elif self.reference is not None:
             lateral = torch.cdist(state[..., :2], self.reference).amin(dim=-1)
             components["reference"] = cfg["reference_path"] * (lateral / cfg["goal_distance_scale_m"]).square()
         return {name: value * self.dt_sec / cfg["reference_dt_sec"] for name, value in components.items()}
@@ -64,6 +111,10 @@ class PassageCost:
         return sum(self.components(state, action, motion_states=motion_states).values())
 
     def terminal(self, states, actions):
+        if self.reference_window is not None:
+            remaining, lateral_squared, heading = self.route_errors(states[..., -1, :])
+            yaw_cost = heading.square() if self.reference_window.direction == 0 else 0
+            return self.settings["terminal_goal"] * (remaining.square() + lateral_squared + yaw_cost)
         return self.settings["terminal_goal"] * ((states[..., -1, :2] - self.goal) / self.settings["goal_distance_scale_m"]).square().sum(dim=-1)
 
     def trajectory(self, states, actions):
@@ -96,7 +147,7 @@ class SamplingPlanner:
         self.last_output = np.zeros(2, dtype=np.float32)
         self.seed = int(settings["seed"])
         self._cuda_indices = [model.device.index or 0] if model.device.type == "cuda" else []
-        with torch.random.fork_rng(devices=self._cuda_indices):
+        with RNG_LOCK, torch.random.fork_rng(devices=self._cuda_indices):
             torch.manual_seed(self.seed)
             horizon = int(settings["horizon_steps"])
             initial = torch.zeros(horizon, 2, device=model.device)
@@ -125,6 +176,38 @@ class SamplingPlanner:
             self.rng_cpu = torch.get_rng_state().clone()
             self.rng_cuda = torch.cuda.get_rng_state(model.device).clone() if self._cuda_indices else None
         self.first_command = True
+
+    def _reference_controls(self, state):
+        window = self.cost.reference_window
+        pose = state[:3].detach().cpu().numpy().astype(np.float64)
+        output = np.zeros((self.controller.T, 2), dtype=np.float32)
+        cursor = 1
+        for index in range(len(output)):
+            while cursor < len(window.world_xy) - 1 and np.linalg.norm(window.world_xy[cursor] - pose[:2]) < 0.15:
+                cursor += 1
+            target = window.world_xy[cursor]
+            delta = target - pose[:2]
+            distance = float(np.linalg.norm(delta))
+            if window.direction == 0:
+                error = float((window.world_yaw_rad[-1] - pose[2] + math.pi) % (2 * math.pi) - math.pi)
+                v, w = 0.0, float(np.clip(1.5 * error, -self.model.limits.max_angular_radps, self.model.limits.max_angular_radps))
+            elif distance < 0.025 and cursor == len(window.world_xy) - 1:
+                v = w = 0.0
+            else:
+                bearing = math.atan2(delta[1], delta[0]) + (math.pi if window.direction < 0 else 0)
+                error = (bearing - pose[2] + math.pi) % (2 * math.pi) - math.pi
+                if abs(error) > 0.65:
+                    v, w = 0.0, float(np.clip(1.5 * error, -self.model.limits.max_angular_radps, self.model.limits.max_angular_radps))
+                else:
+                    v = window.direction * min(self.model.limits.max_linear_mps, max(0.025, distance / self.model.dt_sec))
+                    left = -math.sin(pose[2]) * delta[0] + math.cos(pose[2]) * delta[1]
+                    limit = min(self.model.limits.max_angular_radps, self.model.max_curvature * abs(v))
+                    w = float(np.clip(v * 2 * left / max(distance * distance, 0.01), -limit, limit))
+            output[index] = v, w
+            yaw_mid = pose[2] + 0.5 * w * self.model.dt_sec
+            pose[:2] += v * self.model.dt_sec * np.asarray([math.cos(yaw_mid), math.sin(yaw_mid)])
+            pose[2] += w * self.model.dt_sec
+        return torch.tensor(output, device=self.model.device)
 
     def _prepare_sampling(self, tensor, elapsed_sec):
         controller = self.controller
@@ -182,6 +265,17 @@ class SamplingPlanner:
         priors[5, :turn_steps, 1] = float(np.sign(bearing)) * self.model.limits.max_angular_radps
         priors[5, turn_steps:, 0] = min(speed_limit, distance / max((controller.T - turn_steps) * self.model.dt_sec, self.model.dt_sec))
         controller.action_priors = controller._bound_action(priors)
+        if self.cost.reference_window is not None:
+            reference_controls = controller._bound_action(self._reference_controls(tensor))
+            controller.action_priors[:3] = torch.stack((reference_controls * 0.7, reference_controls, reference_controls * 1.3))
+            controller.action_priors = controller._bound_action(controller.action_priors)
+            if self.first_command:
+                if self.method == "KMPPI":
+                    indices = controller.Tk[0].round().long()
+                    controller.theta = reference_controls[indices].clone()
+                    controller.synchronize_controls()
+                else:
+                    controller.U = reference_controls.clone()
 
     def _synchronize(self):
         if self._cuda_indices:
@@ -224,6 +318,10 @@ class SamplingPlanner:
                 "command_change": float(np.linalg.norm(command - self.last_output)),
                 "candidate_motion_violation_fraction": float((self.controller.states[0, :, :, 16] > 0.5).any(dim=-1).float().mean()),
             }
+            if self.cost.reference_window is not None:
+                diagnostics["reference_length_m"] = self.cost.reference_window.length_m
+                diagnostics["reference_direction"] = self.cost.reference_window.direction
+                diagnostics["reference_clearance_target_m"] = self.cost.reference_clearance_target
             if valid:
                 diagnostics.update({f"cost_{name}": float(value.sum()) for name, value in
                                     self.cost.components(prediction[1:], controls, motion_states=motion_states).items()})

@@ -681,7 +681,20 @@ class FineLocalPlanner:
                 partial_candidates
                 and expanded >= self.config.partial_search_max_expansions
             ):
-                break
+                usable_candidates = [
+                    candidate for candidate in partial_candidates
+                    if self._has_safe_partial_continuation(
+                        grid=grid,
+                        initial_pose=start,
+                        endpoint_pose=node_pose[candidate[1]],
+                        reference_path_world_xy=reference,
+                        travel_distance_m=node_travel_distance[candidate[1]],
+                        constraint=constraint,
+                    )
+                ]
+                partial_candidates = usable_candidates
+                if usable_candidates:
+                    break
             _, _, current_node = heapq.heappop(queue)
             key = node_key[current_node]
             cost = node_cost[current_node]

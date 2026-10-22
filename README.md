@@ -1,6 +1,6 @@
 # CAPTAINav
 
-当前分支在 Isaac Sim 中运行 AGX 视觉语言导航。远程 InternVLA-N1 System 2 根据指令与前视历史输出 pixel-goal 或离散动作；pixel-goal 转换成 metric goal 后交给现有粗粒度或细粒度导航。用户仍可在 RGB-D 局部地图上手动选择目标。
+当前分支在 Isaac Sim 中运行 AGX 三层视觉语言导航。远程 InternVLA-N1 System 2 给出局部目标，COARSE/NavDP 或 FINE/Hybrid A* 生成参考路径，MPPI 或 KMPPI 优化连续运动。用户可在 RGB-D 局部地图上手动选择目标。
 
 ## 导航流程
 
@@ -18,12 +18,14 @@
           |
           +---- STOP ----> 静止复核
                                   |
-            COARSE / FINE / MPPI / KMPPI
+                  COARSE / FINE 参考路径
+                                  |
+                  MPPI / KMPPI 连续运动优化
                                   |
                            AGX 四轮连续控制
 ```
 
-底层支持 `COARSE`（NavDP）、`FINE`（Hybrid A*）、`MPPI` 和 `KMPPI`。默认模式由 `configs/navigation.yaml` 的 `execution.default_mode` 设置，当前为 `COARSE`。Isaac Sim 的 `Navigation Controls` 窗口提供四种模式的下拉选择；切换时清除旧轨迹和规划历史，保留当前局部目标。
+`Navigation Controls` 提供两组独立选项：路径生成选择 `COARSE`（NavDP）或 `FINE`（Hybrid A*），运动控制选择 `MPPI` 或 `KMPPI`。默认组合由 `configs/navigation.yaml` 的 `execution.default_mode` 和 `execution.controller` 设置，当前为 `COARSE + MPPI`。切换组合时保留目标与地图，清除旧路径、控制历史及过期请求。
 
 ## 环境与运行
 
@@ -38,26 +40,28 @@ conda activate vlmnav
 bash scripts/run_nav.sh
 ```
 
-可以通过启动参数直接选择底层：
+通过启动参数选择路径生成与运动控制：
 
 ```bash
-bash scripts/run_nav.sh --local-planner MPPI
-bash scripts/run_nav.sh --local-planner KMPPI
+bash scripts/run_nav.sh --local-planner COARSE --controller MPPI
+bash scripts/run_nav.sh --local-planner COARSE --controller KMPPI
+bash scripts/run_nav.sh --local-planner FINE --controller MPPI
+bash scripts/run_nav.sh --local-planner FINE --controller KMPPI
 ```
 
-启动参数只影响本次运行。运行过程中也可以在 `Navigation Controls` 下拉框切换回 `COARSE` 或 `FINE`。
+启动参数只影响本次运行。运行过程中可以通过两组下拉框独立切换。
 
 启动后，终端会列出 `episodes.json` 中的任务。输入任务编号后，程序才会启动 Isaac Sim，并使用该任务的场景、初始位姿和指令。输入无效编号时会要求重新输入，不会自动选择任务。
 
-完整导航使用远程 S2 服务。`COARSE` 另外需要 NavDP 服务；`FINE`、`MPPI`、`KMPPI` 在本机进行底层规划。主程序获得有效前视帧后自动调用 `/reset` 创建会话，随后通过 `/infer` 执行所选任务的指令。S2 输出 `LOOKDOWN` 时，程序停车并将固定下视相机的新图像发回同一会话。
+完整导航使用远程 S2 服务。`COARSE` 需要 NavDP 服务；`FINE`、`MPPI`、`KMPPI` 在本机计算。主程序获得有效前视帧后自动调用 `/reset` 创建会话，随后通过 `/infer` 执行所选任务的指令。S2 输出 `LOOKDOWN` 时，程序停车并将固定下视相机的新图像发回同一会话。
 
-COARSE 将 NavDP 选中的轨迹根据请求时的机器人位姿转换到里程计坐标，再使用 Pure Pursuit 进行滚动跟踪。跟踪器根据目标方向前进或倒退，方向切换经过减速；短轨迹采用长度四分之一与配置容差中的较小值作为终点容差。轨迹年龄、连接距离、轨迹长度与跟踪偏差用于记录；有效运动轨迹直接交给跟踪器。服务返回静止轨迹时，机器人保持静止并继续请求当前局部目标。请求编号和运行模式用于确认结果所属任务，输入输出保留尺寸及有限数值检查。到达 S2 局部目标后，按 `internnav_s2.goal_reached_tolerance_m` 完成该目标并继续高层决策；轮组执行保留物理运动限制。
+COARSE 将 NavDP 选中的轨迹根据请求时的机器人位姿转换为世界参考路径。FINE 提供包含车体朝向、前进、后退和原地旋转信息的参考路径。参考路径携带高层目标、请求编号、生成时间和地图版本；控制层按运动段顺序选择前瞻目标。短路径结束后继续请求路径，到达 S2 局部目标后按 `internnav_s2.goal_reached_tolerance_m` 继续高层决策。服务返回静止轨迹时继续请求当前目标。
 
-MPPI/KMPPI 依赖通过 `python -m pip install -r constraint_traverse/benchmark/requirements.txt` 安装，参数由 `sampling_planner.config_path` 指向的配置读取，当前为 `constraint_traverse/configs/benchmark.yaml` 中的运动模型、代价、采样和障碍余量设置。输入包括前视和底盘下视 RGB-D 直接建立的二维规划地图、S2 局部目标及实测轮组状态。每个周期执行优化器输出的首个控制指令，底盘控制器限制速度、加减速与转向。障碍和 UNKNOWN 参与优化代价。日志记录 `[SamplingPlan]`、优化耗时及估计间距。
+MPPI/KMPPI 依赖通过 `python -m pip install -r constraint_traverse/benchmark/requirements.txt` 安装，参数由 `sampling_planner.config_path` 指向的配置读取，当前为 `constraint_traverse/configs/benchmark.yaml`。输入为参考路径、前视与底盘下视 RGB-D 二维地图及实测轮组状态。代价包含沿路线剩余距离、横向偏离、朝向、障碍及 UNKNOWN；参考路线提供初始控制和候选动作。`planner.reference_lookahead_m` 控制路径前瞻距离。地图显示参考路径和蓝色预测轨迹。
 
 主导航使用二维占用栅格：深度像素根据相机内外参转换到世界坐标，按地面相对高度识别障碍和地面。各采样像素提供的障碍终点写入占用栅格；平面空闲射线在本批观测到的障碍前截断。地图随机器人平移并保留重叠区域的证据，Goal Map 与规划器使用同一份二维地图。启动日志显示 `[Mapping] type=RGBD_2D`。地图尺寸、栅格分辨率、采样间隔及融合周期读取 `mapping.map`，障碍高度范围读取 `fine_planner.obstacle_min_height_m/obstacle_max_height_m`。
 
-MPPI/KMPPI 每个预测动作按实际物理步长进行子步积分，动作持续时间与执行周期一致。KMPPI 使用项目内 `ConsistentKMPPI` 适配类，统一停车支撑点、候选控制、最终控制与滚动状态。代价分别记录障碍侵入、占据比例、UNKNOWN 覆盖、地图边界、运动约束及目标距离；`[SamplingPlan] diagnostics` 包含 ESS、最大权重、各项成本、控制超限量和指令变化。UNKNOWN 继续具有代价，额外执行复核保持关闭。
+MPPI/KMPPI 在独立进程计算，每个预测动作按物理步长积分。根据近期求解延迟和已提交控制预测接续状态，结果接收时从控制序列首项执行，并记录位置、速度和轮角接续误差。KMPPI 使用 `ConsistentKMPPI` 保持支撑点与控制序列一致。已知无障碍参考路线用于确定可用的柔性间距目标，障碍侵入代价独立计算。`[SamplingPlan] diagnostics` 包含 ESS、最大权重、分项成本、控制超限、参考路径长度、柔性间距目标及运动方向。
 
 前视相机水平视角由 `configs/navigation.yaml` 的 `camera.horizontal_fov_deg` 设置，当前为 `80°`。S2 返回连续同向转向时，程序最多执行 `30°`，停稳后用新的前视画面重新请求决策。
 
@@ -69,8 +73,9 @@ Isaac Sim 中包含 `S2 Decision`、`Goal Map` 和 `Navigation Controls` 窗口�
 
 | 文件 | 用途 |
 | --- | --- |
-| [navigation.py](src/vln_nav/app/navigation.py) | 场景加载、目标选择与四种底层模式 |
+| [navigation.py](src/vln_nav/app/navigation.py) | 场景加载、目标选择与三层调度 |
 | [constraint_traverse/navigation.py](constraint_traverse/navigation.py) | MPPI/KMPPI 规划地图适配与轮组执行 |
+| [reference_path.py](constraint_traverse/reference_path.py) | 统一参考路径与有序运动段前瞻 |
 | [navigation.yaml](configs/navigation.yaml) | 场景、相机、地图、规划和跟踪参数 |
 | [episodes.json](configs/episodes.json) | 可选择任务的场景、初始位姿和指令 |
 | [episode.py](src/vln_nav/runtime/episode.py) | 任务清单校验与终端选择 |
@@ -84,4 +89,4 @@ Isaac Sim 中包含 `S2 Decision`、`Goal Map` 和 `Navigation Controls` 窗口�
 
 程序覆盖写入 `logs/nav_latest.log`。S2 pixel-goal、NavDP 候选轨迹和细粒度几何图片覆盖写入 `debug/local/`。
 
-Fine 模式对完整路径和增量路径统一检查车体扫掠区域：新增覆盖的二维未知栅格或已知障碍会阻止执行。增量路径还检查停车距离与近期实际位姿，避免反复接收没有实际进展的短路径。日志中的 `FULL_PATH`、`SAFE_PARTIAL_PATH`、`NO_SAFE_PROGRESS` 和 `SEARCH_INCOMPLETE` 表示规划结果；首次失败时，`debug/local/fine_failure_*.json` 记录各动作与车体部件的未知覆盖，配套 `.npz` 保存相同地图版本的规划栅格及三维观测，`.png` 显示当前车体、膨胀余量、直行扫掠及转向未知区域。固定地图测试命令为 `PYTHONPATH=src python3 -m unittest discover -s scripts -p 'test_fine_incremental.py'`。
+FINE 搜索完整路径与增量路径时检查车体扫掠区域中的障碍和新增未知栅格。达到短路径搜索节点数量时，仅有通过终点继续通行检查的候选才允许提前返回；候选不合格时继续搜索。有效路径保留使用，当前瞻距离不足或路径附近的地图证据变化时重新生成。`FULL_PATH`、`SAFE_PARTIAL_PATH`、`NO_SAFE_PROGRESS` 和 `SEARCH_INCOMPLETE` 表示路径生成结果。首次失败时，`debug/local/fine_failure_*.json` 记录逐动作诊断，配套 `.npz` 保存二维规划地图，`.png` 显示车体和未知覆盖。测试命令为 `PYTHONPATH=src:. python -m unittest scripts.test_fine_incremental constraint_traverse.test_reference_path constraint_traverse.test_navigation`。窄门物理验收使用 `PYTHONPATH=src:. python -m constraint_traverse.verify_navigation --paths COARSE FINE`，COARSE 需要已启动的 NavDP 服务；验证输出临时数据会自动清理。

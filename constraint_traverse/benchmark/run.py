@@ -20,7 +20,7 @@ def load_config(path):
     from .model import MotionLimits
     MotionLimits(**cfg["motion"])
     for section, fields in {
-        "planner": ("dt_sec", "horizon_steps", "samples", "iterations", "temperature", "noise_linear_std", "noise_angular_std", "kernel_support_points", "kernel_sigma"),
+        "planner": ("dt_sec", "horizon_steps", "samples", "iterations", "temperature", "noise_linear_std", "noise_angular_std", "kernel_support_points", "kernel_sigma", "reference_lookahead_m"),
         "trial": ("goal_tolerance_m", "timeout_sec", "stopped_hold_sec", "settle_frames", "map_size_px"),
         "safety": ("sweep_step_m", "reaction_time_sec"),
         "cost": ("reference_dt_sec", "goal_distance_scale_m", "penetration_scale_m", "obstacle_soft_distance_m"),

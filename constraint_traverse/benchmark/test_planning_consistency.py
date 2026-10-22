@@ -12,6 +12,7 @@ from .model import STATE_SIZE
 from .geometry import sample_body_points
 from .planner import PassageCost, SamplingPlanner
 from .test_benchmark import fixture
+from constraint_traverse.reference_path import ReferencePath
 
 
 def setUpModule():
@@ -19,6 +20,64 @@ def setUpModule():
 
 
 class ConsistencyTests(unittest.TestCase):
+    def reference_cost(self, points, headings=None, directions=None):
+        from constraint_traverse.test_navigation import make_grid, make_geometry
+        cfg, model, _, cost = fixture()
+        cost.geometry = make_geometry()
+        cost.geometry.update_grid(make_grid())
+        metadata = dict(goal_world_xy=np.asarray(points[-1]), source="FINE", request_id=1,
+                        created_sim_time_sec=0, map_version=1)
+        path = (ReferencePath.from_positions(points, initial_yaw_rad=0, **metadata) if headings is None
+                else ReferencePath(np.asarray(points), np.asarray(headings), np.asarray(directions), **metadata))
+        window = path.window([0, 0, 0], lookahead_m=3)
+        cost.set_target(window.world_xy[-1])
+        cost.set_reference_window(window)
+        return cfg, model, cost
+
+    def test_route_progress_rewards_required_detour(self):
+        _, _, cost = self.reference_cost([[0, 0], [-0.4, 0], [-0.4, 0.8], [0.8, 0.8]])
+        states = torch.zeros(2, STATE_SIZE)
+        states[1, 0] = -0.3
+        components = cost.components(states, torch.zeros(2, 2))
+        self.assertLess(float(components["goal"][1]), float(components["goal"][0]))
+
+    def test_spin_reference_has_heading_objective(self):
+        _, _, cost = self.reference_cost([[0, 0], [0, 0]], [0, np.pi / 2], [0, 0])
+        states = torch.zeros(2, 1, STATE_SIZE)
+        states[1, 0, 2] = np.pi / 2
+        terminal = cost.terminal(states, torch.zeros(2, 1, 2))
+        self.assertGreater(float(terminal[0]), float(terminal[1]))
+
+    def test_reference_commands_reverse_and_spin(self):
+        for method in ("MPPI", "KMPPI"):
+            for spin in (False, True):
+                cfg, model, cost = (self.reference_cost([[0, 0], [0, 0]], [0, np.pi / 2], [0, 0]) if spin
+                                    else self.reference_cost([[0, 0], [-0.4, 0]]))
+                planner = SamplingPlanner(method, model, cost, cfg["planner"], cfg["safety"])
+                result = planner.plan(np.zeros(STATE_SIZE, dtype=np.float32))
+                if spin:
+                    self.assertGreater(float(result.command[1]), 0.02, (method, result.command))
+                else:
+                    self.assertLess(float(result.command[0]), -0.005, (method, result.command))
+
+    def test_narrow_reference_sets_attainable_soft_clearance(self):
+        from constraint_traverse.test_navigation import make_grid
+        cfg, _, _, _ = fixture()
+        geometry = PlanningGridGeometry(FootprintConfig((FootprintPartConfig("body", -0.4, 0.4, -0.3, 0.3),), 0.03))
+        grid = make_grid()
+        rows, _ = np.indices(grid.shape)
+        y = grid.origin_y_m + (rows + 0.5) * grid.resolution_m
+        grid.occupied_mask[:] = abs(y) > 0.36
+        grid.free_mask[:] = ~grid.occupied_mask
+        geometry.update_grid(grid)
+        cost = PassageCost(geometry, cfg["cost"])
+        path = ReferencePath.from_positions([[0, 0], [0.6, 0]], initial_yaw_rad=0,
+            goal_world_xy=np.asarray([0.6, 0]), source="FINE", request_id=1, created_sim_time_sec=0, map_version=1)
+        cost.set_target([0.6, 0])
+        cost.set_reference_window(path.window([0, 0, 0], lookahead_m=1.2))
+        self.assertLess(cost.reference_clearance_target, 0.10)
+        self.assertGreaterEqual(cost.reference_clearance_target, geometry.margin_m)
+
     def test_prediction_equals_physical_substeps(self):
         _, model, _, _ = fixture()
         for action in ([0.5, 0], [0.3, 0.3], [0, 0.3], [-0.3, 0]):

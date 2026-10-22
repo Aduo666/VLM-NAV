@@ -1,57 +1,103 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+from typing import Iterator
 
 import cv2
 import numpy as np
 
 from .recorder import decode_depth_png
+from .validate import _find_episode_dirs
+
+
+@dataclass(frozen=True)
+class _ReplayData:
+    episode: Path
+    meta: dict
+    timestamps: np.ndarray
+    human: np.ndarray
+    applied: np.ndarray
+    pose: np.ndarray
+
+    @property
+    def count(self) -> int:
+        return len(self.timestamps)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Replay a collected traversal episode")
-    parser.add_argument("episode", type=Path)
+    parser = argparse.ArgumentParser(description="回放采集记录或批量生成 H.264 视频")
+    parser.add_argument("episode", type=Path, help="记录目录；批量模式下填写数据总目录或场景目录")
     parser.add_argument("--fps", type=float, help="回放帧率；默认读取记录的时间间隔")
-    parser.add_argument("--output", type=Path)
-    return parser.parse_args()
+    parser.add_argument("--output", type=Path, help="单条回放的视频输出路径")
+    parser.add_argument("--batch", action="store_true", help="批量生成 H.264 回放视频")
+    parser.add_argument("--output-dir", type=Path, help="批量视频的输出目录")
+    parser.add_argument("--overwrite", action="store_true", help="重新生成已有视频")
+    args = parser.parse_args()
+    if args.fps is not None and (not np.isfinite(args.fps) or args.fps <= 0):
+        parser.error("--fps 必须为有限正数")
+    if args.batch:
+        if args.output is not None:
+            parser.error("批量模式请使用 --output-dir 指定输出目录")
+        if args.output_dir is None:
+            parser.error("批量模式需要指定 --output-dir")
+    elif args.output_dir is not None or args.overwrite:
+        parser.error("--output-dir 和 --overwrite 需要与 --batch 一起使用")
+    return args
 
 
 def main() -> int:
     args = parse_args()
-    episode = args.episode.expanduser().resolve()
+    if args.batch:
+        try:
+            return _export_batch(args.episode, args.output_dir, args.fps, args.overwrite)
+        except Exception as exc:
+            print(f"批量生成失败：{exc}", flush=True)
+            return 1
+    return _replay_single(args)
+
+
+def _load_replay_data(episode: Path) -> _ReplayData:
     meta = json.loads((episode / "meta.json").read_text(encoding="utf-8"))
     with np.load(episode / "state.npz", allow_pickle=False) as data:
-        count = int(len(data["sample_time_sec"]))
+        timestamps = np.asarray(data["sample_time_sec"], dtype=np.float64)
         human = np.asarray(data["human_action_vw"], dtype=np.float32)
         applied = np.asarray(data["applied_action_vw"], dtype=np.float32)
         pose = np.asarray(data["pose_world_xyyaw"], dtype=np.float32)
-        timestamps = np.asarray(data["sample_time_sec"], dtype=np.float64)
+    count = len(timestamps)
     if count == 0:
         raise ValueError("记录中没有可回放的样本")
-    fps = args.fps
-    if fps is None:
-        fps = 1.0 / float(np.median(np.diff(timestamps))) if count > 1 else 15.0
+    if timestamps.shape != (count,) or human.shape != (count, 2) or applied.shape != (count, 2) or pose.shape != (count, 3):
+        raise ValueError("回放状态的帧数或数组形状不一致")
+    return _ReplayData(episode, meta, timestamps, human, applied, pose)
 
+
+def _replay_fps(timestamps: np.ndarray, requested: float | None) -> float:
+    if requested is not None:
+        return requested
+    if len(timestamps) == 1:
+        return 15.0
+    intervals = np.diff(timestamps)
+    if not np.isfinite(intervals).all() or np.any(intervals <= 0):
+        raise ValueError("回放时间戳必须有限且严格递增")
+    return 1.0 / float(np.median(intervals))
+
+
+def _replay_single(args: argparse.Namespace) -> int:
+    episode = args.episode.expanduser().resolve()
+    data = _load_replay_data(episode)
+    fps = _replay_fps(data.timestamps, args.fps)
     delay_ms = max(1, int(round(1000.0 / max(fps, 0.1))))
     print(
-        f"episode={meta.get('episode_id')} success={meta.get('success')} "
-        f"samples={count} duration={meta.get('duration_sec')}"
+        f"episode={data.meta.get('episode_id')} success={data.meta.get('success')} "
+        f"samples={data.count} duration={data.meta.get('duration_sec')}"
     )
-    start_world = np.asarray(
-        meta.get("start_pose_world_xyyaw", pose[0]), dtype=np.float64
-    )
-    goal_world_value = meta.get("goal_world_xy")
-    if goal_world_value is None:
-        legacy_goal = meta.get("goal_pose_world_xyyaw")
-        goal_world_value = None if legacy_goal is None else legacy_goal[:2]
-    goal_world = (
-        None
-        if goal_world_value is None
-        else np.asarray(goal_world_value, dtype=np.float64)
-    )
-    bev_config = meta.get("bev", {})
     gui_available = _opencv_gui_available()
     output_path = None
     if args.output is not None:
@@ -66,51 +112,7 @@ def main() -> int:
         print("mode=interactive")
 
     try:
-        for index in range(count):
-            stem = f"{index:06d}"
-            rgb = cv2.imread(
-                str(episode / "front_rgb" / f"{stem}.jpg"),
-                cv2.IMREAD_COLOR,
-            )
-            front_depth = decode_depth_png(
-                episode / "front_depth" / f"{stem}.png"
-            )
-            down_depth = decode_depth_png(
-                episode / "down_depth" / f"{stem}.png"
-            )
-            bev = np.load(
-                episode / "bev" / f"{stem}.npy",
-                allow_pickle=False,
-            )
-
-            if rgb is None:
-                raise RuntimeError(f"Missing RGB frame {stem}")
-            start_body = _world_xy_to_body(start_world[:2], pose[index])
-            trajectory_body = _world_xy_to_body(pose[:, :2], pose[index])
-            goal_body = (
-                None
-                if goal_world is None
-                else _world_xy_to_body(goal_world[:2], pose[index])
-            )
-            canvas = _compose(
-                rgb=rgb,
-                front_depth=front_depth,
-                down_depth=down_depth,
-                bev=bev,
-                index=index,
-                pose=pose[index],
-                goal=(
-                    np.full(2, np.nan, dtype=np.float32)
-                    if goal_body is None
-                    else goal_body
-                ),
-                human=human[index],
-                applied=applied[index],
-                bev_config=bev_config,
-                start_body_xy=start_body,
-                goal_body_xy=goal_body,
-                trajectory_body_xy=trajectory_body,
-            )
+        for index, canvas in enumerate(_episode_frames(data)):
             if output_path is not None:
                 if writer is None:
                     height, width = canvas.shape[:2]
@@ -129,8 +131,8 @@ def main() -> int:
 
             cv2.imshow("Constraint Traverse Replay", canvas)
             frame_delay = delay_ms
-            if args.fps is None and index + 1 < count:
-                frame_delay = max(1, int(round(1000.0 * (timestamps[index + 1] - timestamps[index]))))
+            if args.fps is None and index + 1 < data.count:
+                frame_delay = max(1, int(round(1000.0 * (data.timestamps[index + 1] - data.timestamps[index]))))
             key = cv2.waitKey(frame_delay) & 0xFF
             if key in (27, ord("q")):
                 break
@@ -145,6 +147,156 @@ def main() -> int:
     if output_path is not None:
         print(f"saved={output_path}")
     return 0
+
+
+def _episode_frames(data: _ReplayData) -> Iterator[np.ndarray]:
+    start_world = np.asarray(data.meta.get("start_pose_world_xyyaw", data.pose[0]), dtype=np.float64)
+    goal_world_value = data.meta.get("goal_world_xy")
+    if goal_world_value is None:
+        legacy_goal = data.meta.get("goal_pose_world_xyyaw")
+        goal_world_value = None if legacy_goal is None else legacy_goal[:2]
+    goal_world = None if goal_world_value is None else np.asarray(goal_world_value, dtype=np.float64)
+    for index in range(data.count):
+        stem = f"{index:06d}"
+        rgb = cv2.imread(str(data.episode / "front_rgb" / f"{stem}.jpg"), cv2.IMREAD_COLOR)
+        if rgb is None:
+            raise RuntimeError(f"缺少或无法读取 RGB 图像：{stem}")
+        front_depth = decode_depth_png(data.episode / "front_depth" / f"{stem}.png")
+        down_depth = decode_depth_png(data.episode / "down_depth" / f"{stem}.png")
+        bev = np.load(data.episode / "bev" / f"{stem}.npy", allow_pickle=False)
+        goal_body = None if goal_world is None else _world_xy_to_body(goal_world[:2], data.pose[index])
+        yield _compose(
+            rgb=rgb, front_depth=front_depth, down_depth=down_depth, bev=bev,
+            index=index, pose=data.pose[index],
+            goal=np.full(2, np.nan, dtype=np.float32) if goal_body is None else goal_body,
+            human=data.human[index], applied=data.applied[index],
+            bev_config=data.meta.get("bev", {}),
+            start_body_xy=_world_xy_to_body(start_world[:2], data.pose[index]),
+            goal_body_xy=goal_body,
+            trajectory_body_xy=_world_xy_to_body(data.pose[:, :2], data.pose[index]),
+        )
+
+
+def _complete_h264(path: Path, count: int, ffprobe: str) -> bool:
+    if not path.is_file() or path.stat().st_size == 0:
+        return False
+    try:
+        result = subprocess.run(
+            [ffprobe, "-v", "error", "-select_streams", "v:0", "-count_frames",
+             "-show_entries", "stream=codec_name,pix_fmt,width,height,nb_read_frames", "-of", "json", str(path)],
+            capture_output=True, text=True, timeout=60,
+        )
+        if result.returncode != 0 or result.stderr.strip():
+            return False
+        stream = json.loads(result.stdout)["streams"][0]
+        return (
+            stream["codec_name"] == "h264" and stream["pix_fmt"] == "yuv420p"
+            and int(stream["width"]) > 0 and int(stream["height"]) > 0
+            and int(stream["nb_read_frames"]) == count
+        )
+    except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, IndexError, TypeError):
+        return False
+
+
+def _stop_encoder(process: subprocess.Popen) -> None:
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+    if process.stdin is not None:
+        try:
+            process.stdin.close()
+        except OSError:
+            pass
+
+
+def _export_h264(data: _ReplayData, fps: float, output: Path, ffmpeg: str, ffprobe: str) -> None:
+    frames = _episode_frames(data)
+    first = next(frames)
+    height, width = first.shape[:2]
+    output.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, name = tempfile.mkstemp(prefix=f".{output.stem}.", suffix=".tmp.mp4", dir=output.parent)
+    os.close(descriptor)
+    temporary = Path(name)
+    try:
+        with tempfile.TemporaryFile() as errors:
+            process = subprocess.Popen(
+                [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+                 "-f", "rawvideo", "-pixel_format", "bgr24", "-video_size", f"{width}x{height}",
+                 "-framerate", format(fps, ".12g"), "-i", "pipe:0", "-an", "-c:v", "libx264",
+                 "-preset", "fast", "-crf", "20", "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(temporary)],
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=errors,
+            )
+            try:
+                process.stdin.write(np.ascontiguousarray(first).tobytes())
+                for canvas in frames:
+                    if canvas.shape != first.shape:
+                        raise ValueError("同一条记录中的回放画面尺寸发生变化")
+                    process.stdin.write(np.ascontiguousarray(canvas).tobytes())
+                process.stdin.close()
+                returncode = process.wait()
+            except BaseException as exc:
+                _stop_encoder(process)
+                if isinstance(exc, BrokenPipeError):
+                    errors.seek(0)
+                    raise RuntimeError(f"FFmpeg 编码失败：{errors.read().decode(errors='replace').strip()}") from exc
+                raise
+            if returncode != 0:
+                errors.seek(0)
+                raise RuntimeError(f"FFmpeg 编码失败：{errors.read().decode(errors='replace').strip()}")
+        if not _complete_h264(temporary, data.count, ffprobe):
+            raise RuntimeError("生成的视频未通过 H.264 编码及完整帧数检查")
+        # 编码和检查完成后发布正式文件，中断时只清理临时视频。
+        temporary.replace(output)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _export_batch(root: Path, output_dir: Path, fps: float | None, overwrite: bool) -> int:
+    root = root.expanduser().resolve()
+    output_dir = output_dir.expanduser().resolve()
+    if not root.is_dir() or root.name.startswith(("episode_", ".episode_")):
+        raise ValueError("批量输入需要填写数据总目录或场景目录")
+    targets = [path for path in _find_episode_dirs(root) if path.name.startswith("episode_")]
+    if not targets:
+        raise ValueError(f"没有找到已保存的采集记录：{root}")
+    ffmpeg = shutil.which("ffmpeg")
+    ffprobe = shutil.which("ffprobe")
+    if not ffmpeg or not ffprobe:
+        raise RuntimeError("批量生成需要 FFmpeg，请安装能够执行 ffmpeg 和 ffprobe 的版本，并支持 libx264 编码器")
+    generated = skipped = failed = 0
+    interrupted = False
+    try:
+        for index, episode in enumerate(targets, 1):
+            print(f"[{index}/{len(targets)}] 正在处理：{episode}", flush=True)
+            try:
+                data = _load_replay_data(episode)
+                if data.meta.get("status") == "recording":
+                    skipped += 1
+                    print("  跳过：该记录仍在录制", flush=True)
+                    continue
+                scene = Path(root.name) if episode.parent == root else episode.parent.relative_to(root)
+                output = output_dir / scene / f"{episode.name}.mp4"
+                rate = _replay_fps(data.timestamps, fps)
+                if not overwrite and _complete_h264(output, data.count, ffprobe):
+                    skipped += 1
+                    print(f"  跳过：完整视频已存在：{output}", flush=True)
+                    continue
+                print(f"  生成：{output}，帧数={data.count}，帧率={rate:.3f}", flush=True)
+                _export_h264(data, rate, output, ffmpeg, ffprobe)
+                generated += 1
+                print(f"  成功：{output}", flush=True)
+            except Exception as exc:
+                failed += 1
+                print(f"  失败：{episode}；{exc}", flush=True)
+    except KeyboardInterrupt:
+        interrupted = True
+        print("批量生成已中断，可以重新运行命令继续处理。", flush=True)
+    print(f"批量结果：生成={generated}，跳过={skipped}，失败={failed}", flush=True)
+    return 130 if interrupted else (1 if failed else 0)
 
 
 def _opencv_gui_available() -> bool:

@@ -122,6 +122,48 @@ python -m constraint_traverse.collect.replay \
 
 `--fps` 控制回放速度。这批数据约为每秒 14.75 帧，使用 `--fps 10` 时播放得更慢。
 
+## 批量生成回放视频
+
+下面的命令会查找数据总目录中的所有已保存记录，为每条记录生成一个 H.264 编码的 MP4 视频，可以直接在 VS Code 中打开：
+
+```bash
+python -m constraint_traverse.collect.replay \
+  /Data/qiang/data/constraint_traverse \
+  --batch \
+  --output-dir /Data/qiang/data/constraint_traverse_videos
+```
+
+只生成某个场景时，填写该场景目录，输出目录可以继续使用同一个位置：
+
+```bash
+python -m constraint_traverse.collect.replay \
+  /Data/qiang/data/constraint_traverse/kujiale_0067 \
+  --batch \
+  --output-dir /Data/qiang/data/constraint_traverse_videos
+```
+
+输出按场景和记录编号组织，例如：
+
+```text
+constraint_traverse_videos/
+  kujiale_0067/
+    episode_000001.mp4
+    episode_000002.mp4
+```
+
+- `--batch`：启用按目录批量生成，逐条显示进度。
+- `--output-dir`：批量视频的输出目录，必须填写。
+- `--overwrite`：重新生成已有视频。
+- `--fps 10`：统一按每秒 10 帧生成；默认分别读取每条记录的采样帧率。
+
+程序会检查已有视频的编码和完整帧数。与当前记录帧数一致的完整 H.264 视频会自动跳过；损坏、帧数不一致或编码不兼容的视频会重新生成。调整已有视频的播放帧率时，加上 `--overwrite`。
+
+正在录制的临时目录会跳过。成功和失败的已保存记录都可以生成回放。某条记录生成失败后，终端会显示原因并继续处理后续记录，最后统计生成、跳过和失败数量。
+
+按 `Ctrl+C` 可以中断。已经完成的视频会保留，正在生成的临时视频会清理，重新执行同一条命令即可继续。
+
+批量模式需要系统能够执行 `ffmpeg` 和 `ffprobe`，并且 FFmpeg 支持 `libx264` 编码器。单条生成继续使用上面的原有命令。
+
 ## 检查数据是否完整
 
 保存每条记录时，程序会自动检查数据。下面这条命令可以检查整个采集目录：

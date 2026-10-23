@@ -108,6 +108,7 @@ class TraverseEnv(DirectRLEnv):
         self.reset_time = np.zeros(num_envs)
         self.cameras = []
         self.samplers = []
+        self.map_panel = None
         self.last_sensor_time = -float("inf")
         carb.settings.get_settings().set_bool("/isaaclab/render/rtx_sensors", True)
         cfg = DirectRLEnvCfg(decimation=4, episode_length_s=timeout_sec, is_finite_horizon=False,
@@ -203,6 +204,13 @@ class TraverseEnv(DirectRLEnv):
         carb.settings.get_settings().set_bool("/exts/omni.replicator.core/Orchestrator/enabled", True)
         rep.orchestrator.set_capture_on_play(False)
         self._set_initial_view()
+        if self.sim.has_gui():
+            import omni.ui as ui
+            from .ui import EvaluationMapPanel
+            display_config_path = Path(__file__).resolve().parents[2] / "configs/navigation.yaml"
+            with display_config_path.open(encoding="utf-8") as handle:
+                display_config = yaml.safe_load(handle)["map_selector"]
+            self.map_panel = EvaluationMapPanel(ui, display_config=display_config)
 
     def _setup_scene(self):
         carb.settings.get_settings().set_bool("/physics/disableContactProcessing", False)
@@ -286,14 +294,21 @@ class TraverseEnv(DirectRLEnv):
             pair_forces = view.get_contact_force_matrix(dt=self.physics_dt)[0].cpu().numpy()
             if not np.isfinite(net_force).all() or not np.isfinite(pair_forces).all():
                 raise RuntimeError("底盘接触力包含非有限数值")
-            pair_magnitudes = np.linalg.norm(pair_forces, axis=-1)
-            other = int(pair_magnitudes.argmax())
-            force_n = max(float(np.linalg.norm(net_force)), float(pair_magnitudes[other]))
             forces, points, normals, separations, counts, starts = view.get_contact_data(dt=self.physics_dt)
             counts, starts = counts.cpu().numpy(), starts.cpu().numpy()
             if counts.sum() >= view.max_contact_data_count:
                 raise RuntimeError("底盘接触记录超出缓存容量")
             self.contact_count[i] += int(counts.sum())
+            pair_magnitudes = np.linalg.norm(pair_forces, axis=-1)
+            # 同一对象上的相反接触力可能抵消，单独检查各个接触点。
+            for other in np.flatnonzero(counts[0]):
+                start, count = int(starts[0, other]), int(counts[0, other])
+                contact_forces = forces[start:start + count, 0].cpu().numpy()
+                if not np.isfinite(contact_forces).all():
+                    raise RuntimeError("底盘接触点的法向力包含非有限数值")
+                pair_magnitudes[other] = max(pair_magnitudes[other], float(np.abs(contact_forces).max()))
+            other = int(pair_magnitudes.argmax())
+            force_n = max(float(np.linalg.norm(net_force)), float(pair_magnitudes[other]))
             if force_n <= self.collision_force_threshold_n:
                 continue
             record = dict(body_path=bodies[0], scene_body_path=None,
@@ -314,6 +329,19 @@ class TraverseEnv(DirectRLEnv):
                     separation_m=float(separations[index, 0]))
             self.collision_contacts[i] = record
             self.raw_collision[i] = True
+
+    def _stop_collided_envs(self):
+        ids = torch.as_tensor(np.flatnonzero(self.raw_collision), dtype=torch.long, device=self.device)
+        if not len(ids):
+            return
+        self.target_velocity[ids] = 0
+        self.target_position[ids[:, None], self.steering_ids] = self.robot.data.joint_pos[ids[:, None], self.steering_ids]
+        self.applied_command[ids] = 0
+        self._stopped[ids] = True
+        self.robot.write_root_link_velocity_to_sim(torch.zeros(len(ids), 6, device=self.device), env_ids=ids)
+        joint_ids = self.wheel_ids + self.steering_ids
+        self.robot.write_joint_velocity_to_sim(torch.zeros(len(ids), len(joint_ids), device=self.device),
+                                               joint_ids=joint_ids, env_ids=ids)
 
     def _pose_velocity(self):
         root = self.robot.data.root_link_state_w
@@ -344,6 +372,7 @@ class TraverseEnv(DirectRLEnv):
 
     def _apply_action(self):
         self._check_contacts()
+        self._stop_collided_envs()
         now = float(self.sim.current_time)
         if now - self.last_sensor_time >= 1.0 / self.meta["cameras"]["frequency_hz"] - 1e-9:
             self.sim.forward()
@@ -372,6 +401,7 @@ class TraverseEnv(DirectRLEnv):
 
     def _get_dones(self):
         self._check_contacts()
+        self._stop_collided_envs()
         self._record_physics_state()
         pose, velocity = self._pose_velocity()
         collision = torch.tensor(self.raw_collision, device=self.device)
@@ -504,10 +534,17 @@ class TraverseEnv(DirectRLEnv):
         for i in range(self.num_envs):
             snapshot = self.maps[i].snapshot()
             floor_z = position[i, 2] - self.episodes[self.selection[i]].floor_offset
+            bev_config = BevConfig.from_mapping(self.meta["bev"])
             bev = snapshot_to_robot_bev(snapshot, robot_world_xyyaw=poses[i], floor_z_m=float(floor_z),
-                                       config=BevConfig.from_mapping(self.meta["bev"]))
+                                       config=bev_config)
             state = state_vector(goals[i], poses[i], velocities[i], steering[i], wheels[i], previous[i], map_age(now, snapshot.timestamp_sec))
             rows.append(np.concatenate((bev.reshape(-1).astype(np.float32), state)))
+            if i == 0 and self.map_panel is not None:
+                self.map_panel.update(snapshot=snapshot, bev_config=bev_config,
+                    robot_world_xyz=position[i], robot_yaw_rad=float(poses[i, 2]), floor_z_m=float(floor_z),
+                    goal_body_xy=state[:2],
+                    episode=self.episodes[self.selection[i]].path, elapsed_sec=float(self.task.elapsed[i]),
+                    timeout_sec=self.task.timeout_sec, map_age_sec=float(state[-1]))
         self._cached_obs = torch.tensor(np.stack(rows), device=self.device)
         self._cached_step = self._sim_step_counter
         return {"policy": self._cached_obs}
@@ -515,6 +552,9 @@ class TraverseEnv(DirectRLEnv):
     def close(self):
         if getattr(self, "_is_closed", False):
             return
+        if self.map_panel is not None:
+            self.map_panel.shutdown()
+            self.map_panel = None
         self.contact_views = []
         for pair in self.cameras:
             for camera in pair.values():

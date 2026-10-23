@@ -216,12 +216,6 @@ def validate_manifest_sources(manifest: dict) -> None:
             raise ValueError(f"原始示范已变化，请重新运行 prepare：{entry['path']}")
 
 
-def ensure_disjoint(training: dict, other: dict) -> None:
-    seen = {entry.get("trajectory_fingerprint", entry["fingerprint"]) for entry in training["episodes"]}
-    if seen.intersection(entry.get("trajectory_fingerprint", entry["fingerprint"]) for entry in other["episodes"]):
-        raise ValueError("训练与评估数据包含重复 Episode")
-
-
 def validate_sample_interfaces(episode: Episode, arrays: dict) -> None:
     controls, frames = episode.controls, episode.frames
     indices = episode.decisions

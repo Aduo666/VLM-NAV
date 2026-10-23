@@ -4,7 +4,7 @@ import unittest
 
 import numpy as np
 
-from .geometry import DoorTracker, effective_contact
+from .geometry import DoorTracker
 
 
 class GeometryTests(unittest.TestCase):
@@ -58,13 +58,6 @@ class GeometryTests(unittest.TestCase):
         door.update([-0.6, 0, 0])
         door.update([0.6, 0, 0])
         self.assertTrue(door.passed)
-
-    def test_ground_contact_requires_identified_ground(self):
-        contact = dict(wheel=True, normal=[0, 0, 1], position_z=0.07, floor_z=0)
-        self.assertFalse(effective_contact(ground=True, **contact))
-        self.assertTrue(effective_contact(ground=False, **contact))
-        self.assertTrue(effective_contact(wheel=False, ground=True, normal=[0, 0, 1], position_z=0, floor_z=0))
-        self.assertTrue(effective_contact(wheel=True, ground=True, normal=[1, 0, 0], position_z=0, floor_z=0))
 
 
 if __name__ == "__main__":

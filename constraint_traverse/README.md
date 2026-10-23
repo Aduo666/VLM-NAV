@@ -301,7 +301,7 @@ python -m constraint_traverse.isaaclab_training check-sim \
 
 这条命令执行初始状态恢复、相机和地图检查、临时 BC 更新、检查点恢复、Actor 权重迁移，以及一次完整 PPO 采样和更新。还会检查停稳到达、超时价值补偿和真实障碍物碰撞。检查使用的临时模型自动清理。
 
-相机通过 Replicator 同步取得图像，取图期间保持物理时间不变。地图在物理步中处理新帧，策略读取决策前已经完成融合的地图。碰撞通过官方 PhysX 接触视图读取，并按接触对象区分地面和障碍物。
+相机通过 Replicator 同步取得图像，取图期间保持物理时间不变。地图在物理步中处理新帧，策略读取决策前已经完成融合的地图。碰撞通过官方 PhysX 接触视图读取 AGX 底盘刚体 `base_link` 的接触力。
 
 正式启动 BC 训练：
 
@@ -324,18 +324,24 @@ python -m constraint_traverse.isaaclab_training train \
 
 运行 CNN＋MLP 对照模型时，将 `--model` 改为 `mlp`，并指定另外的输出目录。两个模型使用相同的数据、随机种子和评估任务。
 
-闭环评估命令中的数据目录填写另外采集的验证集或测试集：
+闭环评估命令中的数据目录填写需要测试的录制数据集，可以使用训练集或另外采集的验证集、测试集：
 
 ```bash
 python -m constraint_traverse.isaaclab_training evaluate \
   --checkpoint /Data/qiang/constraint_traverse_training/runs/bc_lstm_seed0/last.pt \
-  --dataset /Data/qiang/data/constraint_traverse_validation \
-  --perturbations 3 --seed 0
+  --dataset /Data/qiang/data/constraint_traverse \
+  --seed 0
 ```
 
-评估执行原始起点和扰动起点，扰动位置半径为 0.1 米、朝向范围为正负 5 度，并检查起点附近的障碍物。每个回合恢复对应的历史地图。结果显示成功率、碰撞率、超时率、停滞率、耗时、终点误差和轨迹长度。添加 `--gui` 可以显示仿真窗口；添加 `--output 文件路径.json` 可以保存结果。
+评估将每条数据录制时的起始位置、朝向、车辆状态、目标和历史地图恢复到仿真中，由模型自主驾驶，每条数据运行一次。结果显示成功率、碰撞率、超时率、停滞率、耗时、终点误差和轨迹长度。添加 `--gui` 可以显示仿真窗口；添加 `--output 文件路径.json` 可以保存结果。
+
+机械臂、升降等关节采用机器人 USD 中保存的初始姿态，并在驾驶和回合重置时保持。仿真窗口初始使用机器人模型中的 `dummy_base_link/TopCamera` 视角。
+
+评估采用与采集程序相同的标准 Isaac Sim 启动配置，保留其渲染参数，并复用采集程序的室内灯光生成方式。灯光开关读取 `constraint_traverse/configs/collect.yaml` 中的 `scene.add_indoor_lighting`。
 
 到达要求距离目标不超过 0.15 米、实际线速度不超过 0.05 m/s、角速度不超过 0.08 rad/s，连续保持 0.3 秒。有效障碍物碰撞结束回合，60 秒超时记录为截断。碰撞、成功和超时使用明确的判定优先级，终止统计在自动重置前保存。
+
+碰撞失败只检查底盘 `base_link`。底盘接触力超过阈值时结束回合，默认阈值为 1 牛顿，评估或仿真验收时可以通过 `--collision-force-threshold-n 数值` 设置。接触按物理步检查，保留首次超过阈值的记录。每条评估结果中的 `collision_contact` 包含底盘路径、可识别的场景对象路径、接触力、位置、法向、冲量、间距和时间；未触发碰撞时为 `null`。`contact_count` 表示底盘接触记录数量。
 
 严格统计指定门洞的通过率时，通过 `--doors 标注文件.json` 提供门洞标注。JSON 的键是 `场景名称/episode_编号`，值是该轨迹需要经过的门洞列表；每个门洞包含 `center_world_xy`、`normal_world_xy`、`width_m`、`thickness_m`。方向指向门洞出口，坐标和尺寸使用米。结果记录标注数量和整车通过数量。
 

@@ -6,10 +6,6 @@ import numpy as np
 from scipy.spatial import ConvexHull
 
 
-def effective_contact(*, wheel, ground, normal, position_z, floor_z):
-    return not (wheel and ground and abs(float(normal[2])) >= 0.8 and position_z <= floor_z + 0.08)
-
-
 def footprint_points(records):
     return np.concatenate([np.array([[x, y] for x in (r["envelope_min_base_xyz_m"][0], r["envelope_max_base_xyz_m"][0])
         for y in (r["envelope_min_base_xyz_m"][1], r["envelope_max_base_xyz_m"][1])])

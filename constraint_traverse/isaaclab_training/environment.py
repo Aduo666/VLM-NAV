@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import logging
 from pathlib import Path
 
 import numpy as np
 import torch
 import carb
+import flatdict
+import toml
+import yaml
 from pxr import Usd, UsdPhysics, UsdGeom
-import omni.physx
 import omni.replicator.core as rep
 
 import isaaclab.sim as sim_utils
@@ -25,9 +28,25 @@ from vln_nav.control.fine_path_tracker import fit_agx_command
 from vln_nav.control.trajectory import TrajectoryConfig, VelocityCommand, wheel_targets
 from vln_nav.runtime.agx_profile import load_agx_profile
 from vln_nav.runtime.agx_geometry import build_agx_footprint, validate_agx_geometry
+from vln_nav.runtime.isaac_runtime_utils import bind_viewport_to_camera
+from vln_nav.runtime.scene_lighting import add_indoor_lighting
 from .data import ACTION_SCALE, OBS_SIZE, Episode, map_age, state_vector
-from .geometry import effective_contact, footprint_points
+from .geometry import footprint_points
 from .task_state import TaskState
+
+
+def _collector_render_settings():
+    directory = Path(sim_utils.__file__).resolve().parents[4] / "apps/rendering_modes"
+    keys = set()
+    for path in directory.glob("*.kit"):
+        values = flatdict.FlatDict(toml.load(path), delimiter=".")
+        keys.update("/" + key.replace(".", "/") for key in values)
+    settings = carb.settings.get_settings()
+    values = {key: settings.get(key) for key in sorted(keys)}
+    missing = [key for key, value in values.items() if value is None]
+    if not keys or missing:
+        raise RuntimeError(f"无法读取采集程序的标准渲染设置：{missing}")
+    return values
 
 
 class CollectionCamera(Camera):
@@ -58,7 +77,10 @@ class TraverseEnv(DirectRLEnv):
         return super().step(action)
 
     def __init__(self, episodes: list[Episode], *, num_envs=1, device="cuda:0", seed=0,
-                 perturb=False, timeout_sec=60.0, render_mode=None):
+                 timeout_sec=60.0, collision_force_threshold_n=1.0, render_mode=None):
+        self.collision_force_threshold_n = float(collision_force_threshold_n)
+        if not np.isfinite(self.collision_force_threshold_n) or self.collision_force_threshold_n <= 0:
+            raise ValueError("底盘碰撞力阈值必须是大于零的有限数值")
         self.episodes = episodes
         self.meta = episodes[0].meta
         if any(e.meta["usd_path"] != self.meta["usd_path"] for e in episodes):
@@ -67,14 +89,17 @@ class TraverseEnv(DirectRLEnv):
             raise ValueError("同一环境的底盘或物理配置不同")
         self.controller = TrajectoryConfig.from_mapping(self.meta["controller"])
         self.profile = load_agx_profile(project_root=Path(__file__).resolve().parents[2])
-        self.perturb = perturb
+        collect_config_path = Path(__file__).resolve().parents[1] / "configs/collect.yaml"
+        with collect_config_path.open(encoding="utf-8") as handle:
+            self.collect_scene_config = yaml.safe_load(handle)["scene"]
+        self.collect_render_settings = _collector_render_settings()
         self.selection = np.zeros(num_envs, dtype=np.int64)
         self.reset_sequence = np.zeros(num_envs, dtype=np.int64)
-        self.random = np.random.default_rng(seed)
         self.maps = [LocalVoxelMap(local_voxel_config_from_mapping(self.meta["voxel_map"])) for _ in range(num_envs)]
         self.raw_collision = np.zeros(num_envs, dtype=bool)
         self.contact_count = np.zeros(num_envs, dtype=np.int64)
-        self.floor = np.zeros(num_envs)
+        self.collision_contacts = [None for _ in range(num_envs)]
+        self.last_contact_time = np.full(num_envs, -float("inf"))
         self.camera_valid_ratio = np.zeros((num_envs, 2))
         self.map_updates = np.zeros(num_envs, dtype=np.int64)
         self._cached_obs = None
@@ -87,7 +112,8 @@ class TraverseEnv(DirectRLEnv):
         carb.settings.get_settings().set_bool("/isaaclab/render/rtx_sensors", True)
         cfg = DirectRLEnvCfg(decimation=4, episode_length_s=timeout_sec, is_finite_horizon=False,
             action_space=2, observation_space=OBS_SIZE, state_space=0, seed=seed,
-            sim=sim_utils.SimulationCfg(dt=episodes[0].dt, device=device, render_interval=1, enable_scene_query_support=True),
+            sim=sim_utils.SimulationCfg(dt=episodes[0].dt, device=device, render_interval=1, enable_scene_query_support=True,
+                render=sim_utils.RenderCfg(carb_settings=self.collect_render_settings)),
             scene=InteractiveSceneCfg(num_envs=num_envs, env_spacing=40.0, replicate_physics=False),
             num_rerenders_on_reset=2)
         super().__init__(cfg, render_mode=render_mode)
@@ -129,9 +155,24 @@ class TraverseEnv(DirectRLEnv):
         self.start_pose = torch.zeros(self.num_envs, 3, device=self.device)
         self.reset_errors = torch.zeros(self.num_envs, 6, device=self.device)
         physics = SimulationManager.get_physics_sim_view()
+        if self.robot.body_names.count("base_link") != 1:
+            raise RuntimeError("AGX 模型必须包含唯一的底盘刚体 base_link")
+        chassis_index = self.robot.body_names.index("base_link")
+        room_body_paths = set(room_paths)
         for i in range(self.num_envs):
-            bodies = list(self.robot.root_physx_view.link_paths[i])
-            filters = [path for path in self.room_view.prim_paths if path.startswith(f"/World/envs/env_{i}/")]
+            bodies = [self.robot.root_physx_view.link_paths[i][chassis_index]]
+            filters = set()
+            room = self.sim.stage.GetPrimAtPath(f"/World/envs/env_{i}/Room")
+            for prim in Usd.PrimRange(room, Usd.TraverseInstanceProxies()):
+                if not prim.HasAPI(UsdPhysics.CollisionAPI) or not UsdPhysics.CollisionAPI(prim).GetCollisionEnabledAttr().Get():
+                    continue
+                owner = prim
+                while owner and str(owner.GetPath()) not in room_body_paths:
+                    owner = owner.GetParent()
+                filters.add(str(owner.GetPath()) if owner else str(prim.GetPath()))
+            filters = sorted(filters)
+            if not filters:
+                raise RuntimeError("房间没有可以检测底盘接触的碰撞体")
             view = physics.create_rigid_contact_view(bodies, filter_patterns=[filters] * len(bodies),
                                                      max_contact_data_count=4096)
             if view.sensor_count != len(bodies) or view.filter_count != len(filters):
@@ -143,8 +184,8 @@ class TraverseEnv(DirectRLEnv):
             for source, key in (("front", "front_prim_path"), ("down", "down_prim_path")):
                 suffix = self.meta["cameras"][key].removeprefix("/World/Robot")
                 path = f"/World/envs/env_{i}/Robot" + suffix
+                # 同步取图的周期由 _apply_action 按仿真时间控制。
                 camera = CollectionCamera(prim_path=path, name=f"traverse_{source}_{i}",
-                    frequency=self.meta["cameras"]["frequency_hz"],
                     resolution=(self.meta["cameras"]["width"], self.meta["cameras"]["height"]))
                 intrinsics = self.episodes[0].frames[f"{source}_intrinsics"]
                 usd_camera = UsdGeom.Camera(self.sim.stage.GetPrimAtPath(path))
@@ -161,11 +202,15 @@ class TraverseEnv(DirectRLEnv):
         self.sim.render()
         carb.settings.get_settings().set_bool("/exts/omni.replicator.core/Orchestrator/enabled", True)
         rep.orchestrator.set_capture_on_play(False)
+        self._set_initial_view()
 
     def _setup_scene(self):
         carb.settings.get_settings().set_bool("/physics/disableContactProcessing", False)
         room = sim_utils.UsdFileCfg(usd_path=self.meta["usd_path"])
         room.func("/World/envs/env_0/Room", room)
+        if self.collect_scene_config["add_indoor_lighting"]:
+            add_indoor_lighting(stage=self.sim.stage, environment_prim_path="/World/envs/env_0/Room",
+                lights_prim_path="/World/envs/env_0/InteriorLights", logger=logging.getLogger(__name__))
         robot_path = "/World/envs/env_0/Robot"
         spawn = sim_utils.UsdFileCfg(usd_path=str(self.profile.asset.usd_path), activate_contact_sensors=True)
         spawn.func(robot_path, spawn)
@@ -176,7 +221,21 @@ class TraverseEnv(DirectRLEnv):
         self.collision_geometry = geometry["colliders"]
         self.body_points = footprint_points(self.collision_geometry)
         root = self.sim.stage.GetPrimAtPath(robot_path)
-        joint_names = [p.GetName() for p in Usd.PrimRange(root) if p.IsA(UsdPhysics.RevoluteJoint) or p.IsA(UsdPhysics.PrismaticJoint)]
+        joint_prims = [p for p in Usd.PrimRange(root) if p.IsA(UsdPhysics.RevoluteJoint) or p.IsA(UsdPhysics.PrismaticJoint)]
+        joint_names = [p.GetName() for p in joint_prims]
+        joint_positions = {}
+        for prim in joint_prims:
+            angular = prim.IsA(UsdPhysics.RevoluteJoint)
+            instance = "angular" if angular else "linear"
+            value = prim.GetAttribute(f"state:{instance}:physics:position").Get()
+            if value is None:
+                drive = UsdPhysics.DriveAPI.Get(prim, instance)
+                value = drive.GetTargetPositionAttr().Get() if drive else None
+            value = 0.0 if value is None else float(value)
+            if not np.isfinite(value):
+                raise ValueError(f"USD 关节初始位置无效：{prim.GetPath()}")
+            # USD 旋转关节使用角度，Isaac Lab 使用弧度。
+            joint_positions[prim.GetName()] = float(np.deg2rad(value)) if angular else value
         wheel_names = self.meta["wheel_joint_order"]
         steering_names = self.meta["steering_joint_order"]
         hold_names = [n for n in joint_names if n not in wheel_names + steering_names]
@@ -188,7 +247,11 @@ class TraverseEnv(DirectRLEnv):
             actuators["hold"] = ImplicitActuatorCfg(joint_names_expr=hold_names,
                 stiffness=agx.hold_joint_stiffness, damping=agx.hold_joint_damping)
         self.robot = Articulation(ArticulationCfg(prim_path="/World/envs/env_.*/Robot", spawn=None,
-            init_state=ArticulationCfg.InitialStateCfg(pos=tuple(self.meta["start_position_world_xyz"])), actuators=actuators))
+            init_state=ArticulationCfg.InitialStateCfg(pos=tuple(self.meta["start_position_world_xyz"]),
+                joint_pos=joint_positions), actuators=actuators))
+        self.top_camera_path = robot_path + "/" + self.profile.asset.articulation_path + "/TopCamera"
+        if not self.sim.stage.GetPrimAtPath(self.top_camera_path).IsA(UsdGeom.Camera):
+            raise RuntimeError(f"机器人模型缺少 TopCamera：{self.top_camera_path}")
         transforms = UsdGeom.XformCache(Usd.TimeCode.Default())
         self.camera_mounts = {}
         optical_from_usd = np.diag([1.0, -1.0, -1.0, 1.0])
@@ -205,32 +268,52 @@ class TraverseEnv(DirectRLEnv):
             self.camera_mounts[source] = (body.GetName(), np.linalg.inv(world_from_body) @ world_from_camera @ optical_from_usd)
         self.scene.clone_environments(copy_from_source=True)
         self.scene.articulations["robot"] = self.robot
-        self.wheel_bodies = set()
-        for prim in Usd.PrimRange(root):
-            if prim.IsA(UsdPhysics.Joint) and prim.GetName() in wheel_names:
-                self.wheel_bodies.update(str(target).removeprefix(robot_path) for target in UsdPhysics.Joint(prim).GetBody1Rel().GetTargets())
-        light = sim_utils.DomeLightCfg(intensity=1500.0)
-        light.func("/World/TraverseLight", light)
         self.scene.filter_collisions(global_prim_paths=[])
 
+    def _set_initial_view(self):
+        self.cfg.viewer.cam_prim_path = self.top_camera_path
+        if self.sim.has_gui() and not bind_viewport_to_camera(camera_prim_path=self.top_camera_path,
+                logger=logging.getLogger(__name__), enabled=True):
+            raise RuntimeError(f"无法切换评估窗口至 TopCamera：{self.top_camera_path}")
+
     def _check_contacts(self):
+        now = float(self.sim.current_time)
         for i, (view, bodies, filters) in enumerate(self.contact_views):
-            if float(self.sim.current_time) <= self.reset_time[i] + 1e-7:
+            if now <= self.reset_time[i] + 1e-7 or now <= self.last_contact_time[i] + 1e-7 or self.raw_collision[i]:
                 continue
-            _, points, normals, _, counts, starts = view.get_contact_data(dt=self.physics_dt)
-            points, normals = points.cpu().numpy(), normals.cpu().numpy()
+            self.last_contact_time[i] = now
+            net_force = view.get_net_contact_forces(dt=self.physics_dt)[0].cpu().numpy()
+            pair_forces = view.get_contact_force_matrix(dt=self.physics_dt)[0].cpu().numpy()
+            if not np.isfinite(net_force).all() or not np.isfinite(pair_forces).all():
+                raise RuntimeError("底盘接触力包含非有限数值")
+            pair_magnitudes = np.linalg.norm(pair_forces, axis=-1)
+            other = int(pair_magnitudes.argmax())
+            force_n = max(float(np.linalg.norm(net_force)), float(pair_magnitudes[other]))
+            forces, points, normals, separations, counts, starts = view.get_contact_data(dt=self.physics_dt)
             counts, starts = counts.cpu().numpy(), starts.cpu().numpy()
             if counts.sum() >= view.max_contact_data_count:
-                raise RuntimeError("车辆接触记录超出缓存容量")
-            for body, other in np.argwhere(counts > 0):
-                wheel = bodies[body].removeprefix(f"/World/envs/env_{i}/Robot") in self.wheel_bodies
-                ground = "/Room/Meshes/floor/" in filters[other]
-                start, count = int(starts[body, other]), int(counts[body, other])
-                self.contact_count[i] += count
-                for j in range(start, start + count):
-                    if effective_contact(wheel=wheel, ground=ground, normal=normals[j],
-                                         position_z=points[j, 2], floor_z=self.floor[i]):
-                        self.raw_collision[i] = True
+                raise RuntimeError("底盘接触记录超出缓存容量")
+            self.contact_count[i] += int(counts.sum())
+            if force_n <= self.collision_force_threshold_n:
+                continue
+            record = dict(body_path=bodies[0], scene_body_path=None,
+                timestamp_sec=now, physics_step=int(round(now / self.physics_dt)),
+                force_n=force_n, threshold_n=self.collision_force_threshold_n,
+                net_force_world_xyz_n=net_force.tolist(), pair_force_world_xyz_n=None,
+                position_world_xyz=None, normal_world_xyz=None, normal_force_n=None,
+                normal_impulse_ns=None, separation_m=None)
+            count = int(counts[0, other])
+            if float(pair_magnitudes[other]) > 0 and count:
+                start = int(starts[0, other])
+                patch_forces = forces[start:start + count, 0].cpu().numpy()
+                index = start + int(np.abs(patch_forces).argmax())
+                normal_force = float(forces[index, 0])
+                record.update(scene_body_path=filters[other], pair_force_world_xyz_n=pair_forces[other].tolist(),
+                    position_world_xyz=points[index].cpu().tolist(), normal_world_xyz=normals[index].cpu().tolist(),
+                    normal_force_n=normal_force, normal_impulse_ns=normal_force * self.physics_dt,
+                    separation_m=float(separations[index, 0]))
+            self.collision_contacts[i] = record
+            self.raw_collision[i] = True
 
     def _pose_velocity(self):
         root = self.robot.data.root_link_state_w
@@ -299,6 +382,7 @@ class TraverseEnv(DirectRLEnv):
         if len(ids):
             self.extras["terminal"] = self.task.terminal(ids, pose)
             self.extras["terminal"]["contact_count"] = torch.tensor(self.contact_count[ids.cpu().numpy()].copy(), device=self.device)
+            self.extras["collision_contacts"] = [self.collision_contacts[i] for i in ids.tolist()]
         return terminated, truncated
 
     def _get_rewards(self):
@@ -330,8 +414,6 @@ class TraverseEnv(DirectRLEnv):
             initial = episode.controls
             position = initial["world_position_xyz"][0].astype(np.float64) + origins[env_id]
             quaternion = initial["world_orientation_wxyz"][0].copy()
-            if self.perturb:
-                position, quaternion = self._safe_perturbation(position, quaternion, episode.floor_offset)
             root[j, :3] = torch.tensor(position, device=self.device)
             root[j, 3:7] = torch.tensor(quaternion, device=self.device)
             root[j, 7:] = 0
@@ -357,10 +439,11 @@ class TraverseEnv(DirectRLEnv):
             goal = np.asarray(episode.meta["goal_world_xy"]) + origins[env_id, :2]
             self.task.reset(ids[j:j + 1], torch.tensor(goal[None], dtype=torch.float32, device=self.device),
                             root[j:j + 1, :2], yaw=torch.tensor([yaw], dtype=torch.float32, device=self.device))
-            self.floor[env_id] = position[2] - episode.floor_offset
             self.reset_time[env_id] = now
+            self.last_contact_time[env_id] = now
             self.raw_collision[env_id] = False
             self.contact_count[env_id] = 0
+            self.collision_contacts[env_id] = None
             self.map_updates[env_id] = 0
         self.robot.write_root_pose_to_sim(root[:, :7], ids)
         self.robot.write_root_link_velocity_to_sim(root[:, 7:], ids)
@@ -403,50 +486,6 @@ class TraverseEnv(DirectRLEnv):
         name, mount = self.camera_mounts[source]
         link = self.robot.data.body_link_pose_w[env_id, self.robot.body_names.index(name)].detach().cpu().numpy()
         return world_from_pose_wxyz(link[:3], link[3:7]) @ mount
-
-    def _safe_perturbation(self, position, quaternion, floor_offset):
-        qw, qx, qy, qz = quaternion
-        initial_yaw = np.arctan2(2 * (qw * qz + qx * qy), 1 - 2 * (qy * qy + qz * qz))
-        for _ in range(32):
-            radius, direction = 0.1 * np.sqrt(self.random.random()), self.random.uniform(-np.pi, np.pi)
-            delta = self.random.uniform(-np.deg2rad(5), np.deg2rad(5))
-            candidate = position.copy()
-            candidate[:2] += radius * np.array([np.cos(direction), np.sin(direction)])
-            count = max(1, int(np.ceil(radius / 0.02)), int(np.ceil(abs(delta) / 0.02)))
-            if all(self._pose_is_clear(position + a * (candidate - position), initial_yaw + a * delta,
-                                       position[2] - floor_offset) for a in np.linspace(0, 1, count + 1)):
-                c, s = np.cos(delta / 2), np.sin(delta / 2)
-                return candidate, np.array([c * qw - s * qz, c * qx - s * qy, c * qy + s * qx, c * qz + s * qw])
-        raise RuntimeError("起点附近没有通过碰撞检查的扰动位置")
-
-    def _pose_is_clear(self, position, yaw, floor):
-        blocked = False
-
-        def report(hit):
-            nonlocal blocked
-            if "/Robot/" not in str(hit.rigid_body):
-                blocked = True
-            return not blocked
-
-        c, s = np.cos(yaw), np.sin(yaw)
-        query = omni.physx.get_physx_scene_query_interface()
-        for record in self.collision_geometry:
-            if not record["enabled"]:
-                continue
-            lower = np.array(record["envelope_min_base_xyz_m"])
-            upper = np.array(record["envelope_max_base_xyz_m"])
-            lower[2] = max(lower[2], floor + 0.03 - position[2])
-            if lower[2] >= upper[2]:
-                continue
-            center = (lower + upper) / 2
-            center[:2] = center[:2] @ np.array([[c, s], [-s, c]])
-            center += position
-            extent = (upper - lower) / 2 + np.array([0.02, 0.02, 0.001])
-            query.overlap_box(carb.Float3(*map(float, extent)), carb.Float3(*map(float, center)),
-                              carb.Float4(0, 0, float(np.sin(yaw / 2)), float(np.cos(yaw / 2))), report, False)
-            if blocked:
-                return False
-        return True
 
     def _get_observations(self):
         if self._cached_obs is not None and self._cached_step == self._sim_step_counter:

@@ -14,7 +14,7 @@ from .data import BEV_SIZE, OBS_SIZE, STATE_SIZE
 from .policy import make_policy
 from .runner import BevOnPolicyRunner, runner_config
 from .task_state import TaskState, validate_batches
-from .geometry import DoorTracker, effective_contact
+from .geometry import DoorTracker
 
 
 MANIFEST = dict(state_mean=[0.0] * STATE_SIZE, state_std=[1.0] * STATE_SIZE, episodes=[])
@@ -180,10 +180,7 @@ class TrainingTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 validate_batches(envs, batches)
 
-    def test_collision_and_door_geometry(self):
-        self.assertFalse(effective_contact(wheel=True, ground=True, normal=(0, 0, 1), position_z=0, floor_z=0))
-        self.assertTrue(effective_contact(wheel=True, ground=False, normal=(1, 0, 0), position_z=0, floor_z=0))
-        self.assertTrue(effective_contact(wheel=False, ground=True, normal=(0, 0, 1), position_z=0, floor_z=0))
+    def test_door_geometry(self):
         annotation = dict(center_world_xy=[0, 0], normal_world_xy=[1, 0], width_m=0.8, thickness_m=0.1)
         points = np.array([[-0.4, -0.3], [-0.4, 0.3], [0.4, -0.3], [0.4, 0.3]])
         door = DoorTracker.create(annotation, points, [-1, 0, 0])

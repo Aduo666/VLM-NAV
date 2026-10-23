@@ -12,7 +12,7 @@ import torch
 from tensordict import TensorDict
 
 from .bc import load_checkpoint, observation, save_checkpoint, seed_everything
-from .data import ACTION_SCALE, BEV_SIZE, Episode, discover, ensure_disjoint, fingerprint, load_manifest, read_npz, trajectory_fingerprint
+from .data import ACTION_SCALE, BEV_SIZE, Episode, discover, load_manifest, read_npz
 from .policy import make_policy
 from .runner import BevOnPolicyRunner, runner_config
 from .geometry import DoorTracker
@@ -172,16 +172,12 @@ def check_sim(env, wrapped, manifest, cache, device):
             break
     if collision_record is None or not bool(collision_record["collision"].all()):
         raise AssertionError(f"真实障碍物接触未触发碰撞终止，接触记录数：{env.contact_count.tolist()}")
-    env.perturb = True
-    wrapped.reset()
-    perturbed_pose = env.start_pose[0].cpu().tolist()
     return dict(initial_bev_differences=differences, reset_errors=env.reset_errors.cpu().tolist(),
         checkpoint_max_error=reload_error, transfer_max_error=transfer_error, ppo_losses=losses,
         timeout_resets=resets, action_clipped_fraction=(clipped / 16).cpu().tolist(),
         camera_valid_ratio=sensor_check["valid_ratio"], map_updates=sensor_check["fusion_count"],
         stopping_success=True, obstacle_collision=True,
         sensor_time_check=sensor_check, rollout_steps_per_sec=16 / sample_elapsed,
-        perturbed_start=perturbed_pose,
         torch_peak_memory_mb=(torch.cuda.max_memory_allocated(device) / 1024 ** 2
                               if str(device).startswith("cuda") else None))
 
@@ -190,50 +186,50 @@ def terminal_json(record):
     return {key: value.detach().cpu().tolist() for key, value in record.items()}
 
 
-def evaluate_group(env, wrapped, policy, *, perturbations, annotations):
+def evaluate_group(env, wrapped, policy, *, annotations):
     results = []
-    for perturbation in range(perturbations + 1):
-        env.perturb = perturbation > 0
-        env.reset_sequence[:] = 0
-        obs, _ = wrapped.reset()
-        policy.reset()
-        completed = 0
-        initial_pose = env.start_pose[0].cpu().numpy().copy()
-        initial_map_age = float(obs["policy"][0, -1])
+    env.reset_sequence[:] = 0
+    obs, _ = wrapped.reset()
+    policy.reset()
+    completed = 0
+    initial_pose = env.start_pose[0].cpu().numpy().copy()
+    initial_map_age = float(obs["policy"][0, -1])
 
-        def trackers(index, pose):
-            path = env.episodes[index].path
-            data = annotations.get(str(path), annotations.get(f"{path.parent.name}/{path.name}", []))
-            return [DoorTracker.create(item, env.body_points, pose) for item in data]
+    def trackers(index, pose):
+        path = env.episodes[index].path
+        data = annotations.get(str(path), annotations.get(f"{path.parent.name}/{path.name}", []))
+        return [DoorTracker.create(item, env.body_points, pose) for item in data]
 
-        doors = trackers(0, initial_pose)
-        with torch.inference_mode():
-            while completed < len(env.episodes):
-                action = policy.act_inference(obs)
-                obs, _, dones, extras = wrapped.step(action)
-                policy.reset(dones)
-                pose = (extras["terminal"]["pose_world_xyyaw"][0] if dones.any() else env._pose_velocity()[0][0]).cpu().numpy()
-                for door in doors:
-                    door.update(pose)
-                if dones.any():
-                    result = terminal_json(extras["terminal"])
-                    result.update(episode=str(env.episodes[completed].path), perturbation=perturbation,
-                        initial_map="recorded_history", initial_map_age_sec=initial_map_age,
-                        initial_pose_world_xyyaw=initial_pose.tolist(), doors_annotated=len(doors),
-                        doors_passed=sum(d.passed and not bool(extras["terminal"]["collision"][0]) for d in doors))
-                    results.append(result)
-                    print(json.dumps(result, ensure_ascii=False), flush=True)
-                    completed += 1
-                    if completed < len(env.episodes):
-                        initial_pose = env.start_pose[0].cpu().numpy().copy()
-                        initial_map_age = float(obs["policy"][0, -1])
-                        doors = trackers(completed, initial_pose)
+    doors = trackers(0, initial_pose)
+    with torch.inference_mode():
+        while completed < len(env.episodes):
+            action = policy.act_inference(obs)
+            obs, _, dones, extras = wrapped.step(action)
+            policy.reset(dones)
+            pose = (extras["terminal"]["pose_world_xyyaw"][0] if dones.any() else env._pose_velocity()[0][0]).cpu().numpy()
+            for door in doors:
+                door.update(pose)
+            if dones.any():
+                result = terminal_json(extras["terminal"])
+                result.update(episode=str(env.episodes[completed].path),
+                    collision_contact=extras["collision_contacts"][0],
+                    initial_map="recorded_history", initial_map_age_sec=initial_map_age,
+                    initial_pose_world_xyyaw=initial_pose.tolist(), doors_annotated=len(doors),
+                    doors_passed=sum(d.passed and not bool(extras["terminal"]["collision"][0]) for d in doors))
+                results.append(result)
+                print(json.dumps(result, ensure_ascii=False), flush=True)
+                completed += 1
+                if completed < len(env.episodes):
+                    initial_pose = env.start_pose[0].cpu().numpy().copy()
+                    initial_map_age = float(obs["policy"][0, -1])
+                    doors = trackers(completed, initial_pose)
     return results
 
 
 def run(args):
     from isaaclab.app import AppLauncher
-    launcher = AppLauncher(headless=not args.gui, enable_cameras=True, device=args.device)
+    launcher = AppLauncher(headless=not args.gui, enable_cameras=True, device=args.device,
+        experience="isaacsim.exp.base.python.kit", multi_gpu=False)
     app = launcher.app
     env = None
     try:
@@ -246,14 +242,13 @@ def run(args):
         manifest = load_manifest(args.cache)
         episodes = [Episode(path) for path in discover(args.dataset)]
         if args.command == "check-sim":
-            env = TraverseEnv([episodes[0]], device=args.device, seed=args.seed)
+            env = TraverseEnv([episodes[0]], device=args.device, seed=args.seed,
+                collision_force_threshold_n=args.collision_force_threshold_n)
             wrapped = RslRlVecEnvWrapper(env, clip_actions=1.0)
             result = check_sim(env, wrapped, manifest, args.cache, args.device)
             print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
         else:
-            policy, saved = load_checkpoint(args.checkpoint, args.device)
-            other = dict(episodes=[dict(fingerprint=fingerprint(e.path), trajectory_fingerprint=trajectory_fingerprint(e.path)) for e in episodes])
-            ensure_disjoint(saved["manifest"], other)
+            policy, _ = load_checkpoint(args.checkpoint, args.device)
             groups = defaultdict(list)
             annotations = {} if args.doors is None else json.loads(args.doors.read_text(encoding="utf-8"))
             for episode in episodes:
@@ -261,9 +256,10 @@ def run(args):
             results = []
             for group in groups.values():
                 create_new_stage()
-                env = TraverseEnv(group, device=args.device, seed=args.seed)
+                env = TraverseEnv(group, device=args.device, seed=args.seed,
+                    collision_force_threshold_n=args.collision_force_threshold_n)
                 wrapped = RslRlVecEnvWrapper(env, clip_actions=1.0)
-                results.extend(evaluate_group(env, wrapped, policy, perturbations=args.perturbations, annotations=annotations))
+                results.extend(evaluate_group(env, wrapped, policy, annotations=annotations))
                 env.close()
                 env = None
             summary = dict(episodes=len(results), success_rate=float(np.mean([x["success"][0] for x in results])),

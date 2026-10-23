@@ -13,6 +13,7 @@ def add_indoor_lighting(
     stage,
     environment_prim_path: str,
     logger: logging.Logger,
+    lights_prim_path: str = "/World/InteriorLights",
 ) -> int:
     from pxr import Gf, Usd, UsdGeom, UsdLux
 
@@ -69,7 +70,7 @@ def add_indoor_lighting(
         positions = _fallback_grid(scene_bounds)
         source = "scene_bounds"
 
-    lights_path = "/World/InteriorLights"
+    lights_path = lights_prim_path
     if stage.GetPrimAtPath(lights_path).IsValid():
         stage.RemovePrim(lights_path)
     UsdGeom.Xform.Define(stage, lights_path)

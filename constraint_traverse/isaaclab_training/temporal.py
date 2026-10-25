@@ -14,6 +14,13 @@ from vln_nav.active_perception.contracts import TimedDepthObservation
 from vln_nav.active_perception.local_geometry import LocalVoxelMap
 
 
+class InvalidDepthFrame(RuntimeError):
+    def __init__(self, frames, valid_ratios):
+        self.frames = frames
+        self.valid_ratios = np.asarray(valid_ratios).copy()
+        super().__init__(f"相机有效深度比例不足：{self.valid_ratios.tolist()}")
+
+
 class MapSampler:
     def __init__(self, local_map: LocalVoxelMap, max_skew_sec: float,
                  min_valid_ratio: float, integration_period_sec: float):
@@ -43,6 +50,8 @@ class MapSampler:
         self.last_poll_sec = -np.inf
         self.last_capture_sec = {source: -np.inf for source in ("front", "down")}
         self.last_available_sec = {source: -np.inf for source in ("front", "down")}
+        self._accepted_capture_sec = dict(self.last_capture_sec)
+        self._accepted_available_sec = dict(self.last_available_sec)
         self.valid_ratios = np.zeros(2, dtype=np.float64)
         self.fusion_count = 0
         self._pending = {source: None for source in ("front", "down")}
@@ -74,7 +83,12 @@ class MapSampler:
         frames = (pair.front, pair.down)
         self.valid_ratios[:] = [np.mean(np.isfinite(frame.depth_m) & (frame.depth_m > 0)) for frame in frames]
         if np.any(self.valid_ratios < self.min_valid_ratio):
-            raise RuntimeError(f"相机有效深度比例不足：{self.valid_ratios.tolist()}")
+            # 无效图像不提交时间戳，同一物理时刻重新渲染后仍可读取。
+            self.last_capture_sec = dict(self._accepted_capture_sec)
+            self.last_available_sec = dict(self._accepted_available_sec)
+            raise InvalidDepthFrame(frames, self.valid_ratios)
+        self._accepted_capture_sec = dict(self.last_capture_sec)
+        self._accepted_available_sec = dict(self.last_available_sec)
         capture_time = max(frame.timestamp_sec for frame in frames)
         if capture_time - self.last_integration_sec < self.integration_period_sec - 1e-9:
             return False

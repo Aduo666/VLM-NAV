@@ -38,13 +38,17 @@ class PpoConfig:
     save_interval: int = 50
     timeout_sec: float = 60.0
     collision_force_threshold_n: float = 1.0
+    sensor_render_retries: int = 3
+    max_consecutive_sensor_failures: int = 3
     reward: RewardConfig = field(default_factory=RewardConfig)
 
     def __post_init__(self):
-        for name in ("num_envs", "rollout_steps", "scene_iterations", "num_learning_epochs", "num_mini_batches", "save_interval"):
+        for name in ("num_envs", "rollout_steps", "scene_iterations", "num_learning_epochs", "num_mini_batches", "save_interval", "max_consecutive_sensor_failures"):
             value = getattr(self, name)
             if type(value) is not int or value < 1:
                 raise ValueError(f"{name} 必须是正整数")
+        if type(self.sensor_render_retries) is not int or self.sensor_render_retries < 0:
+            raise ValueError("sensor_render_retries 必须是非负整数")
         validate_batches(self.num_envs, self.num_mini_batches)
         for name in ("learning_rate", "initial_noise_std", "clip_param", "gamma", "gae_lambda", "max_grad_norm",
                      "timeout_sec", "collision_force_threshold_n"):
@@ -115,7 +119,7 @@ class PpoTrainer:
                 raise ValueError("恢复 PPO 训练需要使用 PPO 检查点")
             if source.get("optimizer_state_dict") is None:
                 raise ValueError("PPO 检查点缺少优化器状态")
-            if source.get("training_config") != asdict(config) or source["seed"] != self.seed:
+            if PpoConfig.from_mapping(source["training_config"]) != config or source["seed"] != self.seed:
                 raise ValueError("恢复 PPO 时的配置和随机种子必须与检查点一致")
             self.state = deepcopy(source["training_state"])
             if self.state["dataset"] != self.dataset or self.state["dataset_signature"] != signature:
@@ -167,6 +171,11 @@ class PpoTrainer:
         else:
             self.runner.env = self.env
         self.runner.current_learning_iteration = self.state["completed_iterations"]
+        self.runner.writer = self.writer
+        self.runner.logger_type = "tensorboard"
+        self.runner.tot_timesteps = self.state["total_steps"]
+        self.episode_rewards = torch.zeros(self.config.num_envs, device=self.device)
+        self.episode_lengths = torch.zeros(self.config.num_envs, dtype=torch.long, device=self.device)
         self.runner.train_mode()
         with torch.inference_mode():
             actor_critic = self.runner.alg.policy
@@ -206,11 +215,34 @@ class PpoTrainer:
         for row, env_id in enumerate(arrays["env_ids"]):
             record = {key: value[row] for key, value in arrays.items() if key != "env_ids"}
             record.update(env_id=env_id, iteration=self.state["completed_iterations"] + 1,
-                episode=extras["episode_paths"][row], collision_contact=extras["collision_contacts"][row])
+                episode=extras["episode_paths"][row], collision_contact=extras["collision_contacts"][row],
+                sensor_diagnostic=extras.get("sensor_diagnostics", [None] * len(arrays["env_ids"]))[row],
+                episode_return=float(self.episode_rewards[env_id]), episode_steps=int(self.episode_lengths[env_id]))
             records.append(record)
-            self.recent.append({key: record[key] for key in ("success", "collision", "truncated", "endpoint_error_m")})
+            self.recent.append({key: record.get(key, False) for key in
+                ("success", "collision", "truncated", "endpoint_error_m", "sensor_failure", "episode_return", "episode_steps")})
+            self.episode_rewards[env_id] = 0
+            self.episode_lengths[env_id] = 0
             self.state["episodes_total"] += 1
         return records
+
+    def _log_metrics(self, record, *, iterations, start_iteration):
+        self.runner.writer = self.writer
+        valid = [item for item in self.recent if not item.get("sensor_failure", False)]
+        values = {"Train/" + name: record[name] for name in
+            ("reward_mean", "training_success_rate", "training_collision_rate", "training_timeout_rate",
+             "training_sensor_failure_rate", "training_endpoint_error_m") if record[name] is not None}
+        for axis, name in enumerate(("linear", "angular")):
+            values["Policy/" + name + "_clipped_fraction"] = record["action_clipped_fraction"][axis]
+            self.writer.add_scalar("Policy/" + name + "_noise_std", record["action_noise_std"][axis], record["iteration"])
+        self.runner.log(dict(it=record["iteration"], tot_iter=iterations,
+            start_iter=start_iteration, num_learning_iterations=iterations - start_iteration,
+            collection_time=record["collection_sec"],
+            learn_time=record["iteration_sec"] - record["collection_sec"], loss_dict=record["losses"],
+            ep_infos=[values], rewbuffer=[item["episode_return"] for item in valid if "episode_return" in item],
+            lenbuffer=[item["episode_steps"] for item in valid if "episode_steps" in item]))
+        for name, value in record["reward_terms"].items():
+            self.writer.add_scalar("Reward/" + name, value, record["iteration"])
 
     def run(self, iterations):
         if type(iterations) is not int or iterations <= self.state["completed_iterations"]:
@@ -221,6 +253,7 @@ class PpoTrainer:
         (self.output / "config.yaml").write_text(yaml.safe_dump(description, allow_unicode=True, sort_keys=False), encoding="utf-8")
         self.writer = SummaryWriter(str(self.output / "tensorboard"),
             purge_step=self.state["completed_iterations"] + 1 if self.resume else None)
+        start_iteration = self.state["completed_iterations"] + 1
         try:
             with (self.output / "metrics.jsonl").open("a", encoding="utf-8", buffering=1) as metrics, \
                  (self.output / "episodes.jsonl").open("a", encoding="utf-8", buffering=1) as episodes:
@@ -243,6 +276,8 @@ class PpoTrainer:
                             self.obs = self.obs.to(self.device)
                             if not bool(torch.isfinite(rewards).all()):
                                 raise RuntimeError("PPO 奖励包含非有限数值")
+                            self.episode_rewards += rewards
+                            self.episode_lengths += 1
                             algorithm.process_env_step(self.obs, rewards, dones, extras)
                             reward_sum += rewards.mean()
                             for name, value in extras.get("reward_terms", {}).items():
@@ -274,27 +309,19 @@ class PpoTrainer:
                         episodes_total=self.state["episodes_total"], recent_episodes=len(self.recent),
                         collection_sec=collection_sec, iteration_sec=time.perf_counter() - started,
                         reward_terms={key: float(value / self.config.rollout_steps) for key, value in terms.items()})
+                    valid = [item for item in self.recent if not item.get("sensor_failure", False)]
+                    record["valid_recent_episodes"] = len(valid)
+                    record["training_sensor_failure_rate"] = float(np.mean([item.get("sensor_failure", False) for item in self.recent])) if self.recent else None
                     for key, name in (("success", "training_success_rate"), ("collision", "training_collision_rate"),
                                       ("truncated", "training_timeout_rate"), ("endpoint_error_m", "training_endpoint_error_m")):
-                        record[name] = float(np.mean([item[key] for item in self.recent])) if self.recent else None
+                        record[name] = float(np.mean([item[key] for item in valid])) if valid else None
                     self.runner.current_learning_iteration = iteration
                     self._save(periodic=iteration % self.config.save_interval == 0 or iteration == iterations)
                     for episode_record in completed_episodes:
                         episodes.write(json.dumps(episode_record, ensure_ascii=False, allow_nan=False) + "\n")
                     line = json.dumps(record, ensure_ascii=False, allow_nan=False)
                     metrics.write(line + "\n")
-                    print(line, flush=True)
-                    for name in ("reward_mean", "training_success_rate", "training_collision_rate", "training_timeout_rate",
-                                 "training_endpoint_error_m", "collection_sec", "iteration_sec"):
-                        if record[name] is not None:
-                            self.writer.add_scalar("Train/" + name, record[name], iteration)
-                    for name, value in record["losses"].items():
-                        self.writer.add_scalar("Loss/" + name, value, iteration)
-                    for name, value in record["reward_terms"].items():
-                        self.writer.add_scalar("Reward/" + name, value, iteration)
-                    for axis, name in enumerate(("linear", "angular")):
-                        self.writer.add_scalar("Policy/" + name + "_clipped_fraction", record["action_clipped_fraction"][axis], iteration)
-                        self.writer.add_scalar("Policy/" + name + "_noise_std", record["action_noise_std"][axis], iteration)
+                    self._log_metrics(record, iterations=iterations, start_iteration=start_iteration)
                     self.writer.flush()
                     if switch_scene:
                         self._close_scene()
@@ -347,7 +374,9 @@ def run_cli(args):
             create_new_stage()
             env = TraverseEnv(group, num_envs=config.num_envs, device=args.device, seed=seed,
                 timeout_sec=config.timeout_sec, collision_force_threshold_n=config.collision_force_threshold_n,
-                reward_config=config.reward)
+                reward_config=config.reward, sensor_render_retries=config.sensor_render_retries,
+                max_consecutive_sensor_failures=config.max_consecutive_sensor_failures,
+                sensor_diagnostic_dir=args.output / "sensor_failures")
             try:
                 env.reset_sequence[:] = cursors
                 return RslRlVecEnvWrapper(env, clip_actions=1.0)

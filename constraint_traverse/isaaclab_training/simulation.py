@@ -213,6 +213,7 @@ def evaluate_group(env, wrapped, policy, *, annotations):
                 result = terminal_json(extras["terminal"])
                 result.update(episode=str(env.episodes[completed].path),
                     collision_contact=extras["collision_contacts"][0],
+                    sensor_diagnostic=extras.get("sensor_diagnostics", [None])[0],
                     initial_map="recorded_history", initial_map_age_sec=initial_map_age,
                     initial_pose_world_xyyaw=initial_pose.tolist(), doors_annotated=len(doors),
                     doors_passed=sum(d.passed and not bool(extras["terminal"]["collision"][0]) for d in doors))
@@ -264,7 +265,8 @@ def run(args):
                 env = None
             summary = dict(episodes=len(results), success_rate=float(np.mean([x["success"][0] for x in results])),
                 collision_rate=float(np.mean([x["collision"][0] for x in results])),
-                timeout_rate=float(np.mean([x["truncated"][0] for x in results])),
+                timeout_rate=float(np.mean([x.get("time_limit", x["truncated"])[0] for x in results])),
+                sensor_failure_rate=float(np.mean([x.get("sensor_failure", [False])[0] for x in results])),
                 stall_rate=float(np.mean([x["stalled"][0] for x in results])),
                 mean_elapsed_sec=float(np.mean([x["elapsed_sec"][0] for x in results])),
                 mean_path_length_m=float(np.mean([x["path_length_m"][0] for x in results])),

@@ -33,6 +33,8 @@ from vln_nav.runtime.scene_lighting import add_indoor_lighting
 from .data import ACTION_SCALE, OBS_SIZE, Episode, map_age, state_vector
 from .geometry import footprint_points
 from .task_state import RewardConfig, TaskState
+from .temporal import InvalidDepthFrame
+from .sensor_diagnostics import finite_values, save_sensor_diagnostic
 
 
 def _collector_render_settings():
@@ -77,7 +79,20 @@ class TraverseEnv(DirectRLEnv):
         return super().step(action)
 
     def __init__(self, episodes: list[Episode], *, num_envs=1, device="cuda:0", seed=0,
-                 timeout_sec=60.0, collision_force_threshold_n=1.0, reward_config=None, render_mode=None):
+                 timeout_sec=60.0, collision_force_threshold_n=1.0, reward_config=None,
+                 sensor_render_retries=3, max_consecutive_sensor_failures=3,
+                 sensor_diagnostic_dir=None, render_mode=None):
+        if type(sensor_render_retries) is not int or sensor_render_retries < 0:
+            raise ValueError("相机重新渲染次数必须是非负整数")
+        if type(max_consecutive_sensor_failures) is not int or max_consecutive_sensor_failures < 1:
+            raise ValueError("连续传感器异常回合上限必须是正整数")
+        self.sensor_render_retries = sensor_render_retries
+        self.max_consecutive_sensor_failures = max_consecutive_sensor_failures
+        self.sensor_diagnostic_dir = sensor_diagnostic_dir
+        self.sensor_failed = np.zeros(num_envs, dtype=bool)
+        self.sensor_failure_streak = np.zeros(num_envs, dtype=np.int64)
+        self.sensor_diagnostics = [None for _ in range(num_envs)]
+        self.sensor_retry_count = np.zeros(num_envs, dtype=np.int64)
         self.reward_config = RewardConfig() if reward_config is None else reward_config
         self.collision_force_threshold_n = float(collision_force_threshold_n)
         if not np.isfinite(self.collision_force_threshold_n) or self.collision_force_threshold_n <= 0:
@@ -346,8 +361,8 @@ class TraverseEnv(DirectRLEnv):
             self.collision_contacts[i] = record
             self.raw_collision[i] = True
 
-    def _stop_collided_envs(self):
-        ids = torch.as_tensor(np.flatnonzero(self.raw_collision), dtype=torch.long, device=self.device)
+    def _stop_failed_envs(self):
+        ids = torch.as_tensor(np.flatnonzero(self.raw_collision | self.sensor_failed), dtype=torch.long, device=self.device)
         if not len(ids):
             return
         self.target_velocity[ids] = 0
@@ -386,26 +401,61 @@ class TraverseEnv(DirectRLEnv):
         self.robot.write_joint_effort_limit_to_sim(efforts, joint_ids=self.steering_ids)
         self._stopped = stopped
 
+    def _render_sensors(self, now):
+        self.sim.forward()
+        rep.orchestrator.step(rt_subframes=1, delta_time=0.0, pause_timeline=False, wait_for_render=True)
+        if abs(float(self.sim.current_time) - now) > 1e-7:
+            raise RuntimeError("同步相机渲染意外推进了物理时间")
+        for pair in self.cameras:
+            for camera in pair.values():
+                camera.capture(now)
+        self.last_sensor_time = now
+
+    def _sensor_diagnostic(self, env_id, error, now):
+        episode = self.episodes[self.selection[env_id]]
+        root = self.robot.data.root_link_state_w[env_id].detach().cpu().numpy().copy()
+        arrays = dict(robot_root_state=root,
+            joint_position=self.robot.data.joint_pos[env_id].detach().cpu().numpy(),
+            joint_velocity=self.robot.data.joint_vel[env_id].detach().cpu().numpy())
+        for source in ("front", "down"):
+            arrays[source + "_world_from_camera"] = self.camera_world_transform(env_id, source)
+        metadata = dict(episode=str(episode.path), usd_path=episode.meta["usd_path"], env_id=env_id,
+            timestamp_sec=now, physics_step=int(round(now / self.physics_dt)),
+            valid_ratios=error.valid_ratios.tolist(), render_retries=self.sensor_render_retries,
+            robot_position_world_xyz=finite_values(root[:3]),
+            robot_orientation_wxyz=finite_values(root[3:7]),
+            robot_velocity_world=finite_values(root[7:]),
+            recorded_floor_z_m=float(self.episodes[self.selection[env_id]].frames["floor_z_m"][0]))
+        frames = {source: camera.get_current_frame(clone=True) for source, camera in self.cameras[env_id].items()}
+        path = save_sensor_diagnostic(self.sensor_diagnostic_dir, metadata=metadata, frames=frames, arrays=arrays)
+        logging.getLogger(__name__).warning("传感器异常，回合：%s，有效深度：%s，机器人位置：%s，诊断：%s",
+            episode.path, error.valid_ratios.tolist(), metadata["robot_position_world_xyz"], path)
+        return path
+
     def _apply_action(self):
         self._check_contacts()
-        self._stop_collided_envs()
+        self._stop_failed_envs()
         now = float(self.sim.current_time)
         if now - self.last_sensor_time >= 1.0 / self.meta["cameras"]["frequency_hz"] - 1e-9:
-            self.sim.forward()
-            rep.orchestrator.step(rt_subframes=1, delta_time=0.0, pause_timeline=False, wait_for_render=True)
-            if abs(float(self.sim.current_time) - now) > 1e-7:
-                raise RuntimeError("同步相机渲染意外推进了物理时间")
-            for pair in self.cameras:
-                for camera in pair.values():
-                    camera.capture(now)
-            self.last_sensor_time = now
+            self._render_sensors(now)
         self._record_physics_state()
         for i, sampler in enumerate(self.samplers):
-            if self.raw_collision[i]:
+            if self.raw_collision[i] or self.sensor_failed[i]:
                 continue
-            sampler.poll(self.cameras[i]["front"], self.cameras[i]["down"], now=self.sim.current_time)
+            for attempt in range(self.sensor_render_retries + 1):
+                try:
+                    sampler.poll(self.cameras[i]["front"], self.cameras[i]["down"], now=now)
+                    break
+                except InvalidDepthFrame as error:
+                    if attempt == self.sensor_render_retries:
+                        self.sensor_failed[i] = True
+                        self.sensor_diagnostics[i] = self._sensor_diagnostic(i, error, now)
+                        break
+                    self.sensor_retry_count[i] += 1
+                    self._render_sensors(now)
             self.camera_valid_ratio[i] = sampler.valid_ratios
             self.map_updates[i] = sampler.fusion_count
+        self._stop_failed_envs()
         self.robot.set_joint_position_target(self.target_position)
         self.robot.set_joint_velocity_target(self.target_velocity)
         if self._stopped.any():
@@ -417,19 +467,27 @@ class TraverseEnv(DirectRLEnv):
 
     def _get_dones(self):
         self._check_contacts()
-        self._stop_collided_envs()
+        self._stop_failed_envs()
         self._record_physics_state()
         pose, velocity = self._pose_velocity()
         collision = torch.tensor(self.raw_collision, device=self.device)
         normalized = self.command / torch.as_tensor(ACTION_SCALE, device=self.device)
         self.task.action_variation += torch.linalg.vector_norm(normalized - self.task.previous_action, dim=-1)
-        terminated, truncated = self.task.update(pose[:, :2], velocity, collision, self.step_dt, yaw=pose[:, 2])
+        terminated, truncated = self.task.update(pose[:, :2], velocity, collision, self.step_dt, yaw=pose[:, 2],
+            sensor_failure=torch.as_tensor(self.sensor_failed, device=self.device))
         ids = torch.nonzero(terminated | truncated).flatten()
         if len(ids):
             self.extras["terminal"] = self.task.terminal(ids, pose)
             self.extras["terminal"]["contact_count"] = torch.tensor(self.contact_count[ids.cpu().numpy()].copy(), device=self.device)
             self.extras["collision_contacts"] = [self.collision_contacts[i] for i in ids.tolist()]
             self.extras["episode_paths"] = [str(self.episodes[self.selection[i]].path) for i in ids.tolist()]
+            self.extras["sensor_diagnostics"] = [self.sensor_diagnostics[i] for i in ids.tolist()]
+            self.extras["terminal"]["sensor_retries"] = torch.as_tensor(self.sensor_retry_count[ids.cpu().numpy()].copy(), device=self.device)
+            for i in ids.tolist():
+                self.sensor_failure_streak[i] = self.sensor_failure_streak[i] + 1 if bool(self.task.sensor_failure[i]) else 0
+                if self.sensor_failure_streak[i] >= self.max_consecutive_sensor_failures:
+                    raise RuntimeError(f"连续 {self.sensor_failure_streak[i]} 个回合发生传感器异常，采样已停止。"
+                                       f"诊断文件：{self.sensor_diagnostics[i]}")
         return terminated, truncated
 
     def _get_rewards(self):
@@ -489,6 +547,9 @@ class TraverseEnv(DirectRLEnv):
             self.raw_collision[env_id] = False
             self.contact_count[env_id] = 0
             self.collision_contacts[env_id] = None
+            self.sensor_failed[env_id] = False
+            self.sensor_diagnostics[env_id] = None
+            self.sensor_retry_count[env_id] = 0
             self.map_updates[env_id] = 0
         self.robot.write_root_pose_to_sim(root[:, :7], ids)
         self.robot.write_root_link_velocity_to_sim(root[:, 7:], ids)

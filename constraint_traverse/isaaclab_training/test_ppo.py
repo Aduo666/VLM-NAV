@@ -7,6 +7,7 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -18,6 +19,7 @@ from .policy import make_policy
 from .ppo import PpoConfig, PpoTrainer, compute_returns, load_config, training_runner_config
 from .runner import BevOnPolicyRunner
 from .task_state import RewardConfig, TaskState
+from .sensor_diagnostics import save_sensor_diagnostic
 from .test_training import MANIFEST
 
 
@@ -114,6 +116,104 @@ class PpoTests(unittest.TestCase):
                 PpoConfig(**settings)
         with self.assertRaises(ValueError):
             RewardConfig(hold_progress_reward=-1)
+
+    def test_sensor_failure_is_separate_from_timeout_and_reward(self):
+        task = TaskState(2, "cpu", timeout_sec=0.05)
+        ids = torch.arange(2)
+        task.reset(ids, torch.zeros(2, 2), torch.ones(2, 2))
+        terminated, truncated = task.update(torch.ones(2, 2), torch.zeros(2, 2),
+            torch.zeros(2, dtype=torch.bool), 0.1, sensor_failure=torch.tensor([True, False]))
+        self.assertFalse(bool(terminated.any()))
+        self.assertTrue(bool(truncated.all()))
+        torch.testing.assert_close(task.time_limit, torch.tensor([False, True]))
+        reward, _ = task.rewards(torch.zeros(2, 2), dt=0.1, action_scale=ACTION_SCALE,
+            braking_acceleration=0.6, config=RewardConfig())
+        self.assertEqual(float(reward[0]), 0.0)
+        self.assertLess(float(reward[1]), -2.0)
+        terminal = task.terminal(ids, torch.zeros(2, 3))
+        task.reset(ids, torch.zeros(2, 2), torch.ones(2, 2))
+        self.assertTrue(bool(terminal["sensor_failure"][0]))
+        self.assertFalse(bool(task.sensor_failure.any()))
+        terminated, truncated = task.update(torch.ones(2, 2), torch.zeros(2, 2),
+            torch.ones(2, dtype=torch.bool), 0.1, sensor_failure=torch.ones(2, dtype=torch.bool))
+        self.assertTrue(bool(terminated.all()))
+        self.assertFalse(bool(truncated.any()))
+
+    def test_sensor_diagnostics_preserve_raw_depth(self):
+        with tempfile.TemporaryDirectory(prefix="constraint-traverse-sensor-test-") as folder:
+            depth = np.array([[0, np.inf], [np.nan, 0]], dtype=np.float32)
+            frames = {name: dict(rendering_time=1.0, distance_to_image_plane=depth,
+                rgb=np.zeros((2, 2, 4), dtype=np.uint8)) for name in ("front", "down")}
+            path = save_sensor_diagnostic(folder, metadata=dict(episode="example"), frames=frames,
+                arrays=dict(robot_root_state=np.zeros(13)))
+            saved = json.loads(Path(path).read_text())
+            self.assertEqual(saved["cameras"]["front"]["valid_ratio"], 0.0)
+            self.assertEqual(saved["cameras"]["front"]["inf_ratio"], 0.25)
+            with np.load(Path(folder) / saved["arrays_file"]) as archive:
+                np.testing.assert_array_equal(archive["front_raw_depth_m"], depth)
+
+    def test_native_runner_log_is_used(self):
+        with tempfile.TemporaryDirectory(prefix="constraint-traverse-ppo-test-") as folder:
+            root = Path(folder)
+            trainer, _ = self.trainer(root, output=root / "run")
+            output = io.StringIO()
+            original = BevOnPolicyRunner.log
+            with patch.object(BevOnPolicyRunner, "log", autospec=True, side_effect=original) as native, redirect_stdout(output):
+                trainer.run(1)
+            native.assert_called_once()
+            self.assertIn("Learning iteration 1/1", output.getvalue())
+            self.assertIn("Mean reward:", output.getvalue())
+            self.assertIn("Total timesteps:", output.getvalue())
+            self.assertNotIn('"iteration":', output.getvalue())
+
+    def test_sensor_failure_statistics_are_separate(self):
+        with tempfile.TemporaryDirectory(prefix="constraint-traverse-ppo-test-") as folder:
+            root = Path(folder)
+            trainer, _ = self.trainer(root, output=root / "run")
+            original_factory = trainer.environment_factory
+
+            def factory(group, cursors):
+                env = original_factory(group, cursors)
+                original_step = env.step
+
+                def step(actions):
+                    observations, rewards, dones, extras = original_step(actions)
+                    if "terminal" in extras:
+                        extras["terminal"]["sensor_failure"].fill_(True)
+                        extras["terminal"]["time_limit"].zero_()
+                        rewards.zero_()
+                    return observations, rewards, dones, extras
+
+                env.step = step
+                return env
+
+            trainer.environment_factory = factory
+            with redirect_stdout(io.StringIO()):
+                trainer.run(1)
+            record = json.loads((root / "run/metrics.jsonl").read_text())
+            self.assertEqual(record["training_sensor_failure_rate"], 1.0)
+            self.assertEqual(record["valid_recent_episodes"], 0)
+            self.assertIsNone(record["training_timeout_rate"])
+            self.assertIsNone(record["training_success_rate"])
+
+    def test_resume_checkpoint_without_sensor_configuration(self):
+        with tempfile.TemporaryDirectory(prefix="constraint-traverse-ppo-test-") as folder:
+            root = Path(folder)
+            trainer, _ = self.trainer(root, output=root / "run")
+            with redirect_stdout(io.StringIO()):
+                trainer.run(1)
+            _, source = load_checkpoint(root / "run/last.pt")
+            for key in ("sensor_render_retries", "max_consecutive_sensor_failures"):
+                source["training_config"].pop(key)
+            for record in source["training_state"]["recent_episodes"]:
+                for key in ("sensor_failure", "episode_return", "episode_steps"):
+                    record.pop(key, None)
+            legacy = root / "legacy.pt"
+            torch.save(source, legacy)
+            resumed, _ = self.trainer(root, output=root / "resumed", resume=legacy)
+            with redirect_stdout(io.StringIO()):
+                result = resumed.run(2)
+            self.assertEqual(result["completed_iterations"], 2)
 
     def trainer(self, root, *, output, resume=None, groups=1, config=None):
         config = config or PpoConfig(rollout_steps=4, num_learning_epochs=1, save_interval=1, scene_iterations=1)

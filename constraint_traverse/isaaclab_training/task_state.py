@@ -45,6 +45,8 @@ class TaskState:
         self.success = torch.zeros(num_envs, dtype=torch.bool, device=device)
         self.collision = torch.zeros_like(self.success)
         self.truncated = torch.zeros_like(self.success)
+        self.time_limit = torch.zeros_like(self.success)
+        self.sensor_failure = torch.zeros_like(self.success)
         self.motion_xy = torch.zeros_like(self.goal)
         self.motion_yaw = torch.zeros_like(self.elapsed)
         self.last_motion = torch.zeros_like(self.elapsed)
@@ -66,13 +68,16 @@ class TaskState:
         self.success[ids] = False
         self.collision[ids] = False
         self.truncated[ids] = False
+        self.time_limit[ids] = False
+        self.sensor_failure[ids] = False
         self.motion_xy[ids] = xy
         self.motion_yaw[ids] = 0 if yaw is None else yaw
         self.last_motion[ids] = 0
         self.stalled[ids] = False
         self.action_variation[ids] = 0
 
-    def update(self, xy, velocity, collision, dt, yaw=None):
+    def update(self, xy, velocity, collision, dt, yaw=None, sensor_failure=None):
+        sensor_failure = torch.zeros_like(collision) if sensor_failure is None else sensor_failure
         self.elapsed += float(dt)
         self.velocity.copy_(velocity)
         self.previous_hold_fraction.copy_(self.hold_fraction)
@@ -89,7 +94,7 @@ class TaskState:
         self.stalled |= self.elapsed - self.last_motion >= 12.0
         eligible = ((self.distance <= self.goal_radius_m)
                     & (velocity[:, 0].abs() <= self.goal_linear_speed_mps)
-                    & (velocity[:, 1].abs() <= self.goal_angular_speed_radps) & ~collision)
+                    & (velocity[:, 1].abs() <= self.goal_angular_speed_radps) & ~collision & ~sensor_failure)
         self.hold_since.copy_(torch.where(eligible, torch.where(self.hold_since < 0, self.elapsed, self.hold_since), -1.0))
         hold_sec = torch.where(eligible, self.elapsed - self.hold_since, 0.0)
         self.hold_fraction.copy_((hold_sec / self.goal_hold_sec).clamp(0.0, 1.0))
@@ -97,7 +102,9 @@ class TaskState:
         self.collision.copy_(collision)
         self.success.copy_(reached & ~collision)
         terminated = collision | self.success
-        self.truncated.copy_((self.elapsed >= self.timeout_sec - 1e-6) & ~terminated)
+        self.sensor_failure.copy_(sensor_failure & ~terminated)
+        self.time_limit.copy_((self.elapsed >= self.timeout_sec - 1e-6) & ~terminated & ~self.sensor_failure)
+        self.truncated.copy_(self.time_limit | self.sensor_failure)
         return terminated, self.truncated.clone()
 
     def rewards(self, command, *, dt, action_scale, braking_acceleration, config: RewardConfig):
@@ -112,18 +119,20 @@ class TaskState:
             progress=config.progress_weight * (self.previous_distance - self.distance),
             success=config.success_reward * self.success.float(),
             collision=-config.collision_penalty * self.collision.float(),
-            timeout=-config.timeout_penalty * self.truncated.float(),
+            timeout=-config.timeout_penalty * self.time_limit.float(),
             time=torch.full_like(self.distance, -config.time_penalty_per_sec * float(dt)),
             action_change=-config.action_change_penalty * change,
             braking=-config.linear_speed_penalty_per_sec * float(dt) * excess_speed,
             goal_turning=-config.angular_speed_penalty_per_sec * float(dt) * turning_at_goal,
             hold=config.hold_progress_reward * (self.hold_fraction - self.previous_hold_fraction))
+        terms = {name: torch.where(self.sensor_failure, 0.0, value) for name, value in terms.items()}
         self.previous_action.copy_(action)
         return sum(terms.values()), terms
 
     def terminal(self, ids, pose):
         return dict(env_ids=ids.clone(), success=self.success[ids].clone(),
             collision=self.collision[ids].clone(), truncated=self.truncated[ids].clone(),
+            time_limit=self.time_limit[ids].clone(), sensor_failure=self.sensor_failure[ids].clone(),
             elapsed_sec=self.elapsed[ids].clone(), endpoint_error_m=self.distance[ids].clone(),
             path_length_m=self.length[ids].clone(), pose_world_xyyaw=pose[ids].clone(),
             stalled=self.stalled[ids].clone(), action_variation=self.action_variation[ids].clone())

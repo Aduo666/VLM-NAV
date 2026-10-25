@@ -16,6 +16,8 @@ ppo:
   save_interval: 50
   timeout_sec: 60.0
   collision_force_threshold_n: 1.0
+  sensor_render_retries: 3
+  max_consecutive_sensor_failures: 3
 
 # 速度惩罚按仿真时间计算。停车进度中断后会扣回此前获得的进度奖励。
 reward:

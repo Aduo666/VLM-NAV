@@ -10,7 +10,7 @@ from constraint_traverse.collect.recorder import quantize_depth_m
 from constraint_traverse.collect.sampling import PhysicsState
 from vln_nav.active_perception.local_geometry import LocalVoxelMap, LocalVoxelMapConfig
 
-from .temporal import MapSampler
+from .temporal import InvalidDepthFrame, MapSampler
 
 
 class MockCamera:
@@ -128,6 +128,36 @@ class TemporalTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "有效深度比例不足"):
             item.poll(MockCamera(1., np.full((3, 3), np.nan)), MockCamera(1.), now=1.)
         self.assertEqual(item.fusion_count, 0)
+
+    def test_invalid_pair_can_be_retried_at_same_physics_time(self):
+        item = sampler()
+        item.append_state(physics_state(0.5, 29))
+        item.poll(MockCamera(0.5), MockCamera(0.5), now=0.5)
+        version = item.local_map.snapshot().version
+        item.append_state(physics_state(1.0, 59))
+        front, down = MockCamera(1.0), MockCamera(1.0, np.zeros((3, 3), dtype=np.float32))
+        with self.assertRaises(InvalidDepthFrame):
+            item.poll(front, down, now=1.0)
+        self.assertEqual(item.last_capture_sec, dict(front=0.5, down=0.5))
+        self.assertEqual(item.local_map.snapshot().version, version)
+        self.assertEqual(item.last_integration_sec, 0.5)
+        down.frame["distance_to_image_plane"][:] = 0.7
+        self.assertTrue(item.poll(front, down, now=1.0))
+        self.assertEqual(item.last_capture_sec, dict(front=1.0, down=1.0))
+        self.assertEqual(item.fusion_count, 2)
+
+    def test_failed_pair_discards_partially_accepted_frames(self):
+        item = sampler()
+        item.append_state(physics_state(1.0, 59))
+        front, down = MockCamera(1.0), MockCamera(1.01)
+        self.assertFalse(item.poll(front, down, now=1.0))
+        item.append_state(physics_state(1.01, 60))
+        down.frame["distance_to_image_plane"][:] = 0
+        with self.assertRaises(InvalidDepthFrame):
+            item.poll(front, down, now=1.01)
+        front.frame["rendering_time"] = 1.01
+        down.frame["distance_to_image_plane"][:] = 0.7
+        self.assertTrue(item.poll(front, down, now=1.01))
 
 
 if __name__ == "__main__":

@@ -21,6 +21,19 @@ def seed_everything(seed):
         torch.cuda.manual_seed_all(seed)
 
 
+def capture_rng_state():
+    return dict(python=random.getstate(), numpy=np.random.get_state(), torch=torch.get_rng_state(),
+                cuda=torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None)
+
+
+def restore_rng_state(state):
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"])
+    if state["cuda"] is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(state["cuda"])
+
+
 def observation(arrays, start=0, end=None, device="cpu"):
     bev = arrays["bev"][start:end].reshape(-1, BEV_SIZE).astype(np.float32)
     raw = np.concatenate((bev, arrays["state"][start:end]), axis=-1)
@@ -28,13 +41,13 @@ def observation(arrays, start=0, end=None, device="cpu"):
 
 
 def save_checkpoint(path, policy, manifest, *, model, optimizer=None, epoch=0, seed=0,
-                    training_config=None):
+                    training_config=None, training_stage="bc", training_state=None):
     payload = dict(format_version=1, model=model, model_state_dict=policy.state_dict(),
         actor_state_dict=policy.actor_weights(), manifest=manifest, epoch=epoch, seed=seed,
         training_config=None if training_config is None else dict(training_config),
+        training_stage=training_stage, training_state=training_state,
         optimizer_state_dict=None if optimizer is None else optimizer.state_dict(),
-        rng=dict(python=random.getstate(), numpy=np.random.get_state(), torch=torch.get_rng_state(),
-                 cuda=torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None),
+        rng=capture_rng_state(),
         versions={key: importlib.metadata.version(key) for key in ("torch", "rsl-rl-lib", "tensordict", "numpy")},
         action_scale=[0.8, 0.5], network_config=dict(bev_shape=[3, 80, 80], state_size=15,
             feature_dim=128, lstm_hidden_dim=128, lstm_layers=1, truncate_steps=16),
@@ -71,6 +84,8 @@ def train(cache: Path, output: Path, *, model="lstm", epochs=200, batch_size=Non
     first_epoch = 0
     if resume:
         policy, saved = load_checkpoint(resume, device)
+        if saved.get("training_stage", "bc") != "bc":
+            raise ValueError("BC 恢复训练需要使用 BC 检查点")
         if saved["manifest"] != manifest or saved["model"] != model:
             raise ValueError("恢复训练的数据或模型配置不同")
         training_config = saved.get("training_config")
@@ -97,11 +112,7 @@ def train(cache: Path, output: Path, *, model="lstm", epochs=200, batch_size=Non
     if resume:
         optimizer.load_state_dict(saved["optimizer_state_dict"])
         first_epoch = saved["epoch"]
-        random.setstate(saved["rng"]["python"])
-        np.random.set_state(saved["rng"]["numpy"])
-        torch.set_rng_state(saved["rng"]["torch"])
-        if saved["rng"]["cuda"] is not None and torch.cuda.is_available():
-            torch.cuda.set_rng_state_all(saved["rng"]["cuda"])
+        restore_rng_state(saved["rng"])
     if first_epoch >= epochs:
         raise ValueError("目标训练轮数必须大于检查点中已完成的轮数")
     trajectories = [read_npz(cache / item["cache"]) for item in manifest["episodes"]]

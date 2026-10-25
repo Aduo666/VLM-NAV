@@ -47,6 +47,11 @@ class EncodedObservations:
         # 固定的 BC 归一化参数由编码器缓冲区管理。
         return None
 
+    def get_actions_log_prob(self, actions):
+        values = super().get_actions_log_prob(actions)
+        # RSL-RL 3.1.2 在循环更新中会去掉旧概率的单维度。
+        return values.squeeze() if actions.ndim == 3 else values
+
     def actor_modules(self):
         result = dict(actor_encoder=self.actor_encoder, actor=self.actor)
         if self.is_recurrent:

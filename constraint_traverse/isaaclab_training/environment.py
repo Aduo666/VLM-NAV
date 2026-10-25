@@ -32,7 +32,7 @@ from vln_nav.runtime.isaac_runtime_utils import bind_viewport_to_camera
 from vln_nav.runtime.scene_lighting import add_indoor_lighting
 from .data import ACTION_SCALE, OBS_SIZE, Episode, map_age, state_vector
 from .geometry import footprint_points
-from .task_state import TaskState
+from .task_state import RewardConfig, TaskState
 
 
 def _collector_render_settings():
@@ -77,7 +77,8 @@ class TraverseEnv(DirectRLEnv):
         return super().step(action)
 
     def __init__(self, episodes: list[Episode], *, num_envs=1, device="cuda:0", seed=0,
-                 timeout_sec=60.0, collision_force_threshold_n=1.0, render_mode=None):
+                 timeout_sec=60.0, collision_force_threshold_n=1.0, reward_config=None, render_mode=None):
+        self.reward_config = RewardConfig() if reward_config is None else reward_config
         self.collision_force_threshold_n = float(collision_force_threshold_n)
         if not np.isfinite(self.collision_force_threshold_n) or self.collision_force_threshold_n <= 0:
             raise ValueError("底盘碰撞力阈值必须是大于零的有限数值")
@@ -300,28 +301,43 @@ class TraverseEnv(DirectRLEnv):
                 raise RuntimeError("底盘接触记录超出缓存容量")
             self.contact_count[i] += int(counts.sum())
             pair_magnitudes = np.linalg.norm(pair_forces, axis=-1)
+            overlap_pair = None
+            overlap_index = None
+            minimum_separation = float("inf")
             # 同一对象上的相反接触力可能抵消，单独检查各个接触点。
             for other in np.flatnonzero(counts[0]):
                 start, count = int(starts[0, other]), int(counts[0, other])
                 contact_forces = forces[start:start + count, 0].cpu().numpy()
-                if not np.isfinite(contact_forces).all():
-                    raise RuntimeError("底盘接触点的法向力包含非有限数值")
+                contact_separations = separations[start:start + count, 0].cpu().numpy()
+                if not np.isfinite(contact_forces).all() or not np.isfinite(contact_separations).all():
+                    raise RuntimeError("底盘接触点的法向力或间距包含非有限数值")
                 pair_magnitudes[other] = max(pair_magnitudes[other], float(np.abs(contact_forces).max()))
+                index = int(contact_separations.argmin())
+                if contact_separations[index] <= 0 and contact_separations[index] < minimum_separation:
+                    minimum_separation = float(contact_separations[index])
+                    overlap_pair, overlap_index = int(other), start + index
             other = int(pair_magnitudes.argmax())
             force_n = max(float(np.linalg.norm(net_force)), float(pair_magnitudes[other]))
-            if force_n <= self.collision_force_threshold_n:
-                continue
+            force_triggered = force_n > self.collision_force_threshold_n
+            if not force_triggered:
+                if overlap_index is None:
+                    continue
+                other = overlap_pair
             record = dict(body_path=bodies[0], scene_body_path=None,
                 timestamp_sec=now, physics_step=int(round(now / self.physics_dt)),
                 force_n=force_n, threshold_n=self.collision_force_threshold_n,
+                detection_method="contact_force" if force_triggered else "contact_overlap",
                 net_force_world_xyz_n=net_force.tolist(), pair_force_world_xyz_n=None,
                 position_world_xyz=None, normal_world_xyz=None, normal_force_n=None,
                 normal_impulse_ns=None, separation_m=None)
             count = int(counts[0, other])
-            if float(pair_magnitudes[other]) > 0 and count:
-                start = int(starts[0, other])
-                patch_forces = forces[start:start + count, 0].cpu().numpy()
-                index = start + int(np.abs(patch_forces).argmax())
+            if count:
+                if force_triggered:
+                    start = int(starts[0, other])
+                    patch_forces = forces[start:start + count, 0].cpu().numpy()
+                    index = start + int(np.abs(patch_forces).argmax())
+                else:
+                    index = overlap_index
                 normal_force = float(forces[index, 0])
                 record.update(scene_body_path=filters[other], pair_force_world_xyz_n=pair_forces[other].tolist(),
                     position_world_xyz=points[index].cpu().tolist(), normal_world_xyz=normals[index].cpu().tolist(),
@@ -413,14 +429,13 @@ class TraverseEnv(DirectRLEnv):
             self.extras["terminal"] = self.task.terminal(ids, pose)
             self.extras["terminal"]["contact_count"] = torch.tensor(self.contact_count[ids.cpu().numpy()].copy(), device=self.device)
             self.extras["collision_contacts"] = [self.collision_contacts[i] for i in ids.tolist()]
+            self.extras["episode_paths"] = [str(self.episodes[self.selection[i]].path) for i in ids.tolist()]
         return terminated, truncated
 
     def _get_rewards(self):
-        action = self.command / torch.as_tensor(ACTION_SCALE, device=self.device)
-        change = torch.square(action - self.task.previous_action).sum(dim=-1)
-        reward = self.task.previous_distance - self.task.distance + 10 * self.task.success.float()
-        reward -= 10 * self.task.collision.float() + 0.05 * self.step_dt + 0.01 * change
-        self.task.previous_action.copy_(action)
+        reward, terms = self.task.rewards(self.command, dt=self.step_dt, action_scale=ACTION_SCALE,
+            braking_acceleration=self.controller.max_acceleration_mps2, config=self.reward_config)
+        self.extras["reward_terms"] = terms
         return reward
 
     def _reset_idx(self, env_ids):

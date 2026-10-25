@@ -22,6 +22,17 @@ def main():
     train.add_argument("--seed", type=int, help="随机种子；新训练默认 0，恢复训练使用检查点配置")
     train.add_argument("--device", default="cuda:0")
     train.add_argument("--resume", type=Path)
+    ppo = sub.add_parser("train-ppo", help="使用 BC 权重启动或恢复 PPO 微调")
+    source = ppo.add_mutually_exclusive_group(required=True)
+    source.add_argument("--checkpoint", type=Path, help="用于初始化 Actor 的 BC 检查点")
+    source.add_argument("--resume", type=Path, help="需要恢复的 PPO 检查点")
+    ppo.add_argument("--dataset", type=Path, help="录制数据集或单条 Episode；恢复时默认使用检查点中的路径")
+    ppo.add_argument("--output", type=Path, required=True)
+    ppo.add_argument("--iterations", type=int, required=True, help="希望最终完成的 PPO 更新总次数")
+    ppo.add_argument("--config", type=Path, help="PPO 与奖励配置；新训练默认使用 configs/ppo.yaml")
+    ppo.add_argument("--device", default="cuda:0")
+    ppo.add_argument("--seed", type=int, help="新训练默认 0，恢复训练默认使用检查点中的随机种子")
+    ppo.add_argument("--gui", action="store_true")
     sub.add_parser("check", help="运行数据接口、模型与 PPO 自动测试")
     for name in ("check-sim", "evaluate"):
         p = sub.add_parser(name, help="检查真实仿真任务" if name == "check-sim" else "运行闭环评估")
@@ -39,7 +50,7 @@ def main():
     args = parser.parse_args()
     if args.command != "prepare":
         expected = {"torch": "2.7.0", "rsl-rl-lib": "3.1.2"}
-        if args.command in ("check-sim", "evaluate"):
+        if args.command in ("check-sim", "evaluate", "train-ppo"):
             expected.update({"isaaclab": "0.54.2", "isaaclab-rl": "0.4.7"})
         for package, version in expected.items():
             try:
@@ -58,11 +69,14 @@ def main():
             learning_rate=args.learning_rate, seed=args.seed, device=args.device, resume=args.resume)
     elif args.command == "check":
         import unittest
-        from . import test_training, test_geometry, test_temporal
+        from . import test_training, test_geometry, test_temporal, test_ppo
         suite = unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromModule(module)
-                                   for module in (test_training, test_geometry, test_temporal))
+                                   for module in (test_training, test_geometry, test_temporal, test_ppo))
         result = unittest.TextTestRunner(verbosity=2).run(suite)
         return 0 if result.wasSuccessful() else 1
+    elif args.command == "train-ppo":
+        from .ppo import run_cli
+        run_cli(args)
     else:
         from .simulation import run
         run(args)

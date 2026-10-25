@@ -324,16 +324,81 @@ python -m constraint_traverse.isaaclab_training train \
 
 运行 CNN＋MLP 对照模型时，将 `--model` 改为 `mlp`，并指定另外的输出目录。两个模型使用相同的数据、随机种子和评估任务。
 
+### 使用 BC 权重进行 PPO 微调
+
+加载训练完成的 BC 模型，让小车在仿真中采样并更新策略：
+
+```bash
+python -m constraint_traverse.isaaclab_training train-ppo \
+  --checkpoint /Data/qiang/constraint_traverse_training/runs/bc_lstm_seed0/epoch_0200.pt \
+  --dataset /Data/qiang/data/constraint_traverse \
+  --output /Data/qiang/constraint_traverse_training/runs/ppo_lstm_seed0 \
+  --iterations 2000 --device cuda:0 --seed 0
+```
+
+启动前需要完成前面的环境激活和 `source /Data/qiang/isaacsim5.1.0/setup_conda_env.sh`。`--checkpoint` 填写 BC 检查点，网络结构和观测归一化参数随检查点加载；Actor 使用已有权重，Critic 和探索噪声单独初始化。模型继续输出归一化速度，由相同的底盘控制器执行。
+
+`--dataset` 填写录制数据集目录，也可以填写一条 Episode 的目录。训练恢复录制的起点、车辆状态、目标和历史地图，并使用实时深度继续建图。多个房间轮流参加训练，同一个房间内依次使用各条录制数据。切换房间时保留模型和优化器，清空 Actor、Critic 的循环状态；尚未结束的回合会在下次访问该房间时从录制起点重新开始。
+
+`--iterations 2000` 表示总共执行 2000 次 PPO 更新。默认每次采样 32 个控制周期，每个控制周期约为 0.0678 秒，再使用这批采样更新网络。它与 BC 的 `--epochs` 含义不同。程序达到指定次数后保存模型并结束。添加 `--gui` 可以显示仿真和地图面板。
+
+训练参数位于 [configs/ppo.yaml](configs/ppo.yaml)，也可以通过 `--config 配置文件路径` 指定配置：
+
+| 参数 | 默认值 | 含义 |
+| --- | --- | --- |
+| `num_envs` | 1 | 同一个房间内同时采样的小车数量。 |
+| `rollout_steps` | 32 | 每辆小车采样多少个控制周期后进行一次 PPO 更新。 |
+| `scene_iterations` | 64 | 当前房间完成多少次更新后切换到下一个房间。 |
+| `num_learning_epochs` | 4 | 每批采样数据用于网络更新的次数。 |
+| `num_mini_batches` | 1 | 每批数据分成多少份；并行小车数量必须能够被它整除。 |
+| `learning_rate` | 0.00003 | 网络参数每次调整的幅度。 |
+| `initial_noise_std` | 0.1 | 初始探索噪声的标准差，使用归一化动作单位。 |
+| `clip_param` | 0.1 | PPO 更新中限制策略变化的比例。 |
+| `save_interval` | 50 | 每隔多少次更新额外保存一个独立检查点。 |
+| `timeout_sec` | 60 | 每个回合允许的最长仿真时间，单位为秒。 |
+
+奖励同时考虑接近目标、到达停稳和避碰。默认每接近一米获得约 5 分，到达并停稳获得 10 分，碰撞扣除 10 分，超时扣除 2 分。根据剩余距离和底盘加减速参数计算合理速度，超过该速度会受到惩罚；进入 15 厘米的目标范围后，还会惩罚持续转向。连续停稳期间累计获得最多 2 分的进度奖励，停稳中断后扣回这部分进度奖励，满足到达条件时结束回合。时间消耗和指令变化也有惩罚。所有奖励系数都在配置文件的 `reward` 中，速度和时间惩罚按实际仿真时间计算。
+
+输出目录中包含：
+
+| 文件 | 内容 |
+| --- | --- |
+| `last.pt` | 最近一次完成更新的模型，每次更新后保存。 |
+| `iteration_000050.pt` 等 | 定期检查点；训练结束时也保存带迭代编号的检查点。 |
+| `config.yaml` | 本次使用的 PPO 和奖励参数。 |
+| `metrics.jsonl` | 每次更新的奖励、损失、动作裁剪比例、探索噪声和训练回合统计。 |
+| `episodes.jsonl` | 已结束回合的成功、碰撞、超时、终点误差和具体碰撞接触信息。 |
+| `tensorboard/` | 用于查看训练曲线的记录。 |
+
+成功率、碰撞率和超时率使用最近 100 个已结束的训练回合计算，这些回合包含随机探索。房间切换中断的回合不计入这些统计。可以使用以下命令查看训练曲线：
+
+```bash
+tensorboard --logdir /Data/qiang/constraint_traverse_training/runs/ppo_lstm_seed0/tensorboard
+```
+
+恢复训练时，`--iterations` 填写希望最终完成的总次数：
+
+```bash
+python -m constraint_traverse.isaaclab_training train-ppo \
+  --resume /Data/qiang/constraint_traverse_training/runs/ppo_lstm_seed0/last.pt \
+  --output /Data/qiang/constraint_traverse_training/runs/ppo_lstm_seed0 \
+  --iterations 4000 --device cuda:0
+```
+
+恢复时加载模型、优化器、随机状态和训练进度，使用检查点中的数据路径、随机种子和配置。本回合从对应录制起点重新开始，循环状态清零。数据内容或显式指定的配置发生变化时，程序会报错。从较早的检查点继续训练时，需要指定新的输出目录。
+
+### 闭环评估
+
 闭环评估命令中的数据目录填写需要测试的录制数据集，可以使用训练集或另外采集的验证集、测试集：
 
 ```bash
 python -m constraint_traverse.isaaclab_training evaluate \
-  --checkpoint /Data/qiang/constraint_traverse_training/runs/bc_lstm_seed0/last.pt \
+  --checkpoint /Data/qiang/constraint_traverse_training/runs/ppo_lstm_seed0/last.pt \
   --dataset /Data/qiang/data/constraint_traverse \
   --seed 0
 ```
 
-评估将每条数据录制时的起始位置、朝向、车辆状态、目标和历史地图恢复到仿真中，由模型自主驾驶，每条数据运行一次。结果显示成功率、碰撞率、超时率、停滞率、耗时、终点误差和轨迹长度。添加 `--gui` 可以显示仿真窗口；添加 `--output 文件路径.json` 可以保存结果。
+评估支持 BC 和 PPO 检查点。程序将每条数据录制时的起始位置、朝向、车辆状态、目标和历史地图恢复到仿真中，由模型使用确定性动作自主驾驶，每条数据运行一次。结果显示成功率、碰撞率、超时率、停滞率、耗时、终点误差和轨迹长度。添加 `--gui` 可以显示仿真窗口；添加 `--output 文件路径.json` 可以保存结果。
 
 使用 `--gui` 时还会打开 `Evaluation Map` 窗口，实时显示当前局部地图的俯视图：黑色为障碍物，白色为空闲区域，灰色为未知区域，蓝色箭头表示机器人及车头方向，红色表示目标。显示范围与采集工具共用 `configs/navigation.yaml` 中的 `map_selector` 配置，当前为 10×10 米，窗口缩放时保持图像比例。面板使用英文，仅显示 Episode、仿真计时、目标距离、地图更新时间和显示范围；目标超出范围时显示提示。模型的 BEV 输入范围由采集记录决定。
 
@@ -343,8 +408,6 @@ python -m constraint_traverse.isaaclab_training evaluate \
 
 到达要求距离目标不超过 0.15 米、实际线速度不超过 0.05 m/s、角速度不超过 0.08 rad/s，连续保持 0.3 秒。有效障碍物碰撞结束回合，60 秒超时记录为截断。碰撞、成功和超时使用明确的判定优先级，终止统计在自动重置前保存。
 
-碰撞失败只检查底盘 `base_link`。底盘合力、与场景对象之间的合力或任一接触点的法向力超过阈值时结束回合，默认阈值为 1 牛顿，评估或仿真验收时可以通过 `--collision-force-threshold-n 数值` 设置。接触按物理步检查，检测到碰撞后立即清零驱动轮目标速度及机器人速度，并保持当前转向角度，在当前控制周期结束时记录失败并自动进入下一条数据。保留首次超过阈值的记录。每条评估结果中的 `collision_contact` 包含底盘路径、可识别的场景对象路径、接触力、位置、法向、冲量、间距和时间；未触发碰撞时为 `null`。`contact_count` 表示底盘接触记录数量。
+碰撞失败只检查底盘 `base_link`。底盘合力、与场景对象之间的合力或任一接触点的法向力超过阈值时结束回合，默认阈值为 1 牛顿，评估或仿真验收时可以通过 `--collision-force-threshold-n 数值` 设置。PhysX 报告底盘与场景物体的接触点间距不大于零时，也会触发碰撞，覆盖接触力为零的实际接触；接触点之间仍有间距且接触力未超过阈值时继续运行。接触按物理步检查，检测到碰撞后立即清零驱动轮目标速度及机器人速度，并保持当前转向角度，在当前控制周期结束时记录失败并自动进入下一条数据。保留首次碰撞的记录。每条评估结果中的 `collision_contact` 包含底盘路径、可识别的场景对象路径、接触力、位置、法向、冲量、间距和时间，并通过 `detection_method` 区分 `contact_force` 和 `contact_overlap`；未触发碰撞时为 `null`。`contact_count` 表示底盘接触记录数量。
 
 严格统计指定门洞的通过率时，通过 `--doors 标注文件.json` 提供门洞标注。JSON 的键是 `场景名称/episode_编号`，值是该轨迹需要经过的门洞列表；每个门洞包含 `center_world_xy`、`normal_world_xy`、`width_m`、`thickness_m`。方向指向门洞出口，坐标和尺寸使用米。结果记录标注数量和整车通过数量。
-
-PPO 接入验收复用 BC 的 Actor。正式 PPO 训练的奖励权重和训练预算在 BC 闭环评估后确定。

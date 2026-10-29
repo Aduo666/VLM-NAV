@@ -89,6 +89,7 @@ class CameraFrame:
     depth_m: np.ndarray
     intrinsics: np.ndarray
     world_from_camera: np.ndarray
+    robot_mask: np.ndarray | None = None
 
     def __post_init__(self):
         _identifier(self.frame_id)
@@ -107,6 +108,11 @@ class CameraFrame:
         object.__setattr__(self, "depth_m", depth)
         object.__setattr__(self, "intrinsics", intrinsics)
         object.__setattr__(self, "world_from_camera", _transform(self.world_from_camera))
+        if self.robot_mask is not None:
+            mask = np.asarray(self.robot_mask)
+            if mask.shape != depth.shape or mask.dtype != np.bool_:
+                raise ValueError("机器人像素过滤标记必须为与深度同尺寸的布尔数组")
+            object.__setattr__(self, "robot_mask", _array(mask, dtype=bool))
 
 
 @dataclass(frozen=True, eq=False)

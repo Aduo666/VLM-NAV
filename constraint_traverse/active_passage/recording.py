@@ -57,6 +57,8 @@ class TrialRecorder:
             index = self.counts["observations"]
             relative = f"frames/{index:06d}.npz"
             np.savez_compressed(self.path / relative, rgb=frame.rgb, depth_m=frame.depth_m,
+                                robot_mask=(np.zeros(frame.depth_m.shape, dtype=bool) if frame.robot_mask is None
+                                            else frame.robot_mask),
                                 timestamp_sec=frame.timestamp_sec, intrinsics=frame.intrinsics,
                                 world_from_camera=frame.world_from_camera, world_from_base=robot.world_from_base,
                                 base_twist=robot.base_twist, joint_positions=robot.joint_positions,
@@ -101,6 +103,9 @@ def inspect_record(path):
                 with np.load(path / record["file"], allow_pickle=False) as frame:
                     if frame["rgb"].shape[:2] != frame["depth_m"].shape:
                         raise ValueError("记录中的 RGB 与深度尺寸不一致")
+                    if "robot_mask" in frame and (frame["robot_mask"].shape != frame["depth_m"].shape
+                                                   or frame["robot_mask"].dtype != np.bool_):
+                        raise ValueError("机器人过滤标记的尺寸或类型不一致")
                     if abs(float(frame["timestamp_sec"]) - record["timestamp_sec"]) > 1e-6:
                         raise ValueError("图像索引与实际文件时间不一致")
                 counts["observations"] += 1

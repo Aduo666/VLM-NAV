@@ -45,6 +45,17 @@ class ObservationContractTests(unittest.TestCase):
         np.testing.assert_array_equal(state.joint_positions, [0, 1])
         self.assertFalse(state.joint_positions.flags.writeable)
 
+    def test_robot_pixel_mask_is_copied_and_validated(self):
+        from dataclasses import replace
+        mask = np.zeros((2, 3), dtype=bool)
+        value = replace(frame(), robot_mask=mask)
+        mask[:] = True
+        self.assertFalse(value.robot_mask.any())
+        self.assertFalse(value.robot_mask.flags.writeable)
+        for wrong in (np.zeros((3, 2), dtype=bool), np.zeros((2, 3), dtype=np.uint8)):
+            with self.subTest(shape=wrong.shape), self.assertRaises(ValueError):
+                replace(frame(), robot_mask=wrong)
+
     def test_timestamp_mismatch_is_rejected(self):
         with self.assertRaises(ValueError):
             RealObservation("obs", frame(1), robot(2))

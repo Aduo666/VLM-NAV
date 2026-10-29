@@ -137,6 +137,7 @@ class ExperimentRuntime:
             seed=self.args.seed, scene=str(self.args.usd), robot_asset=str(self.profile.asset.usd_path),
             physics_dt_sec=float(self.world.get_physics_dt()), robot_profile=asdict(self.profile.agx_controller),
             camera_paths=paths, camera_config=camera_cfg,
+            robot_depth_filter=self.sensors.robot_filter.metadata(),
             map_config=self.navigation["mapping"], map_sources=list(self.fusion.sources),
             restoration=dict(protocol="RESET_PHYSICS_AND_RESTORE_NUMERIC_STATE",
                              unavailable=["PhysX 接触求解器内部缓存", "GPU 渲染内部缓存"],

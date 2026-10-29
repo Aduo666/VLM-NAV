@@ -9,6 +9,7 @@ from vln_nav.active_perception.camera_geometry import camera_rgb_to_uint8, world
 from vln_nav.runtime.isaac_runtime_utils import resolve_existing_prim_path, resolve_robot_relative_prim_path
 
 from ..contracts import CameraFrame, RealObservation
+from .robot_filter import RobotDepthFilter
 
 
 def numpy_value(value):
@@ -51,6 +52,7 @@ class ObservationSensors:
             camera.initialize()
             camera.add_distance_to_image_plane_to_frame()
             self.cameras[source] = camera
+        self.robot_filter = RobotDepthFilter(runtime)
 
     def camera_transform(self, source):
         path, mount = self.mounts[source]
@@ -69,14 +71,17 @@ class ObservationSensors:
         if abs(float(world.current_time) - before) > 1e-7:
             raise RuntimeError("传感器同步渲染改变了物理时间")
         robot = self.runtime.robot_state()
+        self.robot_filter.update()
         results = []
         for source, camera in self.cameras.items():
             rgb = camera_rgb_to_uint8(camera.get_rgb())
             depth = camera.get_depth()
             if rgb is None or depth is None:
                 raise RuntimeError(f"相机尚未产生完整 RGB-D：{source}")
-            frame = CameraFrame(source, robot.timestamp_sec, rgb, numpy_value(depth),
-                                numpy_value(camera.get_intrinsics_matrix()), self.camera_transform(source))
+            depth = numpy_value(depth)
+            intrinsics, transform = numpy_value(camera.get_intrinsics_matrix()), self.camera_transform(source)
+            mask = self.robot_filter.mask(depth, intrinsics, transform)
+            frame = CameraFrame(source, robot.timestamp_sec, rgb, depth, intrinsics, transform, mask)
             results.append(RealObservation(f"{self.epoch}:{self.sequence}:{source}", frame, robot))
         self.sequence += 1
         return tuple(results)
@@ -87,4 +92,5 @@ class ObservationSensors:
             for name in tuple(camera._custom_annotators):
                 camera.detach_annotator(name)
         self.cameras.clear()
+        self.robot_filter = None
 

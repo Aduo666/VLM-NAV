@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import redirect_stderr
+from dataclasses import replace
 import io
 from pathlib import Path
 import random
@@ -85,6 +86,19 @@ class ExperimentTests(unittest.TestCase):
             self.assertTrue(np.isnan(frame["depth_m"][0, 0]))
             self.assertTrue(np.isposinf(frame["depth_m"][0, 1]))
             self.assertEqual(frame["depth_m"][1, 0], 0)
+
+    def test_raw_depth_and_robot_mask_are_recorded_separately(self):
+        path = self.experiment.start()
+        raw = self.backend.observation()
+        mask = np.zeros((2, 2), dtype=bool)
+        mask[1, 1] = True
+        filtered = replace(raw, frame=replace(raw.frame, robot_mask=mask))
+        self.experiment.recorder.observations((filtered,))
+        self.experiment.stop()
+        inspect_record(path)
+        with np.load(path / "frames/000001.npz", allow_pickle=False) as frame:
+            self.assertEqual(frame["depth_m"][1, 1], 1.0)
+            self.assertTrue(frame["robot_mask"][1, 1])
 
     def test_timeout_is_saved_without_completion(self):
         path = self.experiment.start()

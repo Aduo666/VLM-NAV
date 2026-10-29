@@ -11,6 +11,77 @@ from ..cameras import CAMERA_PATHS
 from ..state import require_reset_accuracy
 from constraint_traverse.rgbd_map import SOURCE_BITS
 from vln_nav.runtime.isaac_runtime_utils import resolve_robot_relative_prim_path
+from vln_nav.active_perception.camera_geometry import backproject_depth_pixels_to_world
+
+
+def verify_robot_depth_filter(runtime):
+    saved, previous_start = runtime.capture_snapshot(), runtime.experiment.saved
+    try:
+        for camera in runtime.sensors.cameras.values():
+            camera.add_instance_id_segmentation_to_frame()
+        runtime.observations = runtime.sensors.capture()
+        details = {}
+        for observation in runtime.observations:
+            frame, robot = observation.frame, observation.robot
+            data = runtime.sensors.cameras[frame.frame_id]._custom_annotators["instance_id_segmentation"].get_data()
+            labels = data["info"]["idToLabels"]
+            robot_ids = [int(key) for key, value in labels.items()
+                         if str(value).startswith(runtime.profile.asset.prim_path + "/")]
+            stride = runtime.local_map.config.pixel_stride
+            u, v = np.meshgrid(np.arange(stride // 2, frame.depth_m.shape[1], stride),
+                               np.arange(stride // 2, frame.depth_m.shape[0], stride))
+            depth = frame.depth_m[v, u]
+            valid = np.isfinite(depth) & (depth >= runtime.local_map.config.min_depth_m) & (depth <= runtime.local_map.config.max_depth_m)
+            points = backproject_depth_pixels_to_world(pixel_u=u, pixel_v=v, depth_m=np.where(valid, depth, 0),
+                camera_intrinsics=frame.intrinsics, camera_to_world=frame.world_from_camera)
+            local = (points - robot.world_from_base[:3, 3]) @ robot.world_from_base[:3, :3]
+            floor_z = robot.world_from_base[2, 3] - runtime.floor_offset
+            hit = valid & (points[..., 2] - floor_z >= runtime.local_map.min_height) & (points[..., 2] - floor_z <= runtime.local_map.max_height)
+            near = hit & (local[..., 0] > 0) & (local[..., 0] < 1.5) & (np.abs(local[..., 1]) < 0.8)
+            ids = np.asarray(data["data"]).reshape(frame.depth_m.shape)[v, u]
+            self_hit = near & np.isin(ids, robot_ids)
+            remaining = int(np.count_nonzero(self_hit & ~frame.robot_mask[v, u]))
+            details[frame.frame_id] = dict(raw_robot_obstacle_rays=int(self_hit.sum()), remaining_robot_obstacle_rays=remaining)
+            if remaining:
+                raise AssertionError(f"机器人自身障碍回波仍有遗漏：{frame.frame_id}，{remaining}")
+        if runtime.args.usd is None:
+            grid = runtime.local_map.snapshot().grid
+            rows, columns = np.indices(grid.shape)
+            base = runtime.robot_state().world_from_base
+            position = base[:3, 3]
+            dx = grid.origin_x_m + (columns + 0.5) * grid.resolution_m - position[0]
+            dy = grid.origin_y_m + (rows + 0.5) * grid.resolution_m - position[1]
+            x, y = base[0, 0] * dx + base[1, 0] * dy, base[0, 1] * dx + base[1, 1] * dy
+            count = int(np.count_nonzero(grid.occupied_mask & (x > 0) & (x < 1.5) & (np.abs(y) < 0.8)))
+            if count:
+                raise AssertionError(f"空白地面前方仍有历史障碍栅格：{count}")
+            dc = runtime.drive._dc
+            handle = dc.get_rigid_body("/World/Environment/ResetProbe")
+            pose = dc.get_rigid_body_pose(handle)
+            pose.p = tuple(position + base[:3, :3] @ [1.2, 0.6, 0.8])
+            dc.set_rigid_body_pose(handle, pose)
+            dc.set_rigid_body_linear_velocity(handle, (0, 0, 0))
+            runtime.step([0, 0])
+            runtime.observations = runtime.sensors.capture()
+            visible, removed = 0, 0
+            for observation in runtime.observations:
+                frame = observation.frame
+                data = runtime.sensors.cameras[frame.frame_id]._custom_annotators["instance_id_segmentation"].get_data()
+                ids = [int(key) for key, value in data["info"]["idToLabels"].items()
+                       if str(value).startswith("/World/Environment/ResetProbe")]
+                probe = np.isin(np.asarray(data["data"]).reshape(frame.depth_m.shape), ids)
+                visible += int(probe.sum())
+                removed += int(np.count_nonzero(probe & frame.robot_mask))
+            if not visible or removed:
+                raise AssertionError(f"真实测试障碍的过滤检查失败：可见像素 {visible}，被移除像素 {removed}")
+            details["environment_probe"] = dict(visible_pixels=visible, removed_pixels=removed, initial_front_occupied_cells=count)
+        return details
+    finally:
+        for camera in runtime.sensors.cameras.values():
+            camera.remove_instance_id_segmentation_from_frame()
+        runtime.experiment.saved = saved
+        runtime.experiment.reset()
+        runtime.experiment.saved = previous_start
 
 
 def verify_map_fusion(runtime):
@@ -86,8 +157,10 @@ def verify(runtime, repeats):
     if any(value < 0.02 for value in ratios.values()):
         raise AssertionError(f"相机有效深度不足：{ratios}")
     runtime.goal = runtime.robot_state().world_from_base[:3, 3].copy() + [0.5, 0, 0]
+    depth_filter_check = verify_robot_depth_filter(runtime)
     fusion_check = verify_map_fusion(runtime)
     ui_goal_verified = False
+    ui_font = None
     if runtime.panel is not None:
         runtime.panel.update(runtime)
         for _ in range(5):
@@ -101,6 +174,11 @@ def verify(runtime, repeats):
         if runtime.goal is None or not np.isfinite(runtime.goal).all() or np.linalg.norm(runtime.goal - old_goal) < 0.1:
             raise AssertionError("地图点击没有生成有效世界坐标目标")
         ui_goal_verified = True
+        ui_font = runtime.panel.detail.style["font"]
+        import omni.ui as ui
+        atlases = ui.Inspector.get_stored_font_atlases()
+        if not any(ui_font in str(value) for value in atlases):
+            raise AssertionError(f"中文字体没有加载到界面字形缓存：{atlases}")
     initial = runtime.experiment.save_start()
     expected_random = None
     trajectories, errors, records = [], [], []
@@ -158,5 +236,6 @@ def verify(runtime, repeats):
                 camera_paths=active_paths, camera_valid_ratios=ratios, synchronized_observations=True,
                 map_restored=True, random_state_restored=True, records_verified=len(records) + 2,
                 map_fusion=fusion_check,
+                robot_depth_filter=depth_filter_check, ui_font=ui_font,
                 timeout_saved=True, ui_goal_verified=ui_goal_verified,
                 execution_mode="manual", automatic_navigation_tested=False)

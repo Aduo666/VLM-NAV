@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import redirect_stderr
+from dataclasses import replace
 import io
 import unittest
 
@@ -55,6 +56,23 @@ class FusionTests(unittest.TestCase):
         self.assertEqual(self.map.source_mask[self.cell()], SOURCE_BITS["arm"])
         self.assertEqual(dict(result["source_ray_counts"]), {"arm": 1})
         self.assertGreater(self.fusion.source_cell_counts()["arm"], 0)
+
+    def test_robot_pixel_does_not_create_obstacle_or_free_space(self):
+        self.fusion.set_sources(("arm",), timestamp_sec=0)
+        real = observation()
+        filtered = replace(real, frame=replace(real.frame, robot_mask=np.ones((1, 1), dtype=bool)))
+        result = self.integrate(filtered)
+        self.assertTrue(self.map.snapshot().grid.unknown_mask.all())
+        self.assertEqual(result["robot_filtered_pixels"], {"arm": 1})
+        np.testing.assert_array_equal(filtered.frame.depth_m, [[1.0]])
+
+    def test_robot_pixel_cannot_clear_existing_environment_obstacle(self):
+        self.fusion.set_sources(("front", "arm"), timestamp_sec=0)
+        self.integrate(observation("front", distance=2))
+        real = observation(timestamp=2)
+        filtered = replace(real, frame=replace(real.frame, robot_mask=np.ones((1, 1), dtype=bool)))
+        self.integrate(filtered)
+        self.assertTrue(self.map.snapshot().grid.occupied_mask[self.cell(2.025, 0.025)])
 
     def test_three_sources_share_map_with_independent_source_bits(self):
         self.fusion.set_sources(("front", "arm", "down"), timestamp_sec=0)

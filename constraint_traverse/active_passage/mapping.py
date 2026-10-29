@@ -79,12 +79,16 @@ class ObservationMapFusion:
         latest = selected[-1]
         position = latest.robot.world_from_base[:3, 3]
         depths = [TimedDepthObservation(source=value.frame.frame_id, timestamp_sec=value.frame.timestamp_sec,
-                    depth_m=value.frame.depth_m, intrinsics=value.frame.intrinsics,
-                    camera_to_world=value.frame.world_from_camera) for value in selected]
+                    depth_m=(value.frame.depth_m if value.frame.robot_mask is None
+                             else np.where(value.frame.robot_mask, np.nan, value.frame.depth_m)),
+                    intrinsics=value.frame.intrinsics, camera_to_world=value.frame.world_from_camera) for value in selected]
         update = self.local_map.integrate_batch(depths, center_world_xy=position[:2],
                                                floor_z_m=float(position[2]) - floor_offset_m)
         self._last = history
         return dict(**asdict(update), timestamp_sec=float(latest.frame.timestamp_sec),
                     enabled_sources=list(self.sources),
+                    robot_filtered_pixels={source: sum(int(np.count_nonzero(value.frame.robot_mask))
+                        for value in selected if value.frame.frame_id == source and value.frame.robot_mask is not None)
+                        for source in self.sources},
                     observations=[dict(observation_id=value.observation_id, source=value.frame.frame_id,
                                        timestamp_sec=float(value.frame.timestamp_sec)) for value in selected])

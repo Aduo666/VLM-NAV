@@ -32,6 +32,8 @@ python -m constraint_traverse.active_passage run \
 
 相机分工在 `cameras.py` 定义，分辨率、频率和前视视场读取 `configs/navigation.yaml`。每次同步渲染期间保持物理时间不变，保存 RGB、原始浮点深度、内参、实际相机世界位姿、底盘位姿和全部关节状态。相机位姿通过实际所属刚体计算。
 
+建图会过滤机器人自身的深度回波：使用机器人可见三角表面及各刚体实际位姿，识别距离自身表面不超过 3 mm 的深度点。过滤标记单独保存为 `robot_mask`，原始 RGB-D 保持完整。被标记的像素不提交障碍终点，也不用于产生空闲射线。正常运行只使用机器人自身模型，场景物体标签仅在仿真验收中用于核对过滤结果。
+
 | 相机标识 | 实际相机 | 用途 |
 | --- | --- | --- |
 | `front` | 云台 `PanCamera` | 前视导航观测与地图显示 |
@@ -60,7 +62,7 @@ python -m constraint_traverse.active_passage run --map-sources front arm down
 | --- | --- |
 | `meta.json` | 配置、目标、代码版本及源码校验值、记录数量、恢复误差和终止原因 |
 | `records.jsonl` | 物理状态、控制命令、图像索引、融合开关事件与地图更新来源 |
-| `frames/*.npz` | 同时刻 RGB-D、相机内外参及完整机器人状态 |
+| `frames/*.npz` | 同时刻原始 RGB-D、自体像素过滤标记、相机内外参及完整机器人状态 |
 | `initial_state.pkl` | 本程序产生的数值状态快照，供后续实验复现使用 |
 
 停止、超时、主动重置、异常和退出的记录都会保留。手动记录的结束状态不自动表示完成通行。`timestamp_sec` 是恢复后的试验逻辑时间；状态记录中的 `physical_time_sec` 是 Isaac Sim 当前物理时间，两者分别保存。
@@ -95,9 +97,12 @@ python -m constraint_traverse.active_passage check-sim --gpu 1
 | `mapping.py` | 三路真实观测的统一融合、来源开关和去重历史 |
 | `simulation/runtime.py` | Isaac Sim 机器人加载、键盘驾驶和地图显示 |
 | `simulation/sensors.py` | 同步 RGB-D 读取与实际相机位姿 |
+| `simulation/robot_filter.py` | 根据机器人自身表面与实际姿态过滤深度回波 |
 | `simulation/snapshot.py` | 场景与机器人状态的采集、恢复及检查 |
 | `simulation/ui.py` | 控制面板、目标地图和相机画面 |
 | `simulation/verify.py` | 物理验收流程 |
+
+控制面板中的中文标签和消息使用本机包含中文及拉丁字符的 TTF 字体，字体路径由 `simulation/ui.py` 中的 `chinese_text_style()` 选择。
 
 `contracts.py` 定义任务、环境信念、通行规划、机械臂观察和评价五个模块的公共接口。数据对象只携带数值、标识符和不可写数组，规划接口使用信念快照和机器人状态。
 

@@ -13,7 +13,7 @@ from vln_nav.active_perception.contracts import TimedDepthObservation
 from vln_nav.navigation.trajectory_clearance import PlanningGrid
 
 
-SOURCE_BITS = {"front": 1, "down": 2}
+SOURCE_BITS = {"front": 1, "down": 2, "arm": 4}
 
 
 def _logit(probability):

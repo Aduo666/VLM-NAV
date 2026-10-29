@@ -1,5 +1,3 @@
-__pycache__/
-*.pyc
 logs/
 debug/
 .cache/
@@ -7,6 +5,10 @@ weights/
 .codex
 third_party/
 tests/
+!constraint_traverse/active_passage/tests/
+!constraint_traverse/active_passage/tests/**
+__pycache__/
+*.pyc
 流程.txt
 .agents
 .claude

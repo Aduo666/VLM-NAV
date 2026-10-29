@@ -96,7 +96,7 @@ class TraverseEnv(DirectRLEnv):
         self.reward_config = RewardConfig() if reward_config is None else reward_config
         self.collision_force_threshold_n = float(collision_force_threshold_n)
         if not np.isfinite(self.collision_force_threshold_n) or self.collision_force_threshold_n <= 0:
-            raise ValueError("底盘碰撞力阈值必须是大于零的有限数值")
+            raise ValueError("车身碰撞力阈值必须是大于零的有限数值")
         self.episodes = episodes
         self.meta = episodes[0].meta
         if any(e.meta["usd_path"] != self.meta["usd_path"] for e in episodes):
@@ -172,12 +172,13 @@ class TraverseEnv(DirectRLEnv):
         self.start_pose = torch.zeros(self.num_envs, 3, device=self.device)
         self.reset_errors = torch.zeros(self.num_envs, 6, device=self.device)
         physics = SimulationManager.get_physics_sim_view()
-        if self.robot.body_names.count("base_link") != 1:
-            raise RuntimeError("AGX 模型必须包含唯一的底盘刚体 base_link")
-        chassis_index = self.robot.body_names.index("base_link")
+        collision_names = ("base_link", "box_link")
+        if any(self.robot.body_names.count(name) != 1 for name in collision_names):
+            raise RuntimeError("AGX 模型必须包含唯一的车身刚体 base_link 和 box_link")
+        collision_indices = [self.robot.body_names.index(name) for name in collision_names]
         room_body_paths = set(room_paths)
         for i in range(self.num_envs):
-            bodies = [self.robot.root_physx_view.link_paths[i][chassis_index]]
+            bodies = [self.robot.root_physx_view.link_paths[i][index] for index in collision_indices]
             filters = set()
             room = self.sim.stage.GetPrimAtPath(f"/World/envs/env_{i}/Room")
             for prim in Usd.PrimRange(room, Usd.TraverseInstanceProxies()):
@@ -189,7 +190,7 @@ class TraverseEnv(DirectRLEnv):
                 filters.add(str(owner.GetPath()) if owner else str(prim.GetPath()))
             filters = sorted(filters)
             if not filters:
-                raise RuntimeError("房间没有可以检测底盘接触的碰撞体")
+                raise RuntimeError("房间没有可以检测车身接触的碰撞体")
             view = physics.create_rigid_contact_view(bodies, filter_patterns=[filters] * len(bodies),
                                                      max_contact_data_count=4096)
             if view.sensor_count != len(bodies) or view.filter_count != len(filters):
@@ -306,60 +307,64 @@ class TraverseEnv(DirectRLEnv):
             if now <= self.reset_time[i] + 1e-7 or now <= self.last_contact_time[i] + 1e-7 or self.raw_collision[i]:
                 continue
             self.last_contact_time[i] = now
-            net_force = view.get_net_contact_forces(dt=self.physics_dt)[0].cpu().numpy()
-            pair_forces = view.get_contact_force_matrix(dt=self.physics_dt)[0].cpu().numpy()
-            if not np.isfinite(net_force).all() or not np.isfinite(pair_forces).all():
-                raise RuntimeError("底盘接触力包含非有限数值")
+            net_forces = view.get_net_contact_forces(dt=self.physics_dt).cpu().numpy()
+            force_matrix = view.get_contact_force_matrix(dt=self.physics_dt).cpu().numpy()
+            if not np.isfinite(net_forces).all() or not np.isfinite(force_matrix).all():
+                raise RuntimeError("车身接触力包含非有限数值")
             forces, points, normals, separations, counts, starts = view.get_contact_data(dt=self.physics_dt)
             counts, starts = counts.cpu().numpy(), starts.cpu().numpy()
             if counts.sum() >= view.max_contact_data_count:
-                raise RuntimeError("底盘接触记录超出缓存容量")
+                raise RuntimeError("车身接触记录超出缓存容量")
             self.contact_count[i] += int(counts.sum())
-            pair_magnitudes = np.linalg.norm(pair_forces, axis=-1)
-            overlap_pair = None
-            overlap_index = None
-            minimum_separation = float("inf")
-            # 同一对象上的相反接触力可能抵消，单独检查各个接触点。
-            for other in np.flatnonzero(counts[0]):
-                start, count = int(starts[0, other]), int(counts[0, other])
-                contact_forces = forces[start:start + count, 0].cpu().numpy()
-                contact_separations = separations[start:start + count, 0].cpu().numpy()
-                if not np.isfinite(contact_forces).all() or not np.isfinite(contact_separations).all():
-                    raise RuntimeError("底盘接触点的法向力或间距包含非有限数值")
-                pair_magnitudes[other] = max(pair_magnitudes[other], float(np.abs(contact_forces).max()))
-                index = int(contact_separations.argmin())
-                if contact_separations[index] <= 0 and contact_separations[index] < minimum_separation:
-                    minimum_separation = float(contact_separations[index])
-                    overlap_pair, overlap_index = int(other), start + index
-            other = int(pair_magnitudes.argmax())
-            force_n = max(float(np.linalg.norm(net_force)), float(pair_magnitudes[other]))
-            force_triggered = force_n > self.collision_force_threshold_n
-            if not force_triggered:
-                if overlap_index is None:
-                    continue
-                other = overlap_pair
-            record = dict(body_path=bodies[0], scene_body_path=None,
-                timestamp_sec=now, physics_step=int(round(now / self.physics_dt)),
-                force_n=force_n, threshold_n=self.collision_force_threshold_n,
-                detection_method="contact_force" if force_triggered else "contact_overlap",
-                net_force_world_xyz_n=net_force.tolist(), pair_force_world_xyz_n=None,
-                position_world_xyz=None, normal_world_xyz=None, normal_force_n=None,
-                normal_impulse_ns=None, separation_m=None)
-            count = int(counts[0, other])
-            if count:
-                if force_triggered:
-                    start = int(starts[0, other])
-                    patch_forces = forces[start:start + count, 0].cpu().numpy()
-                    index = start + int(np.abs(patch_forces).argmax())
-                else:
-                    index = overlap_index
-                normal_force = float(forces[index, 0])
-                record.update(scene_body_path=filters[other], pair_force_world_xyz_n=pair_forces[other].tolist(),
-                    position_world_xyz=points[index].cpu().tolist(), normal_world_xyz=normals[index].cpu().tolist(),
-                    normal_force_n=normal_force, normal_impulse_ns=normal_force * self.physics_dt,
-                    separation_m=float(separations[index, 0]))
-            self.collision_contacts[i] = record
-            self.raw_collision[i] = True
+            for body_index, body_path in enumerate(bodies):
+                net_force = net_forces[body_index]
+                pair_forces = force_matrix[body_index]
+                pair_magnitudes = np.linalg.norm(pair_forces, axis=-1)
+                overlap_pair = None
+                overlap_index = None
+                minimum_separation = float("inf")
+                # 同一对象上的相反接触力可能抵消，单独检查各个接触点。
+                for other in np.flatnonzero(counts[body_index]):
+                    start, count = int(starts[body_index, other]), int(counts[body_index, other])
+                    contact_forces = forces[start:start + count, 0].cpu().numpy()
+                    contact_separations = separations[start:start + count, 0].cpu().numpy()
+                    if not np.isfinite(contact_forces).all() or not np.isfinite(contact_separations).all():
+                        raise RuntimeError("车身接触点的法向力或间距包含非有限数值")
+                    pair_magnitudes[other] = max(pair_magnitudes[other], float(np.abs(contact_forces).max()))
+                    index = int(contact_separations.argmin())
+                    if contact_separations[index] <= 0 and contact_separations[index] < minimum_separation:
+                        minimum_separation = float(contact_separations[index])
+                        overlap_pair, overlap_index = int(other), start + index
+                other = int(pair_magnitudes.argmax())
+                force_n = max(float(np.linalg.norm(net_force)), float(pair_magnitudes[other]))
+                force_triggered = force_n > self.collision_force_threshold_n
+                if not force_triggered:
+                    if overlap_index is None:
+                        continue
+                    other = overlap_pair
+                record = dict(body_path=body_path, scene_body_path=None,
+                    timestamp_sec=now, physics_step=int(round(now / self.physics_dt)),
+                    force_n=force_n, threshold_n=self.collision_force_threshold_n,
+                    detection_method="contact_force" if force_triggered else "contact_overlap",
+                    net_force_world_xyz_n=net_force.tolist(), pair_force_world_xyz_n=None,
+                    position_world_xyz=None, normal_world_xyz=None, normal_force_n=None,
+                    normal_impulse_ns=None, separation_m=None)
+                count = int(counts[body_index, other])
+                if count:
+                    if force_triggered:
+                        start = int(starts[body_index, other])
+                        patch_forces = forces[start:start + count, 0].cpu().numpy()
+                        index = start + int(np.abs(patch_forces).argmax())
+                    else:
+                        index = overlap_index
+                    normal_force = float(forces[index, 0])
+                    record.update(scene_body_path=filters[other], pair_force_world_xyz_n=pair_forces[other].tolist(),
+                        position_world_xyz=points[index].cpu().tolist(), normal_world_xyz=normals[index].cpu().tolist(),
+                        normal_force_n=normal_force, normal_impulse_ns=normal_force * self.physics_dt,
+                        separation_m=float(separations[index, 0]))
+                self.collision_contacts[i] = record
+                self.raw_collision[i] = True
+                break
 
     def _stop_failed_envs(self):
         ids = torch.as_tensor(np.flatnonzero(self.raw_collision | self.sensor_failed), dtype=torch.long, device=self.device)

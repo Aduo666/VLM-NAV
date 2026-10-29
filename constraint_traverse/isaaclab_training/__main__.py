@@ -42,7 +42,7 @@ def main():
         p.add_argument("--seed", type=int, default=0)
         p.add_argument("--gui", action="store_true")
         p.add_argument("--collision-force-threshold-n", type=float, default=1.0,
-                       help="底盘接触力超过此值时结束回合，单位牛顿，默认 1.0")
+                       help="车身接触力超过此值时结束回合，单位牛顿，默认 1.0")
         if name == "evaluate":
             p.add_argument("--checkpoint", type=Path, required=True)
             p.add_argument("--output", type=Path)

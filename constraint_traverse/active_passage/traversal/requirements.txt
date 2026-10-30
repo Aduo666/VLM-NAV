@@ -1,0 +1,2 @@
+pybind11==2.13.6
+pytorch-mppi==0.9.1

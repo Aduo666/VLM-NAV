@@ -20,18 +20,19 @@ class Experiment:
 
     def save_start(self):
         if self.recorder is not None:
-            raise ValueError("保存起点需要先停止记录")
+            raise ValueError("Stop recording before saving the start state.")
         self.saved = self.backend.capture_snapshot()
         return self.saved
 
-    def start(self):
+    def start(self, *, execution_mode="manual"):
         if self.recorder is not None:
-            raise ValueError("试验已经开始记录")
+            raise ValueError("Recording is already active.")
         if self.backend.goal is None:
-            raise ValueError("请在地图上选择目标位置")
+            raise ValueError("Select a goal on the map.")
         self.saved = self.backend.capture_snapshot()
         metadata = dict(self.metadata, goal_world_xyz=self.backend.goal.tolist(),
-                        joint_names=list(self.saved.robot.joint_names), reset_errors=self.last_reset_errors)
+                        joint_names=list(self.saved.robot.joint_names), reset_errors=self.last_reset_errors,
+                        execution_mode=execution_mode, automatic_planner=execution_mode == "autonomous")
         self.recorder = TrialRecorder(self.output_root, metadata, self.saved)
         self.status = "RECORDING"
         self.last_record = self.recorder.path
@@ -55,7 +56,7 @@ class Experiment:
 
     def reset(self):
         if self.saved is None:
-            raise ValueError("尚未保存试验起点")
+            raise ValueError("No saved start state. Use SAVE START first.")
         self.stop("RESET_BY_USER")
         errors = self.backend.restore_snapshot(self.saved)
         self.last_reset_errors = errors

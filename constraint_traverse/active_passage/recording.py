@@ -22,8 +22,9 @@ class TrialRecorder:
         self.path = Path(output_root) / (datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:8])
         self.path.mkdir(parents=True, exist_ok=False)
         (self.path / "frames").mkdir()
-        self.metadata = dict(metadata, schema_version=1, execution_mode="manual",
-                             automatic_planner=False, start_timestamp_sec=snapshot.robot.timestamp_sec)
+        self.metadata = dict(metadata, schema_version=2, start_timestamp_sec=snapshot.robot.timestamp_sec)
+        self.metadata.setdefault("execution_mode", "manual")
+        self.metadata.setdefault("automatic_planner", False)
         self.counts = dict(states=0, observations=0, events=0)
         self.last_time = float(snapshot.robot.timestamp_sec)
         self.closed = False
@@ -72,6 +73,13 @@ class TrialRecorder:
         self._append(dict(kind="event", name=name, timestamp_sec=float(timestamp), **values))
         self.counts["events"] += 1
 
+    def plan(self, name, timestamp, arrays, **values):
+        directory = self.path / "plans"
+        directory.mkdir(exist_ok=True)
+        relative = f"plans/{self.counts['events']:06d}.npz"
+        np.savez_compressed(self.path / relative, **arrays)
+        self.event(name, timestamp, file=relative, **values)
+
     def finish(self, reason, timestamp, *, details=None):
         if self.closed:
             return
@@ -115,6 +123,10 @@ def inspect_record(path):
                 if record["name"] == "MAP_UPDATE":
                     map_observations.update((row["observation_id"], row["source"], row["timestamp_sec"])
                                             for row in record["update"]["observations"])
+                if record["name"] in {"REFERENCE_PATH", "CONTROL_PLAN"}:
+                    with np.load(path / record["file"], allow_pickle=False) as plan:
+                        if any(not np.isfinite(plan[name]).all() for name in ("prediction", "controls") if name in plan):
+                            raise ValueError("记录的控制轨迹包含无效数值")
             else:
                 raise ValueError("试验记录类型无效")
     if any(metadata[name] != count for name, count in counts.items()):

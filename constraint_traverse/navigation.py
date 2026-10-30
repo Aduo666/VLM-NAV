@@ -246,6 +246,7 @@ class _PlanningWorker:
                     channel.cancel_join_thread()
                     channel.close()
             self.process = None
+            self.requests = self.replies = self.stop_requested = None
             self.busy = False
 
 
@@ -340,6 +341,8 @@ class SamplingNavigationController:
             result.diagnostics["connection_position_error_m"] = float(np.linalg.norm(state[:2] - predicted_start[:2]))
             result.diagnostics["connection_speed_error_mps"] = float(abs(state[3] - predicted_start[3]))
             result.diagnostics["connection_steering_error_rad"] = float(np.abs(state[6:10] - predicted_start[6:10]).max())
+            result.diagnostics["request_timestamp_sec"] = float(timestamp)
+            result.diagnostics["map_version"] = int(version)
             self.logger.info("[SamplingPlan] mode=%s map_version=%d latency=%.3fs age=%.3fs diagnostics=%s",
                              self.method, version, result.planning_sec, now - timestamp, result.diagnostics)
         if grid is None:
@@ -375,6 +378,12 @@ class SamplingNavigationController:
                     self.status = "TRACKING"
                 else:
                     self.status = "WAITING_FOR_PLAN"
+        return self.apply_command(robot=robot, drive=drive, command=self.requested, state=state)
+
+    def apply_command(self, *, robot, drive, command, state=None):
+        if state is None:
+            state = self.read_state(robot, drive)
+        self.requested = np.asarray(command, dtype=np.float32).reshape(2).copy()
         with torch.no_grad():
             predicted = self.execution_model.step(state, self.requested).numpy()
         motors, steering = {}, {}

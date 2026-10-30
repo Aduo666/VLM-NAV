@@ -1,0 +1,19 @@
+path:
+  primitive_file: /opt/ros/humble/share/nav2_smac_planner/sample_primitives/5cm_resolution/0.5m_turning_radius/diff/output.json
+  search_time_sec: 1.0
+  replan_period_sec: 0.75
+  goal_tolerance_m: 0.10
+  unknown_policy: blocked
+
+control:
+  config_path: constraint_traverse/configs/benchmark.yaml
+  max_result_age_sec: 1.0
+  startup_timeout_sec: 20.0
+  response_timeout_sec: 5.0
+  validation_period_sec: 0.20
+
+arrival:
+  position_tolerance_m: 0.30
+  linear_velocity_mps: 0.025
+  angular_velocity_radps: 0.04
+  stopped_hold_sec: 0.30

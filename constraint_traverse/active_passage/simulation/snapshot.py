@@ -107,6 +107,10 @@ def restore(runtime, saved):
     runtime.adapter._steering_measured_rad = deepcopy(saved.controller["adapter"]["measured"])
     runtime.adapter._max_steering_error_rad = saved.controller["adapter"]["error"]
     runtime.requested, runtime.applied = saved.controller["requested"].copy(), saved.controller["applied"].copy()
+    if runtime.navigator is not None:
+        runtime.navigator.reset(runtime.applied)
+    if runtime.contacts is not None:
+        runtime.contacts.events.clear()
     runtime.await_key_release = saved.controller["await_key_release"]
     runtime.teleop._linear, runtime.teleop._angular = saved.teleop["linear"], saved.teleop["angular"]
     runtime.teleop._pressed_keys = set(saved.teleop["pressed"])

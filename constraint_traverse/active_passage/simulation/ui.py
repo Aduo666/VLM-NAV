@@ -1,17 +1,8 @@
 from __future__ import annotations
 
 import numpy as np
-from pathlib import Path
 
 from ..cameras import CAMERA_PATHS, DEFAULT_MAP_SOURCES
-
-
-def chinese_text_style():
-    for filename in ("/usr/share/fonts/MyFonts/YaHei Consolas Hybrid 1.12 For Powerline.ttf",
-                     "/usr/share/fonts/MyFonts/simkai.ttf"):
-        if Path(filename).is_file():
-            return {"font": filename, "font_size": 14}
-    raise FileNotFoundError("界面需要支持中文的 TTF 字体，请安装微软雅黑或楷体字体")
 
 
 class ExperimentPanel:
@@ -19,27 +10,27 @@ class ExperimentPanel:
         self.sink, self.size = sink, int(image_size)
         self.goal_map = self.map_pose = None
         self._sync_sources = False
-        text_style = chinese_text_style()
         self.provider = ui.ByteImageProvider()
-        self.controls = ui.Window("Active Passage Controls", width=350, height=410)
+        self.controls = ui.Window("Active Passage Controls", width=350, height=450)
         self.controls.position_x, self.controls.position_y = 10, 60
         with self.controls.frame:
             with ui.VStack(spacing=6):
-                self.status = ui.Label("READY", height=28, style=text_style)
-                self.detail = ui.Label("", height=42, word_wrap=True, style=text_style)
-                self.goal_label = ui.Label("Goal: --", height=26, style=text_style)
+                self.status = ui.Label("READY", height=28)
+                self.detail = ui.Label("", height=42, word_wrap=True)
+                self.goal_label = ui.Label("Goal: --", height=26)
                 self.source_models = {}
                 with ui.HStack(height=25):
-                    ui.Label("地图融合", width=70, style=text_style)
+                    ui.Label("Map fusion", width=70)
                     for name in CAMERA_PATHS:
                         model = ui.SimpleBoolModel(name in map_sources)
                         ui.CheckBox(model, width=22)
-                        ui.Label(name, width=48, style=text_style)
+                        ui.Label(name, width=48)
                         model.add_value_changed_fn(self._sources_changed)
                         self.source_models[name] = model
-                self.map_stats = ui.Label("", height=28, style=text_style)
+                self.map_stats = ui.Label("", height=28)
                 self.place = ui.Button("PLACE ROBOT", height=30, clicked_fn=lambda: sink("PLACE"))
                 self.save = ui.Button("SAVE START", height=30, clicked_fn=lambda: sink("SAVE_START"))
+                self.navigate = ui.Button("START NAVIGATION", height=32, clicked_fn=lambda: sink("NAVIGATE"))
                 with ui.HStack(height=32):
                     self.start = ui.Button("START RECORDING", clicked_fn=lambda: sink("START"))
                     ui.Button("STOP", clicked_fn=lambda: sink("STOP"))
@@ -90,6 +81,7 @@ class ExperimentPanel:
         self.place.text = "CONFIRM PLACEMENT" if placing else "PLACE ROBOT"
         self.place.enabled = self.save.enabled = not recording
         self.start.enabled = not recording and not placing and runtime.goal is not None
+        self.navigate.enabled = self.start.enabled
         self.reset.enabled = not placing and runtime.experiment.saved is not None
         self.reset_map.enabled = not recording and not placing
         self._sync_sources = True
@@ -100,7 +92,7 @@ class ExperimentPanel:
         finally:
             self._sync_sources = False
         counts = runtime.fusion.source_cell_counts()
-        self.map_stats.text = f"地图 v{runtime.local_map.version} " + " ".join(f"{name}:{value}" for name, value in counts.items())
+        self.map_stats.text = f"Map v{runtime.local_map.version} " + " ".join(f"{name}:{value}" for name, value in counts.items())
         self.goal_map, self.map_pose = runtime.render_map()
         rgba = self.goal_map.rgba
         self.provider.set_data_array(np.ascontiguousarray(rgba).reshape(-1), [rgba.shape[1], rgba.shape[0]])

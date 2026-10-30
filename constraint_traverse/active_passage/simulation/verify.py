@@ -160,7 +160,7 @@ def verify(runtime, repeats):
     depth_filter_check = verify_robot_depth_filter(runtime)
     fusion_check = verify_map_fusion(runtime)
     ui_goal_verified = False
-    ui_font = None
+    ui_english_verified = False
     if runtime.panel is not None:
         runtime.panel.update(runtime)
         for _ in range(5):
@@ -174,11 +174,15 @@ def verify(runtime, repeats):
         if runtime.goal is None or not np.isfinite(runtime.goal).all() or np.linalg.norm(runtime.goal - old_goal) < 0.1:
             raise AssertionError("地图点击没有生成有效世界坐标目标")
         ui_goal_verified = True
-        ui_font = runtime.panel.detail.style["font"]
         import omni.ui as ui
-        atlases = ui.Inspector.get_stored_font_atlases()
-        if not any(ui_font in str(value) for value in atlases):
-            raise AssertionError(f"中文字体没有加载到界面字形缓存：{atlases}")
+        pending = [runtime.panel.controls.frame, runtime.panel.map_window.frame, runtime.panel.camera_window.frame]
+        while pending:
+            widget = pending.pop()
+            text = getattr(widget, "text", None)
+            if isinstance(text, str) and not text.isascii():
+                raise AssertionError(f"面板文字包含非英文字符：{text!r}")
+            pending.extend(ui.Inspector.get_children(widget))
+        ui_english_verified = True
     initial = runtime.experiment.save_start()
     expected_random = None
     trajectories, errors, records = [], [], []
@@ -236,6 +240,6 @@ def verify(runtime, repeats):
                 camera_paths=active_paths, camera_valid_ratios=ratios, synchronized_observations=True,
                 map_restored=True, random_state_restored=True, records_verified=len(records) + 2,
                 map_fusion=fusion_check,
-                robot_depth_filter=depth_filter_check, ui_font=ui_font,
+                robot_depth_filter=depth_filter_check, ui_english_verified=ui_english_verified,
                 timeout_saved=True, ui_goal_verified=ui_goal_verified,
                 execution_mode="manual", automatic_navigation_tested=False)

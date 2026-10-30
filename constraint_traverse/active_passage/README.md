@@ -1,4 +1,13 @@
-交付项 1 提供独立实验入口、键盘驾驶、地图选点、同步 RGB-D 记录和试验状态恢复。该入口记录手动驾驶过程，自动通行规划、NBV 和机械臂主动运动尚未接入。
+独立实验入口提供键盘驾驶、地图选点、Smac State Lattice 路径搜索、PyTorch MPPI 闭环控制、同步 RGB-D 记录和试验状态恢复。
+
+自动导航使用已安装的 Nav2 1.1.20 原生 State Lattice 搜索库，通过 Python 3.11 绑定调用，不需要启动 ROS 节点。编译依赖为 ROS 2 Humble 的 `nav2_smac_planner`、CMake、C++ 编译器和 pybind11；控制依赖为现有 `pytorch-mppi==0.9.1`。在 `vlmnav` 环境中安装绑定依赖并编译：
+
+```bash
+python -m pip install -r constraint_traverse/active_passage/traversal/requirements.txt
+python -m constraint_traverse.active_passage.traversal.build
+```
+
+编译生成的 `.so` 用于当前 Python 3.11 环境，构建临时文件自动清理。换用其他环境后需要重新编译。
 
 在已经安装 Isaac Sim 的 `vlmnav` 环境中启动空白地面实验：
 
@@ -24,11 +33,18 @@ python -m constraint_traverse.active_passage run \
 2. 在地图中点击目标，目标记录为世界坐标 XYZ，仅在地图中显示标记。
 3. `SAVE START` 保存当前机器人、场景、控制器、地图、传感器记录和随机状态。
 4. `START RECORDING` 从当前状态开始记录，并将该状态保存为本次试验起点；目标在记录期间保持固定。
+   `START NAVIGATION` 从当前状态启动自动导航并自动记录。两种开始操作互相独立；记录期间目标保持固定。
 5. `STOP` 停止记录和驱动命令；保持按键时需要释放后重新按下才能继续驾驶。
 6. `RESET TRIAL` 结束当前记录，恢复已保存起点及目标，并检查实际恢复误差。
 7. `RESET MAP` 清除当前显示地图；该操作与试验状态恢复独立。
 
-面板包括 `Active Passage Controls`、`Active Passage Map` 和 `Active Passage RGB`，窗口可以移动。地图复用现有直接 RGB-D 二维地图，默认融合 `front` 和底盘下视 `down`，用途为显示与目标选择。三路相机均通过 `ObservationMapFusion` 提交真实观测。后续三维环境表示和规划方法仍待确定。
+面板包括 `Active Passage Controls`、`Active Passage Map` 和 `Active Passage RGB`，窗口可以移动。地图使用直接 RGB-D 二维建图，默认融合 `front` 和底盘下视 `down`，同时用于显示、选点、路径搜索和控制代价。三路相机均通过 `ObservationMapFusion` 提交真实观测。
+
+点击地图后，目标保存为固定世界坐标。Smac 根据已观测地图搜索包含朝向、前进、后退和原地旋转的参考路径；用户无需指定终点朝向。MPPI 沿参考路径滚动优化四轮控制，每个物理周期读取实测关节和底盘状态。手动驾驶与自动导航共用运动执行模型，积分周期读取 Isaac Sim 实际物理周期。配置位于 `constraint_traverse/configs/active_passage_navigation.yaml`，其中控制参数复用 `benchmark.yaml`。
+
+UNKNOWN 保持禁行。起点完整车体、参考路径扫掠区域、准备执行的短动作及其制动范围都需要已知空闲证据，已知障碍和地图边界同样参与检查。观测不足时显示 `OBSERVATION_REQUIRED` 并停止前进，可以停止试验后通过手动观测补充地图。程序不会根据完整场景几何填补未知区域。
+
+地图中的紫色线表示 Smac 参考路径，绿色线表示 MPPI 预测轨迹，蓝色线表示实际轨迹。自动导航在距离目标不超过 0.30 m、实测线速度不超过 0.025 m/s、角速度不超过 0.04 rad/s 并持续 0.30 s 后记录 `SUCCESS`。该结果表示目标到达；宽门验收另外检查车体尾部越过出口平面。物理接触报告覆盖全部机器人部件，正常轮胎地面支撑单独识别；其他环境碰撞终止试验并记录 `COLLISION`。
 
 相机分工在 `cameras.py` 定义，分辨率、频率和前视视场读取 `configs/navigation.yaml`。每次同步渲染期间保持物理时间不变，保存 RGB、原始浮点深度、内参、实际相机世界位姿、底盘位姿和全部关节状态。相机位姿通过实际所属刚体计算。
 
@@ -42,7 +58,7 @@ python -m constraint_traverse.active_passage run \
 
 机械臂末端下视相机暂不初始化。当前入口保存三路真实观测；机械臂移动与主动观察调度仍待接入。
 
-控制面板的“地图融合”提供 `front`、`arm`、`down` 三个独立勾选项，记录期间也可以切换。其下方显示地图版本和各路相机曾观测过的栅格数量，来源覆盖可以重叠。
+控制面板的 `Map fusion` 提供 `front`、`arm`、`down` 三个独立勾选项，记录期间也可以切换。其下方显示地图版本和各路相机曾观测过的栅格数量，来源覆盖可以重叠。
 
 启动时启用三路融合：
 
@@ -63,6 +79,7 @@ python -m constraint_traverse.active_passage run --map-sources front arm down
 | `meta.json` | 配置、目标、代码版本及源码校验值、记录数量、恢复误差和终止原因 |
 | `records.jsonl` | 物理状态、控制命令、图像索引、融合开关事件与地图更新来源 |
 | `frames/*.npz` | 同时刻原始 RGB-D、自体像素过滤标记、相机内外参及完整机器人状态 |
+| `plans/*.npz` | Smac 参考路径、方向、MPPI 控制序列、预测轨迹、候选轨迹及代价 |
 | `initial_state.pkl` | 本程序产生的数值状态快照，供后续实验复现使用 |
 
 停止、超时、主动重置、异常和退出的记录都会保留。手动记录的结束状态不自动表示完成通行。`timestamp_sec` 是恢复后的试验逻辑时间；状态记录中的 `physical_time_sec` 是 Isaac Sim 当前物理时间，两者分别保存。
@@ -101,8 +118,12 @@ python -m constraint_traverse.active_passage check-sim --gpu 1
 | `simulation/snapshot.py` | 场景与机器人状态的采集、恢复及检查 |
 | `simulation/ui.py` | 控制面板、目标地图和相机画面 |
 | `simulation/verify.py` | 物理验收流程 |
+| `simulation/verify_navigation.py` | 实际运动预测、空地及宽门重复通行验收 |
+| `traversal/` | 原生 Smac 绑定、路径搜索、MPPI 调用与执行范围检查 |
+| `simulation/contacts.py` | 轮胎支撑识别与实际障碍碰撞记录 |
+| `simulation/overlay.py` | 参考路径、预测轨迹和实际轨迹显示 |
 
-控制面板中的中文标签和消息使用本机包含中文及拉丁字符的 TTF 字体，字体路径由 `simulation/ui.py` 中的 `chinese_text_style()` 选择。
+控制面板的标签、状态、地图统计和操作消息均为英文。记录开始后显示试验编号，完整保存路径输出到终端。
 
 `contracts.py` 定义任务、环境信念、通行规划、机械臂观察和评价五个模块的公共接口。数据对象只携带数值、标识符和不可写数组，规划接口使用信念快照和机器人状态。
 
@@ -147,4 +168,14 @@ L=c_{collision}\mathbf1[collision]+c_{incomplete}\mathbf1[incomplete]
 python -m unittest discover -s constraint_traverse/active_passage/tests -v
 ```
 
-公共接口、来源隔离和风险评价可以独立测试。旧功能迁移状态记录在 [MIGRATION.md](MIGRATION.md)。机械臂伸出及收纳、成对通行场景和自动通行执行仍待实现。
+公共接口、来源隔离和风险评价可以独立测试。Smac 与执行检查测试需要完成上述原生绑定编译。旧功能迁移状态记录在 [MIGRATION.md](MIGRATION.md)。机械臂伸出及收纳、NBV 和成对隐藏障碍实验仍待实现。
+
+运行自动导航验收：
+
+```bash
+python -m constraint_traverse.active_passage check-navigation --gpu 1 --repeats 2 --timeout 45
+```
+
+验收包含前进、倒退、连续转弯、原地旋转和制动的 0.2、1、4 秒预测误差，以及空地和宽门的重复通行。地图由测试中的多次人工放置与真实 RGB-D 采集建立，UNKNOWN 持续禁行。宽门默认总几何余量 0.40 m，通过 `--door-clearance` 指定。验收场景完整几何仅用于创建场景、离线间距评价及车体尾部判定，规划器只接收实际观测地图。临时记录自动删除，指定 `--output` 可保留。
+
+`--checks motion` 单独检查运动与预测，`--checks navigation` 检查闭环通行及实际碰撞记录，`--checks contacts` 单独检查墙体接触记录，默认 `all` 包含全部检查。运动检查要求约 0.2 秒的位置误差不超过 2 cm、朝向误差不超过 3°，并检查实际运动方向和制动停稳；1 秒、4 秒误差完整报告。长时间开环预测仍有转向误差，不能据此声称四秒预测准确。

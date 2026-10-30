@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 import numpy as np
 
 from ..cameras import CAMERA_PATHS, DEFAULT_MAP_SOURCES
@@ -9,15 +11,14 @@ class ExperimentPanel:
     def __init__(self, ui, sink, image_size, map_sources=DEFAULT_MAP_SOURCES):
         self.sink, self.size = sink, int(image_size)
         self.goal_map = self.map_pose = None
+        self._map_dirty = True
+        self._last_map_refresh = -float("inf")
         self._sync_sources = False
         self.provider = ui.ByteImageProvider()
-        self.controls = ui.Window("Active Passage Controls", width=350, height=450)
+        self.controls = ui.Window("Active Passage Controls", width=350, height=300)
         self.controls.position_x, self.controls.position_y = 10, 60
         with self.controls.frame:
             with ui.VStack(spacing=6):
-                self.status = ui.Label("READY", height=28)
-                self.detail = ui.Label("", height=42, word_wrap=True)
-                self.goal_label = ui.Label("Goal: --", height=26)
                 self.source_models = {}
                 with ui.HStack(height=25):
                     ui.Label("Map fusion", width=70)
@@ -27,7 +28,6 @@ class ExperimentPanel:
                         ui.Label(name, width=48)
                         model.add_value_changed_fn(self._sources_changed)
                         self.source_models[name] = model
-                self.map_stats = ui.Label("", height=28)
                 self.place = ui.Button("PLACE ROBOT", height=30, clicked_fn=lambda: sink("PLACE"))
                 self.save = ui.Button("SAVE START", height=30, clicked_fn=lambda: sink("SAVE_START"))
                 self.navigate = ui.Button("START NAVIGATION", height=32, clicked_fn=lambda: sink("NAVIGATE"))
@@ -43,17 +43,9 @@ class ExperimentPanel:
                                               fill_policy=ui.IwpFillPolicy.IWP_STRETCH,
                                               opaque_for_mouse_events=True)
             self.image.set_mouse_pressed_fn(self._click)
-        self.providers = {}
-        self.camera_window = ui.Window("Active Passage RGB", width=660, height=210)
-        self.camera_window.position_x, self.camera_window.position_y = 10, 550
-        with self.camera_window.frame:
-            with ui.HStack(spacing=4):
-                for name in CAMERA_PATHS:
-                    with ui.VStack():
-                        ui.Label(name, height=20)
-                        provider = ui.ByteImageProvider()
-                        ui.ImageWithProvider(provider, fill_policy=ui.IwpFillPolicy.IWP_PRESERVE_ASPECT_FIT)
-                        self.providers[name] = provider
+
+    def request_map_refresh(self):
+        self._map_dirty = True
 
     def _sources_changed(self, model):
         if not self._sync_sources:
@@ -75,9 +67,6 @@ class ExperimentPanel:
     def update(self, runtime):
         recording = runtime.experiment.recorder is not None
         placing = runtime.placing
-        self.status.text = "PLACING" if placing else runtime.experiment.status
-        self.detail.text = runtime.message
-        self.goal_label.text = "Goal: --" if runtime.goal is None else "Goal: " + ", ".join(f"{x:.2f}" for x in runtime.goal)
         self.place.text = "CONFIRM PLACEMENT" if placing else "PLACE ROBOT"
         self.place.enabled = self.save.enabled = not recording
         self.start.enabled = not recording and not placing and runtime.goal is not None
@@ -91,15 +80,14 @@ class ExperimentPanel:
                     model.set_value(name in runtime.fusion.sources)
         finally:
             self._sync_sources = False
-        counts = runtime.fusion.source_cell_counts()
-        self.map_stats.text = f"Map v{runtime.local_map.version} " + " ".join(f"{name}:{value}" for name, value in counts.items())
-        self.goal_map, self.map_pose = runtime.render_map()
-        rgba = self.goal_map.rgba
-        self.provider.set_data_array(np.ascontiguousarray(rgba).reshape(-1), [rgba.shape[1], rgba.shape[0]])
-        for observation in runtime.observations:
-            frame = observation.frame
-            rgba = np.concatenate((frame.rgb, np.full((*frame.rgb.shape[:2], 1), 255, dtype=np.uint8)), axis=2)
-            self.providers[frame.frame_id].set_data_array(rgba.reshape(-1), [rgba.shape[1], rgba.shape[0]])
+        now = time.monotonic()
+        period = float(runtime.navigation["map_selector"]["render_period_sec"])
+        if self._map_dirty or now - self._last_map_refresh >= period:
+            self.goal_map, self.map_pose = runtime.render_map()
+            rgba = self.goal_map.rgba
+            self.provider.set_data_array(np.ascontiguousarray(rgba).reshape(-1), [rgba.shape[1], rgba.shape[0]])
+            self._map_dirty = False
+            self._last_map_refresh = now
 
     def close(self):
-        self.controls.visible = self.map_window.visible = self.camera_window.visible = False
+        self.controls.visible = self.map_window.visible = False

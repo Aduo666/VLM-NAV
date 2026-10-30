@@ -393,6 +393,8 @@ class ExperimentRuntime:
                     self.set_map_sources(command[1])
                 else:
                     raise ValueError(f"Unknown command: {name}")
+                if self.panel is not None and name in {"GOAL", "PLACE", "SAVE_START", "STOP", "RESET_TRIAL", "RESET_MAP"}:
+                    self.panel.request_map_refresh()
             except ValueError as error:
                 self.message = str(error) if str(error).isascii() else "Operation failed. See terminal for details."
                 self.logger.info("操作未执行：%s", error)

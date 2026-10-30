@@ -30,7 +30,7 @@ python -m constraint_traverse.active_passage run \
 操作顺序：
 
 1. 确认放置后，使用方向键或 WASD 驾驶，前进与转向可以同时按下。
-2. 在地图中点击目标，目标记录为世界坐标 XYZ，仅在地图中显示标记。
+2. 在实时地图中点击目标。目标记录为世界坐标 XYZ，仅在地图中显示标记。
 3. `SAVE START` 保存当前机器人、场景、控制器、地图、传感器记录和随机状态。
 4. `START RECORDING` 从当前状态开始记录，并将该状态保存为本次试验起点；目标在记录期间保持固定。
    `START NAVIGATION` 从当前状态启动自动导航并自动记录。两种开始操作互相独立；记录期间目标保持固定。
@@ -38,7 +38,9 @@ python -m constraint_traverse.active_passage run \
 6. `RESET TRIAL` 结束当前记录，恢复已保存起点及目标，并检查实际恢复误差。
 7. `RESET MAP` 清除当前显示地图；该操作与试验状态恢复独立。
 
-面板包括 `Active Passage Controls`、`Active Passage Map` 和 `Active Passage RGB`，窗口可以移动。地图使用直接 RGB-D 二维建图，默认融合 `front` 和底盘下视 `down`，同时用于显示、选点、路径搜索和控制代价。三路相机均通过 `ObservationMapFusion` 提交真实观测。
+面板包括 `Active Passage Controls` 和 `Active Passage Map`，窗口可以移动。控制面板提供操作按钮及地图融合开关。地图按 `configs/navigation.yaml` 中的 `map_selector.render_period_sec` 持续刷新，当前周期为 0.25 秒现实时间。放置、停止、保存起点、选择目标和重置操作会立即请求刷新。相机 RGB 预览及面板数值持续刷新已关闭。
+
+地图使用直接 RGB-D 二维建图，默认融合 `front` 和底盘下视 `down`，用于选点、路径搜索和控制代价。三路相机均通过 `ObservationMapFusion` 提交真实观测，采集和地图融合按配置频率执行。
 
 点击地图后，目标保存为固定世界坐标。Smac 根据已观测地图搜索包含朝向、前进、后退和原地旋转的参考路径；用户无需指定终点朝向。MPPI 沿参考路径滚动优化四轮控制，每个物理周期读取实测关节和底盘状态。手动驾驶与自动导航共用运动执行模型，积分周期读取 Isaac Sim 实际物理周期。配置位于 `constraint_traverse/configs/active_passage_navigation.yaml`，其中控制参数复用 `benchmark.yaml`。
 
@@ -70,7 +72,7 @@ UNKNOWN 保持禁行。起点完整车体、参考路径扫掠区域、准备执
 
 机械臂末端下视相机暂不初始化。当前入口保存三路真实观测；机械臂移动与主动观察调度仍待接入。
 
-控制面板的 `Map fusion` 提供 `front`、`arm`、`down` 三个独立勾选项，记录期间也可以切换。其下方显示地图版本和各路相机曾观测过的栅格数量，来源覆盖可以重叠。
+控制面板的 `Map fusion` 提供 `front`、`arm`、`down` 三个独立勾选项，记录期间也可以切换。
 
 启动时启用三路融合：
 
@@ -128,14 +130,14 @@ python -m constraint_traverse.active_passage check-sim --gpu 1
 | `simulation/sensors.py` | 同步 RGB-D 读取与实际相机位姿 |
 | `simulation/robot_filter.py` | 根据机器人自身表面与实际姿态过滤深度回波 |
 | `simulation/snapshot.py` | 场景与机器人状态的采集、恢复及检查 |
-| `simulation/ui.py` | 控制面板、目标地图和相机画面 |
+| `simulation/ui.py` | 操作按钮、地图融合开关和实时选点地图 |
 | `simulation/verify.py` | 物理验收流程 |
 | `simulation/verify_navigation.py` | 实际运动预测、空地及宽门重复通行验收 |
 | `traversal/` | 原生 Smac 绑定、路径搜索、MPPI 调用与执行范围检查 |
 | `simulation/contacts.py` | 轮胎支撑识别与实际障碍碰撞记录 |
 | `simulation/overlay.py` | 参考路径、预测轨迹和实际轨迹显示 |
 
-控制面板的标签、状态、地图统计和操作消息均为英文。记录开始后显示试验编号，完整保存路径输出到终端。
+控制面板的按钮和标签使用英文，运行状态、试验编号和完整保存路径输出到终端。
 
 `contracts.py` 定义任务、环境信念、通行规划、机械臂观察和评价五个模块的公共接口。数据对象只携带数值、标识符和不可写数组，规划接口使用信念快照和机器人状态。
 

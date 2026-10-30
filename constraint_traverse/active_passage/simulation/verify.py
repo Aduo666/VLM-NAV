@@ -175,7 +175,7 @@ def verify(runtime, repeats):
             raise AssertionError("地图点击没有生成有效世界坐标目标")
         ui_goal_verified = True
         import omni.ui as ui
-        pending = [runtime.panel.controls.frame, runtime.panel.map_window.frame, runtime.panel.camera_window.frame]
+        pending = [runtime.panel.controls.frame, runtime.panel.map_window.frame]
         while pending:
             widget = pending.pop()
             text = getattr(widget, "text", None)

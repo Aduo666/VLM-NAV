@@ -20,7 +20,7 @@ from vln_nav.runtime.agx_profile import load_agx_profile
 from vln_nav.runtime.isaac_runtime_utils import get_joint_names, resolve_robot_relative_prim_path, set_local_xform, wait_for_stage_assets
 
 from .geometry import DoorScene, PassageGeometry
-from .model import FourWheelModel, MotionLimits, STATE_SIZE
+from .model import FourWheelModel, MotionLimits, STATE_SIZE, read_steering_targets, read_wheel_targets
 from .planner import PassageCost, SamplingPlanner
 from .record import TrialRecord, TrialSnapshot
 from .ui import BenchmarkPanel, MapRenderer
@@ -136,6 +136,8 @@ class PassageRuntime:
             state[6 + index] = readback["steering_position"][wheel.steering_joint] * wheel.steering_sign
             state[10 + index] = readback["wheel_velocity"][wheel.drive_joint] * wheel.radius_m * wheel.drive_sign
         state[14:16] = self.last_command
+        state[17:21] = read_steering_targets(self.drive, self.profile.agx_controller.continuous, state[6:10])
+        state[21:25] = read_wheel_targets(self.drive, self.profile.agx_controller.continuous, state[10:14])
         return state
 
     def _apply(self, command):
@@ -143,8 +145,8 @@ class PassageRuntime:
             next_state = self.execution_model.step(self._state(), command).numpy()
         motors, steering = {}, {}
         for index, wheel in enumerate(self.profile.agx_controller.continuous.wheels):
-            motors[wheel.drive_joint] = float(next_state[10 + index] / wheel.radius_m / wheel.drive_sign)
-            steering[wheel.steering_joint] = float(next_state[6 + index] / wheel.steering_sign)
+            motors[wheel.drive_joint] = float(next_state[21 + index] / wheel.radius_m / wheel.drive_sign)
+            steering[wheel.steering_joint] = float(next_state[17 + index] / wheel.steering_sign)
         self.drive.apply_continuous_joint_targets(motors, steering)
         self.motor_targets, self.steering_targets = motors, steering
         self.last_command = next_state[14:16].copy()

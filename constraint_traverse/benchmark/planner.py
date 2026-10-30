@@ -75,7 +75,7 @@ class PassageCost:
         heading = torch.atan2(torch.sin(state[..., 2] - yaw), torch.cos(state[..., 2] - yaw))
         return self.route_s[-1] - progress, distances.gather(-1, index[..., None]).squeeze(-1), heading
 
-    def components(self, state, action, *, motion_states=None):
+    def components(self, state, action, *, motion_states=None, previous_state=None):
         cfg = self.settings
         delta = self.goal - state[..., :2]
         distance_squared = (delta / cfg["goal_distance_scale_m"]).square().sum(dim=-1)
@@ -83,6 +83,7 @@ class PassageCost:
         heading = torch.atan2(torch.sin(bearing - state[..., 2]), torch.cos(bearing - state[..., 2]))
         checked = state if motion_states is None else motion_states
         metrics = self.geometry.torch_metrics(checked[..., :3])
+        self.last_geometry_metrics = metrics
         reduce = (lambda value: value) if motion_states is None else (lambda value: value.mean(dim=0))
         gap = metrics["clearance"]
         soft_distance = cfg["obstacle_soft_distance_m"]
@@ -102,13 +103,29 @@ class PassageCost:
             components["goal"] = cfg["goal"] * (remaining / cfg["goal_distance_scale_m"]).square()
             components["reference"] = cfg["reference_path"] * lateral_squared / cfg["goal_distance_scale_m"] ** 2
             components["heading"] = cfg["heading"] * route_heading.square()
+            curvature = torch.abs(torch.atan2(torch.sin(torch.diff(self.route_yaw)),
+                torch.cos(torch.diff(self.route_yaw)))) / self.route_lengths.clamp_min(1e-6)
+            if self.reference_window.direction == 0:
+                desired = torch.zeros_like(remaining)
+            else:
+                limit = torch.minimum(torch.sqrt(cfg.get("lateral_accel_mps2", 0.20) / curvature.clamp_min(1e-3)),
+                                      self.action_limits[1] / curvature.clamp_min(1e-3)).amin()
+                cruise = min(float(self.action_limits[0]), cfg.get("cruise_speed_mps", 0.35), float(limit))
+                desired = self.reference_window.direction * torch.minimum(torch.full_like(remaining, cruise),
+                    torch.sqrt(2 * cfg.get("braking_decel_mps2", 0.30) * remaining.clamp_min(0)))
+            components["speed"] = cfg.get("speed", 4.0) * ((state[..., 3] - desired) / self.action_limits[0]).square()
         elif self.reference is not None:
             lateral = torch.cdist(state[..., :2], self.reference).amin(dim=-1)
             components["reference"] = cfg["reference_path"] * (lateral / cfg["goal_distance_scale_m"]).square()
+        if previous_state is not None:
+            components["control_change"] = cfg.get("control_change", 3.0) * (
+                (action - previous_state[..., 14:16]) / self.action_limits).square().sum(-1)
+            components["steering_change"] = cfg.get("steering_change", 0.25) * (
+                state[..., 17:21] - previous_state[..., 17:21]).square().sum(-1)
         return {name: value * self.dt_sec / cfg["reference_dt_sec"] for name, value in components.items()}
 
-    def running(self, state, action, *, motion_states=None):
-        return sum(self.components(state, action, motion_states=motion_states).values())
+    def running(self, state, action, *, motion_states=None, previous_state=None):
+        return sum(self.components(state, action, motion_states=motion_states, previous_state=previous_state).values())
 
     def terminal(self, states, actions):
         if self.reference_window is not None:
@@ -153,7 +170,7 @@ class SamplingPlanner:
             initial = torch.zeros(horizon, 2, device=model.device)
             kwargs = dict(
                 dynamics=model.step,
-                running_cost=lambda state, action: cost.running(state, action, motion_states=model.last_substeps),
+                running_cost=self._running,
                 nx=STATE_SIZE,
                 noise_sigma=torch.diag(torch.tensor([
                     float(settings["noise_linear_std"]) ** 2,
@@ -164,7 +181,7 @@ class SamplingPlanner:
                 u_min=torch.tensor([-model.limits.max_linear_mps, -model.limits.max_angular_radps], device=model.device),
                 u_max=torch.tensor([model.limits.max_linear_mps, model.limits.max_angular_radps], device=model.device),
                 U_init=initial, sample_null_action=True,
-                project_action=model.project_actions,
+                project_action=self._project_actions,
             )
             if method == "MPPI":
                 self.controller = FeasibleMPPI(**kwargs)
@@ -176,37 +193,84 @@ class SamplingPlanner:
             self.rng_cpu = torch.get_rng_state().clone()
             self.rng_cuda = torch.cuda.get_rng_state(model.device).clone() if self._cuda_indices else None
         self.first_command = True
+        self.controller.candidate_validity = self._candidate_validity
+        self.controller.ess_fraction = float(settings.get("ess_fraction", 0.12))
+        self.controller.noise_correlation = float(settings.get("noise_correlation", 0.85))
+
+    def _project_actions(self, actions):
+        window = self.cost.reference_window
+        if window is None:
+            return self.model.project_actions(actions)
+        v, w = actions[..., 0], actions[..., 1]
+        if window.direction == 0:
+            return torch.stack((torch.zeros_like(v), w), dim=-1)
+        v = v.clamp_min(0) if window.direction > 0 else v.clamp_max(0)
+        bound = self.model.max_curvature * v.abs()
+        return torch.stack((v, w.clamp(min=-bound, max=bound)), dim=-1)
+
+    def _running(self, state, action):
+        value = self.cost.running(state, action, motion_states=self.model.last_substeps,
+                                  previous_state=self.model.last_initial_state)
+        if self._cost_step == 0:
+            metrics = self.cost.last_geometry_metrics
+            self._prefix_valid = torch.stack([metrics[name].amax(dim=0) == 0
+                for name in ("occupied_fraction", "unknown_fraction", "outside_fraction")]).all(dim=0)
+        self._cost_step += 1
+        return value
+
+    def _candidate_validity(self):
+        states = self.controller.states[0, :, 0]
+        stop = self.model.braking_rollout(states, reaction_sec=self.safety["reaction_time_sec"])
+        valid = self._prefix_valid.clone()
+        for batch in stop.split(8):
+            metrics = self.cost.geometry.torch_metrics(batch[..., :3])
+            for name in ("occupied_fraction", "unknown_fraction", "outside_fraction"):
+                valid &= metrics[name].amax(dim=0) == 0
+        return valid
+
+    def _output_prefix_valid(self, first_state, substeps):
+        metrics = self.cost.geometry.torch_metrics(substeps[..., :3])
+        if any(bool((metrics[name] > 0).any()) for name in ("occupied_fraction", "unknown_fraction", "outside_fraction")):
+            return False
+        stopping = self.model.braking_rollout(first_state, reaction_sec=self.safety["reaction_time_sec"])
+        metrics = self.cost.geometry.torch_metrics(stopping[..., :3])
+        return all(bool((metrics[name] == 0).all()) for name in ("occupied_fraction", "unknown_fraction", "outside_fraction"))
 
     def _reference_controls(self, state):
         window = self.cost.reference_window
-        pose = state[:3].detach().cpu().numpy().astype(np.float64)
+        predicted = state.clone()
         output = np.zeros((self.controller.T, 2), dtype=np.float32)
-        cursor = 1
+        linear_limit = max(abs(float(self.controller.u_min[0])), abs(float(self.controller.u_max[0])))
+        points = window.world_xy
+        delta = np.diff(points, axis=0)
+        lengths = np.linalg.norm(delta, axis=1)
+        cumulative = np.r_[0, np.cumsum(lengths)]
+        yaw_delta = (np.diff(window.world_yaw_rad) + math.pi) % (2 * math.pi) - math.pi
+        cursor = 0
         for index in range(len(output)):
-            while cursor < len(window.world_xy) - 1 and np.linalg.norm(window.world_xy[cursor] - pose[:2]) < 0.15:
-                cursor += 1
-            target = window.world_xy[cursor]
-            delta = target - pose[:2]
-            distance = float(np.linalg.norm(delta))
+            pose = predicted[:3].detach().cpu().numpy().astype(np.float64)
             if window.direction == 0:
                 error = float((window.world_yaw_rad[-1] - pose[2] + math.pi) % (2 * math.pi) - math.pi)
-                v, w = 0.0, float(np.clip(1.5 * error, -self.model.limits.max_angular_radps, self.model.limits.max_angular_radps))
-            elif distance < 0.025 and cursor == len(window.world_xy) - 1:
-                v = w = 0.0
+                v, w = 0.0, 3.0 * error
             else:
-                bearing = math.atan2(delta[1], delta[0]) + (math.pi if window.direction < 0 else 0)
-                error = (bearing - pose[2] + math.pi) % (2 * math.pi) - math.pi
-                if abs(error) > 0.65:
-                    v, w = 0.0, float(np.clip(1.5 * error, -self.model.limits.max_angular_radps, self.model.limits.max_angular_radps))
-                else:
-                    v = window.direction * min(self.model.limits.max_linear_mps, max(0.025, distance / self.model.dt_sec))
-                    left = -math.sin(pose[2]) * delta[0] + math.cos(pose[2]) * delta[1]
-                    limit = min(self.model.limits.max_angular_radps, self.model.max_curvature * abs(v))
-                    w = float(np.clip(v * 2 * left / max(distance * distance, 0.01), -limit, limit))
-            output[index] = v, w
-            yaw_mid = pose[2] + 0.5 * w * self.model.dt_sec
-            pose[:2] += v * self.model.dt_sec * np.asarray([math.cos(yaw_mid), math.sin(yaw_mid)])
-            pose[2] += w * self.model.dt_sec
+                fraction = np.clip(((pose[:2] - points[:-1]) * delta).sum(-1)
+                    / np.maximum(lengths ** 2, 1e-12), 0, 1)
+                projected = points[:-1] + fraction[:, None] * delta
+                distance = np.linalg.norm(pose[:2] - projected, axis=1)
+                distance[:cursor] = np.inf
+                cursor = int(distance.argmin())
+                reference_yaw = window.world_yaw_rad[cursor] + fraction[cursor] * yaw_delta[cursor]
+                remaining = cumulative[-1] - cumulative[cursor] - fraction[cursor] * lengths[cursor]
+                speed = min(linear_limit, math.sqrt(max(0, 2 * self.model.limits.linear_decel_mps2 * remaining)))
+                v = window.direction * speed
+                heading_error = (reference_yaw - pose[2] + math.pi) % (2 * math.pi) - math.pi
+                error_xy = pose[:2] - projected[cursor]
+                lateral = -math.sin(reference_yaw) * error_xy[0] + math.cos(reference_yaw) * error_xy[1]
+                curvature = yaw_delta[cursor] / max(lengths[cursor], 1e-6)
+                w = speed * curvature + 3.0 * heading_error - window.direction * 4.0 * lateral
+            control = self.controller._bound_action(torch.tensor([v, w], device=self.model.device))
+            output[index] = control.cpu().numpy()
+            predicted = self.model.step(predicted, control)
         return torch.tensor(output, device=self.model.device)
 
     def _prepare_sampling(self, tensor, elapsed_sec):
@@ -214,8 +278,21 @@ class SamplingPlanner:
         delta = self.cost.goal - tensor[:2]
         distance = float(torch.linalg.vector_norm(delta))
         speed_limit = min(self.model.limits.max_linear_mps, max(0.025, distance * 0.8))
+        if self.cost.reference_window is not None and self.cost.reference_window.direction != 0:
+            curvature = np.abs((np.diff(self.cost.reference_window.world_yaw_rad) + math.pi) % (2 * math.pi) - math.pi)
+            curvature = curvature / np.maximum(np.linalg.norm(np.diff(self.cost.reference_window.world_xy, axis=0), axis=1), 1e-6)
+            maximum = max(float(curvature.max()), 1e-3)
+            speed_limit = min(speed_limit, self.cost.settings.get("cruise_speed_mps", 0.35),
+                self.model.limits.max_angular_radps / maximum,
+                math.sqrt(self.cost.settings.get("lateral_accel_mps2", 0.20) / maximum))
         controller.u_max = torch.tensor([speed_limit, self.model.limits.max_angular_radps], device=self.model.device)
         controller.u_min = -controller.u_max
+        if self.cost.reference_window is not None:
+            direction = self.cost.reference_window.direction
+            if direction >= 0:
+                controller.u_min[0] = 0
+            if direction <= 0:
+                controller.u_max[0] = 0
         scale = min(1.0, max(0.15, distance / self.settings.get("near_goal_distance_m", 0.8)))
         controller.lambda_ = float(self.settings["temperature"]) * scale * scale
         sigma = torch.tensor([self.settings["noise_linear_std"], self.settings["noise_angular_std"]], device=self.model.device) * scale
@@ -267,15 +344,15 @@ class SamplingPlanner:
         controller.action_priors = controller._bound_action(priors)
         if self.cost.reference_window is not None:
             reference_controls = controller._bound_action(self._reference_controls(tensor))
-            controller.action_priors[:3] = torch.stack((reference_controls * 0.7, reference_controls, reference_controls * 1.3))
+            controller.action_priors[:3] = torch.stack((reference_controls * 0.7, reference_controls, reference_controls * 0.9))
             controller.action_priors = controller._bound_action(controller.action_priors)
-            if self.first_command:
-                if self.method == "KMPPI":
-                    indices = controller.Tk[0].round().long()
-                    controller.theta = reference_controls[indices].clone()
-                    controller.synchronize_controls()
-                else:
-                    controller.U = reference_controls.clone()
+            blend = 1.0 if self.first_command else float(self.settings.get("reference_warm_start_blend", 0.5))
+            if self.method == "KMPPI":
+                indices = controller.Tk[0].round().long()
+                controller.theta = torch.lerp(controller.theta, reference_controls[indices], blend)
+                controller.synchronize_controls()
+            else:
+                controller.U = controller._bound_action(torch.lerp(controller.U, reference_controls, blend))
 
     def _synchronize(self):
         if self._cuda_indices:
@@ -291,6 +368,7 @@ class SamplingPlanner:
                 torch.cuda.set_rng_state(self.rng_cuda, self.model.device)
             self._prepare_sampling(tensor, elapsed_sec)
             for iteration in range(int(self.settings["iterations"])):
+                self._cost_step = 0
                 self.controller.command(tensor, shift_nominal_trajectory=False)
             self.first_command = False
             self.rng_cpu = torch.get_rng_state().clone()
@@ -303,16 +381,21 @@ class SamplingPlanner:
             self._synchronize()
             optimized = time.perf_counter()
             poses = prediction[:, :3].cpu().numpy()
-            valid = bool(torch.isfinite(controls).all() and torch.isfinite(prediction).all())
-            reason = "OPTIMIZED" if valid else "INVALID_OUTPUT"
+            valid = bool(torch.isfinite(controls).all() and torch.isfinite(prediction).all()
+                         and self.controller.valid_candidates.any())
+            prefix_valid = valid and self._output_prefix_valid(prediction[1], motion_states[:, 0])
+            valid = bool(valid and prefix_valid)
+            reason = "OPTIMIZED" if valid else "NO_SAFE_CANDIDATE"
             command = controls[0].cpu().numpy() if valid else np.zeros(2, dtype=np.float32)
             clearance = float(self.cost.geometry.torch_clearance(motion_states[..., :3]).amin()) if valid else 0.0
             diagnostics = {
                 "prediction_dt_sec": self.model.dt_sec,
                 "integration_dt_sec": self.model.integration_dt_sec,
-                "ess": float(1 / self.controller.omega.square().sum()),
+                "ess": float(1 / self.controller.omega.square().sum()) if valid else 0.0,
                 "max_weight": float(self.controller.omega.max()),
-                "temperature": float(self.controller.lambda_),
+                "temperature": float(self.controller.weight_temperature),
+                "safe_candidates": int(self.controller.valid_candidates.sum()),
+                "output_prefix_safe": bool(prefix_valid),
                 "best_cost": float(self.controller.cost_total.min()),
                 "control_bound_excess": float(torch.relu(controls.abs() - self.cost.action_limits).max()),
                 "command_change": float(np.linalg.norm(command - self.last_output)),
@@ -324,7 +407,8 @@ class SamplingPlanner:
                 diagnostics["reference_clearance_target_m"] = self.cost.reference_clearance_target
             if valid:
                 diagnostics.update({f"cost_{name}": float(value.sum()) for name, value in
-                                    self.cost.components(prediction[1:], controls, motion_states=motion_states).items()})
+                                    self.cost.components(prediction[1:], controls, motion_states=motion_states,
+                                                         previous_state=prediction[:-1]).items()})
                 diagnostics["cost_terminal"] = float(self.cost.terminal(prediction[1:], controls))
             if self.method == "KMPPI":
                 reconstructed, _ = self.controller.deparameterize_to_trajectory_single(self.controller.theta)

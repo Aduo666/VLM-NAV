@@ -5,6 +5,7 @@ import time
 
 import numpy as np
 import torch
+from scipy.optimize import least_squares
 
 from constraint_traverse.benchmark.geometry import DoorScene, PassageGeometry
 from constraint_traverse.reference_path import angle_difference
@@ -26,6 +27,9 @@ def place(runtime, x, y, yaw):
 
 def verify_motion(runtime):
     results = {}
+    steering_samples = []
+    wheel_samples = []
+    spin_samples = []
     runtime.goal = np.asarray([1.5, 0, 0])
     saved = runtime.capture_snapshot()
     sampling = runtime.navigator.sampling
@@ -41,15 +45,22 @@ def verify_motion(runtime):
         checks = []
         dt = runtime.world.get_physics_dt()
         for index in range(round(4 / dt)):
+            before = sampling.read_state(runtime.robot, runtime.drive)
             predicted = sampling.execution_model.step(predicted, command)
             runtime.step(command)
+            actual = sampling.read_state(runtime.robot, runtime.drive)
+            steering_samples.append((before[6:10].copy(), actual[6:10].copy(), actual[17:21].copy(), dt))
+            wheel_samples.append((before[10:14].copy(), actual[10:14].copy(), actual[21:25].copy(), dt))
+            if name == "spin" and index * dt >= 1.5:
+                spin_samples.append((float(predicted[5]) / sampling.limits.spin_yaw_scale, float(actual[5])))
             if index + 1 in {round(0.2 / dt), round(1 / dt), round(4 / dt)}:
-                actual = sampling.read_state(runtime.robot, runtime.drive)
                 checks.append(dict(duration_sec=(index + 1) * dt,
                     position_error_m=float(np.linalg.norm(actual[:2] - predicted[:2].numpy())),
                     yaw_error_rad=abs(float(angle_difference(actual[2], float(predicted[2])))),
                     actual_speed_mps=float(np.linalg.norm(actual[3:5])), actual_angular_radps=float(actual[5])))
         results[name] = checks
+        results[name + "_four_second_passed"] = (checks[-1]["position_error_m"] <= 0.05
+                                                  and checks[-1]["yaw_error_rad"] <= math.radians(5))
         if checks[0]["position_error_m"] > 0.02 or checks[0]["yaw_error_rad"] > math.radians(3):
             raise AssertionError(f"一个控制周期的运动预测误差超出验收范围：{name}，{checks}")
         displacement = actual[:2] - initial[:2]
@@ -62,6 +73,23 @@ def verify_motion(runtime):
         runtime.logger.info("[MotionAcceptance] %s %s", name, checks)
     snapshot.restore(runtime, saved)
     runtime.world.play()
+    previous, measured, targets, periods = [np.asarray(values) for values in zip(*steering_samples)]
+    selected = np.abs(targets - previous) > 0.01
+    fit = least_squares(lambda parameter: ((targets + (previous - targets)
+        * np.exp(-periods[:, None] / parameter[0]) - measured)[selected]),
+        [sampling.limits.steering_response_sec], bounds=([0.005], [0.5]))
+    results["steering_response_fit_sec"] = float(fit.x[0])
+    results["steering_response_samples"] = int(selected.sum())
+    previous_wheel, measured_wheel, targets_wheel, periods_wheel = [np.asarray(values) for values in zip(*wheel_samples)]
+    selected_wheel = np.abs(targets_wheel - previous_wheel) > 0.003
+    wheel_fit = least_squares(lambda parameter: ((targets_wheel + (previous_wheel - targets_wheel)
+        * np.exp(-periods_wheel[:, None] / parameter[0]) - measured_wheel)[selected_wheel]),
+        [sampling.limits.wheel_response_sec], bounds=([0.0001], [0.1]))
+    results["wheel_response_fit_sec"] = float(wheel_fit.x[0])
+    ideal, measured_yaw = np.asarray(spin_samples).T
+    results["spin_yaw_scale_fit"] = float(ideal @ measured_yaw / (ideal @ ideal))
+    results["four_second_passed"] = all(results[name + "_four_second_passed"]
+        for name in ("forward", "reverse", "turn", "spin", "brake"))
     return results
 
 
@@ -138,9 +166,16 @@ def verify_navigation(runtime):
     runtime.confirm_placement()
     for _ in range(60):
         runtime.step([0, 0])
+    if runtime.args.checks == "turns":
+        from .verify_turns import verify_turns
+        return verify_turns(runtime)
     motion = verify_motion(runtime) if runtime.args.checks in {"all", "motion"} else None
     if runtime.args.checks == "motion":
-        return dict(motion_prediction=motion)
+        return dict(motion_prediction=motion, passed=motion["four_second_passed"])
+    turns = None
+    if runtime.args.checks == "all":
+        from .verify_turns import verify_turns
+        turns = verify_turns(runtime)
     open_frames = opened = None
     if runtime.args.checks != "contacts":
         runtime.experiment.metadata["test_scene"] = dict(name="open_floor", map_initialization="REAL_RGBD_MULTIVIEW_MANUAL_PLACEMENT")
@@ -173,8 +208,9 @@ def verify_navigation(runtime):
     door_frames = observe_environment(runtime)
     door = run_trials(runtime, "wide_door", geometry)
     contact = verify_collision_record(runtime)
-    return dict(motion_prediction=motion, open_floor=opened, wide_door=door,
+    return dict(motion_prediction=motion, turn_tracking=turns, open_floor=opened, wide_door=door,
         body_width_m=width, door_width_m=scene.width_m, total_clearance_m=runtime.args.door_clearance,
         map_initialization="REAL_RGBD_MULTIVIEW_MANUAL_PLACEMENT",
         preobserved_rgbd_frames=dict(open_floor=open_frames, wide_door=door_frames), unknown_policy="blocked",
-        physical_collision_record=contact)
+        physical_collision_record=contact,
+        passed=(motion is None or motion["four_second_passed"]) and (turns is None or turns["passed"]))

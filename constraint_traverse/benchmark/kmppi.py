@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import torch
 from pytorch_mppi import mppi
+from .weighting import AdaptiveWeights
 
 
-class ConsistentKMPPI(mppi.KMPPI):
+class ConsistentKMPPI(AdaptiveWeights, mppi.KMPPI):
     def __init__(self, *args, project_action=None, **kwargs):
         self.project_action = project_action
         self.action_priors = None

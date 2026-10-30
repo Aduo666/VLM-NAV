@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 import io
 from pathlib import Path
@@ -9,7 +9,7 @@ import sys
 import tempfile
 from types import ModuleType, SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 
@@ -198,6 +198,24 @@ class StateTests(unittest.TestCase):
 
 
 class CommandTests(unittest.TestCase):
+    def test_failed_verification_sets_framework_exit_code(self):
+        isaacsim, omni, kit, app, runtime, verify = [ModuleType(name) for name in (
+            "isaacsim", "omni", "omni.kit", "omni.kit.app",
+            "constraint_traverse.active_passage.simulation.runtime",
+            "constraint_traverse.active_passage.simulation.verify_navigation")]
+        isaacsim.SimulationApp = Mock(return_value=SimpleNamespace(close=Mock()))
+        omni.kit, kit.app = kit, app
+        framework = SimpleNamespace(post_quit=Mock(), get_shutdown_event_stream=lambda: SimpleNamespace(
+            create_subscription_to_pop_by_type=lambda *args, **kwargs: object()))
+        app.get_app = lambda: framework
+        runtime.ExperimentRuntime = Mock(return_value=SimpleNamespace(initialize=Mock(), close=Mock()))
+        verify.verify_navigation = lambda runtime: {"passed": False}
+        with patch.dict(sys.modules, {module.__name__: module for module in (isaacsim, omni, kit, app, runtime, verify)}):
+            with redirect_stdout(io.StringIO()):
+                code = run_application(parse_args(["check-navigation", "--checks", "turns"]))
+        self.assertEqual(code, 1)
+        framework.post_quit.assert_called_once_with(1)
+
     def test_temporary_data_is_removed_before_framework_exit(self):
         events = []
 

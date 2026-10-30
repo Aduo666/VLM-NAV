@@ -22,12 +22,19 @@ planner:
   temperature: 0.5
   near_goal_distance_m: 0.80
   reference_lookahead_m: 1.20
-  noise_linear_std: 0.18
-  noise_angular_std: 0.18
+  noise_linear_std: 0.08
+  noise_angular_std: 0.10
   kernel_support_points: 6
   kernel_sigma: 3.0
   candidate_display_count: 24
   seed: 0
+  noise_correlation: 0.85
+  ess_fraction: 0.12
+  reference_warm_start_blend: 0.5
+  connection_position_m: 0.05
+  connection_yaw_rad: 0.0872664626
+  connection_speed_mps: 0.15
+  connection_steering_rad: 0.15
 
 # 轮组几何、关节符号和硬件上限读取 configs/robots/agx.yaml。
 motion:
@@ -38,16 +45,24 @@ motion:
   angular_accel_radps2: 1.0
   angular_decel_radps2: 1.4
   steering_rate_radps: 2.0
-  steering_response_sec: 0.12
+  steering_response_sec: 0.1074
+  spin_yaw_scale: 0.86
+  wheel_response_sec: 0.005
 
 cost:
   reference_dt_sec: 0.20
   goal_distance_scale_m: 1.0
   goal: 8.0
   terminal_goal: 60.0
-  heading: 1.5
-  reference_path: 12.0
+  heading: 10.0
+  reference_path: 240.0
   control: 0.10
+  control_change: 3.0
+  steering_change: 0.25
+  speed: 4.0
+  cruise_speed_mps: 0.35
+  lateral_accel_mps2: 0.20
+  braking_decel_mps2: 0.30
   obstacle: 15.0
   obstacle_soft_distance_m: 0.12
   penetration_scale_m: 0.05

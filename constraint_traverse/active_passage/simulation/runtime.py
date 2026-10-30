@@ -337,7 +337,9 @@ class ExperimentRuntime:
             if self.timestamp - self.last_map_time >= self.navigation["mapping"]["map"]["integration_period_sec"] - 1e-9:
                 self.update_map(observations)
         self.experiment.sample(self.robot_state(), self.requested, self.applied, observations,
-                               physical_time_sec=self.world.current_time)
+            physical_time_sec=self.world.current_time,
+            actuator_targets=dict(wheel_radps=self.navigator.sampling.motor_targets,
+                                  steering_rad=self.navigator.sampling.steering_targets))
         contacts, self.contacts.events = self.contacts.events, []
         if self.experiment.recorder is not None:
             for contact in contacts:

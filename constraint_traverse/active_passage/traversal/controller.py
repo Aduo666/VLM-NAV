@@ -67,6 +67,8 @@ class AutomaticTraversal:
             physics_dt=physics_dt, config_path=settings["control"]["config_path"], logger=logger)
         self.sampling.config["planner"]["seed"] = int(seed)
         self.sampling.config["planner"]["device"] = f"cuda:{gpu}" if torch.cuda.is_available() else "cpu"
+        self.sampling.config["planner"]["max_result_age_sec"] = settings["control"]["max_result_age_sec"]
+        self.sampling.max_result_age_sec = settings["control"]["max_result_age_sec"]
         self.path_planner = SmacLatticePlanner(self.sampling.footprint, settings["path"])
         self.worker = PathWorker(self.path_planner)
         self.epoch = self.request = 0
@@ -86,6 +88,7 @@ class AutomaticTraversal:
         self.signature = self.failed_key = None
         self.last_path_time = -math.inf
         self.stopped_since = self.busy_since = None
+        self.reply_serial = 0
         self.seen_plan = None
         self.actual, self.events = [], []
         self.status = "IDLE"
@@ -158,6 +161,7 @@ class AutomaticTraversal:
 
     def step(self, *, robot, drive, grid, now):
         state = self.sampling.read_state(robot, drive)
+        blocked = False
         self.actual.append(state[:3].copy())
         arrival = self.settings["arrival"]
         reached = np.linalg.norm(state[:2] - self.goal) <= arrival["position_tolerance_m"]
@@ -178,6 +182,9 @@ class AutomaticTraversal:
                 # 关节目标在本物理周期末统一提交，安全检查前不会推进仿真。
                 self.sampling.step(robot=robot, drive=drive, grid=grid, goal_world_xy=self.goal,
                                    now=now, reference_path=self.path)
+                serial = getattr(self.sampling, "response_serial", 0)
+                if serial != getattr(self, "reply_serial", 0):
+                    self.reply_serial, self.busy_since = serial, None
                 command = self.sampling.requested.copy()
                 if self.sampling.last_plan is not None:
                     plan = self.sampling.last_plan
@@ -189,6 +196,7 @@ class AutomaticTraversal:
                     age = now - plan.diagnostics.get("request_timestamp_sec", now)
                     if age > self.settings["control"]["max_result_age_sec"]:
                         command[:] = 0
+                        blocked = True
                         self._status("STALE_CONTROL", now, age_sec=age)
                     else:
                         self._status(self.sampling.status, now)
@@ -201,6 +209,7 @@ class AutomaticTraversal:
                     limit = ("startup_timeout_sec" if self.seen_plan is None else "response_timeout_sec")
                     if time.monotonic() - self.busy_since > self.settings["control"][limit]:
                         command[:] = 0
+                        blocked = True
                         self.active = False
                         self._status("CONTROL_TIMEOUT", now)
                 else:
@@ -209,9 +218,10 @@ class AutomaticTraversal:
             self.check_control(grid, state, command)
         except PlanningFailure as error:
             command[:] = 0
+            blocked = True
             self._status(error.reason, now, detail=error.detail)
         # 使用提交前的实测状态，保持模型中的命令历史与最终提交动作一致。
-        applied = self.sampling.apply_command(robot=robot, drive=drive, command=command, state=state)
+        applied = self.sampling.apply_command(robot=robot, drive=drive, command=command, state=state, blocked=blocked)
         return command, applied
 
     def close(self, wait=False):

@@ -38,9 +38,12 @@ class DynamicsKernel(torch.nn.Module):
         self.angular_decel_radps2 = float(limits.angular_decel_radps2)
         self.steering_rate_radps = float(limits.steering_rate_radps)
         self.steering_response_sec = float(limits.steering_response_sec)
+        self.spin_yaw_scale = float(limits.spin_yaw_scale)
+        self.wheel_response_sec = float(limits.wheel_response_sec)
         self.max_steering_rad = float(hardware.max_steering_rad)
         self.max_lateral_acceleration_mps2 = float(hardware.max_lateral_acceleration_mps2)
         self.max_wheel_radps = float(hardware.max_wheel_radps)
+        self.steering_alignment_rad = float(hardware.steering_alignment_rad)
         self.max_curvature = float(1 / max(float(xy[:, 1].abs().max())
                                            + float(xy[:, 0].abs().max()) / math.tan(hardware.max_steering_rad), 1.0e-6))
 
@@ -67,20 +70,28 @@ class DynamicsKernel(torch.nn.Module):
         angles = torch.where(reverse, angles - torch.sign(angles) * math.pi, angles)
         speeds = torch.where(reverse, -speeds, speeds)
         stopping = (v.abs() + w.abs()) < 1.0e-6
-        angles = torch.where(stopping[..., None], state[..., 6:10], angles)
+        angles = torch.where(stopping[..., None], state[..., 17:21], angles)
         invalid = (angles.abs() > self.max_steering_rad + 1.0e-6).any(dim=-1)
         invalid = invalid | ((v * w).abs() > self.max_lateral_acceleration_mps2 + 1.0e-6)
         scale = (self.max_wheel_radps / (speeds.abs() / self.radii).amax(dim=-1).clamp_min(1.0e-6)).clamp(max=1)
         speeds, v, w = speeds * scale[..., None], v * scale, w * scale
-        angles = torch.where(invalid[..., None], state[..., 6:10], angles)
+        angles = torch.where(invalid[..., None], state[..., 17:21], angles)
         speeds = torch.where(invalid[..., None], torch.zeros_like(speeds), speeds)
-        steer_delta = (angles - state[..., 6:10]) * (1 - math.exp(-dt / self.steering_response_sec))
-        steering = state[..., 6:10] + steer_delta.clamp(-self.steering_rate_radps * dt, self.steering_rate_radps * dt)
-        wheel_speeds = rate_limit(state[..., 10:14], speeds,
+        steering_target = state[..., 17:21] + (angles - state[..., 17:21]).clamp(
+            -self.steering_rate_radps * dt, self.steering_rate_radps * dt)
+        steering = steering_target + (state[..., 6:10] - steering_target) * math.exp(-dt / self.steering_response_sec)
+        aligning = ((angles - state[..., 6:10]).abs().amax(dim=-1) > self.steering_alignment_rad)
+        aligning = aligning & (state[..., 10:14].abs().amax(dim=-1) < 0.025)
+        speeds = torch.where(aligning[..., None], torch.zeros_like(speeds), speeds)
+        wheel_target = rate_limit(state[..., 21:25], speeds,
                                  torch.full_like(speeds, self.linear_accel_mps2),
                                  torch.full_like(speeds, self.linear_decel_mps2), dt)
+        wheel_speeds = wheel_target + (state[..., 10:14] - wheel_target) * math.exp(-dt / self.wheel_response_sec)
         vectors = torch.stack((wheel_speeds * torch.cos(steering), wheel_speeds * torch.sin(steering)), dim=-1)
         twist = vectors.flatten(start_dim=-2) @ self.velocity_inverse.T
+        spinning = (v.abs() < 1e-6) & (w.abs() > 1e-6)
+        twist[..., 2] = twist[..., 2] * torch.where(spinning,
+            torch.full_like(v, self.spin_yaw_scale), torch.ones_like(v))
         yaw_mid = state[..., 2] + 0.5 * twist[..., 2] * dt
         c, s = torch.cos(yaw_mid), torch.sin(yaw_mid)
         result = state.clone()
@@ -93,4 +104,6 @@ class DynamicsKernel(torch.nn.Module):
         result[..., 14] = v
         result[..., 15] = w
         result[..., 16] = invalid.float()
+        result[..., 17:21] = steering_target
+        result[..., 21:25] = wheel_target
         return result

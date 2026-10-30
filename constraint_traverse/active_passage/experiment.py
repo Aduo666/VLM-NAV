@@ -46,10 +46,11 @@ class Experiment:
             self.recorder = None
         self.status = reason
 
-    def sample(self, robot, requested, applied, observations, *, physical_time_sec):
+    def sample(self, robot, requested, applied, observations, *, physical_time_sec, actuator_targets=None):
         if self.recorder is None:
             return
-        self.recorder.state(robot, requested, applied, physical_time_sec=physical_time_sec)
+        self.recorder.state(robot, requested, applied, physical_time_sec=physical_time_sec,
+                            actuator_targets=actuator_targets)
         self.recorder.observations(observations)
         if robot.timestamp_sec - self.recorder.metadata["start_timestamp_sec"] >= self.timeout_sec:
             self.stop("TIMEOUT")

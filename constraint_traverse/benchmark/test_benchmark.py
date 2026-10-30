@@ -103,6 +103,7 @@ class ModelTests(unittest.TestCase):
         _, model, _, _ = fixture()
         state = torch.zeros(STATE_SIZE)
         state[6:10] = torch.tensor([0.2, 0.3, -0.2, -0.3])
+        state[17:21] = state[6:10]
         stopped = model.step(state, [0, 0])
         torch.testing.assert_close(stopped[6:10], state[6:10])
 
@@ -134,20 +135,17 @@ class PlannerTests(unittest.TestCase):
             np.testing.assert_array_equal(first.controls, repeated.controls)
             self.assertEqual(first.candidates.shape, (32, 10, 3))
 
-    def test_optimizer_command_used_directly(self):
+    def test_unsafe_candidates_report_failure(self):
         cfg, model, geometry, cost = fixture()
         cfg["planner"].update(samples=16, horizon_steps=10, iterations=1)
         initial = np.zeros(STATE_SIZE, dtype=np.float32)
         initial[:2] = [0, 0.7]
         for method in ("MPPI", "KMPPI"):
-            with self.subTest(method=method), patch.object(geometry, "validate_poses") as validator, \
-                    patch.object(model, "braking_rollout") as braking:
+            with self.subTest(method=method):
                 result = SamplingPlanner(method, model, cost, cfg["planner"], cfg["safety"]).plan(initial)
-                self.assertTrue(result.valid)
-                self.assertEqual(result.reason, "OPTIMIZED")
-                np.testing.assert_array_equal(result.command, result.controls[0])
-                validator.assert_not_called()
-                braking.assert_not_called()
+                self.assertFalse(result.valid)
+                self.assertEqual(result.reason, "NO_SAFE_CANDIDATE")
+                np.testing.assert_array_equal(result.command, [0, 0])
 
 
 class SnapshotTests(unittest.TestCase):

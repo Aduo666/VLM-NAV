@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -60,6 +61,81 @@ class ConsistencyTests(unittest.TestCase):
                 else:
                     self.assertLess(float(result.command[0]), -0.005, (method, result.command))
 
+    def test_reference_direction_is_enforced_over_full_horizon(self):
+        for method in ("MPPI", "KMPPI"):
+            for direction in (-1, 1):
+                cfg, model, cost = self.reference_cost([[0, 0], [direction * 1.0, 0]])
+                planner = SamplingPlanner(method, model, cost, cfg["planner"], cfg["safety"])
+                result = planner.plan(np.zeros(STATE_SIZE, dtype=np.float32))
+                self.assertTrue(result.valid)
+                self.assertTrue((result.controls[:, 0] * direction >= 0).all())
+                self.assertTrue((result.candidate_controls[..., 0] * direction >= 0).all())
+                self.assertTrue((np.abs(result.controls[:, 1]) <= model.max_curvature * np.abs(result.controls[:, 0]) + 1e-6).all())
+                self.assertGreaterEqual(result.diagnostics["ess"], result.diagnostics["safe_candidates"] * 0.1)
+
+    def test_steering_target_and_actual_response_are_separate(self):
+        _, model, _, _ = fixture()
+        state = torch.zeros(STATE_SIZE)
+        after = model.step(state, [0, 0.3], 1 / 60)
+        self.assertGreater(float(after[17:21].abs().max()), float(after[6:10].abs().max()))
+        self.assertLessEqual(float(after[17:21].abs().max()), model.limits.steering_rate_radps / 60 + 1e-6)
+        self.assertEqual(float(after[10:14].abs().max()), 0)
+
+    def test_wheel_overspeed_does_not_raise_velocity_target(self):
+        _, model, _, _ = fixture()
+        state = torch.zeros(STATE_SIZE)
+        state[3] = 0.8
+        state[10:14] = 0.8
+        state[14] = 0.3
+        state[21:25] = 0.3
+        rims, _, _ = model.actuator_targets(state, [0.3, 0])
+        torch.testing.assert_close(rims, torch.full((4,), 0.3))
+
+    def test_correlated_noise_uses_matching_covariance(self):
+        cfg, model, _, cost = fixture()
+        planner = SamplingPlanner("MPPI", model, cost, cfg["planner"], cfg["safety"])
+        controller = planner.controller
+        noise = torch.linspace(-0.2, 0.2, controller.T * 2).reshape(1, controller.T, 2)
+        index = torch.arange(controller.T)
+        covariance = controller.noise_correlation ** torch.abs(index[:, None] - index[None, :])
+        expected = controller.lambda_ * torch.einsum("ij,bjk,kl->bil", torch.linalg.inv(covariance), noise,
+                                                    controller.noise_sigma_inv)
+        torch.testing.assert_close(controller._compute_action_cost(noise), expected, atol=0.003, rtol=1e-4)
+
+    def test_warm_start_uses_prediction_time_interval(self):
+        from constraint_traverse.navigation import _PlanningWorker, _SamplingJob
+        from constraint_traverse.test_navigation import make_grid
+        cfg, model, _, _ = fixture()
+        owner = SimpleNamespace(geometry=Mock(), config=cfg, physics_dt=1 / 60)
+        worker = _PlanningWorker(owner)
+        worker.model, worker.cost, worker.planner = model, Mock(), Mock()
+        worker.goal, worker.epoch, worker.previous_time = np.asarray([1, 0]), 1, 1.0
+        worker.planner.plan.return_value = SimpleNamespace(diagnostics={})
+        job = _SamplingJob(1, np.zeros(STATE_SIZE, dtype=np.float32), make_grid(), np.asarray([1, 0]), 1.2, None,
+                           np.zeros((6, 2), dtype=np.float32), 7.0)
+        worker._run(job)
+        self.assertIsNone(worker.results.get_nowait()[4])
+        self.assertAlmostEqual(worker.planner.plan.call_args.kwargs["elapsed_sec"], 0.3)
+        self.assertAlmostEqual(worker.previous_time, 1.3)
+
+    def test_reference_guidance_tracks_s_curve_in_prediction_model(self):
+        angle = np.linspace(0, np.pi / 2, 41)
+        radius = 0.5
+        first = np.column_stack((radius * np.sin(angle), radius * (1 - np.cos(angle))))
+        second = np.column_stack((radius + radius * (1 - np.cos(angle[1:])),
+                                  radius + radius * np.sin(angle[1:])))
+        points = np.vstack((first, second))
+        headings = np.r_[angle, np.pi / 2 - angle[1:]]
+        cfg, model, cost = self.reference_cost(points, headings, np.r_[0, np.ones(len(points) - 1)])
+        planner = SamplingPlanner("MPPI", model, cost, cfg["planner"], cfg["safety"])
+        initial = torch.zeros(STATE_SIZE)
+        planner._prepare_sampling(initial, None)
+        controls = planner.controller.get_action_sequence()
+        states = model.rollout(initial, controls)
+        _, errors, _ = cost.route_errors(states)
+        self.assertLess(float(errors.sqrt().max()), 0.04)
+        self.assertTrue(bool((controls[:, 0] >= 0).all()))
+
     def test_narrow_reference_sets_attainable_soft_clearance(self):
         from constraint_traverse.test_navigation import make_grid
         cfg, _, _, _ = fixture()
@@ -105,6 +181,8 @@ class ConsistencyTests(unittest.TestCase):
         def select_null(costs):
             controller.omega = torch.zeros_like(costs)
             controller.omega[0] = 1
+            controller.valid_candidates = torch.ones_like(costs, dtype=torch.bool)
+            controller.weight_temperature = controller.lambda_
             return controller.omega
 
         initial = torch.zeros(STATE_SIZE)

@@ -78,3 +78,41 @@ python -m constraint_traverse.active_passage check-navigation --gpu 1 --checks m
 python -m constraint_traverse.active_passage check-navigation --gpu 1 --checks navigation --repeats 2 --timeout 45
 python -m constraint_traverse.active_passage check-navigation --gpu 1 --checks contacts
 ```
+
+2026-10-30 控制接口与预测模型验收。
+
+执行与预测分别保存实际轮速、轮角以及驱动器目标。目标变化速率根据上一次提交的目标计算。参考段限制前进、倒退或原地旋转，方向切换采用实际停稳条件。MPPI 使用时间相关采样、控制变化与轮角变化代价、候选执行段及制动范围检查和自适应加权。
+
+滚动控制按预测起始时间推进历史序列。停车及控制过期会进入延迟预测；收到后被状态检查拒绝的结果计为工作进程响应。参考控制通过完整四轮模型推演，并结合路径曲率、朝向和横向误差反馈。
+
+| 四秒运动预测 | 位置误差 | 朝向误差 | 5 cm、5° 标准 |
+| --- | --- | --- | --- |
+| 前进 | 0.14 cm | 0.002° | 通过 |
+| 倒退 | 0.01 cm | 0.001° | 通过 |
+| 连续转弯 | 1.95 cm | 0.22° | 通过 |
+| 原地旋转 | 0.02 cm | 0.16° | 通过 |
+| 制动 | 0.02 cm | 小于 0.001° | 通过 |
+
+验收参数为 `steering_response_sec=0.1074`、`wheel_response_sec=0.005`、`spin_yaw_scale=0.86`。一阶响应拟合诊断分别约为 0.1080 s、0.0152 s，旋转有效响应拟合约为 0.8753；拟合诊断与实际底盘轨迹误差分别报告。
+
+185 项模块、路径、控制、地图及退出管理测试通过，包含轮速过冲时目标保持、运动方向约束、相关采样协方差、预测时间推进、停车期间的延迟控制、响应计时、路径投影和 S 形参考控制。
+
+当前完整实现使用真实 AGX、Isaac Sim、随机种子 0 和预先多视角采集的 RGB-D 地图，UNKNOWN 保持禁行。以下路线均采用 `FIXED_TRACKING_DIAGNOSTIC` 固定参考路径，单独评价局部控制器；正常交互入口通过 Smac 生成参考路径。
+
+| 路线 | 第一次最大横向误差 | 第二次最大横向误差 | 到达并停稳 | 方向违规 |
+| --- | --- | --- | --- | --- |
+| 左转 90° | 0.95 cm | 0.97 cm | 两次通过 | 0 |
+| 右转 90° | 0.92 cm | 1.49 cm | 两次通过 | 0 |
+| S 形 | 3.56 cm | 3.70 cm | 两次通过 | 0 |
+| 倒退后换向转弯 | 1.59 cm | 2.77 cm | 两次通过 | 0 |
+
+八次均满足最大横向误差不超过 5 cm、目标距离不超过 0.30 m 且实际停稳的标准，没有障碍碰撞。各条试验的 ESS 中位数约为 30.73～30.74，记录完整性检查全部通过。
+
+本次仿真与规划子进程均已退出，临时数据和调试日志已清理。以上数据对应固定参考路线的功能验收。
+
+复现运动与转弯检查：
+
+```bash
+python -m constraint_traverse.active_passage check-navigation --gpu 0 --checks motion
+python -m constraint_traverse.active_passage check-navigation --gpu 0 --checks turns --repeats 2 --timeout 45
+```

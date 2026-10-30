@@ -184,14 +184,14 @@ class ControllerTests(unittest.TestCase):
                                               goal_world_xy=[1, 0], now=0)
                 self.assertIsNotNone(controller.last_plan)
                 self.assertEqual(controller.last_plan.candidates.shape[0], controller.config["planner"]["samples"])
-                self.assertEqual(controller.status, "TRACKING")
-                self.assertTrue(controller.last_plan.valid)
-                np.testing.assert_array_equal(controller.requested, controller.last_plan.controls[0])
+                self.assertEqual(controller.status, "NO_SAFE_CANDIDATE")
+                self.assertFalse(controller.last_plan.valid)
+                np.testing.assert_array_equal(controller.requested, [0, 0])
                 requested = controller.requested.copy()
                 controller.step(robot=Robot(), drive=drive, grid=make_grid(known=False, version=3),
                                 goal_world_xy=[1, 0], now=0.01)
                 np.testing.assert_array_equal(controller.requested, requested)
-                self.assertEqual(controller.status, "TRACKING")
+                self.assertEqual(controller.status, "NO_SAFE_CANDIDATE")
             controller.close(wait=True)
 
 
@@ -238,6 +238,25 @@ class AsyncControllerTests(unittest.TestCase):
         self.step()
         self.assertIsNone(controller.last_plan)
         np.testing.assert_array_equal(controller.requested, [0, 0])
+
+    def test_delay_prediction_preserves_blocked_command(self):
+        controller = self.controller
+        controller.last_plan, controller.plan_timestamp = self.result(), 1.0
+        controller.command_blocked = True
+        controller._delay_estimate = 0.1
+        captured = []
+        with patch.object(controller._worker, "submit", side_effect=lambda job: captured.append(job) or True):
+            self.step(now=1.05)
+        np.testing.assert_array_equal(captured[0].committed_controls, 0)
+        np.testing.assert_array_equal(controller.requested, [0, 0])
+        self.assertTrue(controller.command_blocked)
+
+    def test_delay_prediction_respects_source_age(self):
+        controller = self.controller
+        controller.last_plan, controller.plan_timestamp = self.result(), 1.0
+        controller.last_plan.diagnostics["request_timestamp_sec"] = 0.0
+        controller.max_result_age_sec = 1.0
+        np.testing.assert_array_equal(controller._control_for_time(1.05), [0, 0])
 
     def test_short_reference_end_retains_high_level_goal(self):
         self.position[0] = 0.2

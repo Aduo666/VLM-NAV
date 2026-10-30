@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import copy
 import logging
+import math
 from pathlib import Path
 
 import yaml
@@ -29,6 +30,14 @@ def load_config(path):
             raise ValueError(f"{section} 的数值配置必须为正数")
     if int(cfg["planner"]["kernel_support_points"]) > int(cfg["planner"]["horizon_steps"]):
         raise ValueError("KMPPI 支持点数量超过预测步数")
+    if not 0 <= float(cfg["planner"].get("noise_correlation", 0.85)) < 1:
+        raise ValueError("控制采样相关系数需要位于 [0, 1)")
+    if not 0 < float(cfg["planner"].get("ess_fraction", 0.12)) <= 1:
+        raise ValueError("有效样本比例需要位于 (0, 1]")
+    for name in ("connection_position_m", "connection_yaw_rad", "connection_speed_mps", "connection_steering_rad"):
+        value = float(cfg["planner"].get(name, 0.05))
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"控制连接误差阈值必须为有限正数：{name}")
     return cfg
 
 

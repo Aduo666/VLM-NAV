@@ -37,7 +37,7 @@ def parse_args(argv=None):
         if command == "check-navigation":
             sub.add_argument("--repeats", type=int, default=2)
             sub.add_argument("--door-clearance", type=float, default=0.40)
-            sub.add_argument("--checks", choices=("all", "motion", "navigation", "contacts"), default="all")
+            sub.add_argument("--checks", choices=("all", "motion", "navigation", "contacts", "turns"), default="all")
     inspect = commands.add_parser("inspect", help="检查已经保存的试验记录")
     inspect.add_argument("path", type=Path)
     args = parser.parse_args(argv)
@@ -95,8 +95,11 @@ def run_application(args, *, cleanup_output=None):
             return 0
         if args.command == "check-navigation":
             from .simulation.verify_navigation import verify_navigation
-            print(json.dumps(verify_navigation(runtime), ensure_ascii=False, indent=2), flush=True)
-            return 0
+            report = verify_navigation(runtime)
+            print(json.dumps(report, ensure_ascii=False, indent=2), flush=True)
+            if not report.get("passed", True):
+                omni.kit.app.get_app().post_quit(1)
+            return 0 if report.get("passed", True) else 1
         return runtime.run()
     except KeyboardInterrupt:
         if runtime is not None and runtime.experiment is not None:

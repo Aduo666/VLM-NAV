@@ -37,6 +37,22 @@ class ReferenceTests(unittest.TestCase):
         np.testing.assert_array_equal(window.world_xy[-1], [1, 0])
         self.assertEqual(path.window([1, 0, 0], lookahead_m=3).direction, -1)
 
+    def test_direction_change_waits_for_measured_stop(self):
+        path = reference([[0, 0], [1, 0], [0, 0]], [0, 0, 0], [0, 1, -1])
+        self.assertEqual(path.window([1, 0, 0], lookahead_m=3, stopped=False).direction, 1)
+        self.assertEqual(path.window([1, 0, 0], lookahead_m=3, stopped=True).direction, -1)
+
+    def test_forward_projection_recovers_after_lateral_offset(self):
+        angle = np.linspace(0, 0.8, 41)
+        points = np.column_stack((np.sin(angle), 1 - np.cos(angle)))
+        path = reference(points, angle, np.r_[0, np.ones(len(points) - 1)])
+        yaw = 0.35
+        pose = [1.1 * np.sin(yaw), 1 - 1.1 * np.cos(yaw), yaw]
+        window = path.window(pose, lookahead_m=1, cursor=1)
+        self.assertGreater(window.cursor, 10)
+        self.assertLess(window.cursor, 25)
+        self.assertEqual(window.direction, 1)
+
     def test_spin_keeps_heading_and_blocks_later_translation(self):
         path = reference([[0, 0], [0, 0], [0, 1]], [0, math.pi / 2, math.pi / 2], [0, 0, 1])
         self.assertEqual(path.window([0, 0, 0], lookahead_m=2).direction, 0)

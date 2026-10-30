@@ -8,7 +8,22 @@ import torch
 
 from .motion_kernel import DynamicsKernel, rate_limit, project_twist
 
-STATE_SIZE = 17
+STATE_SIZE = 25
+
+
+def read_steering_targets(drive, hardware, measured):
+    if not hasattr(drive, "_dc"):
+        return np.asarray(measured, dtype=np.float32).copy()
+    dofs = drive._steering_dofs | drive._passive_steering_dofs
+    return np.asarray([drive._dc.get_dof_position_target(dofs[wheel.steering_joint])
+                       * wheel.steering_sign for wheel in hardware.wheels], dtype=np.float32)
+
+
+def read_wheel_targets(drive, hardware, measured):
+    if not hasattr(drive, "_dc"):
+        return np.asarray(measured, dtype=np.float32).copy()
+    return np.asarray([drive._dc.get_dof_velocity_target(drive._wheel_dofs[wheel.drive_joint])
+                       * wheel.radius_m * wheel.drive_sign for wheel in hardware.wheels], dtype=np.float32)
 
 
 @dataclass(frozen=True)
@@ -21,6 +36,8 @@ class MotionLimits:
     angular_decel_radps2: float
     steering_rate_radps: float
     steering_response_sec: float
+    spin_yaw_scale: float = 1.0
+    wheel_response_sec: float = 0.005
 
     def __post_init__(self):
         if not all(math.isfinite(v) and v > 0 for v in self.__dict__.values()):
@@ -40,6 +57,7 @@ class FourWheelModel:
             raise ValueError("物理积分周期必须为有限正数")
         self.integration_dt_sec = float(integration_dt_sec)
         self.last_substeps = None
+        self.last_initial_state = None
         if device == "auto":
             device = f"cuda:{1 if torch.cuda.device_count() > 1 else 0}" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device)
@@ -58,8 +76,23 @@ class FourWheelModel:
     def project_actions(self, actions):
         return project_twist(actions, self.limits.max_linear_mps, self.limits.max_angular_radps, self.max_curvature)
 
-    def step(self, state, action, dt_sec=None):
+    def actuator_targets(self, state, action):
+        predicted = self.step(state, action)
+        return predicted[..., 21:25], predicted[..., 17:21], predicted[..., 14:16]
+
+    def _state_tensor(self, state):
         state = torch.as_tensor(state, dtype=torch.float32, device=self.device)
+        if state.shape[-1] == 17:
+            state = torch.cat((state, state[..., 6:10]), dim=-1)
+        if state.shape[-1] == 21:
+            state = torch.cat((state, state[..., 10:14]), dim=-1)
+        if state.shape[-1] != STATE_SIZE:
+            raise ValueError("四轮模型状态维度无效")
+        return state
+
+    def step(self, state, action, dt_sec=None):
+        state = self._state_tensor(state)
+        self.last_initial_state = state
         action = torch.as_tensor(action, dtype=state.dtype, device=self.device)
         dt = self.dt_sec if dt_sec is None else float(dt_sec)
         if not math.isfinite(dt) or dt <= 0:
@@ -80,7 +113,7 @@ class FourWheelModel:
 
     def rollout(self, initial, actions, dt_sec=None, *, return_substeps=False):
         actions = torch.as_tensor(actions, dtype=torch.float32, device=self.device)
-        state = torch.as_tensor(initial, dtype=torch.float32, device=self.device)
+        state = self._state_tensor(initial)
         states = [state]
         substeps = []
         for action in actions:
@@ -92,16 +125,16 @@ class FourWheelModel:
         return (result, torch.stack(substeps, dim=1)) if return_substeps else result
 
     def braking_rollout(self, initial, reaction_sec=0.10):
-        state = torch.as_tensor(initial, dtype=torch.float32, device=self.device)
+        state = self._state_tensor(initial)
         states = [state]
         dt = min(self.dt_sec, 0.05)
         count = math.ceil(reaction_sec / dt)
         for _ in range(count):
-            state = self.step(state, state[14:16], dt)
+            state = self.step(state, state[..., 14:16], dt)
             states.append(state)
         for _ in range(math.ceil(10 / dt)):
             state = self.step(state, torch.zeros(2, device=self.device), dt)
             states.append(state)
-            if float(state[3:6].abs().max()) < 0.005 and float(state[10:14].abs().max()) < 0.005:
+            if float(state[..., 3:6].abs().max()) < 0.005 and float(state[..., 10:14].abs().max()) < 0.005:
                 break
         return torch.stack(states)

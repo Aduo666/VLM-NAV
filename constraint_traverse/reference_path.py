@@ -81,11 +81,29 @@ class ReferencePath:
         return cls(points, headings, directions, **metadata)
 
     def window(self, pose, *, lookahead_m, cursor=1, position_tolerance_m=0.04,
-               yaw_tolerance_rad=math.radians(5)):
+               yaw_tolerance_rad=math.radians(5), stopped=True):
         pose = np.asarray(pose, dtype=np.float64)
         if pose.shape != (3,) or not np.isfinite(pose).all() or not math.isfinite(lookahead_m) or lookahead_m <= 0:
             raise ValueError("前瞻路径需要有效位姿和正数距离")
         cursor = max(1, int(cursor))
+        if cursor < len(self.world_xy) and self.motion_direction[cursor] != 0:
+            direction = self.motion_direction[cursor]
+            best, distance_ahead = float("inf"), 0.0
+            nearest = cursor
+            for index in range(cursor, len(self.world_xy)):
+                if self.motion_direction[index] != direction or distance_ahead > 0.5:
+                    break
+                start, end = self.world_xy[index - 1:index + 1]
+                delta = end - start
+                fraction = float(np.clip((pose[:2] - start) @ delta / max(delta @ delta, 1e-12), 0, 1))
+                projected = start + fraction * delta
+                distance = float(np.linalg.norm(pose[:2] - projected))
+                heading = self.world_yaw_rad[index - 1] + fraction * float(angle_difference(
+                    self.world_yaw_rad[index], self.world_yaw_rad[index - 1]))
+                if distance < best and abs(float(angle_difference(heading, pose[2]))) < math.pi / 3:
+                    best, nearest = distance, index
+                distance_ahead += float(np.linalg.norm(delta)) * (1 - fraction)
+            cursor = nearest
         while cursor < len(self.world_xy):
             start, end = self.world_xy[cursor - 1:cursor + 1]
             segment = end - start
@@ -100,6 +118,8 @@ class ReferencePath:
                 reached = (np.linalg.norm(pose[:2] - end) <= position_tolerance_m
                            or (along >= 1 and lateral <= 2 * position_tolerance_m))
             if not reached:
+                break
+            if cursor + 1 < len(self.world_xy) and self.motion_direction[cursor + 1] != direction and not stopped:
                 break
             cursor += 1
         if cursor >= len(self.world_xy):

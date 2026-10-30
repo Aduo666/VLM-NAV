@@ -40,7 +40,7 @@ class TrialRecorder:
         self.stream.write(json.dumps(value, ensure_ascii=False, allow_nan=False) + "\n")
         self.stream.flush()
 
-    def state(self, robot, requested, applied, *, physical_time_sec):
+    def state(self, robot, requested, applied, *, physical_time_sec, actuator_targets=None):
         timestamp = float(robot.timestamp_sec)
         if timestamp < self.last_time - 1e-6:
             raise ValueError("同一条试验记录的时间不能倒退")
@@ -48,7 +48,8 @@ class TrialRecorder:
                           world_from_base=robot.world_from_base.tolist(), base_twist=robot.base_twist.tolist(),
                           joint_names=list(robot.joint_names), joint_positions=robot.joint_positions.tolist(),
                           joint_velocities=robot.joint_velocities.tolist(),
-                          requested_command=np.asarray(requested).tolist(), applied_command=np.asarray(applied).tolist()))
+                          requested_command=np.asarray(requested).tolist(), applied_command=np.asarray(applied).tolist(),
+                          actuator_targets=actuator_targets))
         self.last_time = timestamp
         self.counts["states"] += 1
 

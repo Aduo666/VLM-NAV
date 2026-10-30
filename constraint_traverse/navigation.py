@@ -14,7 +14,7 @@ import numpy as np
 from scipy.ndimage import distance_transform_edt
 import torch
 
-from constraint_traverse.benchmark.model import FourWheelModel, MotionLimits, STATE_SIZE
+from constraint_traverse.benchmark.model import FourWheelModel, MotionLimits, STATE_SIZE, read_steering_targets, read_wheel_targets
 from constraint_traverse.benchmark.geometry import sample_body_points
 from constraint_traverse.benchmark.planner import PassageCost, SamplingPlanner
 from constraint_traverse.benchmark.run import load_config
@@ -208,8 +208,9 @@ class _PlanningWorker:
                 self.cost.set_reference_window(job.window)
             else:
                 self.cost.set_target(goal)
-            elapsed = None if job.previous_activation_time is None else prediction_time - job.previous_activation_time
+            elapsed = None if self.previous_time is None else max(0.0, prediction_time - self.previous_time)
             result = self.planner.plan(predicted_start, elapsed_sec=elapsed)
+            result.diagnostics["prediction_timestamp_sec"] = float(prediction_time)
             self.previous_time = prediction_time
             self.results.put((epoch, timestamp, grid.map_version, result, None, predicted_start))
         except Exception as error:
@@ -281,7 +282,19 @@ class SamplingNavigationController:
         self.reference_cursor = 1
         self._segment_key = None
         self._delay_estimate = 0.0
+        self.max_result_age_sec = float(self.config["planner"].get("max_result_age_sec", float("inf")))
+        self.command_blocked = False
+        self.response_serial = 0
         self.status = "IDLE"
+
+    def _control_for_time(self, now):
+        if self.last_plan is None or not self.last_plan.valid or self.plan_timestamp is None or self.command_blocked:
+            return np.zeros(2, dtype=np.float32)
+        requested_at = self.last_plan.diagnostics.get("request_timestamp_sec", self.plan_timestamp)
+        if now - requested_at > self.max_result_age_sec:
+            return np.zeros(2, dtype=np.float32)
+        index = math.floor((now - self.plan_timestamp) / self.planning_period + 1e-8)
+        return self.last_plan.controls[index].copy() if 0 <= index < len(self.last_plan.controls) else np.zeros(2, dtype=np.float32)
 
     def close(self, wait=False):
         self.reset()
@@ -299,6 +312,8 @@ class SamplingNavigationController:
             state[6 + index] = readback["steering_position"][wheel.steering_joint] * wheel.steering_sign
             state[10 + index] = readback["wheel_velocity"][wheel.drive_joint] * wheel.radius_m * wheel.drive_sign
         state[14:16] = self.last_command
+        state[17:21] = read_steering_targets(drive, self.hardware, state[6:10])
+        state[21:25] = read_wheel_targets(drive, self.hardware, state[10:14])
         return state
 
     def step(self, *, robot, drive, grid, goal_world_xy, now, reference_path: ReferencePath | None = None):
@@ -314,7 +329,8 @@ class SamplingNavigationController:
             if reference_path is not self.reference:
                 self.reference, self.reference_cursor = reference_path, 1
             window = reference_path.window(state[:3], lookahead_m=self.config["planner"]["reference_lookahead_m"],
-                                           cursor=self.reference_cursor)
+                cursor=self.reference_cursor, stopped=(np.linalg.norm(state[3:5]) < 0.025
+                    and abs(state[5]) < 0.04 and np.max(np.abs(state[10:14])) < 0.025))
             if window is not None:
                 self.reference_cursor = window.cursor
                 segment_key = (reference_path.source, window.direction)
@@ -326,14 +342,13 @@ class SamplingNavigationController:
         self._worker.poll()
         while not self._worker.results.empty():
             epoch, timestamp, version, result, error, predicted_start = self._worker.results.get_nowait()
+            self.response_serial += 1
             if epoch != self._epoch:
                 continue
             if error is not None:
                 self.logger.error("[SamplingError] mode=%s error=%s", self.method, error, exc_info=(type(error), error, error.__traceback__))
                 self.status = "PLANNING_ERROR"
                 continue
-            self.last_plan, self.plan_timestamp = result, now
-            self.planner = self._worker.planner
             observed_delay = max(0.0, now - timestamp)
             self._delay_estimate = min(self.planning_period * len(result.controls) / 2,
                                        min(observed_delay, self.planning_period) if self._delay_estimate == 0
@@ -341,6 +356,21 @@ class SamplingNavigationController:
             result.diagnostics["connection_position_error_m"] = float(np.linalg.norm(state[:2] - predicted_start[:2]))
             result.diagnostics["connection_speed_error_mps"] = float(abs(state[3] - predicted_start[3]))
             result.diagnostics["connection_steering_error_rad"] = float(np.abs(state[6:10] - predicted_start[6:10]).max())
+            result.diagnostics["connection_yaw_error_rad"] = abs(float((state[2] - predicted_start[2] + math.pi) % (2 * math.pi) - math.pi))
+            result.diagnostics["request_timestamp_sec"] = float(timestamp)
+            result.diagnostics["map_version"] = int(version)
+            limits = self.config["planner"]
+            disconnected = (result.diagnostics["connection_position_error_m"] > limits.get("connection_position_m", 0.05)
+                or result.diagnostics["connection_yaw_error_rad"] > limits.get("connection_yaw_rad", math.radians(5))
+                or result.diagnostics["connection_speed_error_mps"] > limits.get("connection_speed_mps", 0.15)
+                or result.diagnostics["connection_steering_error_rad"] > limits.get("connection_steering_rad", 0.15))
+            if disconnected:
+                self.logger.warning("[SamplingConnectionRejected] diagnostics=%s", result.diagnostics)
+                self.last_planning_time = -float("inf")
+                continue
+            self.last_plan, self.plan_timestamp = result, now
+            self.command_blocked = False
+            self.planner = self._worker.planner
             result.diagnostics["request_timestamp_sec"] = float(timestamp)
             result.diagnostics["map_version"] = int(version)
             self.logger.info("[SamplingPlan] mode=%s map_version=%d latency=%.3fs age=%.3fs diagnostics=%s",
@@ -360,11 +390,7 @@ class SamplingNavigationController:
                                    unknown_mask=grid.unknown_mask.copy(), clearance_m=grid.clearance_m.copy())
                 controls = []
                 for index in range(math.ceil(self._delay_estimate / self.physics_dt)):
-                    plan_index = (math.floor((now + index * self.physics_dt - self.plan_timestamp) / self.planning_period)
-                                  if self.plan_timestamp is not None else -1)
-                    controls.append(self.last_plan.controls[plan_index].copy()
-                                    if self.last_plan is not None and 0 <= plan_index < len(self.last_plan.controls)
-                                    else np.zeros(2, dtype=np.float32))
+                    controls.append(self._control_for_time(now + index * self.physics_dt))
                 job = _SamplingJob(self._epoch, state.copy(), snapshot, goal.copy(), float(now), window,
                                    np.asarray(controls, dtype=np.float32).reshape(-1, 2), self.plan_timestamp)
                 if self._worker.submit(job):
@@ -374,22 +400,28 @@ class SamplingNavigationController:
             if self.last_plan is not None and self.last_plan.valid:
                 index = math.floor((now - self.plan_timestamp) / self.planning_period + 1.0e-8)
                 if 0 <= index < len(self.last_plan.controls):
-                    self.requested = self.last_plan.controls[index].copy()
-                    self.status = "TRACKING"
+                    self.requested = self._control_for_time(now)
+                    self.status = "CONTROL_BLOCKED" if self.command_blocked else "TRACKING"
                 else:
                     self.status = "WAITING_FOR_PLAN"
+            elif self.last_plan is not None:
+                self.status = self.last_plan.reason
         return self.apply_command(robot=robot, drive=drive, command=self.requested, state=state)
 
-    def apply_command(self, *, robot, drive, command, state=None):
+    def apply_command(self, *, robot, drive, command, state=None, blocked=False):
         if state is None:
             state = self.read_state(robot, drive)
         self.requested = np.asarray(command, dtype=np.float32).reshape(2).copy()
+        if blocked:
+            self.command_blocked = True
         with torch.no_grad():
-            predicted = self.execution_model.step(state, self.requested).numpy()
+            rims, angles, filtered = self.execution_model.actuator_targets(state, self.requested)
+            rims, angles, filtered = rims.numpy(), angles.numpy(), filtered.numpy()
         motors, steering = {}, {}
         for index, wheel in enumerate(self.hardware.wheels):
-            motors[wheel.drive_joint] = float(predicted[10 + index] / wheel.radius_m / wheel.drive_sign)
-            steering[wheel.steering_joint] = float(predicted[6 + index] / wheel.steering_sign)
+            motors[wheel.drive_joint] = float(rims[index] / wheel.radius_m / wheel.drive_sign)
+            steering[wheel.steering_joint] = float(angles[index] / wheel.steering_sign)
         drive.apply_continuous_joint_targets(motors, steering)
-        self.last_command = predicted[14:16].copy()
+        self.motor_targets, self.steering_targets = motors, steering
+        self.last_command = filtered.copy()
         return VelocityCommand(float(self.last_command[0]), float(self.last_command[1]))

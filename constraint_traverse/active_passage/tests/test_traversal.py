@@ -11,7 +11,7 @@ from scipy.ndimage import distance_transform_edt
 
 from constraint_traverse.active_passage.traversal.controller import AutomaticTraversal, load_navigation_config
 from constraint_traverse.active_passage.traversal.planner import PlanningFailure, SmacLatticePlanner
-from constraint_traverse.benchmark.model import FourWheelModel, MotionLimits
+from constraint_traverse.benchmark.model import FourWheelModel, MotionLimits, STATE_SIZE
 from constraint_traverse.benchmark.run import load_config
 from vln_nav.navigation.trajectory_clearance import FootprintConfig, FootprintPartConfig, PlanningGrid
 from vln_nav.runtime.agx_profile import load_agx_profile
@@ -96,9 +96,10 @@ class ExecutionTests(unittest.TestCase):
         cls.validator.path_planner = SmacLatticePlanner(footprint, cls.settings["path"])
 
     def test_executed_prefix_and_braking_must_be_known(self):
-        state = np.zeros(17, dtype=np.float32)
+        state = np.zeros(STATE_SIZE, dtype=np.float32)
         state[3] = state[14] = 0.4
         state[10:14] = 0.4
+        state[21:25] = 0.4
         unknown = np.zeros((160, 160), dtype=bool)
         unknown[:, 90:] = True
         with self.assertRaises(PlanningFailure) as error:
@@ -106,10 +107,10 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(error.exception.reason, "OBSERVATION_REQUIRED")
 
     def test_free_control_prefix_is_accepted(self):
-        self.validator.check_control(grid(), np.zeros(17, dtype=np.float32), [0.3, 0])
+        self.validator.check_control(grid(), np.zeros(STATE_SIZE, dtype=np.float32), [0.3, 0])
 
     def test_zero_command_preserves_rest(self):
-        state = np.zeros(17, dtype=np.float32)
+        state = np.zeros(STATE_SIZE, dtype=np.float32)
         np.testing.assert_allclose(self.model.step(state, [0, 0]).numpy(), state, atol=1e-6)
 
     def controller(self, state):
@@ -126,7 +127,7 @@ class ExecutionTests(unittest.TestCase):
         return manager
 
     def test_arrival_requires_actual_stop_and_hold(self):
-        state = np.zeros(17, dtype=np.float32)
+        state = np.zeros(STATE_SIZE, dtype=np.float32)
         state[3] = 0.2
         manager = self.controller(state)
         manager.step(robot=None, drive=None, grid=grid(), now=0)
@@ -140,7 +141,7 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(manager.status, "SUCCESS")
 
     def test_received_plan_starts_new_response_timeout(self):
-        manager = self.controller(np.zeros(17, dtype=np.float32))
+        manager = self.controller(np.zeros(STATE_SIZE, dtype=np.float32))
         manager.goal = np.asarray([2, 0])
         manager.path = SimpleNamespace(request_id=7)
         manager._update_path = lambda *args: None
@@ -154,6 +155,24 @@ class ExecutionTests(unittest.TestCase):
             manager.step(robot=None, drive=None, grid=grid(), now=0)
         self.assertTrue(manager.active)
         self.assertEqual(manager.status, "TRACKING")
+        self.assertEqual(manager.busy_since, 30)
+
+    def test_received_rejection_is_counted_as_worker_response(self):
+        manager = self.controller(np.zeros(STATE_SIZE, dtype=np.float32))
+        manager.goal = np.asarray([2, 0])
+        manager.path = SimpleNamespace(request_id=7)
+        manager._update_path = lambda *args: None
+        manager.busy_since = 0
+        manager.sampling.last_plan = SimpleNamespace(diagnostics={"request_timestamp_sec": 0})
+        manager.seen_plan = manager.sampling.last_plan
+        manager.sampling.status = "TRACKING"
+        manager.sampling.requested = np.asarray([0.2, 0])
+        manager.sampling.step = lambda **kwargs: None
+        manager.sampling._worker = SimpleNamespace(busy=True)
+        manager.sampling.response_serial = 1
+        with patch("constraint_traverse.active_passage.traversal.controller.time.monotonic", return_value=30):
+            manager.step(robot=None, drive=None, grid=grid(), now=0)
+        self.assertTrue(manager.active)
         self.assertEqual(manager.busy_since, 30)
 
 
